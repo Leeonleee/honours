@@ -56,10 +56,28 @@ fi
 
 echo "yay"
 
-# --- Step 4: Apply code fix patch ---
-echo "Generating and applying code fix patch..."
-git diff "$FIX_COMMIT^" "$FIX_COMMIT" -- $CODE_FILES > ../fix.patch
-git apply ../fix.patch
+# # --- Step 4: Apply code fix patch ---
+# echo "Generating and applying code fix patch..."
+# git diff "$FIX_COMMIT^" "$FIX_COMMIT" -- $CODE_FILES > ../fix.patch
+# git apply ../fix.patch
+
+# --- Step 4: Apply code fix patch from static file ---
+PATCH_FILE="../llm_fix.patch"
+
+if [ ! -f "$PATCH_FILE" ]; then
+  echo "❌ Patch file $PATCH_FILE not found!"
+  exit 1
+fi
+
+echo "Checking if patch applies cleanly..."
+if git apply --check "$PATCH_FILE"; then
+  echo "Applying code fix patch from $PATCH_FILE..."
+  git apply "$PATCH_FILE" || { echo "❌ Failed to apply patch"; exit 1; }
+else
+  echo "❌ Patch failed to apply (dry run check failed)."
+  exit 1
+fi
+
 
 # --- Step 5: Rebuild and rerun test ---
 echo "Rebuilding RocksDB with fix..."
@@ -75,8 +93,8 @@ else
   echo "❌ Post-fix test FAILED unexpectedly."
 fi
 
-# --- Step 6: Clean up ---
-git reset --hard
-git clean -fd
+# # --- Step 6: Clean up ---
+# git reset --hard
+# git clean -fd
 
 echo "=== Done! Logs and verdicts saved to $LOG_DIR"
