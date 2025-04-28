@@ -1,1 +1,56 @@
 # honours
+
+## Repositories
+
+- duckdb/duckdb
+
+## Folder Structure
+
+```
+project
+│   README.md
+│   requirements.txt  
+│
+└───prs
+│   │   pr_1.json
+│   │   pr_2.json
+│   │
+│   └───subfolder1
+│       │   file111.txt
+│       │   file112.txt
+│       │   ...
+│   
+└───folder2
+    │   file021.txt
+    │   file022.txt
+```
+
+- `prs`: contains individual valid PRs, with the following format:
+
+```json
+{
+    "repo": "repo/repo",
+    "pull_number": 12345,
+    "instance_id": "repo__repo-12345",
+    "issue_numbers": [
+        "11111"
+    ],
+    "base_commit": "commit_sha",
+    "patch": "diff file_1 file_2",
+    "test_patch": "diff file_1 file_2",
+    "problem_statement": "problem statement",
+    "hints_text": "\n",
+    "created_at": "date"
+}
+```
+
+## Manually Test Issues
+
+1. Git Clone `ducksdb`
+2. Choose an issue
+    1. checkout to the base commit `git checkout <base_commit>`
+    2. Create the `test.patch` by turning the diff in the `test_patch` field of the JSON into a `test.patch` file
+    3. Apply the `test.patch`
+    4. Run the test using `build/debug/test/unittest path_to_test/test_name.test`
+        - It should fail
+    5. Create the `fix.patch
