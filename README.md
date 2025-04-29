@@ -12,17 +12,19 @@ project
 │   requirements.txt  
 │
 └───prs
-│   │   pr_1.json
-│   │   pr_2.json
+|   |   duckdb-task-instances.jsonl
 │   │
-│   └───subfolder1
-│       │   file111.txt
-│       │   file112.txt
-│       │   ...
+│   └───15277
+|   |   └───15277.json
+│   └───15287
+│   |   └───15287.json
+│   └───...
 │   
-└───folder2
-    │   file021.txt
-    │   file022.txt
+└───scripts
+    │   create_prompt.py
+    │   decode_patch.py
+    |   tasks_to_json.py
+    |   README.md
 ```
 
 - `prs`: contains individual valid PRs, with the following format:
