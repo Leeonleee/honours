@@ -6,7 +6,7 @@
 
 ## Folder Structure
 
-```
+```none
 project
 │   README.md
 │   requirements.txt  
@@ -56,3 +56,24 @@ project
     4. Run the test using `build/debug/test/unittest path_to_test/test_name.test`
         - It should fail
     5. Create the `fix.patch
+
+## Easy PRs
+
+A PR is considered easy if:
+
+- the patch line length <= 40
+- changes files <= 1
+- problem statement length <= 1000
+- if it doesn't contain new control flow `if (,` `for (`, `while (`
+
+### List of Easy PRs
+
+- 342
+- 4250
+- 4654
+- 4713
+- 4810
+- 4973
+- 5805
+- 7443
+- 12942

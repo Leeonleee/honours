@@ -12,7 +12,7 @@ def is_easy_pr(pr_data):
     changed_files = patch.count('diff --git')
 
     # Heuristics
-    if patch_lines > 40:   # You can tweak this (maybe <= 20 even better)
+    if patch_lines > 40:   # You can tweak this threshold
         return False
     if changed_files > 1:
         return False
@@ -26,7 +26,13 @@ def is_easy_pr(pr_data):
 # Path to your extracted folders
 base_dir = "/home/leon/Documents/university/honours/prs"
 
-for pr_folder in os.listdir(base_dir):
+# Sort PR folders numerically
+pr_folders = sorted(
+    (f for f in os.listdir(base_dir) if f.isdigit()), 
+    key=lambda x: int(x)
+)
+
+for pr_folder in pr_folders:
     pr_path = os.path.join(base_dir, pr_folder, f"{pr_folder}.json")
     if not os.path.isfile(pr_path):
         continue
