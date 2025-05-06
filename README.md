@@ -53,6 +53,7 @@ project
     - Create the `.prompt`, `fix.patch`, and `test.patch` files by running `process_single_pr.py <path_to_pr_folder> <path_to_duckdb_repo>`
 3. `git checkout` to the PRs commit
 4. Compile the code using `make -j$(nproc)` and run tests to make sure no tests fail (if time matters, only run the test that is modified in the patch)
+    - May need to change `cmake` or `gcc`
 5. Apply the `test.patch`, recompile if necessary and run the modified test
     - This time the test should fail
     - If time is not a concern, run all test suites to ensure there is no other bug in the codebase
