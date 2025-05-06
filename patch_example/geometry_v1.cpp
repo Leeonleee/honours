@@ -1,4 +1,7 @@
-// geometry.cpp
+#include <vector>
+#include <utility>
+#include <cstdlib>
+
 int euclidean(int a, int b) {
     while (b) {
         int temp = b;
