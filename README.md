@@ -51,15 +51,16 @@ project
 1. Git Clone `ducksdb`
 2. Choose a PR/issue
     - Create the `.prompt`, `fix.patch`, and `test.patch` files by running `process_single_pr.py <path_to_pr_folder> <path_to_duckdb_repo>`
-3. Compile the code and run tests to make sure no tests fail (if time matters, only run the test that is modified in the patch)
-4. Apply the `test.patch`, recompile if necessary and run the modified test
+3. `git checkout` to the PRs commit
+4. Compile the code using `make -j$(nproc)` and run tests to make sure no tests fail (if time matters, only run the test that is modified in the patch)
+5. Apply the `test.patch`, recompile if necessary and run the modified test
     - This time the test should fail
     - If time is not a concern, run all test suites to ensure there is no other bug in the codebase
-5. Apply the `fix.patch`, recompile then run the modified test
+6. Apply the `fix.patch`, recompile then run the modified test
     - This time the test should pass
     - If time is not a concern, run all test suites to ensure there is no other bug in the codebase
 
-If the tests behave as expected after step 5, the PR has been verified and is ready for the LLM to test a fix
+If the tests behave as expected after step 6, the PR has been verified and is ready for the LLM to test a fix
 
 
 ## Manually Verified PRs
