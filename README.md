@@ -4,6 +4,18 @@
 
 - duckdb/duckdb
 
+## Docker
+
+- To run the benchmark, run it using an Amazon Linux 2023 Docker Image
+- Once setup, run these commands:
+
+```bash
+dnf update -y
+dnf groupinstall "Development Tools" -y
+dnf install gcc cmake git wget -y
+
+```
+
 ## Folder Structure
 
 ```none
