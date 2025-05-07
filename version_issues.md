@@ -23,6 +23,7 @@ export PATH=/opt/cmake-3.31.7-linux-x86_64/bin:$PATH
 - This sets cmake to version 3.31.7 for the current terminal session
 
 ## GCC
+
 - The `<cstdint.h>` include error happens in multiple files
 - Older versions require older GCC/G++ versions. GCC 14+ is too new
 - I tried including `<cstdint.h>` but it didn't work, but `<stdint.h>` worked. I googled and apparently it used to be called that?
@@ -30,3 +31,8 @@ export PATH=/opt/cmake-3.31.7-linux-x86_64/bin:$PATH
 ### Fix (Not working yet)
 
 - Downloaded GCC 12.1
+
+```
+export CC=/usr/bin/gcc-12
+export CXX=/usr/bin/g++-12
+```
