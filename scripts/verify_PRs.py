@@ -82,7 +82,7 @@ def get_test_paths_from_patch(patch_path):
 def main():
     valid_prs = []
 
-    for pr in os.listdir(PR_FOLDER_PATH):
+    for pr in sorted(os.listdir(PR_FOLDER_PATH), key=lambda x: int(x) if x.isdigit() else float('inf')):
         pr_path = os.path.join(PR_FOLDER_PATH, pr)
         if not os.path.isdir(pr_path):
             continue
