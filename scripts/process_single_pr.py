@@ -6,6 +6,10 @@ import sys
 
 # Usage: python process_single_pr.py path/to/pr_folder path/to/repo
 
+"""
+This function will create the .prompt, fix.patch, and test.patch for each PR
+"""
+
 pr_folder = sys.argv[1]
 repo_path = sys.argv[2]
 template_path = "../template.prompt"
