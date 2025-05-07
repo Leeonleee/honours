@@ -125,7 +125,7 @@ def main():
         print("✅ Baseline test passed (Expected behaviour)")
 
         # Apply test.patch and rerun test (should fail)
-        run("git reset --hard", cwd=DUCKDB_REPO_PATH)
+        # run("git reset --hard", cwd=DUCKDB_REPO_PATH)
         print("📄 Applying test.patch...")
         if not apply_patch(test_patch_path, DUCKDB_REPO_PATH):
             print("❌ Failed to apply test.patch")
@@ -144,7 +144,7 @@ def main():
         print("✅ Modified test failed (Expected behaviour)")
 
         # Apply fix.patch and rerun test (should pass)
-        run("git reset --hard", cwd=DUCKDB_REPO_PATH)
+        # run("git reset --hard", cwd=DUCKDB_REPO_PATH)
         print("📄 Applying test.patch...")
         if not apply_patch(test_patch_path, DUCKDB_REPO_PATH):
             print("❌ Failed to apply test.patch")
