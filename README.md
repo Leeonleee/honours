@@ -75,6 +75,12 @@ project
 
 If the tests behave as expected after step 6, the PR has been verified and is ready for the LLM to test a fix
 
+## Automatically Verify Individual PRs
+
+1. Run the `scripts/verify_PRs.py` script
+    - Make sure the paths in the script are set correctly. They should be relative to the script's location
+2. The script should output the names of all valid PRs
+
 
 ## Manually Verified PRs
 

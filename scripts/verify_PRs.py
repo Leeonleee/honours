@@ -8,48 +8,48 @@ PR_FOLDER_PATH = "../test_in_progress_prs"
 DUCKDB_REPO_PATH = "../duckdb"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
 
-def run(cmd, cwd=None, check=True):
-    result = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        print(f"[Error] Command failed: {cmd}")
-        print(result.stdout)
-        print(result.stderr)
-        return None
-    return result
+# def run(cmd, cwd=None, check=True):
+#     result = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True)
+#     if check and result.returncode != 0:
+#         print(f"[Error] Command failed: {cmd}")
+#         print(result.stdout)
+#         print(result.stderr)
+#         return None
+#     return result
 
 # run with full terminal output
-# def run(cmd, cwd=None, check=True):
-#     process = subprocess.Popen(
-#         cmd,
-#         cwd=cwd,
-#         shell=True,
-#         stdout=subprocess.PIPE,
-#         stderr=subprocess.PIPE,
-#         text=True,
-#         bufsize=1
-#     )
-#     stdout, stderr = [], []
+def run(cmd, cwd=None, check=True):
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
+    stdout, stderr = [], []
 
-#     for line in process.stdout:
-#         print(line, end='')
-#         stdout.append(line)
-#     for line in process.stderr:
-#         print(line, end='', file=sys.stderr)
-#         stderr.append(line)
+    for line in process.stdout:
+        print(line, end='')
+        stdout.append(line)
+    for line in process.stderr:
+        print(line, end='', file=sys.stderr)
+        stderr.append(line)
 
-#     process.wait()
+    process.wait()
 
-#     if check and process.returncode != 0:
-#         print(f"[Error] Command failed: {cmd}")
-#         return None
+    if check and process.returncode != 0:
+        print(f"[Error] Command failed: {cmd}")
+        return None
 
-#     class Result:
-#         def __init__(self, stdout, stderr, returncode):
-#             self.stdout = ''.join(stdout)
-#             self.stderr = ''.join(stderr)
-#             self.returncode = returncode
+    class Result:
+        def __init__(self, stdout, stderr, returncode):
+            self.stdout = ''.join(stdout)
+            self.stderr = ''.join(stderr)
+            self.returncode = returncode
 
-#     return Result(stdout, stderr, process.returncode)
+    return Result(stdout, stderr, process.returncode)
 
 
 
@@ -120,12 +120,11 @@ def main():
         # Run baseline test (should pass)
         print("✅ Running baseline test... (should pass)")
         if not run_test(test_rel_path, DUCKDB_REPO_PATH):
-            print("Baseline test failed")
+            print("❌ Baseline test failed")
             continue
         print("✅ Baseline test passed (Expected behaviour)")
 
         # Apply test.patch and rerun test (should fail)
-        # run("git reset --hard", cwd=DUCKDB_REPO_PATH)
         print("📄 Applying test.patch...")
         if not apply_patch(test_patch_path, DUCKDB_REPO_PATH):
             print("❌ Failed to apply test.patch")
@@ -137,19 +136,12 @@ def main():
             continue
         print("✅ Compilation succeeded (Expected behaviour)")
         print("🧪 Running modified test (should fail)...")
-
         if run_test(test_rel_path, DUCKDB_REPO_PATH):
             print("❌ Test did not fail after applying test.patch")
             continue
         print("✅ Modified test failed (Expected behaviour)")
 
         # Apply fix.patch and rerun test (should pass)
-        # run("git reset --hard", cwd=DUCKDB_REPO_PATH)
-        print("📄 Applying test.patch...")
-        if not apply_patch(test_patch_path, DUCKDB_REPO_PATH):
-            print("❌ Failed to apply test.patch")
-            continue
-        print("✅ test.patch applied (Expected behaviour)")
         print("📄 Applying fix.patch...")
         if not apply_patch(os.path.join(pr_path, "fix.patch"), DUCKDB_REPO_PATH):
             print("❌ Failed to apply fix.patch")
@@ -167,6 +159,10 @@ def main():
 
         print(f"✅ PR {pr} is valid")
         valid_prs.append(pr)
+
+        # Reset DuckDB repo
+        run("git reset --hard", cwd=DUCKDB_REPO_PATH)
+        run("git clean -fd", cwd=DUCKDB_REPO_PATH)
 
     print("\n=== Valid PRs ===")
     for pr in valid_prs:
