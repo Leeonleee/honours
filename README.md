@@ -113,3 +113,9 @@ Out of these tests, these are verified:
 - 4973
 - 5805
 - 12942
+
+## Running the Benchmark
+
+### Prerequisites
+- Ensure you have the `llm` Python library installed
+  - Install any plugins for it if necessary (the library supports OpenAI models initially)
