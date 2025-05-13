@@ -1,7 +1,6 @@
 #!/bin/bash
 
 models=(
-    "o3"
     "4o"
 )
 
