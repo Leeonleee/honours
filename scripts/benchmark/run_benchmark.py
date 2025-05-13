@@ -1,6 +1,7 @@
 from generate_patches import generate_patches
 from test_patches import test_all
 import argparse, os, shutil
+from pathlib import Path
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run benchmark pipeline")
@@ -10,17 +11,21 @@ def parse_arguments():
     return parser.parse_args()
 
 def cleanup_patches(benchmark_dir):
-    for folder_name in os.listdir(benchmark_dir):
-        patch_dir = os.path.join(benchmark_dir, folder_name, "ai_patches")
-        if os.path.isdir(patch_dir):
-            shutil.rmtree(patch_dir)
-            print(f"🧹 Deleted {patch_dir}")
+    for folder_path in benchmark_dir.iterdir():
+        if not folder_path.is_dir():
+            continue
+        for subfolder in ["ai_patches", "logs"]:
+            target= folder_path / subfolder
+            if target.exists() and target.is_dir():
+                shutil.rmtree(target)
+                print(f"🧹 Deleted {target}")
 
 def main():
     args = parse_arguments()
+    benchmark_dir = Path(args.dir).resolve()
 
-    # print("🔧 Generating patches...")
-    # generate_patches(args.m, args.k, args.dir)
+    print("🔧 Generating patches...")
+    generate_patches(args.m, args.k, args.dir)
 
     print("🧪 Testing patches...")
     test_all(args.m)
