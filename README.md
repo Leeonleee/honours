@@ -108,4 +108,8 @@ A PR is considered easy if:
 - 7443
 - 12942
 
-
+Out of these tests, these are verified:
+- 4713
+- 4973
+- 5805
+- 12942
