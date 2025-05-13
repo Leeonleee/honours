@@ -19,6 +19,7 @@ def run(cmd, cwd=None, check=True, log_path=None):
         text=True
     )
     stdout, stderr = process.communicate()
+    returncode = process.returncode
 
     if log_path:
         with open(log_path, "w") as f:
@@ -28,10 +29,17 @@ def run(cmd, cwd=None, check=True, log_path=None):
             f.write("\n\n=== STDERR ===\n")
             f.write(stderr)
 
-    if check and process.returncode != 0:
+    if check and returncode != 0:
         print(f"[Error] Command failed: {cmd}")
         return None
-    return stdout
+    
+    class Result:
+        def __init__(self, stdout, stderr, returncode):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    return Result(stdout, stderr, returncode)
 
 def reset_repo(repo_path):
     run("git reset --hard", cwd=repo_path)
@@ -98,8 +106,9 @@ def test_all(model):
             # checkout to correct commit
             with open(os.path.join(problem_path, f"{problem}.json")) as f:
                 commit_hash = json.load(f)["base_commit"]
-                print(commit_hash)
-            if not run(f"git checkout {commit_hash}", cwd=DUCKDB_REPO_PATH):
+
+            result = run(f"git checkout {commit_hash}", cwd=DUCKDB_REPO_PATH)
+            if result is None or result.returncode != 0:
                 print(f"❌ Failed to checkout to base commit for {problem}")
                 continue
             
