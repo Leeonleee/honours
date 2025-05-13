@@ -28,7 +28,7 @@ def run(cmd, cwd=None, check=True, log_path=None):
 
     if log_path:
         with open(log_path, "a") as f:
-            f.wrote(f"\n cwd: {cwd}")
+            f.write(f"\n cwd: {cwd}")
             f.write(f"\n$ {cmd}\n\n")
             f.write("=== STDOUT ===\n")
             f.write(stdout)
