@@ -5,6 +5,7 @@ import sys
 
 # Configurations
 PR_FOLDER_PATH = "../test_in_progress_prs"
+# PR_FOLDER_PATH = "../prs"
 DUCKDB_REPO_PATH = "../duckdb"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
 
@@ -81,8 +82,12 @@ def get_test_paths_from_patch(patch_path):
 
 def main():
     valid_prs = []
+    max_prs_to_test = 10
+    tested_pr_count = 0
 
     for pr in sorted(os.listdir(PR_FOLDER_PATH), key=lambda x: int(x) if x.isdigit() else float('inf')):
+        if tested_pr_count >= max_prs_to_test:
+            break
         pr_path = os.path.join(PR_FOLDER_PATH, pr)
         if not os.path.isdir(pr_path):
             continue
@@ -96,18 +101,24 @@ def main():
         # Process PR
         process = run(f"python3 {PROCESS_SCRIPT_PATH} {pr_path} {DUCKDB_REPO_PATH}")
         if process is None:
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
 
         # Checkout to PR commit
         with open(os.path.join(pr_path, f"{pr}.json")) as f:
             commit_hash = json.load(f)["base_commit"]
         if not run(f"git checkout {commit_hash}", cwd=DUCKDB_REPO_PATH):
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
 
         # Compile baseline code
         print("🔧 Compiling code...")
         if not build_duckdb(DUCKDB_REPO_PATH):
             print("❌ Compilation failed")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ Compilation succeeded (Expected behaviour)")
         # Get test path
@@ -115,12 +126,16 @@ def main():
         test_rel_path = get_test_paths_from_patch(test_patch_path)
         if not test_rel_path:
             print(f"Could not determine test path for PR {pr}")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
 
         # Run baseline test (should pass)
         print("✅ Running baseline test... (should pass)")
         if not run_test(test_rel_path, DUCKDB_REPO_PATH):
             print("❌ Baseline test failed")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ Baseline test passed (Expected behaviour)")
 
@@ -128,16 +143,22 @@ def main():
         print("📄 Applying test.patch...")
         if not apply_patch(test_patch_path, DUCKDB_REPO_PATH):
             print("❌ Failed to apply test.patch")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ test.patch applied (Expected behaviour)")
         print("🔧 Compiling code...")
         if build_duckdb(DUCKDB_REPO_PATH) is None:
             print("❌ Compilation failed")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ Compilation succeeded (Expected behaviour)")
         print("🧪 Running modified test (should fail)...")
         if run_test(test_rel_path, DUCKDB_REPO_PATH):
             print("❌ Test did not fail after applying test.patch")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ Modified test failed (Expected behaviour)")
 
@@ -145,20 +166,31 @@ def main():
         print("📄 Applying fix.patch...")
         if not apply_patch(os.path.join(pr_path, "fix.patch"), DUCKDB_REPO_PATH):
             print("❌ Failed to apply fix.patch")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ fix.patch applied (Expected behaviour)")
         print("🔧 Compiling code...")
         if build_duckdb(DUCKDB_REPO_PATH) is None:
             print("❌ Compilation failed")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
         print("✅ Compilation succeeded (Expected behaviour)")
         print("🧪 Running fixed test (should pass)...")
         if not run_test(test_rel_path, DUCKDB_REPO_PATH):
             print("❌ Final test failed")
+            for verified_pr in valid_prs:
+                print(verified_pr)
             continue
 
         print(f"✅ PR {pr} is valid")
         valid_prs.append(pr)
+        tested_pr_count += 1
+
+        # print out valid prs
+        for verified_pr in valid_prs:
+            print(verified_pr)
 
         # Reset DuckDB repo
         run("git reset --hard", cwd=DUCKDB_REPO_PATH)

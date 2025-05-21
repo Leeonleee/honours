@@ -1,0 +1,1420 @@
+You will be provided with a partial code base and an issue statement explaining a problem to resolve.
+In your output, give nothing but the code (no markdown) so that your output can be copy pasted and run immediately with no changes
+
+<issue>
+COPY TO "/dev/stdout" (or pipe) fails
+**Writing to stdout/pipe?**
+
+DuckDB is not able to open `/dev/stdout` or a named pip (`mkfifo`) for writing when the output is redirected. 
+
+Specifying "/dev/stdout" as output file works and e.g. CSV data is printed on terminal, but whenever trying to redirect the output to file or pipe it, DuckDB fails to open the output "file". Reason being most probably that DuckDB tries to open the output with more permissions than plain write ("w").
+
+Use case could for example be to pipe Parquet through DuckDB without having to write data on disk.
+
+Maybe the pipe filesystem could be extended to support output pipes/stdout as well?
+
+On OSX (`v0.2.9 1776611ab`):
+
+```
+duckdb :memory: "COPY (SELECT * FROM 'input.parquet') TO '/dev/stdout' WITH (FORMAT 'Parquet');" | \
+    aws s3 cp - s3://bucket/out.parquet
+Error: IO Error: Cannot open file "/dev/stdout": Permission denied
+```
+
+</issue>
+<code>
+[start of README.md]
+1: <div align="center">
+2:   <img src="https://duckdb.org/images/DuckDB_Logo_dl.png" height="50">
+3: </div>
+4: <p>&nbsp;</p>
+5: 
+6: <p align="center">
+7:   <a href="https://github.com/duckdb/duckdb/actions">
+8:     <img src="https://github.com/cwida/duckdb/workflows/.github/workflows/main.yml/badge.svg?branch=master" alt=".github/workflows/main.yml">
+9:   </a>
+10:   <a href="https://www.codefactor.io/repository/github/cwida/duckdb">
+11:     <img src="https://www.codefactor.io/repository/github/cwida/duckdb/badge" alt="CodeFactor"/>
+12:   </a>
+13:   <a href="https://app.codecov.io/gh/duckdb/duckdb">
+14:     <img src="https://codecov.io/gh/duckdb/duckdb/branch/master/graph/badge.svg?token=FaxjcfFghN" alt="codecov"/>
+15:   </a>
+16: </p>
+17: 
+18: ## DuckDB
+19: DuckDB is a high-performance analytical database system. It is designed to be fast, reliable and easy to use. DuckDB provides a rich SQL dialect, with support far beyond basic SQL. DuckDB supports arbitrary and nested correlated subqueries, window functions, collations, complex types (arrays, structs), and more. For more information on the goals of DuckDB, please refer to [the Why DuckDB page on our website](https://duckdb.org/docs/why_duckdb.html).
+20: 
+21: ## Installation
+22: If you want to install and use DuckDB, please see [our website](https://www.duckdb.org) for installation and usage instructions.
+23: 
+24: ## Data Import
+25: For CSV files and Parquet files, data import is as simple as referencing the file in the FROM clause:
+26: 
+27: ```sql
+28: SELECT * FROM 'myfile.csv';
+29: SELECT * FROM 'myfile.parquet';
+30: ```
+31: 
+32: Refer to our [Data Import](https://duckdb.org/docs/data/overview) section for more information.
+33: 
+34: ## SQL Reference
+35: The [website](https://duckdb.org/docs/sql/introduction) contains a reference of functions and SQL constructs available in DuckDB.
+36: 
+37: ## Development
+38: For development, DuckDB requires [CMake](https://cmake.org), Python3 and a `C++11` compliant compiler. Run `make` in the root directory to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`.
+39: 
+40: Please also refer to our [Contribution Guide](CONTRIBUTING.md).
+41: 
+42: 
+[end of README.md]
+[start of src/common/local_file_system.cpp]
+1: #include "duckdb/common/local_file_system.hpp"
+2: 
+3: #include "duckdb/common/checksum.hpp"
+4: #include "duckdb/common/exception.hpp"
+5: #include "duckdb/common/helper.hpp"
+6: #include "duckdb/common/string_util.hpp"
+7: #include "duckdb/common/windows.hpp"
+8: #include "duckdb/function/scalar/string_functions.hpp"
+9: #include "duckdb/main/client_context.hpp"
+10: #include "duckdb/main/database.hpp"
+11: 
+12: #include <cstdint>
+13: #include <cstdio>
+14: 
+15: #ifndef _WIN32
+16: #include <dirent.h>
+17: #include <fcntl.h>
+18: #include <string.h>
+19: #include <sys/stat.h>
+20: #include <sys/types.h>
+21: #include <unistd.h>
+22: #else
+23: #include <string>
+24: 
+25: #ifdef __MINGW32__
+26: // need to manually define this for mingw
+27: extern "C" WINBASEAPI BOOL WINAPI GetPhysicallyInstalledSystemMemory(PULONGLONG);
+28: #endif
+29: 
+30: #undef FILE_CREATE // woo mingw
+31: #endif
+32: 
+33: namespace duckdb {
+34: 
+35: static void AssertValidFileFlags(uint8_t flags) {
+36: 	// cannot combine Read and Write flags
+37: 	D_ASSERT(!(flags & FileFlags::FILE_FLAGS_READ && flags & FileFlags::FILE_FLAGS_WRITE));
+38: 	// cannot combine Read and CREATE/Append flags
+39: 	D_ASSERT(!(flags & FileFlags::FILE_FLAGS_READ && flags & FileFlags::FILE_FLAGS_APPEND));
+40: 	D_ASSERT(!(flags & FileFlags::FILE_FLAGS_READ && flags & FileFlags::FILE_FLAGS_FILE_CREATE));
+41: 	D_ASSERT(!(flags & FileFlags::FILE_FLAGS_READ && flags & FileFlags::FILE_FLAGS_FILE_CREATE_NEW));
+42: 	// cannot combine CREATE and CREATE_NEW flags
+43: 	D_ASSERT(!(flags & FileFlags::FILE_FLAGS_FILE_CREATE && flags & FileFlags::FILE_FLAGS_FILE_CREATE_NEW));
+44: }
+45: 
+46: #ifndef _WIN32
+47: // somehow sometimes this is missing
+48: #ifndef O_CLOEXEC
+49: #define O_CLOEXEC 0
+50: #endif
+51: 
+52: // Solaris
+53: #ifndef O_DIRECT
+54: #define O_DIRECT 0
+55: #endif
+56: 
+57: struct UnixFileHandle : public FileHandle {
+58: public:
+59: 	UnixFileHandle(FileSystem &file_system, string path, int fd) : FileHandle(file_system, move(path)), fd(fd) {
+60: 	}
+61: 	~UnixFileHandle() override {
+62: 		Close();
+63: 	}
+64: 
+65: protected:
+66: 	void Close() override {
+67: 		if (fd != -1) {
+68: 			close(fd);
+69: 		}
+70: 	};
+71: 
+72: public:
+73: 	int fd;
+74: };
+75: 
+76: unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path, uint8_t flags, FileLockType lock_type,
+77:                                                  FileCompressionType compression, FileOpener *opener) {
+78: 	if (compression != FileCompressionType::UNCOMPRESSED) {
+79: 		throw NotImplementedException("Unsupported compression type for default file system");
+80: 	}
+81: 
+82: 	AssertValidFileFlags(flags);
+83: 
+84: 	int open_flags = 0;
+85: 	int rc;
+86: 	if (flags & FileFlags::FILE_FLAGS_READ) {
+87: 		open_flags = O_RDONLY;
+88: 	} else {
+89: 		// need Read or Write
+90: 		D_ASSERT(flags & FileFlags::FILE_FLAGS_WRITE);
+91: 		open_flags = O_RDWR | O_CLOEXEC;
+92: 		if (flags & FileFlags::FILE_FLAGS_FILE_CREATE) {
+93: 			open_flags |= O_CREAT;
+94: 		} else if (flags & FileFlags::FILE_FLAGS_FILE_CREATE_NEW) {
+95: 			open_flags |= O_CREAT | O_TRUNC;
+96: 		}
+97: 		if (flags & FileFlags::FILE_FLAGS_APPEND) {
+98: 			open_flags |= O_APPEND;
+99: 		}
+100: 	}
+101: 	if (flags & FileFlags::FILE_FLAGS_DIRECT_IO) {
+102: #if defined(__sun) && defined(__SVR4)
+103: 		throw Exception("DIRECT_IO not supported on Solaris");
+104: #endif
+105: #if defined(__DARWIN__) || defined(__APPLE__) || defined(__OpenBSD__)
+106: 		// OSX does not have O_DIRECT, instead we need to use fcntl afterwards to support direct IO
+107: 		open_flags |= O_SYNC;
+108: #else
+109: 		open_flags |= O_DIRECT | O_SYNC;
+110: #endif
+111: 	}
+112: 	int fd = open(path.c_str(), open_flags, 0666);
+113: 	if (fd == -1) {
+114: 		throw IOException("Cannot open file \"%s\": %s", path, strerror(errno));
+115: 	}
+116: 	// #if defined(__DARWIN__) || defined(__APPLE__)
+117: 	// 	if (flags & FileFlags::FILE_FLAGS_DIRECT_IO) {
+118: 	// 		// OSX requires fcntl for Direct IO
+119: 	// 		rc = fcntl(fd, F_NOCACHE, 1);
+120: 	// 		if (fd == -1) {
+121: 	// 			throw IOException("Could not enable direct IO for file \"%s\": %s", path, strerror(errno));
+122: 	// 		}
+123: 	// 	}
+124: 	// #endif
+125: 	if (lock_type != FileLockType::NO_LOCK) {
+126: 		// set lock on file
+127: 		struct flock fl;
+128: 		memset(&fl, 0, sizeof fl);
+129: 		fl.l_type = lock_type == FileLockType::READ_LOCK ? F_RDLCK : F_WRLCK;
+130: 		fl.l_whence = SEEK_SET;
+131: 		fl.l_start = 0;
+132: 		fl.l_len = 0;
+133: 		rc = fcntl(fd, F_SETLK, &fl);
+134: 		if (rc == -1) {
+135: 			throw IOException("Could not set lock on file \"%s\": %s", path, strerror(errno));
+136: 		}
+137: 	}
+138: 	return make_unique<UnixFileHandle>(*this, path, fd);
+139: }
+140: 
+141: void LocalFileSystem::SetFilePointer(FileHandle &handle, idx_t location) {
+142: 	int fd = ((UnixFileHandle &)handle).fd;
+143: 	off_t offset = lseek(fd, location, SEEK_SET);
+144: 	if (offset == (off_t)-1) {
+145: 		throw IOException("Could not seek to location %lld for file \"%s\": %s", location, handle.path,
+146: 		                  strerror(errno));
+147: 	}
+148: }
+149: 
+150: idx_t LocalFileSystem::GetFilePointer(FileHandle &handle) {
+151: 	int fd = ((UnixFileHandle &)handle).fd;
+152: 	off_t position = lseek(fd, 0, SEEK_CUR);
+153: 	if (position == (off_t)-1) {
+154: 		throw IOException("Could not get file position file \"%s\": %s", handle.path, strerror(errno));
+155: 	}
+156: 	return position;
+157: }
+158: 
+159: void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+160: 	int fd = ((UnixFileHandle &)handle).fd;
+161: 	int64_t bytes_read = pread(fd, buffer, nr_bytes, location);
+162: 	if (bytes_read == -1) {
+163: 		throw IOException("Could not read from file \"%s\": %s", handle.path, strerror(errno));
+164: 	}
+165: 	if (bytes_read != nr_bytes) {
+166: 		throw IOException("Could not read all bytes from file \"%s\": wanted=%lld read=%lld", handle.path, nr_bytes,
+167: 		                  bytes_read);
+168: 	}
+169: }
+170: 
+171: int64_t LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+172: 	int fd = ((UnixFileHandle &)handle).fd;
+173: 	int64_t bytes_read = read(fd, buffer, nr_bytes);
+174: 	if (bytes_read == -1) {
+175: 		throw IOException("Could not read from file \"%s\": %s", handle.path, strerror(errno));
+176: 	}
+177: 	return bytes_read;
+178: }
+179: 
+180: void LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+181: 	int fd = ((UnixFileHandle &)handle).fd;
+182: 	int64_t bytes_written = pwrite(fd, buffer, nr_bytes, location);
+183: 	if (bytes_written == -1) {
+184: 		throw IOException("Could not write file \"%s\": %s", handle.path, strerror(errno));
+185: 	}
+186: 	if (bytes_written != nr_bytes) {
+187: 		throw IOException("Could not write all bytes to file \"%s\": wanted=%lld wrote=%lld", handle.path, nr_bytes,
+188: 		                  bytes_written);
+189: 	}
+190: }
+191: 
+192: int64_t LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+193: 	int fd = ((UnixFileHandle &)handle).fd;
+194: 	int64_t bytes_written = write(fd, buffer, nr_bytes);
+195: 	if (bytes_written == -1) {
+196: 		throw IOException("Could not write file \"%s\": %s", handle.path, strerror(errno));
+197: 	}
+198: 	return bytes_written;
+199: }
+200: 
+201: int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {
+202: 	int fd = ((UnixFileHandle &)handle).fd;
+203: 	struct stat s;
+204: 	if (fstat(fd, &s) == -1) {
+205: 		return -1;
+206: 	}
+207: 	return s.st_size;
+208: }
+209: 
+210: time_t LocalFileSystem::GetLastModifiedTime(FileHandle &handle) {
+211: 	int fd = ((UnixFileHandle &)handle).fd;
+212: 	struct stat s;
+213: 	if (fstat(fd, &s) == -1) {
+214: 		return -1;
+215: 	}
+216: 	return s.st_mtime;
+217: }
+218: 
+219: FileType LocalFileSystem::GetFileType(FileHandle &handle) {
+220: 	int fd = ((UnixFileHandle &)handle).fd;
+221: 	struct stat s;
+222: 	if (fstat(fd, &s) == -1) {
+223: 		return FileType::FILE_TYPE_INVALID;
+224: 	}
+225: 	switch (s.st_mode & S_IFMT) {
+226: 	case S_IFBLK:
+227: 		return FileType::FILE_TYPE_BLOCKDEV;
+228: 	case S_IFCHR:
+229: 		return FileType::FILE_TYPE_CHARDEV;
+230: 	case S_IFIFO:
+231: 		return FileType::FILE_TYPE_FIFO;
+232: 	case S_IFDIR:
+233: 		return FileType::FILE_TYPE_DIR;
+234: 	case S_IFLNK:
+235: 		return FileType::FILE_TYPE_LINK;
+236: 	case S_IFREG:
+237: 		return FileType::FILE_TYPE_REGULAR;
+238: 	case S_IFSOCK:
+239: 		return FileType::FILE_TYPE_SOCKET;
+240: 	default:
+241: 		return FileType::FILE_TYPE_INVALID;
+242: 	}
+243: }
+244: 
+245: void LocalFileSystem::Truncate(FileHandle &handle, int64_t new_size) {
+246: 	int fd = ((UnixFileHandle &)handle).fd;
+247: 	if (ftruncate(fd, new_size) != 0) {
+248: 		throw IOException("Could not truncate file \"%s\": %s", handle.path, strerror(errno));
+249: 	}
+250: }
+251: 
+252: bool LocalFileSystem::DirectoryExists(const string &directory) {
+253: 	if (!directory.empty()) {
+254: 		if (access(directory.c_str(), 0) == 0) {
+255: 			struct stat status;
+256: 			stat(directory.c_str(), &status);
+257: 			if (status.st_mode & S_IFDIR) {
+258: 				return true;
+259: 			}
+260: 		}
+261: 	}
+262: 	// if any condition fails
+263: 	return false;
+264: }
+265: 
+266: bool LocalFileSystem::FileExists(const string &filename) {
+267: 	if (!filename.empty()) {
+268: 		if (access(filename.c_str(), 0) == 0) {
+269: 			struct stat status;
+270: 			stat(filename.c_str(), &status);
+271: 			if (!(status.st_mode & S_IFDIR)) {
+272: 				return true;
+273: 			}
+274: 		}
+275: 	}
+276: 	// if any condition fails
+277: 	return false;
+278: }
+279: 
+280: void LocalFileSystem::CreateDirectory(const string &directory) {
+281: 	struct stat st;
+282: 
+283: 	if (stat(directory.c_str(), &st) != 0) {
+284: 		/* Directory does not exist. EEXIST for race condition */
+285: 		if (mkdir(directory.c_str(), 0755) != 0 && errno != EEXIST) {
+286: 			throw IOException("Failed to create directory \"%s\"!", directory);
+287: 		}
+288: 	} else if (!S_ISDIR(st.st_mode)) {
+289: 		throw IOException("Failed to create directory \"%s\": path exists but is not a directory!", directory);
+290: 	}
+291: }
+292: 
+293: int RemoveDirectoryRecursive(const char *path) {
+294: 	DIR *d = opendir(path);
+295: 	idx_t path_len = (idx_t)strlen(path);
+296: 	int r = -1;
+297: 
+298: 	if (d) {
+299: 		struct dirent *p;
+300: 		r = 0;
+301: 		while (!r && (p = readdir(d))) {
+302: 			int r2 = -1;
+303: 			char *buf;
+304: 			idx_t len;
+305: 			/* Skip the names "." and ".." as we don't want to recurse on them. */
+306: 			if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) {
+307: 				continue;
+308: 			}
+309: 			len = path_len + (idx_t)strlen(p->d_name) + 2;
+310: 			buf = new char[len];
+311: 			if (buf) {
+312: 				struct stat statbuf;
+313: 				snprintf(buf, len, "%s/%s", path, p->d_name);
+314: 				if (!stat(buf, &statbuf)) {
+315: 					if (S_ISDIR(statbuf.st_mode)) {
+316: 						r2 = RemoveDirectoryRecursive(buf);
+317: 					} else {
+318: 						r2 = unlink(buf);
+319: 					}
+320: 				}
+321: 				delete[] buf;
+322: 			}
+323: 			r = r2;
+324: 		}
+325: 		closedir(d);
+326: 	}
+327: 	if (!r) {
+328: 		r = rmdir(path);
+329: 	}
+330: 	return r;
+331: }
+332: 
+333: void LocalFileSystem::RemoveDirectory(const string &directory) {
+334: 	RemoveDirectoryRecursive(directory.c_str());
+335: }
+336: 
+337: void LocalFileSystem::RemoveFile(const string &filename) {
+338: 	if (std::remove(filename.c_str()) != 0) {
+339: 		throw IOException("Could not remove file \"%s\": %s", filename, strerror(errno));
+340: 	}
+341: }
+342: 
+343: bool LocalFileSystem::ListFiles(const string &directory, const std::function<void(string, bool)> &callback) {
+344: 	if (!DirectoryExists(directory)) {
+345: 		return false;
+346: 	}
+347: 	DIR *dir = opendir(directory.c_str());
+348: 	if (!dir) {
+349: 		return false;
+350: 	}
+351: 	struct dirent *ent;
+352: 	// loop over all files in the directory
+353: 	while ((ent = readdir(dir)) != nullptr) {
+354: 		string name = string(ent->d_name);
+355: 		// skip . .. and empty files
+356: 		if (name.empty() || name == "." || name == "..") {
+357: 			continue;
+358: 		}
+359: 		// now stat the file to figure out if it is a regular file or directory
+360: 		string full_path = JoinPath(directory, name);
+361: 		if (access(full_path.c_str(), 0) != 0) {
+362: 			continue;
+363: 		}
+364: 		struct stat status;
+365: 		stat(full_path.c_str(), &status);
+366: 		if (!(status.st_mode & S_IFREG) && !(status.st_mode & S_IFDIR)) {
+367: 			// not a file or directory: skip
+368: 			continue;
+369: 		}
+370: 		// invoke callback
+371: 		callback(name, status.st_mode & S_IFDIR);
+372: 	}
+373: 	closedir(dir);
+374: 	return true;
+375: }
+376: 
+377: void LocalFileSystem::FileSync(FileHandle &handle) {
+378: 	int fd = ((UnixFileHandle &)handle).fd;
+379: 	if (fsync(fd) != 0) {
+380: 		throw FatalException("fsync failed!");
+381: 	}
+382: }
+383: 
+384: void LocalFileSystem::MoveFile(const string &source, const string &target) {
+385: 	//! FIXME: rename does not guarantee atomicity or overwriting target file if it exists
+386: 	if (rename(source.c_str(), target.c_str()) != 0) {
+387: 		throw IOException("Could not rename file!");
+388: 	}
+389: }
+390: 
+391: #else
+392: 
+393: constexpr char PIPE_PREFIX[] = "\\\\.\\pipe\\";
+394: 
+395: // Returns the last Win32 error, in string format. Returns an empty string if there is no error.
+396: std::string GetLastErrorAsString() {
+397: 	// Get the error message, if any.
+398: 	DWORD errorMessageID = GetLastError();
+399: 	if (errorMessageID == 0)
+400: 		return std::string(); // No error message has been recorded
+401: 
+402: 	LPSTR messageBuffer = nullptr;
+403: 	idx_t size =
+404: 	    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+405: 	                   NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+406: 
+407: 	std::string message(messageBuffer, size);
+408: 
+409: 	// Free the buffer.
+410: 	LocalFree(messageBuffer);
+411: 
+412: 	return message;
+413: }
+414: 
+415: struct WindowsFileHandle : public FileHandle {
+416: public:
+417: 	WindowsFileHandle(FileSystem &file_system, string path, HANDLE fd)
+418: 	    : FileHandle(file_system, path), position(0), fd(fd) {
+419: 	}
+420: 	virtual ~WindowsFileHandle() {
+421: 		Close();
+422: 	}
+423: 
+424: protected:
+425: 	void Close() override {
+426: 		CloseHandle(fd);
+427: 	};
+428: 
+429: public:
+430: 	idx_t position;
+431: 	HANDLE fd;
+432: };
+433: 
+434: unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path, uint8_t flags, FileLockType lock_type,
+435:                                                  FileCompressionType compression, FileOpener *opener) {
+436: 	if (compression != FileCompressionType::UNCOMPRESSED) {
+437: 		throw NotImplementedException("Unsupported compression type for default file system");
+438: 	}
+439: 	AssertValidFileFlags(flags);
+440: 
+441: 	DWORD desired_access;
+442: 	DWORD share_mode;
+443: 	DWORD creation_disposition = OPEN_EXISTING;
+444: 	DWORD flags_and_attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
+445: 	if (flags & FileFlags::FILE_FLAGS_READ) {
+446: 		desired_access = GENERIC_READ;
+447: 		share_mode = FILE_SHARE_READ;
+448: 	} else {
+449: 		// need Read or Write
+450: 		D_ASSERT(flags & FileFlags::FILE_FLAGS_WRITE);
+451: 		desired_access = GENERIC_READ | GENERIC_WRITE;
+452: 		share_mode = 0;
+453: 		if (flags & FileFlags::FILE_FLAGS_FILE_CREATE) {
+454: 			creation_disposition = OPEN_ALWAYS;
+455: 		} else if (flags & FileFlags::FILE_FLAGS_FILE_CREATE_NEW) {
+456: 			creation_disposition = CREATE_ALWAYS;
+457: 		}
+458: 		if (flags & FileFlags::FILE_FLAGS_DIRECT_IO) {
+459: 			flags_and_attributes |= FILE_FLAG_WRITE_THROUGH;
+460: 		}
+461: 	}
+462: 	if (flags & FileFlags::FILE_FLAGS_DIRECT_IO) {
+463: 		flags_and_attributes |= FILE_FLAG_NO_BUFFERING;
+464: 	}
+465: 	HANDLE hFile =
+466: 	    CreateFileA(path.c_str(), desired_access, share_mode, NULL, creation_disposition, flags_and_attributes, NULL);
+467: 	if (hFile == INVALID_HANDLE_VALUE) {
+468: 		auto error = GetLastErrorAsString();
+469: 		throw IOException("Cannot open file \"%s\": %s", path.c_str(), error);
+470: 	}
+471: 	auto handle = make_unique<WindowsFileHandle>(*this, path.c_str(), hFile);
+472: 	if (flags & FileFlags::FILE_FLAGS_APPEND) {
+473: 		auto file_size = GetFileSize(*handle);
+474: 		SetFilePointer(*handle, file_size);
+475: 	}
+476: 	return move(handle);
+477: }
+478: 
+479: void LocalFileSystem::SetFilePointer(FileHandle &handle, idx_t location) {
+480: 	((WindowsFileHandle &)handle).position = location;
+481: }
+482: 
+483: idx_t LocalFileSystem::GetFilePointer(FileHandle &handle) {
+484: 	return ((WindowsFileHandle &)handle).position;
+485: }
+486: 
+487: void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+488: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+489: 	DWORD bytes_read;
+490: 	OVERLAPPED ov = {};
+491: 	ov.Internal = 0;
+492: 	ov.InternalHigh = 0;
+493: 	ov.Offset = location & 0xFFFFFFFF;
+494: 	ov.OffsetHigh = location >> 32;
+495: 	ov.hEvent = 0;
+496: 	ReadFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+497: 	auto rc = GetOverlappedResult(hFile, &ov, &bytes_read, true);
+498: 	if (rc == 0) {
+499: 		auto error = GetLastErrorAsString();
+500: 		throw IOException("Could not read file \"%s\": %s", handle.path, error);
+501: 	}
+502: 	if (bytes_read != nr_bytes) {
+503: 		throw IOException("Could not read all bytes from file \"%s\": wanted=%lld read=%lld", handle.path, nr_bytes,
+504: 		                  bytes_read);
+505: 	}
+506: }
+507: 
+508: int64_t LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+509: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+510: 	DWORD bytes_read;
+511: 	auto &pos = ((WindowsFileHandle &)handle).position;
+512: 	OVERLAPPED ov = {};
+513: 	ov.Internal = 0;
+514: 	ov.InternalHigh = 0;
+515: 	ov.Offset = pos & 0xFFFFFFFF;
+516: 	ov.OffsetHigh = pos >> 32;
+517: 	ov.hEvent = 0;
+518: 	auto n = std::min<idx_t>(std::max<idx_t>(GetFileSize(handle), pos) - pos, nr_bytes);
+519: 	ReadFile(hFile, buffer, (DWORD)n, NULL, &ov);
+520: 	auto rc = GetOverlappedResult(hFile, &ov, &bytes_read, true);
+521: 	if (rc == 0) {
+522: 		auto error = GetLastErrorAsString();
+523: 		throw IOException("Could not read file \"%s\": %s", handle.path, error);
+524: 	}
+525: 	pos += bytes_read;
+526: 	return bytes_read;
+527: }
+528: 
+529: void LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+530: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+531: 	DWORD bytes_written;
+532: 	OVERLAPPED ov = {};
+533: 	ov.Internal = 0;
+534: 	ov.InternalHigh = 0;
+535: 	ov.Offset = location & 0xFFFFFFFF;
+536: 	ov.OffsetHigh = location >> 32;
+537: 	ov.hEvent = 0;
+538: 	WriteFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+539: 	auto rc = GetOverlappedResult(hFile, &ov, &bytes_written, true);
+540: 	if (rc == 0) {
+541: 		auto error = GetLastErrorAsString();
+542: 		throw IOException("Could not write file \"%s\": %s", handle.path, error);
+543: 	}
+544: 	if (bytes_written != nr_bytes) {
+545: 		throw IOException("Could not write all bytes from file \"%s\": wanted=%lld wrote=%lld", handle.path, nr_bytes,
+546: 		                  bytes_written);
+547: 	}
+548: }
+549: 
+550: int64_t LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+551: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+552: 	DWORD bytes_written;
+553: 	auto &pos = ((WindowsFileHandle &)handle).position;
+554: 	OVERLAPPED ov = {};
+555: 	ov.Internal = 0;
+556: 	ov.InternalHigh = 0;
+557: 	ov.Offset = pos & 0xFFFFFFFF;
+558: 	ov.OffsetHigh = pos >> 32;
+559: 	ov.hEvent = 0;
+560: 	WriteFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+561: 	auto rc = GetOverlappedResult(hFile, &ov, &bytes_written, true);
+562: 	if (rc == 0) {
+563: 		auto error = GetLastErrorAsString();
+564: 		throw IOException("Could not write file \"%s\": %s", handle.path, error);
+565: 	}
+566: 	pos += bytes_written;
+567: 	return bytes_written;
+568: }
+569: 
+570: int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {
+571: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+572: 	LARGE_INTEGER result;
+573: 	if (!GetFileSizeEx(hFile, &result)) {
+574: 		return -1;
+575: 	}
+576: 	return result.QuadPart;
+577: }
+578: 
+579: time_t LocalFileSystem::GetLastModifiedTime(FileHandle &handle) {
+580: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+581: 
+582: 	// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletime
+583: 	FILETIME last_write;
+584: 	if (GetFileTime(hFile, nullptr, nullptr, &last_write) == 0) {
+585: 		return -1;
+586: 	}
+587: 
+588: 	// https://stackoverflow.com/questions/29266743/what-is-dwlowdatetime-and-dwhighdatetime
+589: 	ULARGE_INTEGER ul;
+590: 	ul.LowPart = last_write.dwLowDateTime;
+591: 	ul.HighPart = last_write.dwHighDateTime;
+592: 	int64_t fileTime64 = ul.QuadPart;
+593: 
+594: 	// fileTime64 contains a 64-bit value representing the number of
+595: 	// 100-nanosecond intervals since January 1, 1601 (UTC).
+596: 	// https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+597: 
+598: 	// Adapted from: https://stackoverflow.com/questions/6161776/convert-windows-filetime-to-second-in-unix-linux
+599: 	const auto WINDOWS_TICK = 10000000;
+600: 	const auto SEC_TO_UNIX_EPOCH = 11644473600LL;
+601: 	time_t result = (fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
+602: 	return result;
+603: }
+604: 
+605: void LocalFileSystem::Truncate(FileHandle &handle, int64_t new_size) {
+606: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+607: 	// seek to the location
+608: 	SetFilePointer(handle, new_size);
+609: 	// now set the end of file position
+610: 	if (!SetEndOfFile(hFile)) {
+611: 		auto error = GetLastErrorAsString();
+612: 		throw IOException("Failure in SetEndOfFile call on file \"%s\": %s", handle.path, error);
+613: 	}
+614: }
+615: 
+616: bool LocalFileSystem::DirectoryExists(const string &directory) {
+617: 	DWORD attrs = GetFileAttributesA(directory.c_str());
+618: 	return (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
+619: }
+620: 
+621: bool LocalFileSystem::FileExists(const string &filename) {
+622: 	DWORD attrs = GetFileAttributesA(filename.c_str());
+623: 	return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+624: }
+625: 
+626: void LocalFileSystem::CreateDirectory(const string &directory) {
+627: 	if (DirectoryExists(directory)) {
+628: 		return;
+629: 	}
+630: 	if (directory.empty() || !CreateDirectoryA(directory.c_str(), NULL) || !DirectoryExists(directory)) {
+631: 		throw IOException("Could not create directory!");
+632: 	}
+633: }
+634: 
+635: static void delete_dir_special_snowflake_windows(FileSystem &fs, string directory) {
+636: 	if (directory.size() + 3 > MAX_PATH) {
+637: 		throw IOException("Pathname too long");
+638: 	}
+639: 	// create search pattern
+640: 	TCHAR szDir[MAX_PATH];
+641: 	snprintf(szDir, MAX_PATH, "%s\\*", directory.c_str());
+642: 
+643: 	WIN32_FIND_DATA ffd;
+644: 	HANDLE hFind = FindFirstFile(szDir, &ffd);
+645: 	if (hFind == INVALID_HANDLE_VALUE) {
+646: 		return;
+647: 	}
+648: 
+649: 	do {
+650: 		if (string(ffd.cFileName) == "." || string(ffd.cFileName) == "..") {
+651: 			continue;
+652: 		}
+653: 		if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+654: 			// recurse to zap directory contents
+655: 			delete_dir_special_snowflake_windows(fs, fs.JoinPath(directory, ffd.cFileName));
+656: 		} else {
+657: 			if (strlen(ffd.cFileName) + directory.size() + 1 > MAX_PATH) {
+658: 				throw IOException("Pathname too long");
+659: 			}
+660: 			// create search pattern
+661: 			TCHAR del_path[MAX_PATH];
+662: 			snprintf(del_path, MAX_PATH, "%s\\%s", directory.c_str(), ffd.cFileName);
+663: 			if (!DeleteFileA(del_path)) {
+664: 				throw IOException("Failed to delete directory entry");
+665: 			}
+666: 		}
+667: 	} while (FindNextFile(hFind, &ffd) != 0);
+668: 
+669: 	DWORD dwError = GetLastError();
+670: 	if (dwError != ERROR_NO_MORE_FILES) {
+671: 		throw IOException("Something went wrong");
+672: 	}
+673: 	FindClose(hFind);
+674: 
+675: 	if (!RemoveDirectoryA(directory.c_str())) {
+676: 		throw IOException("Failed to delete directory");
+677: 	}
+678: }
+679: 
+680: void LocalFileSystem::RemoveDirectory(const string &directory) {
+681: 	delete_dir_special_snowflake_windows(*this, directory.c_str());
+682: }
+683: 
+684: void LocalFileSystem::RemoveFile(const string &filename) {
+685: 	DeleteFileA(filename.c_str());
+686: }
+687: 
+688: bool LocalFileSystem::ListFiles(const string &directory, const std::function<void(string, bool)> &callback) {
+689: 	string search_dir = JoinPath(directory, "*");
+690: 
+691: 	WIN32_FIND_DATA ffd;
+692: 	HANDLE hFind = FindFirstFile(search_dir.c_str(), &ffd);
+693: 	if (hFind == INVALID_HANDLE_VALUE) {
+694: 		return false;
+695: 	}
+696: 	do {
+697: 		string cFileName = string(ffd.cFileName);
+698: 		if (cFileName == "." || cFileName == "..") {
+699: 			continue;
+700: 		}
+701: 		callback(cFileName, ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+702: 	} while (FindNextFile(hFind, &ffd) != 0);
+703: 
+704: 	DWORD dwError = GetLastError();
+705: 	if (dwError != ERROR_NO_MORE_FILES) {
+706: 		FindClose(hFind);
+707: 		return false;
+708: 	}
+709: 
+710: 	FindClose(hFind);
+711: 	return true;
+712: }
+713: 
+714: void LocalFileSystem::FileSync(FileHandle &handle) {
+715: 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+716: 	if (FlushFileBuffers(hFile) == 0) {
+717: 		throw IOException("Could not flush file handle to disk!");
+718: 	}
+719: }
+720: 
+721: void LocalFileSystem::MoveFile(const string &source, const string &target) {
+722: 	if (!MoveFileA(source.c_str(), target.c_str())) {
+723: 		throw IOException("Could not move file");
+724: 	}
+725: }
+726: 
+727: FileType LocalFileSystem::GetFileType(FileHandle &handle) {
+728: 	auto path = ((WindowsFileHandle &)handle).path;
+729: 	// pipes in windows are just files in '\\.\pipe\' folder
+730: 	if (strncmp(path.c_str(), PIPE_PREFIX, strlen(PIPE_PREFIX)) == 0) {
+731: 		return FileType::FILE_TYPE_FIFO;
+732: 	}
+733: 	DWORD attrs = GetFileAttributesA(path.c_str());
+734: 	if (attrs != INVALID_FILE_ATTRIBUTES) {
+735: 		if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+736: 			return FileType::FILE_TYPE_DIR;
+737: 		} else {
+738: 			return FileType::FILE_TYPE_REGULAR;
+739: 		}
+740: 	}
+741: 	return FileType::FILE_TYPE_INVALID;
+742: }
+743: #endif
+744: 
+745: bool LocalFileSystem::CanSeek() {
+746: 	return true;
+747: }
+748: 
+749: bool LocalFileSystem::OnDiskFile(FileHandle &handle) {
+750: 	return true;
+751: }
+752: 
+753: void LocalFileSystem::Seek(FileHandle &handle, idx_t location) {
+754: 	if (!CanSeek()) {
+755: 		throw IOException("Cannot seek in files of this type");
+756: 	}
+757: 	SetFilePointer(handle, location);
+758: }
+759: 
+760: idx_t LocalFileSystem::SeekPosition(FileHandle &handle) {
+761: 	if (!CanSeek()) {
+762: 		throw IOException("Cannot seek in files of this type");
+763: 	}
+764: 	return GetFilePointer(handle);
+765: }
+766: 
+767: static bool HasGlob(const string &str) {
+768: 	for (idx_t i = 0; i < str.size(); i++) {
+769: 		switch (str[i]) {
+770: 		case '*':
+771: 		case '?':
+772: 		case '[':
+773: 			return true;
+774: 		default:
+775: 			break;
+776: 		}
+777: 	}
+778: 	return false;
+779: }
+780: 
+781: static void GlobFiles(FileSystem &fs, const string &path, const string &glob, bool match_directory,
+782:                       vector<string> &result, bool join_path) {
+783: 	fs.ListFiles(path, [&](const string &fname, bool is_directory) {
+784: 		if (is_directory != match_directory) {
+785: 			return;
+786: 		}
+787: 		if (LikeFun::Glob(fname.c_str(), fname.size(), glob.c_str(), glob.size())) {
+788: 			if (join_path) {
+789: 				result.push_back(fs.JoinPath(path, fname));
+790: 			} else {
+791: 				result.push_back(fname);
+792: 			}
+793: 		}
+794: 	});
+795: }
+796: 
+797: vector<string> LocalFileSystem::Glob(const string &path) {
+798: 	if (path.empty()) {
+799: 		return vector<string>();
+800: 	}
+801: 	// first check if the path has a glob at all
+802: 	if (!HasGlob(path)) {
+803: 		// no glob: return only the file (if it exists)
+804: 		vector<string> result;
+805: 		if (FileExists(path)) {
+806: 			result.push_back(path);
+807: 		}
+808: 		return result;
+809: 	}
+810: 	// split up the path into separate chunks
+811: 	vector<string> splits;
+812: 	idx_t last_pos = 0;
+813: 	for (idx_t i = 0; i < path.size(); i++) {
+814: 		if (path[i] == '\\' || path[i] == '/') {
+815: 			if (i == last_pos) {
+816: 				// empty: skip this position
+817: 				last_pos = i + 1;
+818: 				continue;
+819: 			}
+820: 			if (splits.empty()) {
+821: 				splits.push_back(path.substr(0, i));
+822: 			} else {
+823: 				splits.push_back(path.substr(last_pos, i - last_pos));
+824: 			}
+825: 			last_pos = i + 1;
+826: 		}
+827: 	}
+828: 	splits.push_back(path.substr(last_pos, path.size() - last_pos));
+829: 	// handle absolute paths
+830: 	bool absolute_path = false;
+831: 	if (path[0] == '/') {
+832: 		// first character is a slash -  unix absolute path
+833: 		absolute_path = true;
+834: 	} else if (StringUtil::Contains(splits[0], ":")) {
+835: 		// first split has a colon -  windows absolute path
+836: 		absolute_path = true;
+837: 	} else if (splits[0] == "~") {
+838: 		// starts with home directory
+839: 		auto home_directory = GetHomeDirectory();
+840: 		if (!home_directory.empty()) {
+841: 			absolute_path = true;
+842: 			splits[0] = home_directory;
+843: 		}
+844: 	}
+845: 	vector<string> previous_directories;
+846: 	if (absolute_path) {
+847: 		// for absolute paths, we don't start by scanning the current directory
+848: 		previous_directories.push_back(splits[0]);
+849: 	}
+850: 	for (idx_t i = absolute_path ? 1 : 0; i < splits.size(); i++) {
+851: 		bool is_last_chunk = i + 1 == splits.size();
+852: 		bool has_glob = HasGlob(splits[i]);
+853: 		// if it's the last chunk we need to find files, otherwise we find directories
+854: 		// not the last chunk: gather a list of all directories that match the glob pattern
+855: 		vector<string> result;
+856: 		if (!has_glob) {
+857: 			// no glob, just append as-is
+858: 			if (previous_directories.empty()) {
+859: 				result.push_back(splits[i]);
+860: 			} else {
+861: 				for (auto &prev_directory : previous_directories) {
+862: 					result.push_back(JoinPath(prev_directory, splits[i]));
+863: 				}
+864: 			}
+865: 		} else {
+866: 			if (previous_directories.empty()) {
+867: 				// no previous directories: list in the current path
+868: 				GlobFiles(*this, ".", splits[i], !is_last_chunk, result, false);
+869: 			} else {
+870: 				// previous directories
+871: 				// we iterate over each of the previous directories, and apply the glob of the current directory
+872: 				for (auto &prev_directory : previous_directories) {
+873: 					GlobFiles(*this, prev_directory, splits[i], !is_last_chunk, result, true);
+874: 				}
+875: 			}
+876: 		}
+877: 		if (is_last_chunk || result.empty()) {
+878: 			return result;
+879: 		}
+880: 		previous_directories = move(result);
+881: 	}
+882: 	return vector<string>();
+883: }
+884: 
+885: unique_ptr<FileSystem> FileSystem::CreateLocal() {
+886: 	return make_unique<LocalFileSystem>();
+887: }
+888: 
+889: } // namespace duckdb
+[end of src/common/local_file_system.cpp]
+[start of src/storage/single_file_block_manager.cpp]
+1: #include "duckdb/storage/single_file_block_manager.hpp"
+2: 
+3: #include "duckdb/common/allocator.hpp"
+4: #include "duckdb/common/exception.hpp"
+5: #include "duckdb/common/serializer/buffered_deserializer.hpp"
+6: #include "duckdb/common/serializer/buffered_serializer.hpp"
+7: #include "duckdb/storage/meta_block_reader.hpp"
+8: #include "duckdb/storage/meta_block_writer.hpp"
+9: #include "duckdb/main/config.hpp"
+10: 
+11: #include <algorithm>
+12: #include <cstring>
+13: 
+14: namespace duckdb {
+15: 
+16: const char MainHeader::MAGIC_BYTES[] = "DUCK";
+17: 
+18: void MainHeader::Serialize(Serializer &ser) {
+19: 	ser.WriteData((data_ptr_t)MAGIC_BYTES, MAGIC_BYTE_SIZE);
+20: 	ser.Write<uint64_t>(version_number);
+21: 	for (idx_t i = 0; i < FLAG_COUNT; i++) {
+22: 		ser.Write<uint64_t>(flags[i]);
+23: 	}
+24: }
+25: 
+26: MainHeader MainHeader::Deserialize(Deserializer &source) {
+27: 	char magic_bytes[MAGIC_BYTE_SIZE];
+28: 	source.ReadData((data_ptr_t)magic_bytes, MAGIC_BYTE_SIZE);
+29: 	if (memcmp(magic_bytes, MainHeader::MAGIC_BYTES, MainHeader::MAGIC_BYTE_SIZE) != 0) {
+30: 		throw IOException("The file is not a valid DuckDB database file!");
+31: 	}
+32: 
+33: 	MainHeader header;
+34: 	header.version_number = source.Read<uint64_t>();
+35: 	// read the flags
+36: 	for (idx_t i = 0; i < FLAG_COUNT; i++) {
+37: 		header.flags[i] = source.Read<uint64_t>();
+38: 	}
+39: 	return header;
+40: }
+41: 
+42: void DatabaseHeader::Serialize(Serializer &ser) {
+43: 	ser.Write<uint64_t>(iteration);
+44: 	ser.Write<block_id_t>(meta_block);
+45: 	ser.Write<block_id_t>(free_list);
+46: 	ser.Write<uint64_t>(block_count);
+47: }
+48: 
+49: DatabaseHeader DatabaseHeader::Deserialize(Deserializer &source) {
+50: 	DatabaseHeader header;
+51: 	header.iteration = source.Read<uint64_t>();
+52: 	header.meta_block = source.Read<block_id_t>();
+53: 	header.free_list = source.Read<block_id_t>();
+54: 	header.block_count = source.Read<uint64_t>();
+55: 	return header;
+56: }
+57: 
+58: template <class T>
+59: void SerializeHeaderStructure(T header, data_ptr_t ptr) {
+60: 	BufferedSerializer ser(ptr, Storage::FILE_HEADER_SIZE);
+61: 	header.Serialize(ser);
+62: }
+63: 
+64: template <class T>
+65: T DeserializeHeaderStructure(data_ptr_t ptr) {
+66: 	BufferedDeserializer source(ptr, Storage::FILE_HEADER_SIZE);
+67: 	return T::Deserialize(source);
+68: }
+69: 
+70: SingleFileBlockManager::SingleFileBlockManager(DatabaseInstance &db, string path_p, bool read_only, bool create_new,
+71:                                                bool use_direct_io)
+72:     : db(db), path(move(path_p)),
+73:       header_buffer(Allocator::Get(db), FileBufferType::MANAGED_BUFFER, Storage::FILE_HEADER_SIZE), iteration_count(0),
+74:       read_only(read_only), use_direct_io(use_direct_io) {
+75: 	uint8_t flags;
+76: 	FileLockType lock;
+77: 	if (read_only) {
+78: 		D_ASSERT(!create_new);
+79: 		flags = FileFlags::FILE_FLAGS_READ;
+80: 		lock = FileLockType::READ_LOCK;
+81: 	} else {
+82: 		flags = FileFlags::FILE_FLAGS_WRITE;
+83: 		lock = FileLockType::WRITE_LOCK;
+84: 		if (create_new) {
+85: 			flags |= FileFlags::FILE_FLAGS_FILE_CREATE;
+86: 		}
+87: 	}
+88: 	if (use_direct_io) {
+89: 		flags |= FileFlags::FILE_FLAGS_DIRECT_IO;
+90: 	}
+91: 	// open the RDBMS handle
+92: 	auto &fs = FileSystem::GetFileSystem(db);
+93: 	handle = fs.OpenFile(path, flags, lock);
+94: 	if (create_new) {
+95: 		// if we create a new file, we fill the metadata of the file
+96: 		// first fill in the new header
+97: 		header_buffer.Clear();
+98: 
+99: 		MainHeader main_header;
+100: 		main_header.version_number = VERSION_NUMBER;
+101: 		memset(main_header.flags, 0, sizeof(uint64_t) * 4);
+102: 
+103: 		SerializeHeaderStructure<MainHeader>(main_header, header_buffer.buffer);
+104: 		// now write the header to the file
+105: 		header_buffer.ChecksumAndWrite(*handle, 0);
+106: 		header_buffer.Clear();
+107: 
+108: 		// write the database headers
+109: 		// initialize meta_block and free_list to INVALID_BLOCK because the database file does not contain any actual
+110: 		// content yet
+111: 		DatabaseHeader h1, h2;
+112: 		// header 1
+113: 		h1.iteration = 0;
+114: 		h1.meta_block = INVALID_BLOCK;
+115: 		h1.free_list = INVALID_BLOCK;
+116: 		h1.block_count = 0;
+117: 		SerializeHeaderStructure<DatabaseHeader>(h1, header_buffer.buffer);
+118: 		header_buffer.ChecksumAndWrite(*handle, Storage::FILE_HEADER_SIZE);
+119: 		// header 2
+120: 		h2.iteration = 0;
+121: 		h2.meta_block = INVALID_BLOCK;
+122: 		h2.free_list = INVALID_BLOCK;
+123: 		h2.block_count = 0;
+124: 		SerializeHeaderStructure<DatabaseHeader>(h2, header_buffer.buffer);
+125: 		header_buffer.ChecksumAndWrite(*handle, Storage::FILE_HEADER_SIZE * 2);
+126: 		// ensure that writing to disk is completed before returning
+127: 		handle->Sync();
+128: 		// we start with h2 as active_header, this way our initial write will be in h1
+129: 		iteration_count = 0;
+130: 		active_header = 1;
+131: 		max_block = 0;
+132: 	} else {
+133: 		// otherwise, we check the metadata of the file
+134: 		header_buffer.ReadAndChecksum(*handle, 0);
+135: 		MainHeader header = DeserializeHeaderStructure<MainHeader>(header_buffer.buffer);
+136: 		// check the version number
+137: 		if (header.version_number != VERSION_NUMBER) {
+138: 			throw IOException(
+139: 			    "Trying to read a database file with version number %lld, but we can only read version %lld.\n"
+140: 			    "The database file was created with an %s version of DuckDB.\n\n"
+141: 			    "The storage of DuckDB is not yet stable; newer versions of DuckDB cannot read old database files and "
+142: 			    "vice versa.\n"
+143: 			    "The storage will be stabilized when version 1.0 releases.\n\n"
+144: 			    "For now, we recommend that you load the database file in a supported version of DuckDB, and use the "
+145: 			    "EXPORT DATABASE command "
+146: 			    "followed by IMPORT DATABASE on the current version of DuckDB.",
+147: 			    header.version_number, VERSION_NUMBER, VERSION_NUMBER > header.version_number ? "older" : "newer");
+148: 		}
+149: 
+150: 		// read the database headers from disk
+151: 		DatabaseHeader h1, h2;
+152: 		header_buffer.ReadAndChecksum(*handle, Storage::FILE_HEADER_SIZE);
+153: 		h1 = DeserializeHeaderStructure<DatabaseHeader>(header_buffer.buffer);
+154: 		header_buffer.ReadAndChecksum(*handle, Storage::FILE_HEADER_SIZE * 2);
+155: 		h2 = DeserializeHeaderStructure<DatabaseHeader>(header_buffer.buffer);
+156: 		// check the header with the highest iteration count
+157: 		if (h1.iteration > h2.iteration) {
+158: 			// h1 is active header
+159: 			active_header = 0;
+160: 			Initialize(h1);
+161: 		} else {
+162: 			// h2 is active header
+163: 			active_header = 1;
+164: 			Initialize(h2);
+165: 		}
+166: 	}
+167: }
+168: 
+169: void SingleFileBlockManager::Initialize(DatabaseHeader &header) {
+170: 	free_list_id = header.free_list;
+171: 	meta_block = header.meta_block;
+172: 	iteration_count = header.iteration;
+173: 	max_block = header.block_count;
+174: }
+175: 
+176: void SingleFileBlockManager::LoadFreeList() {
+177: 	if (read_only) {
+178: 		// no need to load free list for read only db
+179: 		return;
+180: 	}
+181: 	if (free_list_id == INVALID_BLOCK) {
+182: 		// no free list
+183: 		return;
+184: 	}
+185: 	MetaBlockReader reader(db, free_list_id);
+186: 	auto free_list_count = reader.Read<uint64_t>();
+187: 	free_list.clear();
+188: 	for (idx_t i = 0; i < free_list_count; i++) {
+189: 		free_list.insert(reader.Read<block_id_t>());
+190: 	}
+191: 	auto multi_use_blocks_count = reader.Read<uint64_t>();
+192: 	multi_use_blocks.clear();
+193: 	for (idx_t i = 0; i < multi_use_blocks_count; i++) {
+194: 		auto block_id = reader.Read<block_id_t>();
+195: 		auto usage_count = reader.Read<uint32_t>();
+196: 		multi_use_blocks[block_id] = usage_count;
+197: 	}
+198: }
+199: 
+200: void SingleFileBlockManager::StartCheckpoint() {
+201: }
+202: 
+203: bool SingleFileBlockManager::IsRootBlock(block_id_t root) {
+204: 	return root == meta_block;
+205: }
+206: 
+207: block_id_t SingleFileBlockManager::GetFreeBlockId() {
+208: 	block_id_t block;
+209: 	if (!free_list.empty()) {
+210: 		// free list is non empty
+211: 		// take an entry from the free list
+212: 		block = *free_list.begin();
+213: 		// erase the entry from the free list again
+214: 		free_list.erase(free_list.begin());
+215: 	} else {
+216: 		block = max_block++;
+217: 	}
+218: 	return block;
+219: }
+220: 
+221: void SingleFileBlockManager::MarkBlockAsModified(block_id_t block_id) {
+222: 	D_ASSERT(block_id >= 0);
+223: 
+224: 	// check if the block is a multi-use block
+225: 	auto entry = multi_use_blocks.find(block_id);
+226: 	if (entry != multi_use_blocks.end()) {
+227: 		// it is! reduce the reference count of the block
+228: 		entry->second--;
+229: 		// check the reference count: is the block still a multi-use block?
+230: 		if (entry->second <= 1) {
+231: 			// no longer a multi-use block!
+232: 			multi_use_blocks.erase(entry);
+233: 		}
+234: 		return;
+235: 	}
+236: 	modified_blocks.insert(block_id);
+237: }
+238: 
+239: void SingleFileBlockManager::IncreaseBlockReferenceCount(block_id_t block_id) {
+240: 	D_ASSERT(free_list.find(block_id) == free_list.end());
+241: 	auto entry = multi_use_blocks.find(block_id);
+242: 	if (entry != multi_use_blocks.end()) {
+243: 		entry->second++;
+244: 	} else {
+245: 		multi_use_blocks[block_id] = 2;
+246: 	}
+247: }
+248: 
+249: block_id_t SingleFileBlockManager::GetMetaBlock() {
+250: 	return meta_block;
+251: }
+252: 
+253: unique_ptr<Block> SingleFileBlockManager::CreateBlock(block_id_t block_id) {
+254: 	return make_unique<Block>(Allocator::Get(db), block_id);
+255: }
+256: 
+257: void SingleFileBlockManager::Read(Block &block) {
+258: 	D_ASSERT(block.id >= 0);
+259: 	D_ASSERT(std::find(free_list.begin(), free_list.end(), block.id) == free_list.end());
+260: 	block.ReadAndChecksum(*handle, BLOCK_START + block.id * Storage::BLOCK_ALLOC_SIZE);
+261: }
+262: 
+263: void SingleFileBlockManager::Write(FileBuffer &buffer, block_id_t block_id) {
+264: 	D_ASSERT(block_id >= 0);
+265: 	buffer.ChecksumAndWrite(*handle, BLOCK_START + block_id * Storage::BLOCK_ALLOC_SIZE);
+266: }
+267: 
+268: vector<block_id_t> SingleFileBlockManager::GetFreeListBlocks() {
+269: 	vector<block_id_t> free_list_blocks;
+270: 
+271: 	if (!free_list.empty() || !multi_use_blocks.empty() || !modified_blocks.empty()) {
+272: 		// there are blocks in the free list or multi_use_blocks
+273: 		// figure out how many blocks we need to write these to the file
+274: 		auto free_list_size = sizeof(uint64_t) + sizeof(block_id_t) * (free_list.size() + modified_blocks.size());
+275: 		auto multi_use_blocks_size =
+276: 		    sizeof(uint64_t) + (sizeof(block_id_t) + sizeof(uint32_t)) * multi_use_blocks.size();
+277: 		auto total_size = free_list_size + multi_use_blocks_size;
+278: 		// because of potential alignment issues and needing to store a next pointer in a block we subtract
+279: 		// a bit from the max block size
+280: 		auto space_in_block = Storage::BLOCK_SIZE - 4 * sizeof(block_id_t);
+281: 		auto total_blocks = (total_size + space_in_block - 1) / space_in_block;
+282: 		auto &config = DBConfig::GetConfig(db);
+283: 		if (config.debug_many_free_list_blocks) {
+284: 			total_blocks++;
+285: 		}
+286: 		D_ASSERT(total_size > 0);
+287: 		D_ASSERT(total_blocks > 0);
+288: 
+289: 		// reserve the blocks that we are going to write
+290: 		// since these blocks are no longer free we cannot just include them in the free list!
+291: 		for (idx_t i = 0; i < total_blocks; i++) {
+292: 			auto block_id = GetFreeBlockId();
+293: 			free_list_blocks.push_back(block_id);
+294: 		}
+295: 	}
+296: 
+297: 	return free_list_blocks;
+298: }
+299: 
+300: class FreeListBlockWriter : public MetaBlockWriter {
+301: public:
+302: 	FreeListBlockWriter(DatabaseInstance &db_p, vector<block_id_t> &free_list_blocks_p)
+303: 	    : MetaBlockWriter(db_p, free_list_blocks_p[0]), free_list_blocks(free_list_blocks_p), index(1) {
+304: 	}
+305: 
+306: 	vector<block_id_t> &free_list_blocks;
+307: 	idx_t index;
+308: 
+309: protected:
+310: 	block_id_t GetNextBlockId() override {
+311: 		if (index >= free_list_blocks.size()) {
+312: 			throw InternalException(
+313: 			    "Free List Block Writer ran out of blocks, this means not enough blocks were allocated up front");
+314: 		}
+315: 		return free_list_blocks[index++];
+316: 	}
+317: };
+318: 
+319: void SingleFileBlockManager::WriteHeader(DatabaseHeader header) {
+320: 	// set the iteration count
+321: 	header.iteration = ++iteration_count;
+322: 
+323: 	vector<block_id_t> free_list_blocks = GetFreeListBlocks();
+324: 
+325: 	// now handle the free list
+326: 	// add all modified blocks to the free list: they can now be written to again
+327: 	for (auto &block : modified_blocks) {
+328: 		free_list.insert(block);
+329: 	}
+330: 	modified_blocks.clear();
+331: 
+332: 	if (!free_list_blocks.empty()) {
+333: 		// there are blocks to write, either in the free_list or in the modified_blocks
+334: 		// we write these blocks specifically to the free_list_blocks
+335: 		// a normal MetaBlockWriter will fetch blocks to use from the free_list
+336: 		// but since we are WRITING the free_list, this behavior is sub-optimal
+337: 
+338: 		FreeListBlockWriter writer(db, free_list_blocks);
+339: 
+340: 		D_ASSERT(writer.block->id == free_list_blocks[0]);
+341: 		header.free_list = writer.block->id;
+342: 		for (auto &block_id : free_list_blocks) {
+343: 			modified_blocks.insert(block_id);
+344: 		}
+345: 
+346: 		writer.Write<uint64_t>(free_list.size());
+347: 		for (auto &block_id : free_list) {
+348: 			writer.Write<block_id_t>(block_id);
+349: 		}
+350: 		writer.Write<uint64_t>(multi_use_blocks.size());
+351: 		for (auto &entry : multi_use_blocks) {
+352: 			writer.Write<block_id_t>(entry.first);
+353: 			writer.Write<uint32_t>(entry.second);
+354: 		}
+355: 		writer.Flush();
+356: 	} else {
+357: 		// no blocks in the free list
+358: 		header.free_list = INVALID_BLOCK;
+359: 	}
+360: 	header.block_count = max_block;
+361: 
+362: 	auto &config = DBConfig::GetConfig(db);
+363: 	if (config.checkpoint_abort == CheckpointAbort::DEBUG_ABORT_AFTER_FREE_LIST_WRITE) {
+364: 		throw IOException("Checkpoint aborted after free list write because of PRAGMA checkpoint_abort flag");
+365: 	}
+366: 
+367: 	if (!use_direct_io) {
+368: 		// if we are not using Direct IO we need to fsync BEFORE we write the header to ensure that all the previous
+369: 		// blocks are written as well
+370: 		handle->Sync();
+371: 	}
+372: 	// set the header inside the buffer
+373: 	header_buffer.Clear();
+374: 	Store<DatabaseHeader>(header, header_buffer.buffer);
+375: 	// now write the header to the file, active_header determines whether we write to h1 or h2
+376: 	// note that if active_header is h1 we write to h2, and vice versa
+377: 	header_buffer.ChecksumAndWrite(*handle,
+378: 	                               active_header == 1 ? Storage::FILE_HEADER_SIZE : Storage::FILE_HEADER_SIZE * 2);
+379: 	// switch active header to the other header
+380: 	active_header = 1 - active_header;
+381: 	//! Ensure the header write ends up on disk
+382: 	handle->Sync();
+383: }
+384: 
+385: } // namespace duckdb
+[end of src/storage/single_file_block_manager.cpp]
+</code>
+Here is an example of a patch file. It consists of changes to the code base. It specifies the file names, the line numbers of each change, and the removed and added lines. A single patch file can contain changes to multiple files.
+<patch>
+--- a/file.cpp
++++ b/file.cpp
+@@ -3,35 +3,44 @@
+ #include <cstdlib>
+ 
+ int euclidean(int a, int b) {
+-    while (b) {
+-        int temp = b;
+-        b = a % b;
+-        a = temp;
++    if (b == 0) {
++        return a;
+     }
+-    return a;
++    return euclidean(b, a % b);
+ }
+ 
+ std::vector<std::pair<int, int>> bresenham(int x0, int y0, int x1, int y1) {
+     std::vector<std::pair<int, int>> points;
+     int dx = abs(x1 - x0);
+     int dy = abs(y1 - y0);
++    int x = x0, y = y0;
+     int sx = (x0 < x1) ? 1 : -1;
+     int sy = (y0 < y1) ? 1 : -1;
+-    int err = dx - dy;
+ 
+-    while (true) {
+-        points.emplace_back(x0, y0);
+-        if (x0 == x1 && y0 == y1) break;
+-        int e2 = 2 * err;
+-        if (e2 > -dy) {
++    if (dx > dy) {
++        int err = dx / 2;
++        while (x != x1) {
++            points.emplace_back(x, y);
+             err -= dy;
+-            x0 += sx;
++            if (err < 0) {
++                y += sy;
++                err += dx;
++            }
++            x += sx;
+         }
+-        if (e2 < dx) {
+-            err += dx;
+-            y0 += sy;
++    } else {
++        int err = dy / 2;
++        while (y != y1) {
++            points.emplace_back(x, y);
++            err -= dx;
++            if (err < 0) {
++                x += sx;
++                err += dy;
++            }
++            y += sy;
+         }
+     }
+ 
++    points.emplace_back(x, y);
+     return points;
+ }
+
+</patch>
+
+I need you to solve the provided issue by generating a single patch file that I can apply directly to this repository using git apply.
+Please respond with a single patch file in the format shown above.
+Make sure to only include the patch file contents so that the contents of your output can be copied into a patch file and applied directly
+
+Respond below:

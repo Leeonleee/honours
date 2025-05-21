@@ -1,0 +1,1881 @@
+You will be provided with a partial code base and an issue statement explaining a problem to resolve.
+In your output, give nothing but the code (no markdown) so that your output can be copy pasted and run immediately with no changes
+
+<issue>
+UNNEST on NULL Lists
+Currently this is inconsistent with Postgres, we probably want this to be consistent.
+
+```sql
+CREATE TABLE people(id INTEGER, name VARCHAR, address VARCHAR[]);
+insert into people values (1, 'Zuckerberg', ARRAY['New York']);
+insert into people values (2, 'Bezos', ARRAY['Washington', 'Space']);
+insert into people values (3, 'Tim', NULL);
+insert into people values (4, 'Elvis', ARRAY[NULL, NULL, NULL]);
+insert into people values (5, 'Mark', ARRAY[]::VARCHAR[]);
+
+-- current result:
+SELECT name, UNNEST(address) FROM people;
+┌────────────┬─────────────────┐
+│    name    │ unnest(address) │
+├────────────┼─────────────────┤
+│ Zuckerberg │ New York        │
+│ Bezos      │ Washington      │
+│ Bezos      │ Space           │
+│ Tim        │ NULL            │
+│ Elvis      │ NULL            │
+│ Elvis      │ NULL            │
+│ Elvis      │ NULL            │
+└────────────┴─────────────────┘
+-- postgres/desired result
+┌────────────┬─────────────────┐
+│    name    │ unnest(address) │
+├────────────┼─────────────────┤
+│ Zuckerberg │ New York        │
+│ Bezos      │ Washington      │
+│ Bezos      │ Space           │
+│ Elvis      │ NULL            │
+│ Elvis      │ NULL            │
+│ Elvis      │ NULL            │
+└────────────┴─────────────────┘
+```
+
+</issue>
+<code>
+[start of README.md]
+1: <img src="https://duckdb.org/images/DuckDB_Logo_dl.png" height="50">
+2: 
+3: ![.github/workflows/main.yml](https://github.com/cwida/duckdb/workflows/.github/workflows/main.yml/badge.svg?branch=master)
+4: [![CodeFactor](https://www.codefactor.io/repository/github/cwida/duckdb/badge)](https://www.codefactor.io/repository/github/cwida/duckdb)
+5: [![codecov](https://codecov.io/gh/duckdb/duckdb/branch/master/graph/badge.svg?token=FaxjcfFghN)](https://codecov.io/gh/duckdb/duckdb)
+6: 
+7: 
+8: ## Installation
+9: If you just want to install and use DuckDB, please see [our website](https://www.duckdb.org) for installation and usage instructions.
+10: 
+11: ## Development
+12: For development, DuckDB requires [CMake](https://cmake.org), Python3 and a `C++11` compliant compiler. Run `make` in the root directory to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`.
+13: 
+14: Please also refer to our [Contribution Guide](CONTRIBUTING.md).
+15: 
+16: 
+[end of README.md]
+[start of src/execution/operator/projection/physical_unnest.cpp]
+1: #include "duckdb/execution/operator/projection/physical_unnest.hpp"
+2: 
+3: #include "duckdb/common/vector_operations/vector_operations.hpp"
+4: #include "duckdb/common/algorithm.hpp"
+5: #include "duckdb/execution/expression_executor.hpp"
+6: #include "duckdb/planner/expression/bound_reference_expression.hpp"
+7: #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+8: 
+9: namespace duckdb {
+10: 
+11: //! The operator state of the window
+12: class PhysicalUnnestOperatorState : public PhysicalOperatorState {
+13: public:
+14: 	PhysicalUnnestOperatorState(PhysicalOperator &op, PhysicalOperator *child)
+15: 	    : PhysicalOperatorState(op, child), parent_position(0), list_position(0), list_length(-1) {
+16: 	}
+17: 
+18: 	idx_t parent_position;
+19: 	idx_t list_position;
+20: 	int64_t list_length = -1;
+21: 
+22: 	DataChunk list_data;
+23: 	vector<VectorData> list_vector_data;
+24: 	vector<VectorData> list_child_data;
+25: };
+26: 
+27: // this implements a sorted window functions variant
+28: PhysicalUnnest::PhysicalUnnest(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list,
+29:                                idx_t estimated_cardinality, PhysicalOperatorType type)
+30:     : PhysicalOperator(type, move(types), estimated_cardinality), select_list(std::move(select_list)) {
+31: 
+32: 	D_ASSERT(!this->select_list.empty());
+33: }
+34: 
+35: static void UnnestNull(idx_t start, idx_t end, Vector &result) {
+36: 	if (result.GetType().InternalType() == PhysicalType::STRUCT) {
+37: 		auto &children = StructVector::GetEntries(result);
+38: 		for (auto &child : children) {
+39: 			UnnestNull(start, end, *child);
+40: 		}
+41: 	}
+42: 	auto &validity = FlatVector::Validity(result);
+43: 	for (idx_t i = start; i < end; i++) {
+44: 		validity.SetInvalid(i);
+45: 	}
+46: 	if (result.GetType().InternalType() == PhysicalType::STRUCT) {
+47: 		auto &struct_children = StructVector::GetEntries(result);
+48: 		for (auto &child : struct_children) {
+49: 			UnnestNull(start, end, *child);
+50: 		}
+51: 	}
+52: }
+53: 
+54: template <class T>
+55: static void TemplatedUnnest(VectorData &vdata, idx_t start, idx_t end, Vector &result) {
+56: 	auto source_data = (T *)vdata.data;
+57: 	auto &source_mask = vdata.validity;
+58: 	auto result_data = FlatVector::GetData<T>(result);
+59: 	auto &result_mask = FlatVector::Validity(result);
+60: 
+61: 	for (idx_t i = start; i < end; i++) {
+62: 		auto source_idx = vdata.sel->get_index(i);
+63: 		auto target_idx = i - start;
+64: 		if (source_mask.RowIsValid(source_idx)) {
+65: 			result_data[target_idx] = source_data[source_idx];
+66: 			result_mask.SetValid(target_idx);
+67: 		} else {
+68: 			result_mask.SetInvalid(target_idx);
+69: 		}
+70: 	}
+71: }
+72: 
+73: static void UnnestValidity(VectorData &vdata, idx_t start, idx_t end, Vector &result) {
+74: 	auto &source_mask = vdata.validity;
+75: 	auto &result_mask = FlatVector::Validity(result);
+76: 
+77: 	for (idx_t i = start; i < end; i++) {
+78: 		auto source_idx = vdata.sel->get_index(i);
+79: 		auto target_idx = i - start;
+80: 		result_mask.Set(target_idx, source_mask.RowIsValid(source_idx));
+81: 	}
+82: }
+83: 
+84: static void UnnestVector(VectorData &vdata, Vector &source, idx_t list_size, idx_t start, idx_t end, Vector &result) {
+85: 	switch (result.GetType().InternalType()) {
+86: 	case PhysicalType::BOOL:
+87: 	case PhysicalType::INT8:
+88: 		TemplatedUnnest<int8_t>(vdata, start, end, result);
+89: 		break;
+90: 	case PhysicalType::INT16:
+91: 		TemplatedUnnest<int16_t>(vdata, start, end, result);
+92: 		break;
+93: 	case PhysicalType::INT32:
+94: 		TemplatedUnnest<int32_t>(vdata, start, end, result);
+95: 		break;
+96: 	case PhysicalType::INT64:
+97: 		TemplatedUnnest<int64_t>(vdata, start, end, result);
+98: 		break;
+99: 	case PhysicalType::INT128:
+100: 		TemplatedUnnest<hugeint_t>(vdata, start, end, result);
+101: 		break;
+102: 	case PhysicalType::UINT8:
+103: 		TemplatedUnnest<uint8_t>(vdata, start, end, result);
+104: 		break;
+105: 	case PhysicalType::UINT16:
+106: 		TemplatedUnnest<uint16_t>(vdata, start, end, result);
+107: 		break;
+108: 	case PhysicalType::UINT32:
+109: 		TemplatedUnnest<uint32_t>(vdata, start, end, result);
+110: 		break;
+111: 	case PhysicalType::UINT64:
+112: 		TemplatedUnnest<uint64_t>(vdata, start, end, result);
+113: 		break;
+114: 	case PhysicalType::FLOAT:
+115: 		TemplatedUnnest<float>(vdata, start, end, result);
+116: 		break;
+117: 	case PhysicalType::DOUBLE:
+118: 		TemplatedUnnest<double>(vdata, start, end, result);
+119: 		break;
+120: 	case PhysicalType::INTERVAL:
+121: 		TemplatedUnnest<interval_t>(vdata, start, end, result);
+122: 		break;
+123: 	case PhysicalType::VARCHAR:
+124: 		TemplatedUnnest<string_t>(vdata, start, end, result);
+125: 		break;
+126: 	case PhysicalType::LIST: {
+127: 		auto &target = ListVector::GetEntry(result);
+128: 		target.Reference(ListVector::GetEntry(source));
+129: 		ListVector::SetListSize(result, ListVector::GetListSize(source));
+130: 		TemplatedUnnest<list_entry_t>(vdata, start, end, result);
+131: 		break;
+132: 	}
+133: 	case PhysicalType::STRUCT: {
+134: 		auto &source_entries = StructVector::GetEntries(source);
+135: 		auto &target_entries = StructVector::GetEntries(result);
+136: 		UnnestValidity(vdata, start, end, result);
+137: 		for (idx_t i = 0; i < source_entries.size(); i++) {
+138: 			VectorData sdata;
+139: 			source_entries[i]->Orrify(list_size, sdata);
+140: 			UnnestVector(sdata, *source_entries[i], list_size, start, end, *target_entries[i]);
+141: 		}
+142: 		break;
+143: 	}
+144: 	default:
+145: 		throw InternalException("Unimplemented type for UNNEST");
+146: 	}
+147: }
+148: 
+149: void PhysicalUnnest::GetChunkInternal(ExecutionContext &context, DataChunk &chunk,
+150:                                       PhysicalOperatorState *state_p) const {
+151: 	auto state = reinterpret_cast<PhysicalUnnestOperatorState *>(state_p);
+152: 	while (true) { // repeat until we actually have produced some rows
+153: 		if (state->child_chunk.size() == 0 || state->parent_position >= state->child_chunk.size()) {
+154: 			// get the child data
+155: 			children[0]->GetChunk(context, state->child_chunk, state->child_state.get());
+156: 			if (state->child_chunk.size() == 0) {
+157: 				return;
+158: 			}
+159: 			state->parent_position = 0;
+160: 			state->list_position = 0;
+161: 			state->list_length = -1;
+162: 
+163: 			// get the list data to unnest
+164: 			ExpressionExecutor executor;
+165: 			vector<LogicalType> list_data_types;
+166: 			for (auto &exp : select_list) {
+167: 				D_ASSERT(exp->type == ExpressionType::BOUND_UNNEST);
+168: 				auto bue = (BoundUnnestExpression *)exp.get();
+169: 				list_data_types.push_back(bue->child->return_type);
+170: 				executor.AddExpression(*bue->child.get());
+171: 			}
+172: 			state->list_data.Destroy();
+173: 			state->list_data.Initialize(list_data_types);
+174: 			executor.Execute(state->child_chunk, state->list_data);
+175: 
+176: 			// paranoia aplenty
+177: 			state->child_chunk.Verify();
+178: 			state->list_data.Verify();
+179: 			D_ASSERT(state->child_chunk.size() == state->list_data.size());
+180: 			D_ASSERT(state->list_data.ColumnCount() == select_list.size());
+181: 
+182: 			// initialize VectorData object so the nullmask can accessed
+183: 			state->list_vector_data.resize(state->list_data.ColumnCount());
+184: 			state->list_child_data.resize(state->list_data.ColumnCount());
+185: 			for (idx_t col_idx = 0; col_idx < state->list_data.ColumnCount(); col_idx++) {
+186: 				auto &list_vector = state->list_data.data[col_idx];
+187: 				list_vector.Orrify(state->list_data.size(), state->list_vector_data[col_idx]);
+188: 
+189: 				auto &child_vector = ListVector::GetEntry(list_vector);
+190: 				auto list_size = ListVector::GetListSize(list_vector);
+191: 				child_vector.Orrify(list_size, state->list_child_data[col_idx]);
+192: 			}
+193: 		}
+194: 
+195: 		// need to figure out how many times we need to repeat for current row
+196: 		if (state->list_length < 0) {
+197: 			for (idx_t col_idx = 0; col_idx < state->list_data.ColumnCount(); col_idx++) {
+198: 				auto &vdata = state->list_vector_data[col_idx];
+199: 				auto current_idx = vdata.sel->get_index(state->parent_position);
+200: 
+201: 				int64_t list_length;
+202: 				// deal with NULL values
+203: 				if (!vdata.validity.RowIsValid(current_idx)) {
+204: 					list_length = 1;
+205: 				} else {
+206: 					auto list_data = (list_entry_t *)vdata.data;
+207: 					auto list_entry = list_data[current_idx];
+208: 					list_length = (int64_t)list_entry.length;
+209: 				}
+210: 
+211: 				if (list_length > state->list_length) {
+212: 					state->list_length = list_length;
+213: 				}
+214: 			}
+215: 		}
+216: 
+217: 		D_ASSERT(state->list_length >= 0);
+218: 
+219: 		auto this_chunk_len = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state->list_length - state->list_position);
+220: 
+221: 		// first cols are from child, last n cols from unnest
+222: 		chunk.SetCardinality(this_chunk_len);
+223: 
+224: 		for (idx_t col_idx = 0; col_idx < state->child_chunk.ColumnCount(); col_idx++) {
+225: 			ConstantVector::Reference(chunk.data[col_idx], state->child_chunk.data[col_idx], state->parent_position,
+226: 			                          state->child_chunk.size());
+227: 		}
+228: 
+229: 		for (idx_t col_idx = 0; col_idx < state->list_data.ColumnCount(); col_idx++) {
+230: 			auto &result_vector = chunk.data[col_idx + state->child_chunk.ColumnCount()];
+231: 
+232: 			auto &vdata = state->list_vector_data[col_idx];
+233: 			auto &child_data = state->list_child_data[col_idx];
+234: 			auto current_idx = vdata.sel->get_index(state->parent_position);
+235: 
+236: 			auto list_data = (list_entry_t *)vdata.data;
+237: 			auto list_entry = list_data[current_idx];
+238: 
+239: 			idx_t list_count;
+240: 			if (state->list_position >= list_entry.length) {
+241: 				list_count = 0;
+242: 			} else {
+243: 				list_count = MinValue<idx_t>(this_chunk_len, list_entry.length - state->list_position);
+244: 			}
+245: 
+246: 			if (list_entry.length > state->list_position) {
+247: 				if (!vdata.validity.RowIsValid(current_idx)) {
+248: 					UnnestNull(0, list_count, result_vector);
+249: 				} else {
+250: 					auto &list_vector = state->list_data.data[col_idx];
+251: 					auto &child_vector = ListVector::GetEntry(list_vector);
+252: 					auto list_size = ListVector::GetListSize(list_vector);
+253: 
+254: 					auto base_offset = list_entry.offset + state->list_position;
+255: 					UnnestVector(child_data, child_vector, list_size, base_offset, base_offset + list_count,
+256: 					             result_vector);
+257: 				}
+258: 			}
+259: 			UnnestNull(list_count, this_chunk_len, result_vector);
+260: 		}
+261: 
+262: 		state->list_position += this_chunk_len;
+263: 		if ((int64_t)state->list_position == state->list_length) {
+264: 			state->parent_position++;
+265: 			state->list_length = -1;
+266: 			state->list_position = 0;
+267: 		}
+268: 
+269: 		chunk.Verify();
+270: 		if (chunk.size() > 0) {
+271: 			return;
+272: 		}
+273: 	}
+274: }
+275: 
+276: unique_ptr<PhysicalOperatorState> PhysicalUnnest::GetOperatorState() {
+277: 	return make_unique<PhysicalUnnestOperatorState>(*this, children[0].get());
+278: }
+279: 
+280: } // namespace duckdb
+[end of src/execution/operator/projection/physical_unnest.cpp]
+[start of src/main/query_profiler.cpp]
+1: #include "duckdb/main/query_profiler.hpp"
+2: #include "duckdb/common/to_string.hpp"
+3: #include "duckdb/common/fstream.hpp"
+4: #include "duckdb/common/printer.hpp"
+5: #include "duckdb/common/string_util.hpp"
+6: #include "duckdb/execution/physical_operator.hpp"
+7: #include "duckdb/execution/operator/join/physical_delim_join.hpp"
+8: #include "duckdb/execution/operator/helper/physical_execute.hpp"
+9: #include "duckdb/common/tree_renderer.hpp"
+10: #include "duckdb/parser/sql_statement.hpp"
+11: #include "duckdb/common/limits.hpp"
+12: #include "duckdb/execution/expression_executor.hpp"
+13: #include "duckdb/planner/expression/bound_function_expression.hpp"
+14: #include <utility>
+15: #include <algorithm>
+16: 
+17: namespace duckdb {
+18: 
+19: void QueryProfiler::StartQuery(string query) {
+20: 	if (!enabled) {
+21: 		return;
+22: 	}
+23: 	this->running = true;
+24: 	this->query = move(query);
+25: 	tree_map.clear();
+26: 	root = nullptr;
+27: 	phase_timings.clear();
+28: 	phase_stack.clear();
+29: 
+30: 	main_query.Start();
+31: }
+32: 
+33: bool QueryProfiler::OperatorRequiresProfiling(PhysicalOperatorType op_type) {
+34: 	switch (op_type) {
+35: 	case PhysicalOperatorType::ORDER_BY:
+36: 	case PhysicalOperatorType::RESERVOIR_SAMPLE:
+37: 	case PhysicalOperatorType::STREAMING_SAMPLE:
+38: 	case PhysicalOperatorType::LIMIT:
+39: 	case PhysicalOperatorType::TOP_N:
+40: 	case PhysicalOperatorType::WINDOW:
+41: 	case PhysicalOperatorType::UNNEST:
+42: 	case PhysicalOperatorType::SIMPLE_AGGREGATE:
+43: 	case PhysicalOperatorType::HASH_GROUP_BY:
+44: 	case PhysicalOperatorType::FILTER:
+45: 	case PhysicalOperatorType::PROJECTION:
+46: 	case PhysicalOperatorType::COPY_TO_FILE:
+47: 	case PhysicalOperatorType::TABLE_SCAN:
+48: 	case PhysicalOperatorType::CHUNK_SCAN:
+49: 	case PhysicalOperatorType::DELIM_SCAN:
+50: 	case PhysicalOperatorType::EXPRESSION_SCAN:
+51: 	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
+52: 	case PhysicalOperatorType::NESTED_LOOP_JOIN:
+53: 	case PhysicalOperatorType::HASH_JOIN:
+54: 	case PhysicalOperatorType::CROSS_PRODUCT:
+55: 	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+56: 	case PhysicalOperatorType::DELIM_JOIN:
+57: 	case PhysicalOperatorType::UNION:
+58: 	case PhysicalOperatorType::RECURSIVE_CTE:
+59: 	case PhysicalOperatorType::EMPTY_RESULT:
+60: 		return true;
+61: 	default:
+62: 		return false;
+63: 	}
+64: }
+65: 
+66: void QueryProfiler::EndQuery() {
+67: 	if (!enabled || !running) {
+68: 		return;
+69: 	}
+70: 
+71: 	main_query.End();
+72: 	this->running = false;
+73: 	// print or output the query profiling after termination, if this is enabled
+74: 	if (automatic_print_format != ProfilerPrintFormat::NONE) {
+75: 		// check if this query should be output based on the operator types
+76: 		string query_info;
+77: 		if (automatic_print_format == ProfilerPrintFormat::JSON) {
+78: 			query_info = ToJSON();
+79: 		} else if (automatic_print_format == ProfilerPrintFormat::QUERY_TREE) {
+80: 			query_info = ToString();
+81: 		} else if (automatic_print_format == ProfilerPrintFormat::QUERY_TREE_OPTIMIZER) {
+82: 			query_info = ToString(true);
+83: 		}
+84: 
+85: 		if (save_location.empty()) {
+86: 			Printer::Print(query_info);
+87: 			Printer::Print("\n");
+88: 		} else {
+89: 			WriteToFile(save_location.c_str(), query_info);
+90: 		}
+91: 	}
+92: }
+93: 
+94: void QueryProfiler::StartPhase(string new_phase) {
+95: 	if (!enabled || !running) {
+96: 		return;
+97: 	}
+98: 
+99: 	if (!phase_stack.empty()) {
+100: 		// there are active phases
+101: 		phase_profiler.End();
+102: 		// add the timing to all phases prior to this one
+103: 		string prefix = "";
+104: 		for (auto &phase : phase_stack) {
+105: 			phase_timings[phase] += phase_profiler.Elapsed();
+106: 			prefix += phase + " > ";
+107: 		}
+108: 		// when there are previous phases, we prefix the current phase with those phases
+109: 		new_phase = prefix + new_phase;
+110: 	}
+111: 
+112: 	// start a new phase
+113: 	phase_stack.push_back(new_phase);
+114: 	// restart the timer
+115: 	phase_profiler.Start();
+116: }
+117: 
+118: void QueryProfiler::EndPhase() {
+119: 	if (!enabled || !running) {
+120: 		return;
+121: 	}
+122: 	D_ASSERT(phase_stack.size() > 0);
+123: 
+124: 	// end the timer
+125: 	phase_profiler.End();
+126: 	// add the timing to all currently active phases
+127: 	for (auto &phase : phase_stack) {
+128: 		phase_timings[phase] += phase_profiler.Elapsed();
+129: 	}
+130: 	// now remove the last added phase
+131: 	phase_stack.pop_back();
+132: 
+133: 	if (!phase_stack.empty()) {
+134: 		phase_profiler.Start();
+135: 	}
+136: }
+137: 
+138: void QueryProfiler::Initialize(PhysicalOperator *root_op) {
+139: 	if (!enabled || !running) {
+140: 		return;
+141: 	}
+142: 	this->query_requires_profiling = false;
+143: 	this->root = CreateTree(root_op);
+144: 	if (!query_requires_profiling) {
+145: 		// query does not require profiling: disable profiling for this query
+146: 		this->running = false;
+147: 		tree_map.clear();
+148: 		root = nullptr;
+149: 		phase_timings.clear();
+150: 		phase_stack.clear();
+151: 	}
+152: }
+153: 
+154: OperatorProfiler::OperatorProfiler(bool enabled_p) : enabled(enabled_p) {
+155: 	execution_stack = std::stack<const PhysicalOperator *>();
+156: }
+157: 
+158: void OperatorProfiler::StartOperator(const PhysicalOperator *phys_op) {
+159: 	if (!enabled) {
+160: 		return;
+161: 	}
+162: 
+163: 	if (!execution_stack.empty()) {
+164: 		// add timing for the previous element
+165: 		op.End();
+166: 
+167: 		AddTiming(execution_stack.top(), op.Elapsed(), 0);
+168: 	}
+169: 
+170: 	execution_stack.push(phys_op);
+171: 
+172: 	// start timing for current element
+173: 	op.Start();
+174: }
+175: 
+176: void OperatorProfiler::EndOperator(DataChunk *chunk) {
+177: 	if (!enabled) {
+178: 		return;
+179: 	}
+180: 
+181: 	// finish timing for the current element
+182: 	op.End();
+183: 
+184: 	AddTiming(execution_stack.top(), op.Elapsed(), chunk ? chunk->size() : 0);
+185: 
+186: 	D_ASSERT(!execution_stack.empty());
+187: 	execution_stack.pop();
+188: 
+189: 	// start timing again for the previous element, if any
+190: 	if (!execution_stack.empty()) {
+191: 		op.Start();
+192: 	}
+193: }
+194: 
+195: void OperatorProfiler::AddTiming(const PhysicalOperator *op, double time, idx_t elements) {
+196: 	if (!enabled) {
+197: 		return;
+198: 	}
+199: 	if (!Value::DoubleIsValid(time)) {
+200: 		return;
+201: 	}
+202: 	auto entry = timings.find(op);
+203: 	if (entry == timings.end()) {
+204: 		// add new entry
+205: 		timings[op] = OperatorInformation(time, elements);
+206: 	} else {
+207: 		// add to existing entry
+208: 		entry->second.time += time;
+209: 		entry->second.elements += elements;
+210: 	}
+211: }
+212: void OperatorProfiler::Flush(const PhysicalOperator *phys_op, ExpressionExecutor *expression_executor,
+213:                              const string &name, int id) {
+214: 	auto entry = timings.find(phys_op);
+215: 	if (entry == timings.end()) {
+216: 		return;
+217: 	}
+218: 	auto &operator_timing = timings.find(phys_op)->second;
+219: 	if (int(operator_timing.executors_info.size()) <= id) {
+220: 		operator_timing.executors_info.resize(id + 1);
+221: 	}
+222: 	operator_timing.executors_info[id] = make_unique<ExpressionExecutorInfo>(*expression_executor, name, id);
+223: 	operator_timing.name = phys_op->GetName();
+224: }
+225: 
+226: void QueryProfiler::Flush(OperatorProfiler &profiler) {
+227: 	if (!enabled || !running) {
+228: 		return;
+229: 	}
+230: 	lock_guard<mutex> guard(flush_lock);
+231: 	for (auto &node : profiler.timings) {
+232: 		auto entry = tree_map.find(node.first);
+233: 		D_ASSERT(entry != tree_map.end());
+234: 
+235: 		entry->second->info.time += node.second.time;
+236: 		entry->second->info.elements += node.second.elements;
+237: 		if (!detailed_enabled) {
+238: 			continue;
+239: 		}
+240: 		for (auto &info : node.second.executors_info) {
+241: 			if (!info) {
+242: 				continue;
+243: 			}
+244: 			if (int(entry->second->info.executors_info.size()) <= info->id) {
+245: 				entry->second->info.executors_info.resize(info->id + 1);
+246: 			}
+247: 			entry->second->info.executors_info[info->id] = move(info);
+248: 		}
+249: 	}
+250: }
+251: 
+252: static string DrawPadded(const string &str, idx_t width) {
+253: 	if (str.size() > width) {
+254: 		return str.substr(0, width);
+255: 	} else {
+256: 		width -= str.size();
+257: 		int half_spaces = width / 2;
+258: 		int extra_left_space = width % 2 != 0 ? 1 : 0;
+259: 		return string(half_spaces + extra_left_space, ' ') + str + string(half_spaces, ' ');
+260: 	}
+261: }
+262: 
+263: static string RenderTitleCase(string str) {
+264: 	str = StringUtil::Lower(str);
+265: 	str[0] = toupper(str[0]);
+266: 	for (idx_t i = 0; i < str.size(); i++) {
+267: 		if (str[i] == '_') {
+268: 			str[i] = ' ';
+269: 			if (i + 1 < str.size()) {
+270: 				str[i + 1] = toupper(str[i + 1]);
+271: 			}
+272: 		}
+273: 	}
+274: 	return str;
+275: }
+276: 
+277: static string RenderTiming(double timing) {
+278: 	string timing_s;
+279: 	if (timing >= 1) {
+280: 		timing_s = StringUtil::Format("%.2f", timing);
+281: 	} else if (timing >= 0.1) {
+282: 		timing_s = StringUtil::Format("%.3f", timing);
+283: 	} else {
+284: 		timing_s = StringUtil::Format("%.4f", timing);
+285: 	}
+286: 	return timing_s + "s";
+287: }
+288: 
+289: string QueryProfiler::ToString(bool print_optimizer_output) const {
+290: 	std::stringstream str;
+291: 	ToStream(str, print_optimizer_output);
+292: 	return str.str();
+293: }
+294: 
+295: void QueryProfiler::ToStream(std::ostream &ss, bool print_optimizer_output) const {
+296: 	if (!enabled) {
+297: 		ss << "Query profiling is disabled. Call "
+298: 		      "Connection::EnableProfiling() to enable profiling!";
+299: 		return;
+300: 	}
+301: 	ss << "┌─────────────────────────────────────┐\n";
+302: 	ss << "│┌───────────────────────────────────┐│\n";
+303: 	ss << "││    Query Profiling Information    ││\n";
+304: 	ss << "│└───────────────────────────────────┘│\n";
+305: 	ss << "└─────────────────────────────────────┘\n";
+306: 	ss << StringUtil::Replace(query, "\n", " ") + "\n";
+307: 	if (query.empty()) {
+308: 		return;
+309: 	}
+310: 
+311: 	constexpr idx_t TOTAL_BOX_WIDTH = 39;
+312: 	ss << "┌─────────────────────────────────────┐\n";
+313: 	ss << "│┌───────────────────────────────────┐│\n";
+314: 	string total_time = "Total Time: " + RenderTiming(main_query.Elapsed());
+315: 	ss << "││" + DrawPadded(total_time, TOTAL_BOX_WIDTH - 4) + "││\n";
+316: 	ss << "│└───────────────────────────────────┘│\n";
+317: 	ss << "└─────────────────────────────────────┘\n";
+318: 	// print phase timings
+319: 	if (print_optimizer_output) {
+320: 		bool has_previous_phase = false;
+321: 		for (const auto &entry : GetOrderedPhaseTimings()) {
+322: 			if (!StringUtil::Contains(entry.first, " > ")) {
+323: 				// primary phase!
+324: 				if (has_previous_phase) {
+325: 					ss << "│└───────────────────────────────────┘│\n";
+326: 					ss << "└─────────────────────────────────────┘\n";
+327: 				}
+328: 				ss << "┌─────────────────────────────────────┐\n";
+329: 				ss << "│" +
+330: 				          DrawPadded(RenderTitleCase(entry.first) + ": " + RenderTiming(entry.second),
+331: 				                     TOTAL_BOX_WIDTH - 2) +
+332: 				          "│\n";
+333: 				ss << "│┌───────────────────────────────────┐│\n";
+334: 				has_previous_phase = true;
+335: 			} else {
+336: 				string entry_name = StringUtil::Split(entry.first, " > ")[1];
+337: 				ss << "││" +
+338: 				          DrawPadded(RenderTitleCase(entry_name) + ": " + RenderTiming(entry.second),
+339: 				                     TOTAL_BOX_WIDTH - 4) +
+340: 				          "││\n";
+341: 			}
+342: 		}
+343: 		if (has_previous_phase) {
+344: 			ss << "│└───────────────────────────────────┘│\n";
+345: 			ss << "└─────────────────────────────────────┘\n";
+346: 		}
+347: 	}
+348: 	// render the main operator tree
+349: 	if (root) {
+350: 		Render(*root, ss);
+351: 	}
+352: }
+353: 
+354: // Print a row
+355: static void PrintRow(std::ostream &ss, const string &annotation, int id, const string &name, double time,
+356:                      int sample_counter, int tuple_counter, string extra_info, int depth) {
+357: 	ss << string(depth * 3, ' ') << " {\n";
+358: 	ss << string(depth * 3, ' ') << "   \"annotation\": \"" + annotation + "\",\n";
+359: 	ss << string(depth * 3, ' ') << "   \"id\": " + to_string(id) + ",\n";
+360: 	ss << string(depth * 3, ' ') << "   \"name\": \"" + name + "\",\n";
+361: #if defined(RDTSC)
+362: 	ss << string(depth * 3, ' ') << "   \"timing\": \"NULL\" ,\n";
+363: 	ss << string(depth * 3, ' ') << "   \"cycles_per_tuple\": " + StringUtil::Format("%.4f", time) + ",\n";
+364: #else
+365: 	ss << string(depth * 3, ' ') << "   \"timing\":" + to_string(time) + ",\n";
+366: 	ss << string(depth * 3, ' ') << "   \"cycles_per_tuple\": \"NULL\" ,\n";
+367: #endif
+368: 	ss << string(depth * 3, ' ') << "   \"sample_size\": " << to_string(sample_counter) + ",\n";
+369: 	ss << string(depth * 3, ' ') << "   \"input_size\": " << to_string(tuple_counter) + ",\n";
+370: 	ss << string(depth * 3, ' ') << "   \"extra_info\": \""
+371: 	   << StringUtil::Replace(std::move(extra_info), "\n", "\\n") + "\"\n";
+372: 	ss << string(depth * 3, ' ') << " },\n";
+373: }
+374: 
+375: static void ExtractFunctions(std::ostream &ss, ExpressionInfo &info, int &fun_id, int depth) {
+376: 	if (info.hasfunction) {
+377: 		D_ASSERT(info.sample_tuples_count != 0);
+378: 		PrintRow(ss, "Function", fun_id++, info.function_name,
+379: 		         int(info.function_time) / double(info.sample_tuples_count), info.sample_tuples_count,
+380: 		         info.tuples_count, "", depth);
+381: 	}
+382: 	if (info.children.empty()) {
+383: 		return;
+384: 	}
+385: 	// extract the children of this node
+386: 	for (auto &child : info.children) {
+387: 		ExtractFunctions(ss, *child, fun_id, depth);
+388: 	}
+389: }
+390: 
+391: static void ToJSONRecursive(QueryProfiler::TreeNode &node, std::ostream &ss, int depth = 1) {
+392: 	ss << string(depth * 3, ' ') << " {\n";
+393: 	ss << string(depth * 3, ' ') << "   \"name\": \"" + node.name + "\",\n";
+394: 	ss << string(depth * 3, ' ') << "   \"timing\":" + to_string(node.info.time) + ",\n";
+395: 	ss << string(depth * 3, ' ') << "   \"cardinality\":" + to_string(node.info.elements) + ",\n";
+396: 	ss << string(depth * 3, ' ')
+397: 	   << "   \"extra_info\": \"" + StringUtil::Replace(node.extra_info, "\n", "\\n") + "\",\n";
+398: 	ss << string(depth * 3, ' ') << "   \"timings\": [";
+399: 	int32_t function_counter = 1;
+400: 	int32_t expression_counter = 1;
+401: 	ss << "\n ";
+402: 	for (auto &expr_executor : node.info.executors_info) {
+403: 		// For each Expression tree
+404: 		if (!expr_executor) {
+405: 			continue;
+406: 		}
+407: 		for (auto &expr_timer : expr_executor->roots) {
+408: 			D_ASSERT(expr_timer->sample_tuples_count != 0);
+409: 			PrintRow(ss, "ExpressionRoot", expression_counter++, expr_timer->name,
+410: 			         int(expr_timer->time) / double(expr_timer->sample_tuples_count), expr_timer->sample_tuples_count,
+411: 			         expr_timer->tuples_count, expr_timer->extra_info, depth + 1);
+412: 			// Extract all functions inside the tree
+413: 			ExtractFunctions(ss, *expr_timer->root, function_counter, depth + 1);
+414: 		}
+415: 	}
+416: 	ss.seekp(-2, ss.cur);
+417: 	ss << "\n";
+418: 	ss << string(depth * 3, ' ') << "   ],\n";
+419: 	ss << string(depth * 3, ' ') << "   \"children\": [\n";
+420: 	if (node.children.empty()) {
+421: 		ss << string(depth * 3, ' ') << "   ]\n";
+422: 	} else {
+423: 		for (idx_t i = 0; i < node.children.size(); i++) {
+424: 			if (i > 0) {
+425: 				ss << ",\n";
+426: 			}
+427: 			ToJSONRecursive(*node.children[i], ss, depth + 1);
+428: 		}
+429: 		ss << string(depth * 3, ' ') << "   ]\n";
+430: 	}
+431: 	ss << string(depth * 3, ' ') << " }\n";
+432: }
+433: 
+434: string QueryProfiler::ToJSON() const {
+435: 	if (!enabled) {
+436: 		return "{ \"result\": \"disabled\" }\n";
+437: 	}
+438: 	if (query.empty()) {
+439: 		return "{ \"result\": \"empty\" }\n";
+440: 	}
+441: 	if (!root) {
+442: 		return "{ \"result\": \"error\" }\n";
+443: 	}
+444: 	std::stringstream ss;
+445: 	ss << "{\n";
+446: 	ss << "   \"name\":  \"Query\", \n";
+447: 	ss << "   \"result\": " + to_string(main_query.Elapsed()) + ",\n";
+448: 	ss << "   \"timing\": " + to_string(main_query.Elapsed()) + ",\n";
+449: 	ss << "   \"cardinality\": " + to_string(root->info.elements) + ",\n";
+450: 	// JSON cannot have literal control characters in string literals
+451: 	string extra_info = StringUtil::Replace(query, "\t", "\\t");
+452: 	extra_info = StringUtil::Replace(extra_info, "\n", "\\n");
+453: 	ss << "   \"extra-info\": \"" + extra_info + "\", \n";
+454: 	// print the phase timings
+455: 	ss << "   \"timings\": [\n";
+456: 	const auto &ordered_phase_timings = GetOrderedPhaseTimings();
+457: 	for (idx_t i = 0; i < ordered_phase_timings.size(); i++) {
+458: 		if (i > 0) {
+459: 			ss << ",\n";
+460: 		}
+461: 		ss << "   {\n";
+462: 		ss << "   \"annotation\": \"" + ordered_phase_timings[i].first + "\", \n";
+463: 		ss << "   \"timing\": " + to_string(ordered_phase_timings[i].second) + "\n";
+464: 		ss << "   }";
+465: 	}
+466: 	ss << "\n";
+467: 	ss << "   ],\n";
+468: 	// recursively print the physical operator tree
+469: 	ss << "   \"children\": [\n";
+470: 	ToJSONRecursive(*root, ss);
+471: 	ss << "   ]\n";
+472: 	ss << "}";
+473: 	return ss.str();
+474: }
+475: 
+476: void QueryProfiler::WriteToFile(const char *path, string &info) const {
+477: 	ofstream out(path);
+478: 	out << info;
+479: 	out.close();
+480: 	// throw an IO exception if it fails to write the file
+481: 	if (out.fail()) {
+482: 		throw IOException(strerror(errno));
+483: 	}
+484: }
+485: 
+486: unique_ptr<QueryProfiler::TreeNode> QueryProfiler::CreateTree(PhysicalOperator *root, idx_t depth) {
+487: 	if (OperatorRequiresProfiling(root->type)) {
+488: 		this->query_requires_profiling = true;
+489: 	}
+490: 	auto node = make_unique<QueryProfiler::TreeNode>();
+491: 	node->name = root->GetName();
+492: 	node->extra_info = root->ParamsToString();
+493: 	node->depth = depth;
+494: 	tree_map[root] = node.get();
+495: 	for (auto &child : root->children) {
+496: 		auto child_node = CreateTree(child.get(), depth + 1);
+497: 		node->children.push_back(move(child_node));
+498: 	}
+499: 	switch (root->type) {
+500: 	case PhysicalOperatorType::DELIM_JOIN: {
+501: 		auto &delim_join = (PhysicalDelimJoin &)*root;
+502: 		auto child_node = CreateTree((PhysicalOperator *)delim_join.join.get(), depth + 1);
+503: 		node->children.push_back(move(child_node));
+504: 		child_node = CreateTree((PhysicalOperator *)delim_join.distinct.get(), depth + 1);
+505: 		node->children.push_back(move(child_node));
+506: 		break;
+507: 	}
+508: 	case PhysicalOperatorType::EXECUTE: {
+509: 		auto &execute = (PhysicalExecute &)*root;
+510: 		auto child_node = CreateTree((PhysicalOperator *)execute.plan, depth + 1);
+511: 		node->children.push_back(move(child_node));
+512: 		break;
+513: 	}
+514: 	default:
+515: 		break;
+516: 	}
+517: 	return node;
+518: }
+519: 
+520: void QueryProfiler::Render(const QueryProfiler::TreeNode &node, std::ostream &ss) const {
+521: 	TreeRenderer renderer;
+522: 	if (IsDetailedEnabled()) {
+523: 		renderer.EnableDetailed();
+524: 	} else {
+525: 		renderer.EnableStandard();
+526: 	}
+527: 	renderer.Render(node, ss);
+528: }
+529: 
+530: void QueryProfiler::Print() {
+531: 	Printer::Print(ToString());
+532: }
+533: 
+534: vector<QueryProfiler::PhaseTimingItem> QueryProfiler::GetOrderedPhaseTimings() const {
+535: 	vector<PhaseTimingItem> result;
+536: 	// first sort the phases alphabetically
+537: 	vector<string> phases;
+538: 	for (auto &entry : phase_timings) {
+539: 		phases.push_back(entry.first);
+540: 	}
+541: 	std::sort(phases.begin(), phases.end());
+542: 	for (const auto &phase : phases) {
+543: 		auto entry = phase_timings.find(phase);
+544: 		D_ASSERT(entry != phase_timings.end());
+545: 		result.emplace_back(entry->first, entry->second);
+546: 	}
+547: 	return result;
+548: }
+549: void QueryProfiler::Propagate(QueryProfiler &qp) {
+550: 	this->automatic_print_format = qp.automatic_print_format;
+551: 	this->save_location = qp.save_location;
+552: 	this->enabled = qp.enabled;
+553: 	this->detailed_enabled = qp.detailed_enabled;
+554: }
+555: 
+556: void ExpressionInfo::ExtractExpressionsRecursive(unique_ptr<ExpressionState> &state) {
+557: 	if (state->child_states.empty()) {
+558: 		return;
+559: 	}
+560: 	// extract the children of this node
+561: 	for (auto &child : state->child_states) {
+562: 		auto expr_info = make_unique<ExpressionInfo>();
+563: 		if (child->expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+564: 			expr_info->hasfunction = true;
+565: 			expr_info->function_name = ((BoundFunctionExpression &)child->expr).function.ToString();
+566: 			expr_info->function_time = child->profiler.time;
+567: 			expr_info->sample_tuples_count = child->profiler.sample_tuples_count;
+568: 			expr_info->tuples_count = child->profiler.tuples_count;
+569: 		}
+570: 		expr_info->ExtractExpressionsRecursive(child);
+571: 		children.push_back(move(expr_info));
+572: 	}
+573: 	return;
+574: }
+575: 
+576: ExpressionExecutorInfo::ExpressionExecutorInfo(ExpressionExecutor &executor, const string &name, int id) : id(id) {
+577: 	// Extract Expression Root Information from ExpressionExecutorStats
+578: 	for (auto &state : executor.GetStates()) {
+579: 		roots.push_back(make_unique<ExpressionRootInfo>(*state, name));
+580: 	}
+581: }
+582: 
+583: ExpressionRootInfo::ExpressionRootInfo(ExpressionExecutorState &state, string name)
+584:     : current_count(state.profiler.current_count), sample_count(state.profiler.sample_count),
+585:       sample_tuples_count(state.profiler.sample_tuples_count), tuples_count(state.profiler.tuples_count),
+586:       name(state.name), time(state.profiler.time) {
+587: 	// Use the name of expression-tree as extra-info
+588: 	extra_info = move(name);
+589: 	auto expression_info_p = make_unique<ExpressionInfo>();
+590: 	// Maybe root has a function
+591: 	if (state.root_state->expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+592: 		expression_info_p->hasfunction = true;
+593: 		expression_info_p->function_name = ((BoundFunctionExpression &)state.root_state->expr).function.name;
+594: 		expression_info_p->function_time = state.root_state->profiler.time;
+595: 		expression_info_p->sample_tuples_count = state.root_state->profiler.sample_tuples_count;
+596: 		expression_info_p->tuples_count = state.root_state->profiler.tuples_count;
+597: 	}
+598: 	expression_info_p->ExtractExpressionsRecursive(state.root_state);
+599: 	root = move(expression_info_p);
+600: }
+601: } // namespace duckdb
+[end of src/main/query_profiler.cpp]
+[start of src/storage/table/row_group.cpp]
+1: #include "duckdb/storage/table/row_group.hpp"
+2: #include "duckdb/common/types/vector.hpp"
+3: #include "duckdb/transaction/transaction.hpp"
+4: #include "duckdb/common/exception.hpp"
+5: #include "duckdb/storage/table/column_data.hpp"
+6: #include "duckdb/storage/table/standard_column_data.hpp"
+7: #include "duckdb/storage/table/update_segment.hpp"
+8: #include "duckdb/common/chrono.hpp"
+9: #include "duckdb/planner/table_filter.hpp"
+10: #include "duckdb/execution/expression_executor.hpp"
+11: #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+12: #include "duckdb/storage/meta_block_reader.hpp"
+13: #include "duckdb/transaction/transaction_manager.hpp"
+14: 
+15: namespace duckdb {
+16: 
+17: constexpr const idx_t RowGroup::ROW_GROUP_VECTOR_COUNT;
+18: constexpr const idx_t RowGroup::ROW_GROUP_SIZE;
+19: 
+20: RowGroup::RowGroup(DatabaseInstance &db, DataTableInfo &table_info, idx_t start, idx_t count)
+21:     : SegmentBase(start, count), db(db), table_info(table_info) {
+22: 
+23: 	Verify();
+24: }
+25: 
+26: RowGroup::RowGroup(DatabaseInstance &db, DataTableInfo &table_info, const vector<LogicalType> &types,
+27:                    RowGroupPointer &pointer)
+28:     : SegmentBase(pointer.row_start, pointer.tuple_count), db(db), table_info(table_info) {
+29: 	// deserialize the columns
+30: 	if (pointer.data_pointers.size() != types.size()) {
+31: 		throw IOException("Row group column count is unaligned with table column count. Corrupt file?");
+32: 	}
+33: 	for (idx_t i = 0; i < pointer.data_pointers.size(); i++) {
+34: 		auto &block_pointer = pointer.data_pointers[i];
+35: 		MetaBlockReader column_data_reader(db, block_pointer.block_id);
+36: 		column_data_reader.offset = block_pointer.offset;
+37: 		this->columns.push_back(ColumnData::Deserialize(table_info, i, start, column_data_reader, types[i], nullptr));
+38: 	}
+39: 
+40: 	// set up the statistics
+41: 	for (auto &stats : pointer.statistics) {
+42: 		this->stats.push_back(make_shared<SegmentStatistics>(stats->type, move(stats)));
+43: 	}
+44: 	this->version_info = move(pointer.versions);
+45: 
+46: 	Verify();
+47: }
+48: 
+49: RowGroup::~RowGroup() {
+50: }
+51: 
+52: void RowGroup::InitializeEmpty(const vector<LogicalType> &types) {
+53: 	// set up the segment trees for the column segments
+54: 	for (idx_t i = 0; i < types.size(); i++) {
+55: 		auto column_data = ColumnData::CreateColumn(GetTableInfo(), i, start, types[i]);
+56: 		stats.push_back(make_shared<SegmentStatistics>(types[i]));
+57: 		columns.push_back(move(column_data));
+58: 	}
+59: }
+60: 
+61: bool RowGroup::InitializeScanWithOffset(RowGroupScanState &state, idx_t vector_offset) {
+62: 	auto &column_ids = state.parent.column_ids;
+63: 	if (state.parent.table_filters) {
+64: 		if (!CheckZonemap(*state.parent.table_filters, column_ids)) {
+65: 			return false;
+66: 		}
+67: 	}
+68: 
+69: 	state.row_group = this;
+70: 	state.vector_index = vector_offset;
+71: 	state.max_row =
+72: 	    this->start > state.parent.max_row ? 0 : MinValue<idx_t>(this->count, state.parent.max_row - this->start);
+73: 	state.column_scans = unique_ptr<ColumnScanState[]>(new ColumnScanState[column_ids.size()]);
+74: 	for (idx_t i = 0; i < column_ids.size(); i++) {
+75: 		auto column = column_ids[i];
+76: 		if (column != COLUMN_IDENTIFIER_ROW_ID) {
+77: 			columns[column]->InitializeScanWithOffset(state.column_scans[i],
+78: 			                                          start + vector_offset * STANDARD_VECTOR_SIZE);
+79: 		} else {
+80: 			state.column_scans[i].current = nullptr;
+81: 		}
+82: 	}
+83: 	return true;
+84: }
+85: 
+86: bool RowGroup::InitializeScan(RowGroupScanState &state) {
+87: 	auto &column_ids = state.parent.column_ids;
+88: 	if (state.parent.table_filters) {
+89: 		if (!CheckZonemap(*state.parent.table_filters, column_ids)) {
+90: 			return false;
+91: 		}
+92: 	}
+93: 	state.row_group = this;
+94: 	state.vector_index = 0;
+95: 	state.max_row =
+96: 	    this->start > state.parent.max_row ? 0 : MinValue<idx_t>(this->count, state.parent.max_row - this->start);
+97: 	state.column_scans = unique_ptr<ColumnScanState[]>(new ColumnScanState[column_ids.size()]);
+98: 	for (idx_t i = 0; i < column_ids.size(); i++) {
+99: 		auto column = column_ids[i];
+100: 		if (column != COLUMN_IDENTIFIER_ROW_ID) {
+101: 			columns[column]->InitializeScan(state.column_scans[i]);
+102: 		} else {
+103: 			state.column_scans[i].current = nullptr;
+104: 		}
+105: 	}
+106: 	return true;
+107: }
+108: 
+109: unique_ptr<RowGroup> RowGroup::AlterType(ClientContext &context, const LogicalType &target_type, idx_t changed_idx,
+110:                                          ExpressionExecutor &executor, TableScanState &scan_state,
+111:                                          DataChunk &scan_chunk) {
+112: 	Verify();
+113: 
+114: 	// construct a new column data for this type
+115: 	auto column_data = ColumnData::CreateColumn(GetTableInfo(), changed_idx, start, target_type);
+116: 
+117: 	ColumnAppendState append_state;
+118: 	column_data->InitializeAppend(append_state);
+119: 
+120: 	// scan the original table, and fill the new column with the transformed value
+121: 	InitializeScan(scan_state.row_group_scan_state);
+122: 
+123: 	Vector append_vector(target_type);
+124: 	auto altered_col_stats = make_shared<SegmentStatistics>(target_type);
+125: 	while (true) {
+126: 		// scan the table
+127: 		scan_chunk.Reset();
+128: 		ScanCommitted(scan_state.row_group_scan_state, scan_chunk, TableScanType::TABLE_SCAN_COMMITTED_ROWS);
+129: 		if (scan_chunk.size() == 0) {
+130: 			break;
+131: 		}
+132: 		// execute the expression
+133: 		executor.ExecuteExpression(scan_chunk, append_vector);
+134: 		column_data->Append(*altered_col_stats->statistics, append_state, append_vector, scan_chunk.size());
+135: 	}
+136: 
+137: 	// set up the row_group based on this row_group
+138: 	auto row_group = make_unique<RowGroup>(db, table_info, this->start, this->count);
+139: 	row_group->version_info = version_info;
+140: 	for (idx_t i = 0; i < columns.size(); i++) {
+141: 		if (i == changed_idx) {
+142: 			// this is the altered column: use the new column
+143: 			row_group->columns.push_back(move(column_data));
+144: 			row_group->stats.push_back(move(altered_col_stats));
+145: 		} else {
+146: 			// this column was not altered: use the data directly
+147: 			row_group->columns.push_back(columns[i]);
+148: 			row_group->stats.push_back(stats[i]);
+149: 		}
+150: 	}
+151: 	row_group->Verify();
+152: 	return row_group;
+153: }
+154: 
+155: unique_ptr<RowGroup> RowGroup::AddColumn(ClientContext &context, ColumnDefinition &new_column,
+156:                                          ExpressionExecutor &executor, Expression *default_value, Vector &result) {
+157: 	Verify();
+158: 
+159: 	// construct a new column data for the new column
+160: 	auto added_column = ColumnData::CreateColumn(GetTableInfo(), columns.size(), start, new_column.type);
+161: 
+162: 	auto added_col_stats = make_shared<SegmentStatistics>(new_column.type);
+163: 	idx_t rows_to_write = this->count;
+164: 	if (rows_to_write > 0) {
+165: 		DataChunk dummy_chunk;
+166: 
+167: 		ColumnAppendState state;
+168: 		added_column->InitializeAppend(state);
+169: 		for (idx_t i = 0; i < rows_to_write; i += STANDARD_VECTOR_SIZE) {
+170: 			idx_t rows_in_this_vector = MinValue<idx_t>(rows_to_write - i, STANDARD_VECTOR_SIZE);
+171: 			if (default_value) {
+172: 				dummy_chunk.SetCardinality(rows_in_this_vector);
+173: 				executor.ExecuteExpression(dummy_chunk, result);
+174: 			}
+175: 			added_column->Append(*added_col_stats->statistics, state, result, rows_in_this_vector);
+176: 		}
+177: 	}
+178: 
+179: 	// set up the row_group based on this row_group
+180: 	auto row_group = make_unique<RowGroup>(db, table_info, this->start, this->count);
+181: 	row_group->version_info = version_info;
+182: 	row_group->columns = columns;
+183: 	row_group->stats = stats;
+184: 	// now add the new column
+185: 	row_group->columns.push_back(move(added_column));
+186: 	row_group->stats.push_back(move(added_col_stats));
+187: 
+188: 	row_group->Verify();
+189: 	return row_group;
+190: }
+191: 
+192: unique_ptr<RowGroup> RowGroup::RemoveColumn(idx_t removed_column) {
+193: 	Verify();
+194: 
+195: 	D_ASSERT(removed_column < columns.size());
+196: 
+197: 	auto row_group = make_unique<RowGroup>(db, table_info, this->start, this->count);
+198: 	row_group->version_info = version_info;
+199: 	row_group->columns = columns;
+200: 	row_group->stats = stats;
+201: 	// now remove the column
+202: 	row_group->columns.erase(row_group->columns.begin() + removed_column);
+203: 	row_group->stats.erase(row_group->stats.begin() + removed_column);
+204: 
+205: 	row_group->Verify();
+206: 	return row_group;
+207: }
+208: 
+209: void RowGroup::CommitDrop() {
+210: 	for (idx_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+211: 		CommitDropColumn(column_idx);
+212: 	}
+213: }
+214: 
+215: void RowGroup::CommitDropColumn(idx_t column_idx) {
+216: 	D_ASSERT(column_idx < columns.size());
+217: 	columns[column_idx]->CommitDropColumn();
+218: }
+219: 
+220: void RowGroup::NextVector(RowGroupScanState &state) {
+221: 	state.vector_index++;
+222: 	for (idx_t i = 0; i < state.parent.column_ids.size(); i++) {
+223: 		auto column = state.parent.column_ids[i];
+224: 		if (column == COLUMN_IDENTIFIER_ROW_ID) {
+225: 			continue;
+226: 		}
+227: 		D_ASSERT(column < columns.size());
+228: 		columns[column]->Skip(state.column_scans[i]);
+229: 	}
+230: }
+231: 
+232: bool RowGroup::CheckZonemap(TableFilterSet &filters, const vector<column_t> &column_ids) {
+233: 	for (auto &entry : filters.filters) {
+234: 		auto column_index = entry.first;
+235: 		auto &filter = entry.second;
+236: 		auto base_column_index = column_ids[column_index];
+237: 
+238: 		auto propagate_result = filter->CheckStatistics(*stats[base_column_index]->statistics);
+239: 		if (propagate_result == FilterPropagateResult::FILTER_ALWAYS_FALSE ||
+240: 		    propagate_result == FilterPropagateResult::FILTER_FALSE_OR_NULL) {
+241: 			return false;
+242: 		}
+243: 	}
+244: 	return true;
+245: }
+246: 
+247: bool RowGroup::CheckZonemapSegments(RowGroupScanState &state) {
+248: 	if (!state.parent.table_filters) {
+249: 		return true;
+250: 	}
+251: 	auto &column_ids = state.parent.column_ids;
+252: 	for (auto &entry : state.parent.table_filters->filters) {
+253: 		D_ASSERT(entry.first < column_ids.size());
+254: 		auto column_idx = entry.first;
+255: 		auto base_column_idx = column_ids[column_idx];
+256: 		bool read_segment = columns[base_column_idx]->CheckZonemap(state.column_scans[column_idx], *entry.second);
+257: 		if (!read_segment) {
+258: 			idx_t target_row =
+259: 			    state.column_scans[column_idx].current->start + state.column_scans[column_idx].current->count;
+260: 			D_ASSERT(target_row >= this->start);
+261: 			D_ASSERT(target_row <= this->start + this->count);
+262: 			idx_t target_vector_index = (target_row - this->start) / STANDARD_VECTOR_SIZE;
+263: 			if (state.vector_index == target_vector_index) {
+264: 				// we can't skip any full vectors because this segment contains less than a full vector
+265: 				// for now we just bail-out
+266: 				// FIXME: we could check if we can ALSO skip the next segments, in which case skipping a full vector
+267: 				// might be possible
+268: 				// we don't care that much though, since a single segment that fits less than a full vector is
+269: 				// exceedingly rare
+270: 				return true;
+271: 			}
+272: 			while (state.vector_index < target_vector_index) {
+273: 				NextVector(state);
+274: 			}
+275: 			return false;
+276: 		}
+277: 	}
+278: 
+279: 	return true;
+280: }
+281: 
+282: template <TableScanType TYPE>
+283: void RowGroup::TemplatedScan(Transaction *transaction, RowGroupScanState &state, DataChunk &result) {
+284: 	const bool ALLOW_UPDATES = TYPE != TableScanType::TABLE_SCAN_COMMITTED_ROWS_DISALLOW_UPDATES &&
+285: 	                           TYPE != TableScanType::TABLE_SCAN_COMMITTED_ROWS_OMIT_PERMANENTLY_DELETED;
+286: 	auto &table_filters = state.parent.table_filters;
+287: 	auto &column_ids = state.parent.column_ids;
+288: 	auto &adaptive_filter = state.parent.adaptive_filter;
+289: 	while (true) {
+290: 		if (state.vector_index * STANDARD_VECTOR_SIZE >= state.max_row) {
+291: 			// exceeded the amount of rows to scan
+292: 			return;
+293: 		}
+294: 		idx_t current_row = state.vector_index * STANDARD_VECTOR_SIZE;
+295: 		auto max_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.max_row - current_row);
+296: 
+297: 		//! first check the zonemap if we have to scan this partition
+298: 		if (!CheckZonemapSegments(state)) {
+299: 			continue;
+300: 		}
+301: 		// second, scan the version chunk manager to figure out which tuples to load for this transaction
+302: 		idx_t count;
+303: 		SelectionVector valid_sel(STANDARD_VECTOR_SIZE);
+304: 		if (TYPE == TableScanType::TABLE_SCAN_REGULAR) {
+305: 			D_ASSERT(transaction);
+306: 			count = state.row_group->GetSelVector(*transaction, state.vector_index, valid_sel, max_count);
+307: 			if (count == 0) {
+308: 				// nothing to scan for this vector, skip the entire vector
+309: 				NextVector(state);
+310: 				continue;
+311: 			}
+312: 		} else if (TYPE == TableScanType::TABLE_SCAN_COMMITTED_ROWS_OMIT_PERMANENTLY_DELETED) {
+313: 			auto &transaction_manager = TransactionManager::Get(db);
+314: 			auto lowest_active_start = transaction_manager.LowestActiveStart();
+315: 			auto lowest_active_id = transaction_manager.LowestActiveId();
+316: 
+317: 			count = state.row_group->GetCommittedSelVector(lowest_active_start, lowest_active_id, state.vector_index,
+318: 			                                               valid_sel, max_count);
+319: 			if (count == 0) {
+320: 				// nothing to scan for this vector, skip the entire vector
+321: 				NextVector(state);
+322: 				continue;
+323: 			}
+324: 		} else {
+325: 			count = max_count;
+326: 		}
+327: 		if (count == max_count && !table_filters) {
+328: 			// scan all vectors completely: full scan without deletions or table filters
+329: 			for (idx_t i = 0; i < column_ids.size(); i++) {
+330: 				auto column = column_ids[i];
+331: 				if (column == COLUMN_IDENTIFIER_ROW_ID) {
+332: 					// scan row id
+333: 					D_ASSERT(result.data[i].GetType().InternalType() == ROW_TYPE);
+334: 					result.data[i].Sequence(this->start + current_row, 1);
+335: 				} else {
+336: 					if (TYPE != TableScanType::TABLE_SCAN_REGULAR) {
+337: 						columns[column]->ScanCommitted(state.vector_index, state.column_scans[i], result.data[i],
+338: 						                               ALLOW_UPDATES);
+339: 					} else {
+340: 						D_ASSERT(transaction);
+341: 						columns[column]->Scan(*transaction, state.vector_index, state.column_scans[i], result.data[i]);
+342: 					}
+343: 				}
+344: 			}
+345: 		} else {
+346: 			// partial scan: we have deletions or table filters
+347: 			idx_t approved_tuple_count = count;
+348: 			SelectionVector sel;
+349: 			if (count != max_count) {
+350: 				sel.Initialize(valid_sel);
+351: 			} else {
+352: 				sel.Initialize(FlatVector::INCREMENTAL_SELECTION_VECTOR);
+353: 			}
+354: 			//! first, we scan the columns with filters, fetch their data and generate a selection vector.
+355: 			//! get runtime statistics
+356: 			auto start_time = high_resolution_clock::now();
+357: 			if (table_filters) {
+358: 				D_ASSERT(ALLOW_UPDATES);
+359: 				for (idx_t i = 0; i < table_filters->filters.size(); i++) {
+360: 					auto tf_idx = adaptive_filter->permutation[i];
+361: 					auto col_idx = column_ids[tf_idx];
+362: 					columns[col_idx]->Select(*transaction, state.vector_index, state.column_scans[tf_idx],
+363: 					                         result.data[tf_idx], sel, approved_tuple_count,
+364: 					                         *table_filters->filters[tf_idx]);
+365: 				}
+366: 				for (auto &table_filter : table_filters->filters) {
+367: 					result.data[table_filter.first].Slice(sel, approved_tuple_count);
+368: 				}
+369: 			}
+370: 			if (approved_tuple_count == 0) {
+371: 				// all rows were filtered out by the table filters
+372: 				// skip this vector in all the scans that were not scanned yet
+373: 				D_ASSERT(table_filters);
+374: 				result.Reset();
+375: 				for (idx_t i = 0; i < column_ids.size(); i++) {
+376: 					auto col_idx = column_ids[i];
+377: 					if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+378: 						continue;
+379: 					}
+380: 					if (table_filters->filters.find(i) == table_filters->filters.end()) {
+381: 						columns[col_idx]->Skip(state.column_scans[i]);
+382: 					}
+383: 				}
+384: 				state.vector_index++;
+385: 				continue;
+386: 			}
+387: 			//! Now we use the selection vector to fetch data for the other columns.
+388: 			for (idx_t i = 0; i < column_ids.size(); i++) {
+389: 				if (!table_filters || table_filters->filters.find(i) == table_filters->filters.end()) {
+390: 					auto column = column_ids[i];
+391: 					if (column == COLUMN_IDENTIFIER_ROW_ID) {
+392: 						D_ASSERT(result.data[i].GetType().InternalType() == PhysicalType::INT64);
+393: 						result.data[i].SetVectorType(VectorType::FLAT_VECTOR);
+394: 						auto result_data = (int64_t *)FlatVector::GetData(result.data[i]);
+395: 						for (size_t sel_idx = 0; sel_idx < approved_tuple_count; sel_idx++) {
+396: 							result_data[sel_idx] = this->start + current_row + sel.get_index(sel_idx);
+397: 						}
+398: 					} else {
+399: 						if (TYPE == TableScanType::TABLE_SCAN_REGULAR) {
+400: 							D_ASSERT(transaction);
+401: 							columns[column]->FilterScan(*transaction, state.vector_index, state.column_scans[i],
+402: 							                            result.data[i], sel, approved_tuple_count);
+403: 						} else {
+404: 							D_ASSERT(!transaction);
+405: 							columns[column]->FilterScanCommitted(state.vector_index, state.column_scans[i],
+406: 							                                     result.data[i], sel, approved_tuple_count,
+407: 							                                     ALLOW_UPDATES);
+408: 						}
+409: 					}
+410: 				}
+411: 			}
+412: 			auto end_time = high_resolution_clock::now();
+413: 			if (adaptive_filter && table_filters->filters.size() > 1) {
+414: 				adaptive_filter->AdaptRuntimeStatistics(duration_cast<duration<double>>(end_time - start_time).count());
+415: 			}
+416: 			D_ASSERT(approved_tuple_count > 0);
+417: 			count = approved_tuple_count;
+418: 		}
+419: 		result.SetCardinality(count);
+420: 		state.vector_index++;
+421: 		break;
+422: 	}
+423: }
+424: 
+425: void RowGroup::Scan(Transaction &transaction, RowGroupScanState &state, DataChunk &result) {
+426: 	TemplatedScan<TableScanType::TABLE_SCAN_REGULAR>(&transaction, state, result);
+427: }
+428: 
+429: void RowGroup::ScanCommitted(RowGroupScanState &state, DataChunk &result, TableScanType type) {
+430: 	switch (type) {
+431: 	case TableScanType::TABLE_SCAN_COMMITTED_ROWS:
+432: 		TemplatedScan<TableScanType::TABLE_SCAN_COMMITTED_ROWS>(nullptr, state, result);
+433: 		break;
+434: 	case TableScanType::TABLE_SCAN_COMMITTED_ROWS_DISALLOW_UPDATES:
+435: 		TemplatedScan<TableScanType::TABLE_SCAN_COMMITTED_ROWS_DISALLOW_UPDATES>(nullptr, state, result);
+436: 		break;
+437: 	case TableScanType::TABLE_SCAN_COMMITTED_ROWS_OMIT_PERMANENTLY_DELETED:
+438: 		TemplatedScan<TableScanType::TABLE_SCAN_COMMITTED_ROWS_OMIT_PERMANENTLY_DELETED>(nullptr, state, result);
+439: 		break;
+440: 	default:
+441: 		throw InternalException("Unrecognized table scan type");
+442: 	}
+443: }
+444: 
+445: ChunkInfo *RowGroup::GetChunkInfo(idx_t vector_idx) {
+446: 	if (!version_info) {
+447: 		return nullptr;
+448: 	}
+449: 	return version_info->info[vector_idx].get();
+450: }
+451: 
+452: idx_t RowGroup::GetSelVector(Transaction &transaction, idx_t vector_idx, SelectionVector &sel_vector, idx_t max_count) {
+453: 	lock_guard<mutex> lock(row_group_lock);
+454: 
+455: 	auto info = GetChunkInfo(vector_idx);
+456: 	if (!info) {
+457: 		return max_count;
+458: 	}
+459: 	return info->GetSelVector(transaction, sel_vector, max_count);
+460: }
+461: 
+462: idx_t RowGroup::GetCommittedSelVector(transaction_t start_time, transaction_t transaction_id, idx_t vector_idx,
+463:                                       SelectionVector &sel_vector, idx_t max_count) {
+464: 	lock_guard<mutex> lock(row_group_lock);
+465: 
+466: 	auto info = GetChunkInfo(vector_idx);
+467: 	if (!info) {
+468: 		return max_count;
+469: 	}
+470: 	return info->GetCommittedSelVector(start_time, transaction_id, sel_vector, max_count);
+471: }
+472: 
+473: bool RowGroup::Fetch(Transaction &transaction, idx_t row) {
+474: 	D_ASSERT(row < this->count);
+475: 	lock_guard<mutex> lock(row_group_lock);
+476: 
+477: 	idx_t vector_index = row / STANDARD_VECTOR_SIZE;
+478: 	auto info = GetChunkInfo(vector_index);
+479: 	if (!info) {
+480: 		return true;
+481: 	}
+482: 	return info->Fetch(transaction, row - vector_index * STANDARD_VECTOR_SIZE);
+483: }
+484: 
+485: void RowGroup::FetchRow(Transaction &transaction, ColumnFetchState &state, const vector<column_t> &column_ids,
+486:                         row_t row_id, DataChunk &result, idx_t result_idx) {
+487: 	for (idx_t col_idx = 0; col_idx < column_ids.size(); col_idx++) {
+488: 		auto column = column_ids[col_idx];
+489: 		if (column == COLUMN_IDENTIFIER_ROW_ID) {
+490: 			// row id column: fill in the row ids
+491: 			D_ASSERT(result.data[col_idx].GetType().InternalType() == PhysicalType::INT64);
+492: 			result.data[col_idx].SetVectorType(VectorType::FLAT_VECTOR);
+493: 			auto data = FlatVector::GetData<row_t>(result.data[col_idx]);
+494: 			data[result_idx] = row_id;
+495: 		} else {
+496: 			// regular column: fetch data from the base column
+497: 			columns[column]->FetchRow(transaction, state, row_id, result.data[col_idx], result_idx);
+498: 		}
+499: 	}
+500: }
+501: 
+502: void RowGroup::AppendVersionInfo(Transaction &transaction, idx_t row_group_start, idx_t count,
+503:                                  transaction_t commit_id) {
+504: 	idx_t row_group_end = row_group_start + count;
+505: 	lock_guard<mutex> lock(row_group_lock);
+506: 
+507: 	this->count += count;
+508: 	D_ASSERT(this->count <= RowGroup::ROW_GROUP_SIZE);
+509: 
+510: 	// create the version_info if it doesn't exist yet
+511: 	if (!version_info) {
+512: 		version_info = make_unique<VersionNode>();
+513: 	}
+514: 	idx_t start_vector_idx = row_group_start / STANDARD_VECTOR_SIZE;
+515: 	idx_t end_vector_idx = (row_group_end - 1) / STANDARD_VECTOR_SIZE;
+516: 	for (idx_t vector_idx = start_vector_idx; vector_idx <= end_vector_idx; vector_idx++) {
+517: 		idx_t start = vector_idx == start_vector_idx ? row_group_start - start_vector_idx * STANDARD_VECTOR_SIZE : 0;
+518: 		idx_t end =
+519: 		    vector_idx == end_vector_idx ? row_group_end - end_vector_idx * STANDARD_VECTOR_SIZE : STANDARD_VECTOR_SIZE;
+520: 		if (start == 0 && end == STANDARD_VECTOR_SIZE) {
+521: 			// entire vector is encapsulated by append: append a single constant
+522: 			auto constant_info = make_unique<ChunkConstantInfo>(this->start + vector_idx * STANDARD_VECTOR_SIZE);
+523: 			constant_info->insert_id = commit_id;
+524: 			constant_info->delete_id = NOT_DELETED_ID;
+525: 			version_info->info[vector_idx] = move(constant_info);
+526: 		} else {
+527: 			// part of a vector is encapsulated: append to that part
+528: 			ChunkVectorInfo *info;
+529: 			if (!version_info->info[vector_idx]) {
+530: 				// first time appending to this vector: create new info
+531: 				auto insert_info = make_unique<ChunkVectorInfo>(this->start + vector_idx * STANDARD_VECTOR_SIZE);
+532: 				info = insert_info.get();
+533: 				version_info->info[vector_idx] = move(insert_info);
+534: 			} else {
+535: 				D_ASSERT(version_info->info[vector_idx]->type == ChunkInfoType::VECTOR_INFO);
+536: 				// use existing vector
+537: 				info = (ChunkVectorInfo *)version_info->info[vector_idx].get();
+538: 			}
+539: 			info->Append(start, end, commit_id);
+540: 		}
+541: 	}
+542: }
+543: 
+544: void RowGroup::CommitAppend(transaction_t commit_id, idx_t row_group_start, idx_t count) {
+545: 	D_ASSERT(version_info.get());
+546: 	idx_t row_group_end = row_group_start + count;
+547: 	lock_guard<mutex> lock(row_group_lock);
+548: 
+549: 	idx_t start_vector_idx = row_group_start / STANDARD_VECTOR_SIZE;
+550: 	idx_t end_vector_idx = (row_group_end - 1) / STANDARD_VECTOR_SIZE;
+551: 	for (idx_t vector_idx = start_vector_idx; vector_idx <= end_vector_idx; vector_idx++) {
+552: 		idx_t start = vector_idx == start_vector_idx ? row_group_start - start_vector_idx * STANDARD_VECTOR_SIZE : 0;
+553: 		idx_t end =
+554: 		    vector_idx == end_vector_idx ? row_group_end - end_vector_idx * STANDARD_VECTOR_SIZE : STANDARD_VECTOR_SIZE;
+555: 
+556: 		auto info = version_info->info[vector_idx].get();
+557: 		info->CommitAppend(commit_id, start, end);
+558: 	}
+559: }
+560: 
+561: void RowGroup::RevertAppend(idx_t row_group_start) {
+562: 	if (!version_info) {
+563: 		return;
+564: 	}
+565: 	idx_t start_row = row_group_start - this->start;
+566: 	idx_t start_vector_idx = (start_row + (STANDARD_VECTOR_SIZE - 1)) / STANDARD_VECTOR_SIZE;
+567: 	for (idx_t vector_idx = start_vector_idx; vector_idx < RowGroup::ROW_GROUP_VECTOR_COUNT; vector_idx++) {
+568: 		version_info->info[vector_idx].reset();
+569: 	}
+570: 	for (auto &column : columns) {
+571: 		column->RevertAppend(row_group_start);
+572: 	}
+573: 	this->count = MinValue<idx_t>(row_group_start - this->start, this->count);
+574: 	Verify();
+575: }
+576: 
+577: void RowGroup::InitializeAppend(Transaction &transaction, RowGroupAppendState &append_state,
+578:                                 idx_t remaining_append_count) {
+579: 	append_state.row_group = this;
+580: 	append_state.offset_in_row_group = this->count;
+581: 	// for each column, initialize the append state
+582: 	append_state.states = unique_ptr<ColumnAppendState[]>(new ColumnAppendState[columns.size()]);
+583: 	for (idx_t i = 0; i < columns.size(); i++) {
+584: 		columns[i]->InitializeAppend(append_state.states[i]);
+585: 	}
+586: 	// append the version info for this row_group
+587: 	idx_t append_count = MinValue<idx_t>(remaining_append_count, RowGroup::ROW_GROUP_SIZE - this->count);
+588: 	AppendVersionInfo(transaction, this->count, append_count, transaction.transaction_id);
+589: }
+590: 
+591: void RowGroup::Append(RowGroupAppendState &state, DataChunk &chunk, idx_t append_count) {
+592: 	// append to the current row_group
+593: 	for (idx_t i = 0; i < columns.size(); i++) {
+594: 		columns[i]->Append(*stats[i]->statistics, state.states[i], chunk.data[i], append_count);
+595: 	}
+596: 	state.offset_in_row_group += append_count;
+597: }
+598: 
+599: void RowGroup::Update(Transaction &transaction, DataChunk &update_chunk, row_t *ids, idx_t offset, idx_t count,
+600:                       const vector<column_t> &column_ids) {
+601: #ifdef DEBUG
+602: 	for (size_t i = offset; i < offset + count; i++) {
+603: 		D_ASSERT(ids[i] >= row_t(this->start) && ids[i] < row_t(this->start + this->count));
+604: 	}
+605: #endif
+606: 	for (idx_t i = 0; i < column_ids.size(); i++) {
+607: 		auto column = column_ids[i];
+608: 		D_ASSERT(column != COLUMN_IDENTIFIER_ROW_ID);
+609: 		D_ASSERT(columns[column]->type.id() == update_chunk.data[i].GetType().id());
+610: 		columns[column]->Update(transaction, column, update_chunk.data[i], ids, offset, count);
+611: 		MergeStatistics(column, *columns[column]->GetUpdateStatistics());
+612: 	}
+613: }
+614: 
+615: void RowGroup::UpdateColumn(Transaction &transaction, DataChunk &updates, Vector &row_ids,
+616:                             const vector<column_t> &column_path) {
+617: 	D_ASSERT(updates.ColumnCount() == 1);
+618: 	auto ids = FlatVector::GetData<row_t>(row_ids);
+619: 
+620: 	auto primary_column_idx = column_path[0];
+621: 	D_ASSERT(primary_column_idx != COLUMN_IDENTIFIER_ROW_ID);
+622: 	D_ASSERT(primary_column_idx < columns.size());
+623: 	columns[primary_column_idx]->UpdateColumn(transaction, column_path, updates.data[0], ids, updates.size(), 1);
+624: 	MergeStatistics(primary_column_idx, *columns[primary_column_idx]->GetUpdateStatistics());
+625: }
+626: 
+627: unique_ptr<BaseStatistics> RowGroup::GetStatistics(idx_t column_idx) {
+628: 	D_ASSERT(column_idx < stats.size());
+629: 
+630: 	lock_guard<mutex> slock(stats_lock);
+631: 	return stats[column_idx]->statistics->Copy();
+632: }
+633: 
+634: void RowGroup::MergeStatistics(idx_t column_idx, BaseStatistics &other) {
+635: 	D_ASSERT(column_idx < stats.size());
+636: 
+637: 	lock_guard<mutex> slock(stats_lock);
+638: 	stats[column_idx]->statistics->Merge(other);
+639: }
+640: 
+641: RowGroupPointer RowGroup::Checkpoint(TableDataWriter &writer, vector<unique_ptr<BaseStatistics>> &global_stats) {
+642: 	vector<unique_ptr<ColumnCheckpointState>> states;
+643: 	states.reserve(columns.size());
+644: 
+645: 	// checkpoint the individual columns of the row group
+646: 	for (idx_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+647: 		auto &column = columns[column_idx];
+648: 		auto checkpoint_state = column->Checkpoint(*this, writer);
+649: 		D_ASSERT(checkpoint_state);
+650: 
+651: 		auto stats = checkpoint_state->GetStatistics();
+652: 		D_ASSERT(stats);
+653: 
+654: 		global_stats[column_idx]->Merge(*stats);
+655: 		states.push_back(move(checkpoint_state));
+656: 	}
+657: 
+658: 	// construct the row group pointer and write the column meta data to disk
+659: 	D_ASSERT(states.size() == columns.size());
+660: 	RowGroupPointer row_group_pointer;
+661: 	row_group_pointer.row_start = start;
+662: 	row_group_pointer.tuple_count = count;
+663: 	for (auto &state : states) {
+664: 		// get the current position of the meta data writer
+665: 		auto &meta_writer = writer.GetMetaWriter();
+666: 		auto pointer = meta_writer.GetBlockPointer();
+667: 
+668: 		// store the stats and the data pointers in the row group pointers
+669: 		row_group_pointer.data_pointers.push_back(pointer);
+670: 		row_group_pointer.statistics.push_back(state->GetStatistics());
+671: 
+672: 		// now flush the actual column data to disk
+673: 		state->FlushToDisk();
+674: 	}
+675: 	row_group_pointer.versions = version_info;
+676: 	Verify();
+677: 	return row_group_pointer;
+678: }
+679: 
+680: void RowGroup::CheckpointDeletes(VersionNode *versions, Serializer &serializer) {
+681: 	if (!versions) {
+682: 		// no version information: write nothing
+683: 		serializer.Write<idx_t>(0);
+684: 		return;
+685: 	}
+686: 	// first count how many ChunkInfo's we need to deserialize
+687: 	idx_t chunk_info_count = 0;
+688: 	for (idx_t vector_idx = 0; vector_idx < RowGroup::ROW_GROUP_VECTOR_COUNT; vector_idx++) {
+689: 		auto chunk_info = versions->info[vector_idx].get();
+690: 		if (!chunk_info) {
+691: 			continue;
+692: 		}
+693: 		chunk_info_count++;
+694: 	}
+695: 	// now serialize the actual version information
+696: 	serializer.Write<idx_t>(chunk_info_count);
+697: 	for (idx_t vector_idx = 0; vector_idx < RowGroup::ROW_GROUP_VECTOR_COUNT; vector_idx++) {
+698: 		auto chunk_info = versions->info[vector_idx].get();
+699: 		if (!chunk_info) {
+700: 			continue;
+701: 		}
+702: 		serializer.Write<idx_t>(vector_idx);
+703: 		chunk_info->Serialize(serializer);
+704: 	}
+705: }
+706: 
+707: shared_ptr<VersionNode> RowGroup::DeserializeDeletes(Deserializer &source) {
+708: 	auto chunk_count = source.Read<idx_t>();
+709: 	if (chunk_count == 0) {
+710: 		// no deletes
+711: 		return nullptr;
+712: 	}
+713: 	auto version_info = make_shared<VersionNode>();
+714: 	for (idx_t i = 0; i < chunk_count; i++) {
+715: 		idx_t vector_index = source.Read<idx_t>();
+716: 		if (vector_index >= RowGroup::ROW_GROUP_VECTOR_COUNT) {
+717: 			throw Exception("In DeserializeDeletes, vector_index is out of range for the row group. Corrupted file?");
+718: 		}
+719: 		version_info->info[vector_index] = ChunkInfo::Deserialize(source);
+720: 	}
+721: 	return version_info;
+722: }
+723: 
+724: void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer) {
+725: 	serializer.Write<uint64_t>(pointer.row_start);
+726: 	serializer.Write<uint64_t>(pointer.tuple_count);
+727: 	for (auto &stats : pointer.statistics) {
+728: 		stats->Serialize(serializer);
+729: 	}
+730: 	for (auto &data_pointer : pointer.data_pointers) {
+731: 		serializer.Write<block_id_t>(data_pointer.block_id);
+732: 		serializer.Write<uint64_t>(data_pointer.offset);
+733: 	}
+734: 	CheckpointDeletes(pointer.versions.get(), serializer);
+735: }
+736: 
+737: RowGroupPointer RowGroup::Deserialize(Deserializer &source, const vector<ColumnDefinition> &columns) {
+738: 	RowGroupPointer result;
+739: 	result.row_start = source.Read<uint64_t>();
+740: 	result.tuple_count = source.Read<uint64_t>();
+741: 
+742: 	result.data_pointers.reserve(columns.size());
+743: 	result.statistics.reserve(columns.size());
+744: 
+745: 	for (idx_t i = 0; i < columns.size(); i++) {
+746: 		auto stats = BaseStatistics::Deserialize(source, columns[i].type);
+747: 		result.statistics.push_back(move(stats));
+748: 	}
+749: 	for (idx_t i = 0; i < columns.size(); i++) {
+750: 		BlockPointer pointer;
+751: 		pointer.block_id = source.Read<block_id_t>();
+752: 		pointer.offset = source.Read<uint64_t>();
+753: 		result.data_pointers.push_back(pointer);
+754: 	}
+755: 	result.versions = DeserializeDeletes(source);
+756: 	return result;
+757: }
+758: 
+759: //===--------------------------------------------------------------------===//
+760: // GetStorageInfo
+761: //===--------------------------------------------------------------------===//
+762: void RowGroup::GetStorageInfo(idx_t row_group_index, vector<vector<Value>> &result) {
+763: 	for (idx_t col_idx = 0; col_idx < columns.size(); col_idx++) {
+764: 		columns[col_idx]->GetStorageInfo(row_group_index, {col_idx}, result);
+765: 	}
+766: }
+767: 
+768: //===--------------------------------------------------------------------===//
+769: // Version Delete Information
+770: //===--------------------------------------------------------------------===//
+771: class VersionDeleteState {
+772: public:
+773: 	VersionDeleteState(RowGroup &info, Transaction &transaction, DataTable *table, idx_t base_row)
+774: 	    : info(info), transaction(transaction), table(table), current_info(nullptr), current_chunk(INVALID_INDEX),
+775: 	      count(0), base_row(base_row), delete_count(0) {
+776: 	}
+777: 
+778: 	RowGroup &info;
+779: 	Transaction &transaction;
+780: 	DataTable *table;
+781: 	ChunkVectorInfo *current_info;
+782: 	idx_t current_chunk;
+783: 	row_t rows[STANDARD_VECTOR_SIZE];
+784: 	idx_t count;
+785: 	idx_t base_row;
+786: 	idx_t chunk_row;
+787: 	idx_t delete_count;
+788: 
+789: public:
+790: 	void Delete(row_t row_id);
+791: 	void Flush();
+792: };
+793: 
+794: idx_t RowGroup::Delete(Transaction &transaction, DataTable *table, row_t *ids, idx_t count) {
+795: 	lock_guard<mutex> lock(row_group_lock);
+796: 	VersionDeleteState del_state(*this, transaction, table, this->start);
+797: 
+798: 	// obtain a write lock
+799: 	for (idx_t i = 0; i < count; i++) {
+800: 		D_ASSERT(ids[i] >= 0);
+801: 		D_ASSERT(idx_t(ids[i]) >= this->start && idx_t(ids[i]) < this->start + this->count);
+802: 		del_state.Delete(ids[i] - this->start);
+803: 	}
+804: 	del_state.Flush();
+805: 	return del_state.delete_count;
+806: }
+807: 
+808: void RowGroup::Verify() {
+809: #ifdef DEBUG
+810: 	for (auto &column : columns) {
+811: 		column->Verify(*this);
+812: 	}
+813: #endif
+814: }
+815: 
+816: void VersionDeleteState::Delete(row_t row_id) {
+817: 	D_ASSERT(row_id >= 0);
+818: 	idx_t vector_idx = row_id / STANDARD_VECTOR_SIZE;
+819: 	idx_t idx_in_vector = row_id - vector_idx * STANDARD_VECTOR_SIZE;
+820: 	if (current_chunk != vector_idx) {
+821: 		Flush();
+822: 
+823: 		if (!info.version_info) {
+824: 			info.version_info = make_unique<VersionNode>();
+825: 		}
+826: 
+827: 		if (!info.version_info->info[vector_idx]) {
+828: 			// no info yet: create it
+829: 			info.version_info->info[vector_idx] =
+830: 			    make_unique<ChunkVectorInfo>(info.start + vector_idx * STANDARD_VECTOR_SIZE);
+831: 		} else if (info.version_info->info[vector_idx]->type == ChunkInfoType::CONSTANT_INFO) {
+832: 			auto &constant = (ChunkConstantInfo &)*info.version_info->info[vector_idx];
+833: 			// info exists but it's a constant info: convert to a vector info
+834: 			auto new_info = make_unique<ChunkVectorInfo>(info.start + vector_idx * STANDARD_VECTOR_SIZE);
+835: 			new_info->insert_id = constant.insert_id.load();
+836: 			for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+837: 				new_info->inserted[i] = constant.insert_id.load();
+838: 			}
+839: 			info.version_info->info[vector_idx] = move(new_info);
+840: 		}
+841: 		D_ASSERT(info.version_info->info[vector_idx]->type == ChunkInfoType::VECTOR_INFO);
+842: 		current_info = (ChunkVectorInfo *)info.version_info->info[vector_idx].get();
+843: 		current_chunk = vector_idx;
+844: 		chunk_row = vector_idx * STANDARD_VECTOR_SIZE;
+845: 	}
+846: 	rows[count++] = idx_in_vector;
+847: }
+848: 
+849: void VersionDeleteState::Flush() {
+850: 	if (count == 0) {
+851: 		return;
+852: 	}
+853: 	// delete in the current info
+854: 	delete_count += current_info->Delete(transaction, rows, count);
+855: 	// now push the delete into the undo buffer
+856: 	transaction.PushDelete(table, current_info, rows, count, base_row + chunk_row);
+857: 	count = 0;
+858: }
+859: 
+860: } // namespace duckdb
+[end of src/storage/table/row_group.cpp]
+</code>
+Here is an example of a patch file. It consists of changes to the code base. It specifies the file names, the line numbers of each change, and the removed and added lines. A single patch file can contain changes to multiple files.
+<patch>
+--- a/file.cpp
++++ b/file.cpp
+@@ -3,35 +3,44 @@
+ #include <cstdlib>
+ 
+ int euclidean(int a, int b) {
+-    while (b) {
+-        int temp = b;
+-        b = a % b;
+-        a = temp;
++    if (b == 0) {
++        return a;
+     }
+-    return a;
++    return euclidean(b, a % b);
+ }
+ 
+ std::vector<std::pair<int, int>> bresenham(int x0, int y0, int x1, int y1) {
+     std::vector<std::pair<int, int>> points;
+     int dx = abs(x1 - x0);
+     int dy = abs(y1 - y0);
++    int x = x0, y = y0;
+     int sx = (x0 < x1) ? 1 : -1;
+     int sy = (y0 < y1) ? 1 : -1;
+-    int err = dx - dy;
+ 
+-    while (true) {
+-        points.emplace_back(x0, y0);
+-        if (x0 == x1 && y0 == y1) break;
+-        int e2 = 2 * err;
+-        if (e2 > -dy) {
++    if (dx > dy) {
++        int err = dx / 2;
++        while (x != x1) {
++            points.emplace_back(x, y);
+             err -= dy;
+-            x0 += sx;
++            if (err < 0) {
++                y += sy;
++                err += dx;
++            }
++            x += sx;
+         }
+-        if (e2 < dx) {
+-            err += dx;
+-            y0 += sy;
++    } else {
++        int err = dy / 2;
++        while (y != y1) {
++            points.emplace_back(x, y);
++            err -= dx;
++            if (err < 0) {
++                x += sx;
++                err += dy;
++            }
++            y += sy;
+         }
+     }
+ 
++    points.emplace_back(x, y);
+     return points;
+ }
+
+</patch>
+
+I need you to solve the provided issue by generating a single patch file that I can apply directly to this repository using git apply.
+Please respond with a single patch file in the format shown above.
+Make sure to only include the patch file contents so that the contents of your output can be copied into a patch file and applied directly
+
+Respond below:

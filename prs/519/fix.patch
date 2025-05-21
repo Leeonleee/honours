@@ -1,0 +1,477 @@
+diff --git a/src/execution/index/art/art.cpp b/src/execution/index/art/art.cpp
+index 6e7467e301fd..9b03b2ab8aff 100644
+--- a/src/execution/index/art/art.cpp
++++ b/src/execution/index/art/art.cpp
+@@ -347,8 +347,6 @@ void ART::Delete(IndexLock &state, DataChunk &input, Vector &row_ids) {
+ 			continue;
+ 		}
+ 		Erase(tree, *keys[i], 0, row_identifiers[i]);
+-		// assert that the entry was erased properly
+-		assert(!is_unique || Lookup(tree, *keys[i], 0) == nullptr);
+ 	}
+ }
+ 
+@@ -360,7 +358,11 @@ void ART::Erase(unique_ptr<Node> &node, Key &key, unsigned depth, row_t row_id)
+ 	if (node->type == NodeType::NLeaf) {
+ 		// Make sure we have the right leaf
+ 		if (ART::LeafMatches(node.get(), key, depth)) {
+-			node.reset();
++			auto leaf = static_cast<Leaf *>(node.get());
++			leaf->Remove(row_id);
++			if (leaf->num_elements == 0) {
++				node.reset();
++			}
+ 		}
+ 		return;
+ 	}
+@@ -381,11 +383,9 @@ void ART::Erase(unique_ptr<Node> &node, Key &key, unsigned depth, row_t row_id)
+ 		if (child_ref->type == NodeType::NLeaf && LeafMatches(child_ref.get(), key, depth)) {
+ 			// Leaf found, remove entry
+ 			auto leaf = static_cast<Leaf *>(child_ref.get());
+-			if (leaf->num_elements > 1) {
+-				// leaf has multiple rows: remove the row from the leaf
+-				leaf->Remove(row_id);
+-			} else {
+-				// Leaf only has one element, delete leaf, decrement node counter and maybe shrink node
++			leaf->Remove(row_id);
++			if (leaf->num_elements == 0) {
++				// Leaf is empty, delete leaf, decrement node counter and maybe shrink node
+ 				Node::Erase(*this, node, pos);
+ 			}
+ 		} else {
+@@ -401,6 +401,8 @@ void ART::Erase(unique_ptr<Node> &node, Key &key, unsigned depth, row_t row_id)
+ static unique_ptr<Key> CreateKey(ART &art, TypeId type, Value &value) {
+ 	assert(type == value.type);
+ 	switch (type) {
++	case TypeId::BOOL:
++		return Key::CreateKey<bool>(value.value_.boolean, art.is_little_endian);
+ 	case TypeId::INT8:
+ 		return Key::CreateKey<int8_t>(value.value_.tinyint, art.is_little_endian);
+ 	case TypeId::INT16:
+diff --git a/src/execution/index/art/leaf.cpp b/src/execution/index/art/leaf.cpp
+index 76613f97cae9..6bddd2984343 100644
+--- a/src/execution/index/art/leaf.cpp
++++ b/src/execution/index/art/leaf.cpp
+@@ -27,13 +27,16 @@ void Leaf::Insert(row_t row_id) {
+ 
+ //! TODO: Maybe shrink array dynamically?
+ void Leaf::Remove(row_t row_id) {
+-	idx_t entry_offset = -1;
++	idx_t entry_offset = INVALID_INDEX;
+ 	for (idx_t i = 0; i < num_elements; i++) {
+ 		if (row_ids[i] == row_id) {
+ 			entry_offset = i;
+ 			break;
+ 		}
+ 	}
++	if (entry_offset == INVALID_INDEX) {
++		return;
++	}
+ 	num_elements--;
+ 	for (idx_t j = entry_offset; j < num_elements; j++) {
+ 		row_ids[j] = row_ids[j + 1];
+diff --git a/src/execution/operator/join/physical_nested_loop_join.cpp b/src/execution/operator/join/physical_nested_loop_join.cpp
+index c34d8caf9c09..ac20a66ae8c0 100644
+--- a/src/execution/operator/join/physical_nested_loop_join.cpp
++++ b/src/execution/operator/join/physical_nested_loop_join.cpp
+@@ -25,6 +25,8 @@ class PhysicalNestedLoopJoinState : public PhysicalComparisonJoinState {
+ 
+ 	idx_t left_tuple;
+ 	idx_t right_tuple;
++
++	unique_ptr<bool[]> left_found_match;
+ };
+ 
+ PhysicalNestedLoopJoin::PhysicalNestedLoopJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
+@@ -197,7 +199,6 @@ void PhysicalNestedLoopJoin::GetChunkInternal(ClientContext &context, DataChunk
+ 		}
+ 		return;
+ 	}
+-
+ 	if ((type == JoinType::INNER || type == JoinType::LEFT) &&
+ 	    state->right_chunk >= state->right_chunks.chunks.size()) {
+ 		return;
+@@ -214,6 +215,27 @@ void PhysicalNestedLoopJoin::GetChunkInternal(ClientContext &context, DataChunk
+ 				// we exhausted all right chunks!
+ 				// move to the next left chunk
+ 				do {
++					if (type == JoinType::LEFT) {
++						// left join: before we move to the next chunk, see if we need to output any vectors that didn't have a match found
++						if (state->left_found_match) {
++							SelectionVector remaining_sel(STANDARD_VECTOR_SIZE);
++							idx_t remaining_count = 0;
++							for(idx_t i = 0; i < state->child_chunk.size(); i++) {
++								if (!state->left_found_match[i]) {
++									remaining_sel.set_index(remaining_count++, i);
++								}
++							}
++							state->left_found_match.reset();
++							chunk.Slice(state->child_chunk, remaining_sel, remaining_count);
++							for (idx_t idx = state->child_chunk.column_count(); idx < chunk.column_count(); idx++) {
++								chunk.data[idx].vector_type = VectorType::CONSTANT_VECTOR;
++								ConstantVector::SetNull(chunk.data[idx], true);
++							}
++						} else {
++							state->left_found_match = unique_ptr<bool[]>(new bool[STANDARD_VECTOR_SIZE]);
++							memset(state->left_found_match.get(), 0, sizeof(bool) * STANDARD_VECTOR_SIZE);
++						}
++					}
+ 					children[0]->GetChunk(context, state->child_chunk, state->child_state.get());
+ 					if (state->child_chunk.size() == 0) {
+ 						return;
+@@ -271,6 +293,7 @@ void PhysicalNestedLoopJoin::GetChunkInternal(ClientContext &context, DataChunk
+ 
+ 		// now perform the join
+ 		switch (type) {
++		case JoinType::LEFT:
+ 		case JoinType::INNER: {
+ 			SelectionVector lvector(STANDARD_VECTOR_SIZE), rvector(STANDARD_VECTOR_SIZE);
+ 			idx_t match_count =
+@@ -283,6 +306,11 @@ void PhysicalNestedLoopJoin::GetChunkInternal(ClientContext &context, DataChunk
+ 			}
+ 			// we have matching tuples!
+ 			// construct the result
++			if (state->left_found_match) {
++				for(idx_t i = 0; i < match_count; i++) {
++					state->left_found_match[lvector.get_index(i)] = true;
++				}
++			}
+ 			chunk.Slice(state->child_chunk, lvector, match_count);
+ 			chunk.Slice(right_data, rvector, match_count, state->child_chunk.column_count());
+ 			break;
+diff --git a/src/execution/operator/join/physical_piecewise_merge_join.cpp b/src/execution/operator/join/physical_piecewise_merge_join.cpp
+index 7f1587f06a4c..4c032d84a92c 100644
+--- a/src/execution/operator/join/physical_piecewise_merge_join.cpp
++++ b/src/execution/operator/join/physical_piecewise_merge_join.cpp
+@@ -228,7 +228,7 @@ static void templated_quicksort_inplace(T *data, const SelectionVector &sel, idx
+ 			i++;
+ 		}
+ 
+-		while (i <= j && OP::Operation(data[dpivot_idx], data[sel.get_index(result.get_index(j))])) {
++		while (i <= j && !OP::Operation(data[sel.get_index(result.get_index(j))], data[dpivot_idx])) {
+ 			j--;
+ 		}
+ 
+@@ -265,6 +265,30 @@ static void templated_quicksort(VectorData &vdata, const SelectionVector &not_nu
+ 	templated_quicksort<T, duckdb::LessThanEquals>((T *)vdata.data, *vdata.sel, not_null_sel, not_null_count, result);
+ }
+ 
++idx_t FilterNulls(VectorData &vdata, idx_t count, SelectionVector &not_null) {
++	idx_t not_null_count = 0;
++	for (idx_t i = 0; i < count; i++) {
++		auto idx = vdata.sel->get_index(i);
++		if (!(*vdata.nullmask)[idx]) {
++			not_null.set_index(not_null_count++, i);
++		}
++	}
++	return not_null_count;
++}
++
++template<class T>
++idx_t FilterNullsAndNaNs(VectorData &vdata, idx_t count, SelectionVector &not_null) {
++	auto data = (T *) vdata.data;
++	idx_t not_null_count = 0;
++	for (idx_t i = 0; i < count; i++) {
++		auto idx = vdata.sel->get_index(i);
++		if (!(*vdata.nullmask)[idx] && (!std::isnan(data[idx]))) {
++			not_null.set_index(not_null_count++, i);
++		}
++	}
++	return not_null_count;
++}
++
+ void OrderVector(Vector &vector, idx_t count, MergeOrder &order) {
+ 	if (count == 0) {
+ 		order.count = 0;
+@@ -274,13 +298,18 @@ void OrderVector(Vector &vector, idx_t count, MergeOrder &order) {
+ 	auto &vdata = order.vdata;
+ 
+ 	// first filter out all the non-null values
+-	idx_t not_null_count = 0;
+ 	SelectionVector not_null(STANDARD_VECTOR_SIZE);
+-	for (idx_t i = 0; i < count; i++) {
+-		auto idx = vdata.sel->get_index(i);
+-		if (!(*vdata.nullmask)[idx]) {
+-			not_null.set_index(not_null_count++, i);
+-		}
++	idx_t not_null_count;
++	switch(vector.type) {
++	case TypeId::FLOAT:
++		not_null_count = FilterNullsAndNaNs<float>(vdata, count, not_null);
++		break;
++	case TypeId::DOUBLE:
++		not_null_count = FilterNullsAndNaNs<double>(vdata, count, not_null);
++		break;
++	default:
++		not_null_count = FilterNulls(vdata, count, not_null);
++		break;
+ 	}
+ 	order.count = not_null_count;
+ 	order.order.Initialize(STANDARD_VECTOR_SIZE);
+diff --git a/src/function/scalar/math/numeric.cpp b/src/function/scalar/math/numeric.cpp
+index 190364a3d712..b5d4c284ef5a 100644
+--- a/src/function/scalar/math/numeric.cpp
++++ b/src/function/scalar/math/numeric.cpp
+@@ -4,7 +4,6 @@
+ #include <algorithm>
+ #include <cmath>
+ 
+-using namespace duckdb;
+ using namespace std;
+ 
+ namespace duckdb {
+@@ -161,6 +160,37 @@ void PowFun::RegisterFunction(BuiltinFunctions &set) {
+ 	set.AddFunction(power_function);
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Unary wrappers to turn values < 0 or <= 0 into NULL
++//===--------------------------------------------------------------------===//
++struct UnaryNegativeWrapper {
++	template <class FUNC, class OP, class INPUT_TYPE, class RESULT_TYPE>
++	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input, nullmask_t &nullmask, idx_t idx) {
++		if (input < 0) {
++			nullmask[idx] = true;
++			return 0;
++		} else {
++			return OP::template Operation<INPUT_TYPE, RESULT_TYPE>(input);
++		}
++	}
++};
++
++struct UnaryZeroOrNegativeWrapper {
++	template <class FUNC, class OP, class INPUT_TYPE, class RESULT_TYPE>
++	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input, nullmask_t &nullmask, idx_t idx) {
++		if (input <= 0) {
++			nullmask[idx] = true;
++			return 0;
++		} else {
++			return OP::template Operation<INPUT_TYPE, RESULT_TYPE>(input);
++		}
++	}
++};
++
++template <class T, class OP, class OPWRAPPER>
++static void UnaryScalarFunctionWrapper(DataChunk &input, ExpressionState &state, Vector &result) {
++	UnaryExecutor::Execute<T, T, OP, true, OPWRAPPER>(input.data[0], result, input.size());
++}
+ //===--------------------------------------------------------------------===//
+ // sqrt
+ //===--------------------------------------------------------------------===//
+@@ -172,12 +202,27 @@ struct SqrtOperator {
+ 
+ void SqrtFun::RegisterFunction(BuiltinFunctions &set) {
+ 	set.AddFunction(ScalarFunction("sqrt", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                               ScalarFunction::UnaryFunction<double, double, SqrtOperator>));
++	                               UnaryScalarFunctionWrapper<double, SqrtOperator, UnaryNegativeWrapper>));
++}
++
++//===--------------------------------------------------------------------===//
++// cbrt
++//===--------------------------------------------------------------------===//
++struct CbRtOperator {
++	template <class TA, class TR> static inline TR Operation(TA left) {
++		return cbrt(left);
++	}
++};
++
++void CbrtFun::RegisterFunction(BuiltinFunctions &set) {
++	set.AddFunction(ScalarFunction("cbrt", {SQLType::DOUBLE}, SQLType::DOUBLE,
++	                               ScalarFunction::UnaryFunction<double, double, CbRtOperator>));
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // ln
+ //===--------------------------------------------------------------------===//
++
+ struct LnOperator {
+ 	template <class TA, class TR> static inline TR Operation(TA left) {
+ 		return log(left);
+@@ -186,7 +231,7 @@ struct LnOperator {
+ 
+ void LnFun::RegisterFunction(BuiltinFunctions &set) {
+ 	set.AddFunction(ScalarFunction("ln", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                               ScalarFunction::UnaryFunction<double, double, LnOperator>));
++	                               UnaryScalarFunctionWrapper<double, LnOperator, UnaryZeroOrNegativeWrapper>));
+ }
+ 
+ //===--------------------------------------------------------------------===//
+@@ -200,7 +245,7 @@ struct Log10Operator {
+ 
+ void Log10Fun::RegisterFunction(BuiltinFunctions &set) {
+ 	ScalarFunction log_function("log10", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                            ScalarFunction::UnaryFunction<double, double, Log10Operator>);
++	                               UnaryScalarFunctionWrapper<double, Log10Operator, UnaryZeroOrNegativeWrapper>);
+ 	set.AddFunction(log_function);
+ 	// "log" is an alias for "log10"
+ 	log_function.name = "log";
+@@ -218,21 +263,7 @@ struct Log2Operator {
+ 
+ void Log2Fun::RegisterFunction(BuiltinFunctions &set) {
+ 	set.AddFunction(ScalarFunction("log2", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                               ScalarFunction::UnaryFunction<double, double, Log2Operator>));
+-}
+-
+-//===--------------------------------------------------------------------===//
+-// cbrt
+-//===--------------------------------------------------------------------===//
+-struct CbRtOperator {
+-	template <class TA, class TR> static inline TR Operation(TA left) {
+-		return cbrt(left);
+-	}
+-};
+-
+-void CbrtFun::RegisterFunction(BuiltinFunctions &set) {
+-	set.AddFunction(ScalarFunction("cbrt", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                               ScalarFunction::UnaryFunction<double, double, CbRtOperator>));
++	                               UnaryScalarFunctionWrapper<double, Log2Operator, UnaryZeroOrNegativeWrapper>));
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/function/scalar/operators/bitwise.cpp b/src/function/scalar/operators/bitwise.cpp
+index d767423c680b..bb75a8705aa0 100644
+--- a/src/function/scalar/operators/bitwise.cpp
++++ b/src/function/scalar/operators/bitwise.cpp
+@@ -65,7 +65,7 @@ void BitwiseXorFun::RegisterFunction(BuiltinFunctions &set) {
+ //===--------------------------------------------------------------------===//
+ struct BitwiseShiftLeftOperator {
+ 	template <class TA, class TB, class TR> static inline TR Operation(TA left, TB right) {
+-		return left << right;
++		return right < 0 ? 0 : left << right;
+ 	}
+ };
+ 
+@@ -83,7 +83,7 @@ void LeftShiftFun::RegisterFunction(BuiltinFunctions &set) {
+ //===--------------------------------------------------------------------===//
+ struct BitwiseShiftRightOperator {
+ 	template <class TA, class TB, class TR> static inline TR Operation(TA left, TB right) {
+-		return left >> right;
++		return right < 0 ? 0 : left >> right;
+ 	}
+ };
+ 
+diff --git a/src/include/duckdb/common/vector_operations/unary_executor.hpp b/src/include/duckdb/common/vector_operations/unary_executor.hpp
+index c2710dbaa6b6..821dfbd28c10 100644
+--- a/src/include/duckdb/common/vector_operations/unary_executor.hpp
++++ b/src/include/duckdb/common/vector_operations/unary_executor.hpp
+@@ -18,14 +18,14 @@ namespace duckdb {
+ 
+ struct UnaryOperatorWrapper {
+ 	template <class FUNC, class OP, class INPUT_TYPE, class RESULT_TYPE>
+-	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input) {
++	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input, nullmask_t &nullmask, idx_t idx) {
+ 		return OP::template Operation<INPUT_TYPE, RESULT_TYPE>(input);
+ 	}
+ };
+ 
+ struct UnaryLambdaWrapper {
+ 	template <class FUNC, class OP, class INPUT_TYPE, class RESULT_TYPE>
+-	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input) {
++	static inline RESULT_TYPE Operation(FUNC fun, INPUT_TYPE input, nullmask_t &nullmask, idx_t idx) {
+ 		return fun(input);
+ 	}
+ };
+@@ -42,7 +42,7 @@ struct UnaryExecutor {
+ 			for (idx_t i = 0; i < count; i++) {
+ 				auto idx = sel_vector->get_index(i);
+ 				if (!nullmask[idx]) {
+-					result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[idx]);
++					result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[idx], result_nullmask, i);
+ 				} else {
+ 					result_nullmask[i] = true;
+ 				}
+@@ -50,7 +50,7 @@ struct UnaryExecutor {
+ 		} else {
+ 			for (idx_t i = 0; i < count; i++) {
+ 				auto idx = sel_vector->get_index(i);
+-				result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[idx]);
++				result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[idx], result_nullmask, i);
+ 			}
+ 		}
+ 	}
+@@ -64,12 +64,12 @@ struct UnaryExecutor {
+ 			result_nullmask = nullmask;
+ 			for (idx_t i = 0; i < count; i++) {
+ 				if (!nullmask[i]) {
+-					result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[i]);
++					result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[i], result_nullmask, i);
+ 				}
+ 			}
+ 		} else {
+ 			for (idx_t i = 0; i < count; i++) {
+-				result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[i]);
++				result_data[i] = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, ldata[i], result_nullmask, i);
+ 			}
+ 		}
+ 	}
+@@ -86,7 +86,7 @@ struct UnaryExecutor {
+ 				ConstantVector::SetNull(result, true);
+ 			} else {
+ 				ConstantVector::SetNull(result, false);
+-				*result_data = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, *ldata);
++				*result_data = OPWRAPPER::template Operation<FUNC, OP, INPUT_TYPE, RESULT_TYPE>(fun, *ldata, ConstantVector::Nullmask(result), 0);
+ 			}
+ 			break;
+ 		}
+@@ -117,9 +117,9 @@ struct UnaryExecutor {
+ 	}
+ 
+ public:
+-	template <class INPUT_TYPE, class RESULT_TYPE, class OP, bool IGNORE_NULL = false>
++	template <class INPUT_TYPE, class RESULT_TYPE, class OP, bool IGNORE_NULL = false, class OPWRAPPER=UnaryOperatorWrapper>
+ 	static void Execute(Vector &input, Vector &result, idx_t count) {
+-		ExecuteStandard<INPUT_TYPE, RESULT_TYPE, UnaryOperatorWrapper, OP, bool, IGNORE_NULL>(input, result, count,
++		ExecuteStandard<INPUT_TYPE, RESULT_TYPE, OPWRAPPER, OP, bool, IGNORE_NULL>(input, result, count,
+ 		                                                                                      false);
+ 	}
+ 
+diff --git a/src/parser/transform/expression/transform_bool_expr.cpp b/src/parser/transform/expression/transform_bool_expr.cpp
+index 9fa37086f43b..386f7c52f5eb 100644
+--- a/src/parser/transform/expression/transform_bool_expr.cpp
++++ b/src/parser/transform/expression/transform_bool_expr.cpp
+@@ -32,6 +32,12 @@ unique_ptr<ParsedExpression> Transformer::TransformBoolExpr(PGBoolExpr *root) {
+ 				// convert COMPARE_IN to COMPARE_NOT_IN
+ 				next->type = ExpressionType::COMPARE_NOT_IN;
+ 				result = move(next);
++			} else if (next->type >= ExpressionType::COMPARE_EQUAL &&
++			        next->type <= ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
++				// NOT on a comparison: we can negate the comparison
++				// e.g. NOT(x > y) is equivalent to x <= y
++				next->type = NegateComparisionExpression(next->type);
++				result = move(next);
+ 			} else {
+ 				result = make_unique<OperatorExpression>(ExpressionType::OPERATOR_NOT, move(next));
+ 			}
+diff --git a/src/planner/binder/tableref/plan_joinref.cpp b/src/planner/binder/tableref/plan_joinref.cpp
+index 757266b601ac..2efd47145c76 100644
+--- a/src/planner/binder/tableref/plan_joinref.cpp
++++ b/src/planner/binder/tableref/plan_joinref.cpp
+@@ -74,28 +74,6 @@ unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, uni
+ 				// successfully created the join condition
+ 				continue;
+ 			}
+-		} else if (expr->type == ExpressionType::OPERATOR_NOT) {
+-			auto &not_expr = (BoundOperatorExpression &)*expr;
+-			assert(not_expr.children.size() == 1);
+-			ExpressionType child_type = not_expr.children[0]->GetExpressionType();
+-			// the condition is ON NOT (EXPRESSION)
+-			// we can transform this to remove the NOT if the child is a Comparison
+-			// e.g.:
+-			// ON NOT (X = 3) can be turned into ON (X <> 3)
+-			// ON NOT (X > 3) can be turned into ON (X <= 3)
+-			// for non-comparison operators here we just push the filter
+-			if (child_type >= ExpressionType::COMPARE_EQUAL &&
+-			    child_type <= ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+-				// switcheroo the child condition
+-				// our join needs to compare explicit left and right sides. So we
+-				// invert the condition to express NOT, this way we can still use
+-				// equi-joins
+-				not_expr.children[0]->type = NegateComparisionExpression(child_type);
+-				if (CreateJoinCondition(*not_expr.children[0], left_bindings, right_bindings, conditions)) {
+-					// successfully created the join condition
+-					continue;
+-				}
+-			}
+ 		}
+ 		arbitrary_expressions.push_back(move(expr));
+ 	}

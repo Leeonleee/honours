@@ -1,0 +1,715 @@
+diff --git a/src/include/duckdb/planner/bind_context.hpp b/src/include/duckdb/planner/bind_context.hpp
+index 4493b8c04ebd..cd96d1d94023 100644
+--- a/src/include/duckdb/planner/bind_context.hpp
++++ b/src/include/duckdb/planner/bind_context.hpp
+@@ -25,6 +25,11 @@ class Binder;
+ class LogicalGet;
+ class BoundQueryNode;
+ 
++struct UsingColumnSet {
++	string primary_binding;
++	unordered_set<string> bindings;
++};
++
+ //! The BindContext object keeps track of all the tables and columns that are
+ //! encountered during the binding process.
+ class BindContext {
+@@ -71,10 +76,15 @@ class BindContext {
+ 	//! We need this to correctly bind recursive CTEs with multiple references.
+ 	void AddCTEBinding(idx_t index, const string &alias, vector<string> names, vector<LogicalType> types);
+ 
+-	//! Hide a binding
+-	void HideBinding(const string &binding_name, const string &column_name);
+-	//! Returns true if the given column is hidden from the given binding
+-	bool BindingIsHidden(const string &binding_name, const string &column_name);
++	//! Add an implicit join condition (e.g. USING (x))
++	void AddUsingBinding(const string &column_name, UsingColumnSet set);
++
++	//! Returns any using column set for the given column name, or nullptr if there is none. On conflict (multiple using column sets with the same name) throw an exception.
++	UsingColumnSet *GetUsingBinding(const string &column_name);
++	//! Returns any using column set for the given column name, or nullptr if there is none
++	UsingColumnSet *GetUsingBinding(const string &column_name, const string &binding_name);
++	//! Erase a using binding from the set of using bindings
++	void RemoveUsingBinding(const string &column_name, UsingColumnSet *set);
+ 
+ 	unordered_map<string, std::shared_ptr<Binding>> GetCTEBindings() {
+ 		return cte_bindings;
+@@ -96,15 +106,14 @@ class BindContext {
+ 	//! Gets a binding of the specified name. Returns a nullptr and sets the out_error if the binding could not be
+ 	//! found.
+ 	Binding *GetBinding(const string &name, string &out_error);
+-	void GenerateAllColumnExpressions(vector<unique_ptr<ParsedExpression>> &new_select_list, Binding *binding);
+ 
+ private:
+ 	//! The set of bindings
+ 	unordered_map<string, unique_ptr<Binding>> bindings;
+ 	//! The list of bindings in insertion order
+ 	vector<std::pair<string, Binding *>> bindings_list;
+-	//! The set of hidden columns from the result
+-	qualified_column_set_t hidden_columns;
++	//! The set of columns used in USING join conditions
++	unordered_map<string, vector<UsingColumnSet>> using_columns;
+ 
+ 	//! The set of CTE bindings
+ 	unordered_map<string, std::shared_ptr<Binding>> cte_bindings;
+diff --git a/src/include/duckdb/planner/binder.hpp b/src/include/duckdb/planner/binder.hpp
+index 4d4f21b44858..79b60323734f 100644
+--- a/src/include/duckdb/planner/binder.hpp
++++ b/src/include/duckdb/planner/binder.hpp
+@@ -219,6 +219,9 @@ class Binder {
+ 	unique_ptr<LogicalOperator> CastLogicalOperatorToTypes(vector<LogicalType> &source_types,
+ 	                                                       vector<LogicalType> &target_types,
+ 	                                                       unique_ptr<LogicalOperator> op);
++
++	string FindBinding(const string &using_column, const string &join_side);
++	bool TryFindBinding(const string &using_column, const string &join_side, string &result);
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/parser/transform/expression/transform_coalesce.cpp b/src/parser/transform/expression/transform_coalesce.cpp
+index 4b362c06dd92..be093aa6d563 100644
+--- a/src/parser/transform/expression/transform_coalesce.cpp
++++ b/src/parser/transform/expression/transform_coalesce.cpp
+@@ -1,4 +1,3 @@
+-#include "duckdb/parser/expression/case_expression.hpp"
+ #include "duckdb/parser/expression/operator_expression.hpp"
+ #include "duckdb/parser/transformer.hpp"
+ 
+@@ -14,31 +13,14 @@ unique_ptr<ParsedExpression> Transformer::TransformCoalesce(PGAExpr *root) {
+ 	}
+ 	auto coalesce_args = reinterpret_cast<PGList *>(root->lexpr);
+ 	D_ASSERT(coalesce_args->length > 0); // parser ensures this already
+-	if (coalesce_args->length == 1) {
+-		// special case, dont need to do anything, bug #1222
+-		return TransformExpression(reinterpret_cast<PGNode *>(coalesce_args->head->data.ptr_value));
+-	}
+-	auto exp_root = make_unique<CaseExpression>();
+-	auto cur_root = exp_root.get();
+-	for (auto cell = coalesce_args->head; cell && cell->next; cell = cell->next) {
++
++	auto coalesce_op = make_unique<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
++	for (auto cell = coalesce_args->head; cell; cell = cell->next) {
+ 		// get the value of the COALESCE
+ 		auto value_expr = TransformExpression(reinterpret_cast<PGNode *>(cell->data.ptr_value));
+-		// perform an IS NOT NULL comparison with the value here
+-		cur_root->check = make_unique<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, value_expr->Copy());
+-		// if IS NOT NULL, we output the value
+-		cur_root->result_if_true = move(value_expr);
+-		if (cell->next->next == nullptr) {
+-			// if there is no next in the chain, the COALESCE ends there
+-			cur_root->result_if_false = TransformExpression(reinterpret_cast<PGNode *>(cell->next->data.ptr_value));
+-		} else {
+-			// more COALESCE parameters remain, create a nested CASE statement
+-			auto next_case = make_unique<CaseExpression>();
+-			auto case_ptr = next_case.get();
+-			cur_root->result_if_false = move(next_case);
+-			cur_root = case_ptr;
+-		}
++		coalesce_op->children.push_back(move(value_expr));
+ 	}
+-	return move(exp_root);
++	return move(coalesce_op);
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/planner/bind_context.cpp b/src/planner/bind_context.cpp
+index 05aa59739766..d468146bd47d 100644
+--- a/src/planner/bind_context.cpp
++++ b/src/planner/bind_context.cpp
+@@ -4,6 +4,7 @@
+ #include "duckdb/parser/tableref/subqueryref.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/bound_query_node.hpp"
++#include "duckdb/parser/expression/operator_expression.hpp"
+ 
+ #include "duckdb/common/string_util.hpp"
+ #include "duckdb/common/pair.hpp"
+@@ -16,13 +17,12 @@ string BindContext::GetMatchingBinding(const string &column_name) {
+ 	string result;
+ 	for (auto &kv : bindings) {
+ 		auto binding = kv.second.get();
++		auto is_using_binding = GetUsingBinding(column_name, kv.first);
++		if (is_using_binding) {
++			continue;
++		}
+ 		if (binding->HasMatchingBinding(column_name)) {
+-			// check if the binding is ignored
+-			if (BindingIsHidden(kv.first, column_name)) {
+-				continue;
+-			}
+-
+-			if (!result.empty()) {
++			if (!result.empty() || is_using_binding) {
+ 				throw BinderException("Ambiguous reference to column name \"%s\" (use: \"%s.%s\" "
+ 				                      "or \"%s.%s\")",
+ 				                      column_name, result, column_name, kv.first, column_name);
+@@ -45,13 +45,67 @@ vector<string> BindContext::GetSimilarBindings(const string &column_name) {
+ 	return StringUtil::TopNStrings(scores);
+ }
+ 
+-void BindContext::HideBinding(const string &binding_name, const string &column_name) {
+-	hidden_columns.insert(QualifiedColumnName(binding_name, column_name));
++void BindContext::AddUsingBinding(const string &column_name, UsingColumnSet set) {
++	using_columns[column_name].push_back(move(set));
++}
++
++UsingColumnSet *BindContext::GetUsingBinding(const string &column_name) {
++	auto entry = using_columns.find(column_name);
++	if (entry == using_columns.end()) {
++		return nullptr;
++	}
++	if (entry->second.size() > 1) {
++		string error = "Ambiguous column reference: column \"" + column_name + "\" can refer to either:
+";
++		for(auto &using_set : entry->second) {
++			string result_bindings;
++			for(auto &binding : using_set.bindings) {
++				if (result_bindings.empty()) {
++					result_bindings = "[";
++				} else {
++					result_bindings += ", ";
++				}
++				result_bindings += binding + "." + column_name;
++			}
++			error += result_bindings + "]";
++		}
++		throw BinderException(error);
++	}
++	return &entry->second[0];
++}
++
++UsingColumnSet *BindContext::GetUsingBinding(const string &column_name, const string &binding_name) {
++	if (binding_name.empty()) {
++		return GetUsingBinding(column_name);
++	}
++	auto entry = using_columns.find(column_name);
++	if (entry == using_columns.end()) {
++		return nullptr;
++	}
++	for(auto &using_set : entry->second) {
++		auto &bindings = using_set.bindings;
++		if (bindings.find(binding_name) != bindings.end()) {
++			return &using_set;
++		}
++	}
++	return nullptr;
+ }
+ 
+-bool BindContext::BindingIsHidden(const string &binding_name, const string &column_name) {
+-	QualifiedColumnName qcolumn(binding_name, column_name);
+-	return hidden_columns.find(qcolumn) != hidden_columns.end();
++void BindContext::RemoveUsingBinding(const string &column_name, UsingColumnSet *set) {
++	if (!set) {
++		return;
++	}
++	auto entry = using_columns.find(column_name);
++	D_ASSERT(entry != using_columns.end());
++	auto &bindings = entry->second;
++	for(size_t i = 0; i < bindings.size(); i++) {
++		if (&bindings[i] == set) {
++			bindings.erase(bindings.begin() + i);
++			break;
++		}
++	}
++	if (bindings.empty()) {
++		using_columns.erase(column_name);
++	}
+ }
+ 
+ unordered_set<string> BindContext::GetMatchingBindings(const string &column_name) {
+@@ -102,27 +156,43 @@ BindResult BindContext::BindColumn(ColumnRefExpression &colref, idx_t depth) {
+ 	return binding->Bind(colref, depth);
+ }
+ 
+-void BindContext::GenerateAllColumnExpressions(vector<unique_ptr<ParsedExpression>> &new_select_list,
+-                                               Binding *binding) {
+-	for (auto &column_name : binding->names) {
+-		D_ASSERT(!column_name.empty());
+-		if (BindingIsHidden(binding->alias, column_name)) {
+-			continue;
+-		}
+-		new_select_list.push_back(make_unique<ColumnRefExpression>(column_name, binding->alias));
+-	}
+-}
+-
+ void BindContext::GenerateAllColumnExpressions(vector<unique_ptr<ParsedExpression>> &new_select_list,
+                                                string relation_name) {
+ 	if (bindings_list.size() == 0) {
+ 		throw BinderException("SELECT * expression without FROM clause!");
+ 	}
+ 	if (relation_name == "") { // SELECT * case
+-		// we have to bind the tables and subqueries in order of table_index
++		// bind all expressions of each table in-order
++		unordered_set<UsingColumnSet*> handled_using_columns;
+ 		for (auto &entry : bindings_list) {
+ 			auto binding = entry.second;
+-			GenerateAllColumnExpressions(new_select_list, binding);
++			for (auto &column_name : binding->names) {
++				// check if this column is a USING column
++				auto using_binding = GetUsingBinding(column_name, binding->alias);
++				if (using_binding) {
++					// it is!
++					// check if we have already emitted the using column
++					if (handled_using_columns.find(using_binding) != handled_using_columns.end()) {
++						// we have! bail out
++						continue;
++					}
++					// we have not! output the using column
++					if (using_binding->primary_binding.empty()) {
++						// no primary binding: output a coalesce
++						auto coalesce = make_unique<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
++						for(auto &child_binding : using_binding->bindings) {
++							coalesce->children.push_back(make_unique<ColumnRefExpression>(column_name, child_binding));
++						}
++						new_select_list.push_back(move(coalesce));
++					} else {
++						// primary binding: output the qualified column ref
++						new_select_list.push_back(make_unique<ColumnRefExpression>(column_name, using_binding->primary_binding));
++					}
++					handled_using_columns.insert(using_binding);
++					continue;
++				}
++				new_select_list.push_back(make_unique<ColumnRefExpression>(column_name, binding->alias));
++			}
+ 		}
+ 	} else { // SELECT tbl.* case
+ 		string error;
+@@ -130,7 +200,9 @@ void BindContext::GenerateAllColumnExpressions(vector<unique_ptr<ParsedExpressio
+ 		if (!binding) {
+ 			throw BinderException(error);
+ 		}
+-		GenerateAllColumnExpressions(new_select_list, binding);
++		for (auto &column_name : binding->names) {
++			new_select_list.push_back(make_unique<ColumnRefExpression>(column_name, binding->alias));
++		}
+ 	}
+ }
+ 
+@@ -199,8 +271,17 @@ void BindContext::AddContext(BindContext other) {
+ 	for (auto &binding : other.bindings_list) {
+ 		bindings_list.push_back(move(binding));
+ 	}
+-	for (auto &hidden_column : other.hidden_columns) {
+-		hidden_columns.insert(hidden_column);
++	for (auto &entry : other.using_columns) {
++		for(auto &alias : entry.second) {
++#ifdef DEBUG
++			for(auto &other_alias : using_columns[entry.first]) {
++				for(auto &col : alias.bindings) {
++					D_ASSERT(other_alias.bindings.find(col) == other_alias.bindings.end());
++				}
++			}
++#endif
++			using_columns[entry.first].push_back(alias);
++		}
+ 	}
+ }
+ 
+diff --git a/src/planner/binder/expression/bind_columnref_expression.cpp b/src/planner/binder/expression/bind_columnref_expression.cpp
+index f3c778b841fc..9f2deff669bc 100644
+--- a/src/planner/binder/expression/bind_columnref_expression.cpp
++++ b/src/planner/binder/expression/bind_columnref_expression.cpp
+@@ -2,6 +2,7 @@
+ #include "duckdb/planner/binder.hpp"
+ #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+ #include "duckdb/planner/expression_binder.hpp"
++#include "duckdb/parser/expression/operator_expression.hpp"
+ #include "duckdb/common/string_util.hpp"
+ 
+ namespace duckdb {
+@@ -11,6 +12,24 @@ BindResult ExpressionBinder::BindExpression(ColumnRefExpression &colref, idx_t d
+ 	// individual column reference
+ 	// resolve to either a base table or a subquery expression
+ 	if (colref.table_name.empty()) {
++		auto using_binding = binder.bind_context.GetUsingBinding(colref.column_name);
++		if (using_binding) {
++			// we are referencing a USING column
++			// check if we can refer to one of the base columns directly
++			unique_ptr<Expression> expression;
++			if (!using_binding->primary_binding.empty()) {
++				// we can! just assign the table name and re-bind
++				colref.table_name = using_binding->primary_binding;
++				return BindExpression(colref, depth);
++			} else {
++				// we cannot! we need to bind this as a coalesce between all the relevant columns
++				auto coalesce = make_unique<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
++				for(auto &entry : using_binding->bindings) {
++					coalesce->children.push_back(make_unique<ColumnRefExpression>(colref.column_name, entry));
++				}
++				return BindExpression(*coalesce, depth);
++			}
++		}
+ 		// no table name: find a binding that contains this
+ 		if (binder.macro_binding != nullptr && binder.macro_binding->HasMatchingBinding(colref.column_name)) {
+ 			// priority to macro parameter bindings TODO: throw a warning when this name conflicts
+diff --git a/src/planner/binder/expression/bind_operator_expression.cpp b/src/planner/binder/expression/bind_operator_expression.cpp
+index 23771bab6359..a1bbda1aa545 100644
+--- a/src/planner/binder/expression/bind_operator_expression.cpp
++++ b/src/planner/binder/expression/bind_operator_expression.cpp
+@@ -1,6 +1,7 @@
+ #include "duckdb/parser/expression/operator_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
+ #include "duckdb/planner/expression/bound_operator_expression.hpp"
++#include "duckdb/planner/expression/bound_case_expression.hpp"
+ #include "duckdb/planner/expression_binder.hpp"
+ 
+ namespace duckdb {
+@@ -13,6 +14,9 @@ static LogicalType ResolveNotType(OperatorExpression &op, vector<BoundExpression
+ }
+ 
+ static LogicalType ResolveInType(OperatorExpression &op, vector<BoundExpression *> &children) {
++	if (children.size() == 0) {
++		return LogicalType::BOOLEAN;
++	}
+ 	// get the maximum type from the children
+ 	LogicalType max_type = children[0]->expr->return_type;
+ 	for (idx_t i = 1; i < children.size(); i++) {
+@@ -23,7 +27,7 @@ static LogicalType ResolveInType(OperatorExpression &op, vector<BoundExpression
+ 		children[i]->expr = BoundCastExpression::AddCastToType(move(children[i]->expr), max_type);
+ 	}
+ 	// (NOT) IN always returns a boolean
+-	return LogicalType(LogicalTypeId::BOOLEAN);
++	return LogicalType::BOOLEAN;
+ }
+ 
+ static LogicalType ResolveOperatorType(OperatorExpression &op, vector<BoundExpression *> &children) {
+@@ -34,6 +38,7 @@ static LogicalType ResolveOperatorType(OperatorExpression &op, vector<BoundExpre
+ 		return LogicalType::BOOLEAN;
+ 	case ExpressionType::COMPARE_IN:
+ 	case ExpressionType::COMPARE_NOT_IN:
++	case ExpressionType::OPERATOR_COALESCE:
+ 		return ResolveInType(op, children);
+ 	default:
+ 		D_ASSERT(op.type == ExpressionType::OPERATOR_NOT);
+@@ -58,6 +63,25 @@ BindResult ExpressionBinder::BindExpression(OperatorExpression &op, idx_t depth)
+ 	}
+ 	// now resolve the types
+ 	LogicalType result_type = ResolveOperatorType(op, children);
++	if (op.type == ExpressionType::OPERATOR_COALESCE) {
++		if (children.size() == 0) {
++			return BindResult("COALESCE needs at least one child");
++		}
++		unique_ptr<Expression> current_node;
++		for(size_t i = children.size(); i > 0; i--) {
++			auto child = move(children[i - 1]->expr);
++			if (!current_node) {
++				// no node yet: simply move the child
++				current_node = move(child);
++			} else {
++				// create a case statement
++				auto check = make_unique<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
++				check->children.push_back(child->Copy());
++				current_node = make_unique<BoundCaseExpression>(move(check), move(child), move(current_node));
++			}
++		}
++		return BindResult(move(current_node));
++	}
+ 
+ 	auto result = make_unique<BoundOperatorExpression>(op.type, result_type);
+ 	for (auto &child : children) {
+diff --git a/src/planner/binder/query_node/bind_select_node.cpp b/src/planner/binder/query_node/bind_select_node.cpp
+index 72c8bedc5792..d975b5f5f958 100644
+--- a/src/planner/binder/query_node/bind_select_node.cpp
++++ b/src/planner/binder/query_node/bind_select_node.cpp
+@@ -200,8 +200,7 @@ unique_ptr<BoundQueryNode> Binder::BindNode(SelectNode &statement) {
+ 			// * statement, expand to all columns from the FROM clause
+ 			bind_context.GenerateAllColumnExpressions(new_select_list);
+ 		} else if (select_element->GetExpressionType() == ExpressionType::TABLE_STAR) {
+-			auto table_star =
+-			    (TableStarExpression *)select_element.get(); // TODO this cast to explicit class is a bit dirty?
++			auto table_star = (TableStarExpression *)select_element.get();
+ 			bind_context.GenerateAllColumnExpressions(new_select_list, table_star->relation_name);
+ 		} else {
+ 			// regular statement, add it to the list
+diff --git a/src/planner/binder/tableref/bind_joinref.cpp b/src/planner/binder/tableref/bind_joinref.cpp
+index ca4523fd417c..afb425b549f2 100644
+--- a/src/planner/binder/tableref/bind_joinref.cpp
++++ b/src/planner/binder/tableref/bind_joinref.cpp
+@@ -2,23 +2,82 @@
+ #include "duckdb/planner/binder.hpp"
+ #include "duckdb/planner/expression_binder/where_binder.hpp"
+ #include "duckdb/planner/tableref/bound_joinref.hpp"
++#include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/parser/expression/columnref_expression.hpp"
+ #include "duckdb/parser/expression/constant_expression.hpp"
+-#include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/parser/expression/conjunction_expression.hpp"
++#include "duckdb/parser/expression/bound_expression.hpp"
+ 
+ namespace duckdb {
+ 
+-static void AddCondition(JoinRef &ref, string left_alias, string right_alias, string column_name) {
+-	auto left_expr = make_unique<ColumnRefExpression>(column_name, left_alias);
+-	auto right_expr = make_unique<ColumnRefExpression>(column_name, right_alias);
+-	auto comp_expr =
+-	    make_unique<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, move(left_expr), move(right_expr));
+-	if (!ref.condition) {
+-		ref.condition = move(comp_expr);
++static unique_ptr<ParsedExpression> BindColumn(Binder &binder, ClientContext &context, const string &alias, const string &column_name) {
++	auto expr = make_unique_base<ParsedExpression, ColumnRefExpression>(column_name, alias);
++	ExpressionBinder expr_binder(binder, context);
++	auto result = expr_binder.Bind(expr);
++	return make_unique<BoundExpression>(move(result), nullptr);
++}
++
++static unique_ptr<ParsedExpression> AddCondition(ClientContext &context, Binder &left_binder, Binder &right_binder, const string &left_alias, const string &right_alias, const string &column_name) {
++	ExpressionBinder expr_binder(left_binder, context);
++	auto left = BindColumn(left_binder, context, left_alias, column_name);
++	auto right = BindColumn(right_binder, context, right_alias, column_name);
++	return make_unique<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, move(left), move(right));
++}
++
++bool Binder::TryFindBinding(const string &using_column, const string &join_side, string &result) {
++	// for each using column, get the matching binding
++	auto bindings = bind_context.GetMatchingBindings(using_column);
++	if (bindings.size() == 0) {
++		return false;
++	}
++	// find the join binding
++	for (auto &binding : bindings) {
++		if (!result.empty()) {
++			string error = "Column name \"" + using_column +
++							"\" is ambiguous: it exists more than once on " + join_side + " side of join.
+Candidates:";
++			for (auto &binding : bindings) {
++				error += "
+\t" + binding + "." + using_column;
++			}
++			throw BinderException(error);
++		} else {
++			result = binding;
++		}
++	}
++	return true;
++}
++
++string Binder::FindBinding(const string &using_column, const string &join_side) {
++	string result;
++	if (!TryFindBinding(using_column, join_side, result)) {
++		throw BinderException("Column \"%s\" does not exist on %s side of join!", using_column, join_side);
++	}
++	return result;
++}
++
++
++static void AddUsingBindings(UsingColumnSet &set, UsingColumnSet *input_set, const string &input_binding) {
++	if (input_set) {
++		for(auto &entry : input_set->bindings) {
++			set.bindings.insert(entry);
++		}
+ 	} else {
+-		ref.condition =
+-		    make_unique<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, move(ref.condition), move(comp_expr));
++		set.bindings.insert(input_binding);
++	}
++}
++
++static void SetPrimaryBinding(UsingColumnSet &set, JoinType join_type, const string &left_binding, const string &right_binding) {
++	switch(join_type) {
++	case JoinType::LEFT:
++	case JoinType::INNER:
++	case JoinType::SEMI:
++	case JoinType::ANTI:
++		set.primary_binding = left_binding;
++		break;
++	case JoinType::RIGHT:
++		set.primary_binding = right_binding;
++		break;
++	default:
++		break;
+ 	}
+ }
+ 
+@@ -32,6 +91,8 @@ unique_ptr<BoundTableRef> Binder::Bind(JoinRef &ref) {
+ 	result->type = ref.type;
+ 	result->left = left_binder.Bind(*ref.left);
+ 	result->right = right_binder.Bind(*ref.right);
++
++	vector<unique_ptr<ParsedExpression>> extra_conditions;
+ 	if (ref.is_natural) {
+ 		// natural join, figure out which column names are present in both sides of the join
+ 		// first bind the left hand side and get a list of all the tables and column names
+@@ -39,9 +100,6 @@ unique_ptr<BoundTableRef> Binder::Bind(JoinRef &ref) {
+ 		auto &lhs_binding_list = left_binder.bind_context.GetBindingsList();
+ 		for (auto &binding : lhs_binding_list) {
+ 			for (auto &column_name : binding.second->names) {
+-				if (left_binder.bind_context.BindingIsHidden(binding.first, column_name)) {
+-					continue;
+-				}
+ 				if (lhs_columns.find(column_name) == lhs_columns.end()) {
+ 					// new column candidate: add it to the set
+ 					lhs_columns[column_name] = binding.first;
+@@ -57,34 +115,38 @@ unique_ptr<BoundTableRef> Binder::Bind(JoinRef &ref) {
+ 		for (auto &column : lhs_columns) {
+ 			auto &column_name = column.first;
+ 			auto &left_binding = column.second;
+-			// loop over the set of lhs columns, and figure out if there is a table in the rhs with the same name
+-			auto right_bindings = right_binder.bind_context.GetMatchingBindings(column_name);
+-			string right_binding;
+ 
+-			if (right_bindings.size() == 0) {
+-				// no match found for this column on the rhs
+-				continue;
++			auto left_using_binding = left_binder.bind_context.GetUsingBinding(column_name, left_binding);
++			auto right_using_binding = right_binder.bind_context.GetUsingBinding(column_name);
++
++			string right_binding;
++			// loop over the set of lhs columns, and figure out if there is a table in the rhs with the same name
++			if (!right_using_binding) {
++				if (!right_binder.TryFindBinding(column_name, "right", right_binding)) {
++					// no match found for this column on the rhs: skip
++					continue;
++				}
+ 			}
+ 			// found this column name in both the LHS and the RHS of this join
+ 			// add it to the natural join!
+-			// first check if the binding is ambiguous
+-			bool left_ambiguous = left_binding.empty();
+-			bool right_ambiguous = right_bindings.size() > 1;
+-			if (left_ambiguous || right_ambiguous) {
++			// first check if the binding is ambiguous on the LHS
++			if (!left_using_binding && left_binding.empty()) {
+ 				// binding is ambiguous on left or right side: throw an exception
+-				string error_msg = "Column name \"" + column_name + "\" is ambiguous: it exists more than once on the ";
+-				error_msg += left_ambiguous ? "left" : "right";
+-				error_msg += " side of the join.";
++				string error_msg = "Column name \"" + column_name + "\" is ambiguous: it exists more than once on the left side of the join.";
+ 				throw BinderException(FormatError(ref, error_msg));
+ 			}
+-			for (auto &binding : right_bindings) {
+-				right_binding = binding;
+-			}
+ 			// there is a match! create the join condition
+-			AddCondition(ref, left_binding, right_binding, column_name);
+-			bind_context.HideBinding(right_binding, column_name);
++			extra_conditions.push_back(AddCondition(context, left_binder, right_binder, left_binding, right_binding, column_name));
++
++			UsingColumnSet set;
++			AddUsingBindings(set, left_using_binding, left_binding);
++			AddUsingBindings(set, right_using_binding, right_binding);
++			SetPrimaryBinding(set, ref.type, left_binding, right_binding);
++			left_binder.bind_context.RemoveUsingBinding(column_name, left_using_binding);
++			right_binder.bind_context.RemoveUsingBinding(column_name, right_using_binding);
++			bind_context.AddUsingBinding(column_name, move(set));
+ 		}
+-		if (!ref.condition) {
++		if (extra_conditions.size() == 0) {
+ 			// no matching bindings found in natural join: throw an exception
+ 			string error_msg = "No columns found to join on in NATURAL JOIN.
+";
+ 			error_msg += "Use CROSS JOIN if you intended for this to be a cross-product.";
+@@ -114,70 +176,50 @@ unique_ptr<BoundTableRef> Binder::Bind(JoinRef &ref) {
+ 	} else if (ref.using_columns.size() > 0) {
+ 		// USING columns
+ 		D_ASSERT(!result->condition);
+-		vector<string> left_join_bindings;
+ 
+-		for (auto &using_column : ref.using_columns) {
+-			// for each using column, get the matching binding
+-			auto left_bindings = left_binder.bind_context.GetMatchingBindings(using_column);
+-			if (left_bindings.size() == 0) {
+-				throw BinderException("Column \"%s\" does not exist on left side of join!", using_column);
+-			}
+-			// find the join binding
+-			string left_binding;
+-			for (auto &binding : left_bindings) {
+-				if (left_binder.bind_context.BindingIsHidden(binding, using_column)) {
+-					continue;
+-				}
+-				if (!left_binding.empty()) {
+-					string error = "Column name \"" + using_column +
+-					               "\" is ambiguous: it exists more than once on left side of join.
+Candidates:";
+-					for (auto &binding : left_bindings) {
+-						error += "
+\t" + binding + "." + using_column;
+-					}
+-					throw BinderException(error);
+-				} else {
+-					left_binding = binding;
+-				}
+-			}
+-			left_join_bindings.push_back(left_binding);
+-		}
+ 		for (idx_t i = 0; i < ref.using_columns.size(); i++) {
+ 			auto &using_column = ref.using_columns[i];
+-			auto left_binding = left_join_bindings[i];
+-
+-			auto right_bindings = right_binder.bind_context.GetMatchingBindings(using_column);
++			string left_binding;
+ 			string right_binding;
+-			for (auto &binding : right_bindings) {
+-				if (right_binder.bind_context.BindingIsHidden(binding, using_column)) {
+-					continue;
+-				}
+-				if (!right_binding.empty()) {
+-					string error = "Column name \"" + using_column +
+-					               "\" is ambiguous: it exists more than once on right side of join.
+Candidates:";
+-					for (auto &binding : right_bindings) {
+-						error += "
+\t" + binding + "." + using_column;
+-					}
+-					throw BinderException(error);
+-				} else {
+-					right_binding = binding;
+-				}
++			auto left_using_binding = left_binder.bind_context.GetUsingBinding(using_column);
++			auto right_using_binding = right_binder.bind_context.GetUsingBinding(using_column);
++			if (!left_using_binding) {
++				left_binding = left_binder.FindBinding(using_column, "left");
++			} else {
++				left_binding = left_using_binding->primary_binding;
+ 			}
+-			if (right_binding.empty()) {
+-				throw BinderException("Column \"%s\" does not exist on right side of join!", using_column);
++			if (!right_using_binding) {
++				right_binding = right_binder.FindBinding(using_column, "right");
++			} else {
++				right_binding = right_using_binding->primary_binding;
+ 			}
+-			D_ASSERT(!left_binding.empty());
+-			AddCondition(ref, left_binding, right_binding, using_column);
+-			right_binder.bind_context.HideBinding(right_binding, using_column);
++			extra_conditions.push_back(AddCondition(context, left_binder, right_binder, left_binding, right_binding, using_column));
++
++			UsingColumnSet set;
++			AddUsingBindings(set, left_using_binding, left_binding);
++			AddUsingBindings(set, right_using_binding, right_binding);
++			SetPrimaryBinding(set, ref.type, left_binding, right_binding);
++			left_binder.bind_context.RemoveUsingBinding(using_column, left_using_binding);
++			right_binder.bind_context.RemoveUsingBinding(using_column, right_using_binding);
++			bind_context.AddUsingBinding(using_column, move(set));
+ 		}
+ 	}
+ 	bind_context.AddContext(move(left_binder.bind_context));
+ 	bind_context.AddContext(move(right_binder.bind_context));
+ 	MoveCorrelatedExpressions(left_binder);
+ 	MoveCorrelatedExpressions(right_binder);
++	for(auto &condition : extra_conditions) {
++		if (ref.condition) {
++			ref.condition = make_unique<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, move(ref.condition), move(condition));
++		} else {
++			ref.condition = move(condition);
++		}
++	}
+ 	if (ref.condition) {
+ 		WhereBinder binder(*this, context);
+ 		result->condition = binder.Bind(ref.condition);
+ 	}
++	D_ASSERT(result->condition);
+ 	return move(result);
+ }
+ 
+diff --git a/tools/sqlite3_api_wrapper/sqlite3_api_wrapper.cpp b/tools/sqlite3_api_wrapper/sqlite3_api_wrapper.cpp
+index 7de4dddec291..0e3a6eb62ef1 100644
+--- a/tools/sqlite3_api_wrapper/sqlite3_api_wrapper.cpp
++++ b/tools/sqlite3_api_wrapper/sqlite3_api_wrapper.cpp
+@@ -197,6 +197,7 @@ bool sqlite3_display_result(StatementType type) {
+ 	case StatementType::EXPLAIN_STATEMENT:
+ 	case StatementType::PRAGMA_STATEMENT:
+ 	case StatementType::SELECT_STATEMENT:
++	case StatementType::SHOW_STATEMENT:
+ 		return true;
+ 	default:
+ 		return false;

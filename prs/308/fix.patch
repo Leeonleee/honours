@@ -1,0 +1,957 @@
+diff --git a/src/execution/operator/persistent/buffered_csv_reader.cpp b/src/execution/operator/persistent/buffered_csv_reader.cpp
+index fd779cbf5c86..7d00e323d268 100644
+--- a/src/execution/operator/persistent/buffered_csv_reader.cpp
++++ b/src/execution/operator/persistent/buffered_csv_reader.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include <algorithm>
+ #include <fstream>
++#include <queue>
++#include <cstring>
+ 
+ using namespace duckdb;
+ using namespace std;
+@@ -34,14 +36,68 @@ BufferedCSVReader::BufferedCSVReader(CopyInfo &info, vector<SQLType> sql_types,
+ 	}
+ }
+ 
++void BufferedCSVReader::MatchBufferPosition(bool &prev_pos_matches, index_t &control_str_offset, index_t &tmp_position, bool &match, string &control_str) {
++	if (prev_pos_matches && control_str_offset < control_str.length()) {
++		if (buffer[tmp_position] != control_str[control_str_offset]) {
++			prev_pos_matches = false;
++		} else {
++			if (control_str_offset == control_str.length() - 1) {
++				prev_pos_matches = false;
++				match = true;
++			}
++		}
++	}
++}
++
++bool BufferedCSVReader::MatchControlString(bool &delim_match, bool &quote_match, bool &escape_match) {
++	index_t tmp_position = position;
++	index_t control_str_offset = 0;
++
++	bool delim = true;
++	bool quote = true;
++	bool escape = true;
++
++	while (true) {
++		// check if the delimiter string matches
++		MatchBufferPosition(delim, control_str_offset, tmp_position, delim_match, info.delimiter);
++		// check if the quote string matches
++		MatchBufferPosition(quote, control_str_offset, tmp_position, quote_match, info.quote);
++		// check if the escape string matches
++		MatchBufferPosition(escape, control_str_offset, tmp_position, escape_match, info.escape);
++
++		// return if matching is not possible any longer
++		if (!delim && !quote && !escape) {
++			return false;
++		}
++
++		tmp_position++;
++		control_str_offset++;
++
++		// make sure not to exceed buffer size, and return if there cannot be any further control strings
++		if (tmp_position >= buffer_size) {
++			return true;
++		}
++	}
++}
++
+ void BufferedCSVReader::ParseCSV(DataChunk &insert_chunk) {
+ 	cached_buffers.clear();
+ 
+-	index_t column = 0;
+-	index_t offset = 0;
++	// used for parsing algorithm
+ 	bool in_quotes = false;
+ 	bool finished_chunk = false;
+-	bool seen_escape = true;
++	bool seen_escape = false;
++	bool reset_quotes = false;
++	bool quote_or_escape = false;
++	bool exhausted_buffer = false;
++	index_t column = 0;
++	index_t offset = 0;
++	std::queue<index_t> escape_positions;
++
++	// used for fast control sequence detection
++	bool delimiter = false;
++	bool quote = false;
++	bool escape = false;
+ 
+ 	if (position >= buffer_size) {
+ 		if (!ReadBuffer(start)) {
+@@ -54,65 +110,114 @@ void BufferedCSVReader::ParseCSV(DataChunk &insert_chunk) {
+ 		if (finished_chunk) {
+ 			return;
+ 		}
+-		if (in_quotes) {
+-			if (buffer[position] == info.escape) {
+-				seen_escape = true;
+-				// FIXME this is only part of the deal, we also need to zap the escapes below
+-			}
+-			else if (!seen_escape) {
+-				if (buffer[position] == info.quote) {
+-					// end quote
+-					offset = 1;
++
++		// detect control strings
++		exhausted_buffer = MatchControlString(delimiter, quote, escape);
++
++		if (!exhausted_buffer) {
++			// if QUOTE equals ESCAPE we might need to determine which one we detected in the previous loop
++			if (quote_or_escape) {
++				if (delimiter || is_newline(buffer[position]) || (source.eof() && position + 1 == buffer_size)) {
++					// found quote without escape, end quote
++					offset = info.quote.length();
+ 					in_quotes = false;
++				} else {
++					// found escape
++					seen_escape = true;
+ 				}
+-			} else {
+-				seen_escape = false;
++				quote_or_escape = false;
+ 			}
+ 
+-		} else {
+-			if (buffer[position] == info.quote) {
+-				// start quotes can only occur at the start of a field
+-				if (position == start) {
+-					// increment start by 1
+-					start++;
+-					// read until we encounter a quote again
+-					in_quotes = true;
++			if (in_quotes) {
++				if (!quote && !escape && !seen_escape) {
++					// plain value character
++					seen_escape = false;
++				} else if (!quote && !escape && seen_escape) {
++					throw ParserException("Error on line %lld: neither QUOTE nor ESCAPE is proceeded by ESCAPE", linenr);
++				} else if (!quote && escape && !seen_escape) {
++					// escape
++					seen_escape = true;
++					position += info.escape.length() - 1;
++				} else if (!quote && escape && seen_escape) {
++					// escaped escape
++					// we store the position of the escape so we can skip it when adding the value
++					escape_positions.push(position);
++					position += info.escape.length() - 1;
++					seen_escape = false;
++				} else if (quote && !escape && !seen_escape) {
++					// found quote without escape, end quote
++					offset = info.quote.length();
++					position += info.quote.length() - 1;
++					in_quotes = false;
++				} else if (quote && !escape && seen_escape) {
++					// escaped quote
++					// we store the position of the escape so we can skip it when adding the value
++					escape_positions.push(position);
++					position += info.quote.length() - 1;
++					seen_escape = false;
++				} else if (quote && escape && !seen_escape) {
++					// either escape or end of quote, decide depending on next character
++					// NOTE: QUOTE and ESCAPE cannot be subsets of each other
++					position += info.escape.length() - 1;
++					quote_or_escape = true;
++				} else if (quote && escape && seen_escape) {
++					// we store the position of the escape so we can skip it when adding the value
++					escape_positions.push(position);
++					position += info.escape.length() - 1;
++					seen_escape = false;
+ 				}
+-			} else if (buffer[position] == info.delimiter) {
+-				// encountered delimiter
+-				AddValue(buffer.get() + start, position - start - offset, column);
+-				start = position + 1;
+-				offset = 0;
+-			}
+-			if (is_newline(buffer[position]) || (source.eof() && position + 1 == buffer_size)) {
+-				char newline = buffer[position];
+-				// encountered a newline, add the current value and push the row
+-				AddValue(buffer.get() + start, position - start - offset, column);
+-				finished_chunk = AddRow(insert_chunk, column);
+-
+-				// move to the next character
+-				start = position + 1;
+-				offset = 0;
+-				if (newline == '\r') {
+-					// \r, skip subsequent 
+
+-					if (position + 1 >= buffer_size) {
+-						if (!ReadBuffer(start)) {
+-							break;
++			} else {
++				if (quote) {
++					// start quotes can only occur at the start of a field
++					if (position == start) {
++						in_quotes = true;
++						// increment start by quote length
++						start += info.quote.length();
++						reset_quotes = in_quotes;
++						position += info.quote.length() - 1;
++					} else {
++						throw ParserException("Error on line %lld: unterminated quotes", linenr);
++					}
++				} else if (delimiter) {
++					// encountered delimiter
++					AddValue(buffer.get() + start, position - start - offset, column, escape_positions);
++					start = position + info.delimiter.length();
++					reset_quotes = in_quotes;
++					position += info.delimiter.length() - 1;
++					offset = 0;
++				}
++
++				if (is_newline(buffer[position]) || (source.eof() && position + 1 == buffer_size)) {
++					char newline = buffer[position];
++					// encountered a newline, add the current value and push the row
++					AddValue(buffer.get() + start, position - start - offset, column, escape_positions);
++					finished_chunk = AddRow(insert_chunk, column);
++
++					// move to the next character
++					start = position + 1;
++					reset_quotes = in_quotes;
++					offset = 0;
++					if (newline == '\r') {
++						// \r, skip subsequent 
+
++						if (position + 1 >= buffer_size) {
++							if (!ReadBuffer(start)) {
++								break;
++							}
++							if (buffer[position] == '
+') {
++								start++;
++								position++;
++							}
++							continue;
+ 						}
+-						if (buffer[position] == '
+') {
++						if (buffer[position + 1] == '
+') {
+ 							start++;
+ 							position++;
+ 						}
+-						continue;
+-					}
+-					if (buffer[position + 1] == '
+') {
+-						start++;
+-						position++;
+ 					}
+ 				}
+-			}
+-			if (offset != 0) {
+-				in_quotes = true;
++				if (offset != 0) {
++					in_quotes = true;
++				}
+ 			}
+ 		}
+ 
+@@ -122,8 +227,22 @@ void BufferedCSVReader::ParseCSV(DataChunk &insert_chunk) {
+ 			if (!ReadBuffer(start)) {
+ 				break;
+ 			}
++			// restore the current state after reading from the buffer
++			in_quotes = reset_quotes;
++			seen_escape = false;
++			position = start;
++			quote_or_escape = false;
++			while (!escape_positions.empty()) {
++				escape_positions.pop();
++			}
+ 		}
++
++		// reset values for control string matching
++		delimiter = false;
++		quote = false;
++		escape = false;
+ 	}
++
+ 	if (in_quotes) {
+ 		throw ParserException("Error on line %lld: unterminated quotes", linenr);
+ 	}
+@@ -161,7 +280,11 @@ bool BufferedCSVReader::ReadBuffer(index_t &start) {
+ 	return read_count > 0;
+ }
+ 
+-void BufferedCSVReader::AddValue(char *str_val, index_t length, index_t &column) {
++void BufferedCSVReader::AddValue(char *str_val, index_t length, index_t &column, std::queue<index_t> &escape_positions) {
++	// used to remove escape characters
++	index_t pos = start;
++	bool in_escape = false;
++
+ 	if (column == sql_types.size() && length == 0) {
+ 		// skip a single trailing delimiter
+ 		column++;
+@@ -173,16 +296,40 @@ void BufferedCSVReader::AddValue(char *str_val, index_t length, index_t &column)
+ 	}
+ 	// insert the line number into the chunk
+ 	index_t row_entry = parse_chunk.data[column].count++;
+-	if (length == 0) {
++
++	str_val[length] = '\0';
++	// test against null string
++	if (info.null_str == str_val && !info.force_not_null[column]) {
+ 		parse_chunk.data[column].nullmask[row_entry] = true;
+ 	} else {
+-		auto data = (const char **)parse_chunk.data[column].data;
+-		data[row_entry] = str_val;
+-		str_val[length] = '\0';
+-		if (!Value::IsUTF8String(str_val)) {
++		// optionally remove escape(s)
++		string new_val = "";
++		for (const char *val = str_val; *val; val++) {
++			if (!escape_positions.empty()){
++				if (escape_positions.front() == pos) {
++					in_escape = false;
++					escape_positions.pop();
++				} else if (escape_positions.front() - info.escape.length() == pos) {
++					in_escape = true;
++				}
++			}
++			if (!in_escape) {
++				new_val += *val;
++			}
++			pos++;
++		}
++		while (!escape_positions.empty()) {
++			escape_positions.pop();
++		}
++		// test for valid utf-8 string
++		if (!Value::IsUTF8String(new_val.c_str())) {
+ 			throw ParserException("Error on line %lld: file is not valid UTF8", linenr);
+ 		}
++
++		auto& v = parse_chunk.data[column];
++		((const char **)v.data)[row_entry] = v.string_heap.AddString(new_val.c_str());
+ 	}
++
+ 	// move to the next column
+ 	column++;
+ }
+diff --git a/src/execution/operator/persistent/physical_copy_to_file.cpp b/src/execution/operator/persistent/physical_copy_to_file.cpp
+index 8ee0a6b5e9e0..a5740eb109a7 100644
+--- a/src/execution/operator/persistent/physical_copy_to_file.cpp
++++ b/src/execution/operator/persistent/physical_copy_to_file.cpp
+@@ -54,23 +54,82 @@ class BufferedWriter {
+ 	ofstream to_csv;
+ };
+ 
+-static void WriteQuotedString(BufferedWriter &writer, const char *str_value, char delimiter, char quote) {
+-	// scan the string for the delimiter
+-	bool write_quoted = false;
+-	index_t len = 0;
+-	for (const char *val = str_value; *val; val++) {
+-		len++;
+-		if (*val == delimiter || *val == '
+' || *val == '\r') {
+-			// delimiter or newline, write a quoted string
++string AddEscapes(string &to_be_escaped, string escape, string val) {
++	index_t i = 0;
++	string new_val = "";
++	index_t found = val.find(to_be_escaped);
++
++	while (found != string::npos) {
++		while (i < found) {
++			new_val += val[i];
++			i++;
++		}
++		new_val += escape;
++		found = val.find(to_be_escaped, found + escape.length());
++	}
++	while (i < val.length()) {
++		new_val += val[i];
++		i++;
++	}
++	return new_val;
++}
++
++static void WriteQuotedString(BufferedWriter &writer, const char *str_value, string &delimiter, string &quote, string &escape, string &null_str, bool write_quoted) {
++	// used for adding escapes
++	bool add_escapes = false;
++	string new_val = str_value;
++
++	// check for 
+, \r, 
+\r in string
++	if (!write_quoted) {
++		for (const char *val = str_value; *val; val++) {
++			if (*val == '
+' || *val == '\r') {
++				// newline, write a quoted string
++				write_quoted = true;
++			}
++		}
++	}
++
++	// check if value is null string
++	if (!write_quoted) {
++		if (new_val == null_str) {
+ 			write_quoted = true;
+ 		}
+ 	}
++
++	// check for delimiter
+ 	if (!write_quoted) {
+-		writer.Write(str_value, len);
++		if (new_val.find(delimiter) != string::npos) {
++			write_quoted = true;
++		}
++	}
++
++	// check for quote
++	if (new_val.find(quote) != string::npos) {
++		write_quoted = true;
++		add_escapes = true;
++	}
++
++	// check for escapes in quoted string
++	if (write_quoted && !add_escapes) {
++		if (new_val.find(escape) != string::npos) {
++			add_escapes = true;
++		}
++	}
++
++	if (add_escapes) {
++		new_val = AddEscapes(escape, escape, new_val);
++		// also escape quotes
++		if (escape != quote) {
++			new_val = AddEscapes(quote, escape, new_val);
++		}
++	}
++
++	if (!write_quoted) {
++		writer.Write(new_val);
+ 	} else {
+-		writer.Write(&quote, 1);
+-		writer.Write(str_value, len);
+-		writer.Write(&quote, 1);
++		writer.Write(quote);
++		writer.Write(new_val);
++		writer.Write(quote);
+ 	}
+ }
+ 
+@@ -84,13 +143,13 @@ void PhysicalCopyToFile::GetChunkInternal(ClientContext &context, DataChunk &chu
+ 		// write the header line
+ 		for (index_t i = 0; i < names.size(); i++) {
+ 			if (i != 0) {
+-				writer.Write(&info.delimiter, 1);
++				writer.Write(info.delimiter);
+ 			}
+-			WriteQuotedString(writer, names[i].c_str(), info.delimiter, info.quote);
++			WriteQuotedString(writer, names[i].c_str(), info.delimiter, info.quote, info.escape, info.null_str, false);
+ 		}
+ 		writer.Write(newline);
+ 	}
+-	// cerate a chunk with VARCHAR columns
++	// create a chunk with VARCHAR columns
+ 	vector<TypeId> types;
+ 	for (index_t col_idx = 0; col_idx < state->child_chunk.column_count; col_idx++) {
+ 		types.push_back(TypeId::VARCHAR);
+@@ -116,16 +175,20 @@ void PhysicalCopyToFile::GetChunkInternal(ClientContext &context, DataChunk &chu
+ 		}
+ 		// now loop over the vectors and output the values
+ 		VectorOperations::Exec(cast_chunk.data[0], [&](index_t i, index_t k) {
++			// write values
+ 			for (index_t col_idx = 0; col_idx < state->child_chunk.column_count; col_idx++) {
+ 				if (col_idx != 0) {
+-					writer.Write(&info.delimiter, 1);
++					writer.Write(info.delimiter);
+ 				}
+ 				if (cast_chunk.data[col_idx].nullmask[i]) {
++					// write null value
++					writer.Write(info.null_str);
+ 					continue;
+ 				}
++
+ 				// non-null value, fetch the string value from the cast chunk
+ 				auto str_value = ((const char **)cast_chunk.data[col_idx].data)[i];
+-				WriteQuotedString(writer, str_value, info.delimiter, info.quote);
++				WriteQuotedString(writer, str_value, info.delimiter, info.quote, info.escape, info.null_str, info.force_quote[col_idx]);
+ 			}
+ 			writer.Write(newline);
+ 		});
+diff --git a/src/include/execution/operator/persistent/buffered_csv_reader.hpp b/src/include/execution/operator/persistent/buffered_csv_reader.hpp
+index 0cd35aafc099..3b0a74057948 100644
+--- a/src/include/execution/operator/persistent/buffered_csv_reader.hpp
++++ b/src/include/execution/operator/persistent/buffered_csv_reader.hpp
+@@ -11,6 +11,8 @@
+ #include "execution/physical_operator.hpp"
+ #include "parser/parsed_data/copy_info.hpp"
+ 
++#include <queue>
++
+ namespace duckdb {
+ struct CopyInfo;
+ 
+@@ -44,13 +46,17 @@ class BufferedCSVReader {
+ 
+ private:
+ 	//! Adds a value to the current row
+-	void AddValue(char *str_val, index_t length, index_t &column);
++	void AddValue(char *str_val, index_t length, index_t &column, std::queue<index_t> &escape_positions);
+ 	//! Adds a row to the insert_chunk, returns true if the chunk is filled as a result of this row being added
+ 	bool AddRow(DataChunk &insert_chunk, index_t &column);
+ 	//! Finalizes a chunk, parsing all values that have been added so far and adding them to the insert_chunk
+ 	void Flush(DataChunk &insert_chunk);
+ 	//! Reads a new buffer from the CSV file if the current one has been exhausted
+ 	bool ReadBuffer(index_t &start);
++	//! Sets the control strings starting at the current buffer position, returns false if the buffer was exhausted
++	bool MatchControlString(bool &delim_str, bool &quote_str, bool &escape_str);
++	//! Matches one position of the buffer against a corresponding char in a control string
++	void MatchBufferPosition(bool &prev_pos_matches, index_t &control_str_offset, index_t &tmp_position, bool &match, string &control_str);
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/parser/parsed_data/copy_info.hpp b/src/include/parser/parsed_data/copy_info.hpp
+index bc1fb12b8cab..2d3b7bab48a6 100644
+--- a/src/include/parser/parsed_data/copy_info.hpp
++++ b/src/include/parser/parsed_data/copy_info.hpp
+@@ -22,26 +22,38 @@ struct CopyInfo {
+ 	string schema;
+ 	//! The table name to copy to/from
+ 	string table;
+-	//! The file path to copy to or copy from
++	//! List of columns to copy to/from
++	vector<string> select_list;
++	//! The file path to copy to/from
+ 	string file_path;
+-	//! Whether or not this is a copy to file or copy from a file
++	//! Whether or not this is a copy to file (false) or copy from a file (true)
+ 	bool is_from;
+-	//! Delimiter to parse
+-	char delimiter;
+-	//! Quote to use
+-	char quote;
+-	//! Escape character to use
+-	char escape;
++	//! Delimiter to separate columns within each line
++	string delimiter;
++	//! Quote used for columns that contain reserved characters, e.g., delimiter
++	string quote;
++	//! Escape character to escape quote character
++	string escape;
+ 	//! Whether or not the file has a header line
+ 	bool header;
+ 	//! The file format of the external file
+ 	ExternalFileFormat format;
+-	// List of Columns that will be copied from/to.
+-	vector<string> select_list;
++	//! Specifies the string that represents a null value
++	string null_str;
++	//! Determines whether all columns must be quoted
++	bool quote_all;
++	//! Forces quoting to be used for all non-NULL values in each specified column
++	vector<string> force_quote_list;
++	//! True, if column with that index must be quoted
++	vector<bool> force_quote;
++	//! Null values will be read as zero-length strings in each specified column
++	vector<string> force_not_null_list;
++	//! True, if column with that index must skip null check
++	vector<bool> force_not_null;
+ 
+ 	CopyInfo()
+-	    : schema(DEFAULT_SCHEMA), is_from(false), delimiter(','), quote('"'), escape('\0'), header(false),
+-	      format(ExternalFileFormat::CSV) {
++	    : schema(DEFAULT_SCHEMA), is_from(false), delimiter(","), quote("\""), escape(""), header(false),
++	      format(ExternalFileFormat::CSV), null_str(""), quote_all(false) {
+ 	}
+ };
+ 
+diff --git a/src/include/planner/statement/bound_copy_statement.hpp b/src/include/planner/statement/bound_copy_statement.hpp
+index b5694c4006d5..91a3433c3a0d 100644
+--- a/src/include/planner/statement/bound_copy_statement.hpp
++++ b/src/include/planner/statement/bound_copy_statement.hpp
+@@ -23,9 +23,9 @@ class BoundCopyStatement : public BoundSQLStatement {
+ 
+ 	//! The CopyInfo
+ 	unique_ptr<CopyInfo> info;
+-	//! The bound insert statement (only for COPY from file -> database)
++	//! The bound insert statement (only for COPY FROM)
+ 	unique_ptr<BoundSQLStatement> bound_insert;
+-	// The bound SQL statement (only for COPY from database -> file)
++	//! The bound SQL statement (only for COPY TO)
+ 	unique_ptr<BoundQueryNode> select_statement;
+ 
+ 	vector<string> names;
+diff --git a/src/parser/transform/statement/transform_copy.cpp b/src/parser/transform/statement/transform_copy.cpp
+index dd7faaa52d29..808a08f91d21 100644
+--- a/src/parser/transform/statement/transform_copy.cpp
++++ b/src/parser/transform/statement/transform_copy.cpp
+@@ -14,26 +14,165 @@ using namespace std;
+ 
+ static ExternalFileFormat StringToExternalFileFormat(const string &str) {
+ 	auto upper = StringUtil::Upper(str);
+-	if (upper == "CSV") {
+-		return ExternalFileFormat::CSV;
++	return ExternalFileFormat::CSV;
++}
++
++void SetControlString(DefElem *def_elem, string option, string option_example, string &info_str) {
++	auto *val = (postgres::Value *)(def_elem->arg);
++	if (!val || val->type != T_String) {
++		throw ParserException("Unsupported parameter type for " + option + ": expected e.g. " + option_example);
+ 	}
+-	throw ConversionException("No ExternalFileFormat for input '%s'", upper.c_str());
++	info_str = val->val.str;
+ }
+ 
+-unique_ptr<CopyStatement> Transformer::TransformCopy(Node *node) {
++void SubstringDetection(string &str_1, string &str_2, string name_str_1, string name_str_2) {
++	if (str_1.find(str_2) != string::npos || str_2.find(str_1) != std::string::npos) {
++		throw Exception("COPY " + name_str_1 + " must not appear in the " + name_str_2 + " specification and vice versa");
++	}
++}
++
++void HandleOptions(CopyStmt *stmt, CopyInfo &info) {
++	// option names
+ 	const string kDelimiterTok = "delimiter";
+ 	const string kFormatTok = "format";
+ 	const string kQuoteTok = "quote";
+ 	const string kEscapeTok = "escape";
+ 	const string kHeaderTok = "header";
++	const string kNullTok = "null";
++	const string kForceQuoteTok = "force_quote";
++	const string kForceNotNullTok = "force_not_null";
++	const string kEncodingTok = "encoding";
++
++	ListCell *cell = nullptr;
++
++	// iterate over each option
++	for_each_cell(cell, stmt->options->head) {
++		auto *def_elem = reinterpret_cast<DefElem *>(cell->data.ptr_value);
++
++		if (StringUtil::StartsWith(def_elem->defname, "delim") || StringUtil::StartsWith(def_elem->defname, "sep")) {
++			// delimiter
++			SetControlString(def_elem, "DELIMITER", "DELIMITER ','", info.delimiter);
++
++		} else if (def_elem->defname == kFormatTok) {
++			// format
++			auto *format_val = (postgres::Value *)(def_elem->arg);
++			if (!format_val || format_val->type != T_String) {
++				throw ParserException("Unsupported parameter type for FORMAT: expected e.g. FORMAT 'csv'");
++			}
++			if (StringUtil::Upper(format_val->val.str) != "CSV") {
++				throw Exception("Copy is only supported for .CSV-files, FORMAT 'csv'");
++			}
++			info.format = StringToExternalFileFormat(format_val->val.str);
++
++		} else if (def_elem->defname == kQuoteTok) {
++			// quote
++			SetControlString(def_elem, "QUOTE", "QUOTE '\"'", info.quote);
++			if (info.quote.length() == 0) {
++				throw Exception("QUOTE must not be empty");
++			}
++
++		} else if (def_elem->defname == kEscapeTok) {
++			// escape
++			SetControlString(def_elem, "ESCAPE", "ESCAPE '\"'", info.escape);
++			if (info.escape.length() == 0) {
++				throw Exception("ESCAPE must not be empty");
++			}
++
++		} else if (def_elem->defname == kHeaderTok) {
++			// header
++			auto *header_val = (postgres::Value *)(def_elem->arg);
++			if (!header_val) {
++				info.header = true;
++				continue;
++			}
++			switch (header_val->type) {
++			case T_Integer:
++				info.header = header_val->val.ival == 1 ? true : false;
++				break;
++			case T_String: {
++				auto val = duckdb::Value(string(header_val->val.str));
++				info.header = val.CastAs(TypeId::BOOLEAN).value_.boolean;
++				break;
++			}
++			default:
++				throw ParserException("Unsupported parameter type for HEADER: expected e.g. HEADER 1");
++			}
++
++		} else if (def_elem->defname == kNullTok) {
++			// null
++			SetControlString(def_elem, "NULL", "NULL 'null'", info.null_str);
++
++		} else if (def_elem->defname == kForceQuoteTok) {
++			// force quote
++			// only for COPY ... TO ...
++			if(info.is_from) {
++				throw Exception("The FORCE_QUOTE option is only for COPY ... TO ...");
++			}
++
++			auto *force_quote_val = def_elem->arg;
++			if (!force_quote_val || (force_quote_val->type != T_A_Star && force_quote_val->type != T_List)) {
++				throw ParserException("Unsupported parameter type for FORCE_QUOTE: expected e.g. FORCE_QUOTE *");
++			}
++
++			// * option (all columns)
++			if (force_quote_val->type == T_A_Star) {
++				info.quote_all = true;
++			}
++
++			// list of columns
++			if (force_quote_val->type == T_List) {
++				auto column_list = (postgres::List*)(force_quote_val);
++				for (ListCell *c = column_list->head; c != NULL; c = lnext(c)) {
++					ResTarget *target = (ResTarget *)(c->data.ptr_value);
++					info.force_quote_list.push_back(string(target->name));
++				}
++			}
++
++		} else if (def_elem->defname == kForceNotNullTok) {
++			// force not null
++			// only for COPY ... FROM ...
++			if (!info.is_from) {
++				throw Exception("The FORCE_NOT_NULL option is only for COPY ... FROM ...");
++			}
+ 
++			auto *force_not_null_val = def_elem->arg;
++			if (!force_not_null_val || force_not_null_val->type != T_List) {
++				throw ParserException("Unsupported parameter type for FORCE_NOT_NULL: expected e.g. FORCE_NOT_NULL *");
++			}
++
++			auto column_list = (postgres::List*)(force_not_null_val);
++			for (ListCell *c = column_list->head; c != NULL; c = lnext(c)) {
++				ResTarget *target = (ResTarget *)(c->data.ptr_value);
++				info.force_not_null_list.push_back(string(target->name));
++			}
++
++		} else if (def_elem->defname == kEncodingTok) {
++			// encoding
++			auto *encoding_val = (postgres::Value *)(def_elem->arg);
++			if (!encoding_val || encoding_val->type != T_String) {
++				throw ParserException("Unsupported parameter type for ENCODING: expected e.g. ENCODING 'UTF-8'");
++			}
++			if (StringUtil::Upper(encoding_val->val.str) != "UTF8" && StringUtil::Upper(encoding_val->val.str) != "UTF-8") {
++				throw Exception("Copy is only supported for UTF-8 encoded files, ENCODING 'UTF-8'");
++			}
++
++		} else {
++			throw ParserException("Unsupported COPY option: %s", def_elem->defname);
++		}
++	}
++}
++
++unique_ptr<CopyStatement> Transformer::TransformCopy(Node *node) {
+ 	CopyStmt *stmt = reinterpret_cast<CopyStmt *>(node);
+ 	assert(stmt);
+ 	auto result = make_unique<CopyStatement>();
+ 	auto &info = *result->info;
++
++	// get file_path and is_from
+ 	info.file_path = stmt->filename;
+ 	info.is_from = stmt->is_from;
+ 
++	// get select_list
+ 	if (stmt->attlist) {
+ 		for (auto n = stmt->attlist->head; n != nullptr; n = n->next) {
+ 			auto target = reinterpret_cast<ResTarget *>(n->data.ptr_value);
+@@ -66,74 +205,26 @@ unique_ptr<CopyStatement> Transformer::TransformCopy(Node *node) {
+ 		result->select_statement = TransformSelectNode((SelectStmt *)stmt->query);
+ 	}
+ 
+-	// Handle options
++	// handle options
+ 	if (stmt->options) {
+-		ListCell *cell = nullptr;
+-		for_each_cell(cell, stmt->options->head) {
+-			auto *def_elem = reinterpret_cast<DefElem *>(cell->data.ptr_value);
+-
+-			if (StringUtil::StartsWith(def_elem->defname, "delim") ||
+-			    StringUtil::StartsWith(def_elem->defname, "sep")) {
+-				// delimiter
+-				auto *delimiter_val = reinterpret_cast<postgres::Value *>(def_elem->arg);
+-				if (!delimiter_val || delimiter_val->type != T_String) {
+-					throw ParserException("Unsupported parameter type for DELIMITER: expected e.g. DELIMITER ','");
+-				}
+-				index_t delim_len = strlen(delimiter_val->val.str);
+-				info.delimiter = '\0';
+-				char *delim_cstr = delimiter_val->val.str;
+-				if (delim_len == 1) {
+-					info.delimiter = delim_cstr[0];
+-				}
+-				if (delim_len == 2 && delim_cstr[0] == '\\' && delim_cstr[1] == 't') {
+-					info.delimiter = '\t';
+-				}
+-				if (info.delimiter == '\0') {
+-					throw Exception("Could not interpret DELIMITER option");
+-				}
+-			} else if (def_elem->defname == kFormatTok) {
+-				// format
+-				auto *format_val = reinterpret_cast<postgres::Value *>(def_elem->arg);
+-				if (!format_val || format_val->type != T_String) {
+-					throw ParserException("Unsupported parameter type for FORMAT: expected e.g. FORMAT 'csv'");
+-				}
+-				info.format = StringToExternalFileFormat(format_val->val.str);
+-			} else if (def_elem->defname == kQuoteTok) {
+-				// quote
+-				auto *quote_val = reinterpret_cast<postgres::Value *>(def_elem->arg);
+-				if (!quote_val || quote_val->type != T_String) {
+-					throw ParserException("Unsupported parameter type for QUOTE: expected e.g. QUOTE '\"'");
+-				}
+-				info.quote = *quote_val->val.str;
+-			} else if (def_elem->defname == kEscapeTok) {
+-				// escape
+-				auto *escape_val = reinterpret_cast<postgres::Value *>(def_elem->arg);
+-				if (!escape_val || escape_val->type != T_String) {
+-					throw ParserException("Unsupported parameter type for ESCAPE: expected e.g. ESCAPE '\\'");
+-				}
+-				info.escape = *escape_val->val.str;
+-			} else if (def_elem->defname == kHeaderTok) {
+-				auto *header_val = reinterpret_cast<postgres::Value *>(def_elem->arg);
+-				if (!header_val) {
+-					info.header = true;
+-					continue;
+-				}
+-				switch (header_val->type) {
+-				case T_Integer:
+-					info.header = header_val->val.ival == 1 ? true : false;
+-					break;
+-				case T_String: {
+-					auto val = duckdb::Value(string(header_val->val.str));
+-					info.header = val.CastAs(TypeId::BOOLEAN).value_.boolean;
+-					break;
+-				}
+-				default:
+-					throw ParserException("Unsupported parameter type for HEADER");
+-				}
+-			} else {
+-				throw ParserException("Unsupported COPY option: %s", def_elem->defname);
+-			}
+-		}
++		HandleOptions(stmt, info);
++	}
++
++	// the default character of the ESCAPE option is the same as the QUOTE character
++	if (info.escape == "") {
++		info.escape = info.quote;
++	}
++	// escape and delimiter must not be substrings of each other
++	SubstringDetection(info.delimiter, info.escape, "DELIMITER", "ESCAPE");
++	// delimiter and quote must not be substrings of each other
++	SubstringDetection(info.quote, info.delimiter, "DELIMITER", "QUOTE");
++	// escape and quote must not be substrings of each other (but can be the same)
++	if (info.quote != info.escape) {
++		SubstringDetection(info.quote, info.escape, "QUOTE", "ESCAPE");
++	}
++	// null string and delimiter must not be substrings of each other
++	if (info.null_str != "") {
++		SubstringDetection(info.delimiter, info.null_str, "DELIMITER", "NULL");
+ 	}
+ 
+ 	return result;
+diff --git a/src/planner/binder/statement/bind_copy.cpp b/src/planner/binder/statement/bind_copy.cpp
+index 7e9acca84148..d51db095d851 100644
+--- a/src/planner/binder/statement/bind_copy.cpp
++++ b/src/planner/binder/statement/bind_copy.cpp
+@@ -7,16 +7,40 @@
+ using namespace duckdb;
+ using namespace std;
+ 
++//void transformColumnList(){}
++
+ unique_ptr<BoundSQLStatement> Binder::Bind(CopyStatement &stmt) {
+ 	auto result = make_unique<BoundCopyStatement>();
++
+ 	if (stmt.select_statement) {
+-		// COPY from a query
++		// COPY TO a file
+ 		result->select_statement = Bind(*stmt.select_statement);
+ 		result->names = {"Count"};
+ 		result->sql_types = {SQLType::BIGINT};
++
++		auto names = result->select_statement->names;
++		auto quote_list = stmt.info->force_quote_list;
++
++		// set all columns to false
++		for (index_t i = 0; i < names.size(); i++) {
++			stmt.info->force_quote.push_back(stmt.info->quote_all);
++		}
++
++		if (!quote_list.empty()) {
++			// validate force_quote_list entries
++			for (const auto& column : quote_list) {
++				auto it = find(names.begin(), names.end(), column);
++				if (it != names.end()) {
++					stmt.info->force_quote[distance(names.begin(), it)] = true;
++				} else {
++					throw BinderException("Column %s in FORCE_QUOTE is not used in COPY", column.c_str());
++				}
++			}
++		}
++
+ 	} else {
+ 		assert(!stmt.info->table.empty());
+-		// COPY to a table
++		// COPY FROM a file
+ 		// generate an insert statement for the the to-be-inserted table
+ 		InsertStatement insert;
+ 		insert.table = stmt.info->table;
+@@ -25,9 +49,37 @@ unique_ptr<BoundSQLStatement> Binder::Bind(CopyStatement &stmt) {
+ 
+ 		// bind the insert statement to the base table
+ 		result->bound_insert = Bind(insert);
++
+ 		auto &bound_insert = (BoundInsertStatement &)*result->bound_insert;
+ 		// get the set of expected columns from the insert statement; these types will be parsed from the CSV
+ 		result->sql_types = bound_insert.expected_types;
++
++		auto table = context.catalog.GetTable(context.ActiveTransaction(), stmt.info->schema, stmt.info->table);
++		// set all columns to false
++		for (index_t i = 0; i < table->columns.size(); i++) {
++			stmt.info->force_not_null.push_back(false);
++		}
++
++		// transform column names of force_not_null_list into force_not_null booleans
++		if (!stmt.info->force_not_null_list.empty()) {
++			// validate force_not_null_list entries
++			for (const auto& column : stmt.info->force_not_null_list) {
++				auto entry = table->name_map.find(column);
++				if (entry == table->name_map.end()) {
++					throw BinderException("Column %s not found in table %s", column.c_str(), table->name.c_str());
++				}
++				if (bound_insert.column_index_map.size() > 0) {
++					auto it = find(bound_insert.column_index_map.begin(), bound_insert.column_index_map.end(), entry->second);
++					if (it != bound_insert.column_index_map.end()) {
++						stmt.info->force_not_null[entry->second] = true;
++					} else {
++						throw BinderException("Column %s in FORCE_NOT_NULL is not used in COPY", column.c_str());
++					}
++				} else {
++					stmt.info->force_not_null[entry->second] = true;
++				}
++			}
++		}
+ 	}
+ 	result->info = move(stmt.info);
+ 	return move(result);
+diff --git a/src/planner/logical_plan/statement/plan_copy.cpp b/src/planner/logical_plan/statement/plan_copy.cpp
+index 80dd1672e3bb..be7b515f6395 100644
+--- a/src/planner/logical_plan/statement/plan_copy.cpp
++++ b/src/planner/logical_plan/statement/plan_copy.cpp
+@@ -8,7 +8,7 @@ using namespace std;
+ 
+ unique_ptr<LogicalOperator> LogicalPlanGenerator::CreatePlan(BoundCopyStatement &stmt) {
+ 	if (stmt.select_statement) {
+-		// COPY from a query
++		// COPY TO a file
+ 		auto names = stmt.select_statement->names;
+ 		auto types = stmt.select_statement->types;
+ 
+@@ -22,7 +22,7 @@ unique_ptr<LogicalOperator> LogicalPlanGenerator::CreatePlan(BoundCopyStatement
+ 
+ 		return move(copy);
+ 	} else {
+-		// COPY to a table
++		// COPY FROM a file
+ 		assert(!stmt.info->table.empty());
+ 		// first create a plan for the insert statement
+ 		auto insert = CreatePlan(*stmt.bound_insert);

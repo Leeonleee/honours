@@ -1,0 +1,162 @@
+diff --git a/extension/parquet/column_reader.cpp b/extension/parquet/column_reader.cpp
+index d890f34bc382..66390a315b3c 100644
+--- a/extension/parquet/column_reader.cpp
++++ b/extension/parquet/column_reader.cpp
+@@ -312,7 +312,9 @@ void ColumnReader::Skip(idx_t num_values) {
+ 	// TODO this can be optimized, for example we dont actually have to bitunpack offsets
+ 	auto values_read =
+ 	    Read(num_values, none_filter, (uint8_t *)dummy_define.ptr, (uint8_t *)dummy_repeat.ptr, dummy_result);
+-	D_ASSERT(values_read == num_values);
++	if (values_read != num_values) {
++		throw std::runtime_error("Row count mismatch when skipping rows");
++	}
+ }
+ 
+ void StringColumnReader::VerifyString(const char *str_data, idx_t str_len) {
+diff --git a/extension/parquet/include/column_reader.hpp b/extension/parquet/include/column_reader.hpp
+index b50e5298e2cb..842cb95cd0fb 100644
+--- a/extension/parquet/include/column_reader.hpp
++++ b/extension/parquet/include/column_reader.hpp
+@@ -412,7 +412,9 @@ class StructColumnReader : public ColumnReader {
+ 			auto child_read = make_unique<Vector>();
+ 			child_read->Initialize(Type().child_types()[i].second);
+ 			auto child_num_values = child_readers[i]->Read(num_values, filter, define_out, repeat_out, *child_read);
+-			D_ASSERT(child_num_values == num_values);
++			if (child_num_values != num_values) {
++				throw std::runtime_error("Struct child row count mismatch");
++			}
+ 			StructVector::AddEntry(result, Type().child_types()[i].first, move(child_read));
+ 		}
+ 
+diff --git a/src/include/duckdb/main/relation.hpp b/src/include/duckdb/main/relation.hpp
+index 0d1912dad244..c3c758377058 100644
+--- a/src/include/duckdb/main/relation.hpp
++++ b/src/include/duckdb/main/relation.hpp
+@@ -49,7 +49,7 @@ class Relation : public std::enable_shared_from_this<Relation> {
+ 	DUCKDB_API void Print();
+ 	DUCKDB_API void Head(idx_t limit = 10);
+ 
+-	DUCKDB_API shared_ptr<Relation> CreateView(const string &name, bool replace = true);
++	DUCKDB_API shared_ptr<Relation> CreateView(const string &name, bool replace = true, bool temporary = false);
+ 	DUCKDB_API unique_ptr<QueryResult> Query(const string &sql);
+ 	DUCKDB_API unique_ptr<QueryResult> Query(const string &name, const string &sql);
+ 
+diff --git a/src/include/duckdb/main/relation/create_view_relation.hpp b/src/include/duckdb/main/relation/create_view_relation.hpp
+index 255189faf079..77d932fde84c 100644
+--- a/src/include/duckdb/main/relation/create_view_relation.hpp
++++ b/src/include/duckdb/main/relation/create_view_relation.hpp
+@@ -14,11 +14,12 @@ namespace duckdb {
+ 
+ class CreateViewRelation : public Relation {
+ public:
+-	CreateViewRelation(shared_ptr<Relation> child, string view_name, bool replace);
++	CreateViewRelation(shared_ptr<Relation> child, string view_name, bool replace, bool temporary);
+ 
+ 	shared_ptr<Relation> child;
+ 	string view_name;
+ 	bool replace;
++	bool temporary;
+ 	vector<ColumnDefinition> columns;
+ 
+ public:
+diff --git a/src/main/relation.cpp b/src/main/relation.cpp
+index d51665747997..48edc9a331ed 100644
+--- a/src/main/relation.cpp
++++ b/src/main/relation.cpp
+@@ -202,7 +202,10 @@ void Relation::Insert(const string &table_name) {
+ 
+ void Relation::Insert(const string &schema_name, const string &table_name) {
+ 	auto insert = make_shared<InsertRelation>(shared_from_this(), schema_name, table_name);
+-	insert->Execute();
++	auto res = insert->Execute();
++	if (!res->success) {
++		throw Exception("Failed to insert into table '" + table_name + "': " + res->error);
++	}
+ }
+ 
+ void Relation::Insert(const vector<vector<Value>> &values) {
+@@ -217,12 +220,18 @@ void Relation::Create(const string &table_name) {
+ 
+ void Relation::Create(const string &schema_name, const string &table_name) {
+ 	auto create = make_shared<CreateTableRelation>(shared_from_this(), schema_name, table_name);
+-	create->Execute();
++	auto res = create->Execute();
++	if (!res->success) {
++		throw Exception("Failed to create table '" + table_name + "': " + res->error);
++	}
+ }
+ 
+ void Relation::WriteCSV(const string &csv_file) {
+ 	auto write_csv = make_shared<WriteCSVRelation>(shared_from_this(), csv_file);
+-	write_csv->Execute();
++	auto res = write_csv->Execute();
++	if (!res->success) {
++		throw Exception("Failed to write '" + csv_file + "': " + res->error);
++	}
+ }
+ 
+ void Relation::Head(idx_t limit) {
+@@ -230,9 +239,12 @@ void Relation::Head(idx_t limit) {
+ 	limit_node->Execute()->Print();
+ }
+ 
+-shared_ptr<Relation> Relation::CreateView(const string &name, bool replace) {
+-	auto view = make_shared<CreateViewRelation>(shared_from_this(), name, replace);
+-	view->Execute();
++shared_ptr<Relation> Relation::CreateView(const string &name, bool replace, bool temporary) {
++	auto view = make_shared<CreateViewRelation>(shared_from_this(), name, replace, temporary);
++	auto res = view->Execute();
++	if (!res->success) {
++		throw Exception("Failed to create view '" + name + "': " + res->error);
++	}
+ 	return shared_from_this();
+ }
+ 
+diff --git a/src/main/relation/create_view_relation.cpp b/src/main/relation/create_view_relation.cpp
+index 3b2e3bc62106..2b1e62ba9046 100644
+--- a/src/main/relation/create_view_relation.cpp
++++ b/src/main/relation/create_view_relation.cpp
+@@ -6,9 +6,10 @@
+ 
+ namespace duckdb {
+ 
+-CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string view_name, bool replace)
+-    : Relation(child_p->context, RelationType::CREATE_VIEW_RELATION), child(move(child_p)), view_name(move(view_name)),
+-      replace(replace) {
++CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string view_name_p, bool replace_p,
++                                       bool temporary_p)
++    : Relation(child_p->context, RelationType::CREATE_VIEW_RELATION), child(move(child_p)),
++      view_name(move(view_name_p)), replace(replace_p), temporary(temporary_p) {
+ 	context.TryBindRelation(*this, this->columns);
+ }
+ 
+@@ -24,6 +25,8 @@ BoundStatement CreateViewRelation::Bind(Binder &binder) {
+ 	auto info = make_unique<CreateViewInfo>();
+ 	info->query = move(select);
+ 	info->view_name = view_name;
++	info->temporary = temporary;
++	info->schema = "";
+ 	info->on_conflict = replace ? OnCreateConflict::REPLACE_ON_CONFLICT : OnCreateConflict::ERROR_ON_CONFLICT;
+ 	stmt.info = move(info);
+ 	return binder.Bind((SQLStatement &)stmt);
+diff --git a/tools/rpkg/src/duckdbr.cpp b/tools/rpkg/src/duckdbr.cpp
+index 318bcd0725d0..7c661d475d81 100644
+--- a/tools/rpkg/src/duckdbr.cpp
++++ b/tools/rpkg/src/duckdbr.cpp
+@@ -337,6 +337,7 @@ static void *duckdb_altrep_strings_dataptr(SEXP x, Rboolean writeable) {
+ 			}
+ 			dest_offset += STANDARD_VECTOR_SIZE;
+ 		}
++		wrapper->vectors.clear();
+ 	}
+ 	return CHARACTER_POINTER(R_altrep_data2(x));
+ }
+@@ -1141,7 +1142,7 @@ SEXP duckdb_register_R(SEXP connsexp, SEXP namesexp, SEXP valuesexp) {
+ 		Rf_error("duckdb_register_R: Need at least one-column data frame parameter for value");
+ 	}
+ 	try {
+-		conn->TableFunction("r_dataframe_scan", {Value::POINTER((uintptr_t)valuesexp)})->CreateView(name, true);
++		conn->TableFunction("r_dataframe_scan", {Value::POINTER((uintptr_t)valuesexp)})->CreateView(name, true, true);
+ 		auto key = Rf_install(("_registered_df_" + name).c_str());
+ 		Rf_setAttrib(connsexp, key, valuesexp);
+ 	} catch (exception &e) {

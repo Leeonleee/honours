@@ -1,0 +1,3091 @@
+diff --git a/.travis.yml b/.travis.yml
+index 44442d31bc41..9a7a49a37235 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -347,7 +347,7 @@ matrix:
+       script:
+         - python scripts/amalgamation.py > /dev/null
+         - rsync -a -e "ssh $SSHFLAGS -p 2222" --exclude=.git --exclude=build --exclude=third_party/sqllogictest --exclude=third_party/imdb .  root@localhost:/duckdb
+-        - $SCMD 'rm -rf /duckdb/build && mkdir -p /duckdb/build && cd /duckdb/build && export PATH=/opt/csw/bin/:$PATH CXX=g++ CC=gcc  && cmake -DCMAKE_AR=/opt/csw/bin/gar -DCMAKE_BUILD_TYPE=Debug -DAMALGAMATION_BUILD=1 .. && gmake -j2'
++        - travis_wait 30 $SCMD 'rm -rf /duckdb/build && mkdir -p /duckdb/build && cd /duckdb/build && export PATH=/opt/csw/bin/:$PATH CXX=g++ CC=gcc  && cmake -DCMAKE_AR=/opt/csw/bin/gar -DCMAKE_BUILD_TYPE=Debug -DAMALGAMATION_BUILD=1 .. && gmake -j2'
+         - $SCMD /duckdb/build/test/unittest "~[copy]~[file_system]~[.]"
+ 
+ 
+diff --git a/src/common/types.cpp b/src/common/types.cpp
+index 16b80b716911..f06249132ea9 100644
+--- a/src/common/types.cpp
++++ b/src/common/types.cpp
+@@ -159,13 +159,15 @@ void SQLType::Serialize(Serializer &serializer) {
+ 	serializer.Write(id);
+ 	serializer.Write(width);
+ 	serializer.Write(scale);
++	serializer.Write<CollationType>(collation);
+ }
+ 
+ SQLType SQLType::Deserialize(Deserializer &source) {
+ 	auto id = source.Read<SQLTypeId>();
+ 	auto width = source.Read<uint16_t>();
+ 	auto scale = source.Read<uint8_t>();
+-	return SQLType(id, width, scale);
++	auto collation = source.Read<CollationType>();
++	return SQLType(id, width, scale, collation);
+ }
+ 
+ string SQLTypeIdToString(SQLTypeId id) {
+@@ -344,13 +346,44 @@ SQLType MaxSQLType(SQLType left, SQLType right) {
+ 		return right;
+ 	} else if (right.id < left.id) {
+ 		return left;
+-	} else if (left.width > right.width) {
++	} else if (left.width > right.width || left.collation > right.collation) {
+ 		return left;
+ 	} else {
+ 		return right;
+ 	}
+ }
+ 
++CollationType ParseCollation(string collation_argument, CollationType collation) {
++	if (collation_argument == "nocase") {
++		switch(collation) {
++		case CollationType::COLLATE_DEFAULT:
++			return CollationType::COLLATE_NOCASE;
++		case CollationType::COLLATE_NOACCENT:
++			return CollationType::COLLATE_NOCASE_NOACCENT;
++		default:
++			throw ParserException("Unexpected NOCASE collation!");
++		}
++	} else if (collation_argument == "noaccent") {
++		switch(collation) {
++		case CollationType::COLLATE_DEFAULT:
++			return CollationType::COLLATE_NOACCENT;
++		case CollationType::COLLATE_NOCASE:
++			return CollationType::COLLATE_NOCASE_NOACCENT;
++		default:
++			throw ParserException("Unexpected NOACCENT collation!");
++		}
++	} else if (collation_argument == "binary" || collation_argument == "c" || collation_argument == "posix") {
++		switch(collation) {
++		case CollationType::COLLATE_DEFAULT:
++			return CollationType::COLLATE_NONE;
++		default:
++			throw ParserException("Unexpected BINARY collation!");
++		}
++	} else {
++		throw ParserException("Unsupported collation type %s", collation_argument.c_str());
++	}
++}
++
+ bool ApproxEqual(float ldecimal, float rdecimal) {
+ 	float epsilon = fabs(rdecimal) * 0.01;
+ 	return fabs(ldecimal - rdecimal) <= epsilon;
+diff --git a/src/execution/operator/helper/physical_pragma.cpp b/src/execution/operator/helper/physical_pragma.cpp
+index a5cf9bdfbb36..b53b2c6910a4 100644
+--- a/src/execution/operator/helper/physical_pragma.cpp
++++ b/src/execution/operator/helper/physical_pragma.cpp
+@@ -68,6 +68,17 @@ void PhysicalPragma::GetChunkInternal(ClientContext &context, DataChunk &chunk,
+ 				    "Memory limit must be an assignment with a memory unit (e.g. PRAGMA memory_limit='1GB')");
+ 			}
+ 		}
++	} else if (keyword == "collation" || keyword == "default_collation") {
++		if (pragma.pragma_type != PragmaType::ASSIGNMENT) {
++			throw ParserException("Collation must be an assignment (e.g. PRAGMA default_collation=NOCASE)");
++		}
++		CollationType collation = CollationType::COLLATE_DEFAULT;
++		auto collation_param = StringUtil::Lower(pragma.parameters[0].CastAs(TypeId::VARCHAR).str_value);
++		auto splits = StringUtil::Split(collation_param, ".");
++		for(auto &collation_argument : splits) {
++			collation = ParseCollation(collation_argument, collation);
++		}
++		context.db.collation = collation;
+ 	} else {
+ 		throw ParserException("Unrecognized PRAGMA keyword: %s", keyword.c_str());
+ 	}
+diff --git a/src/function/function.cpp b/src/function/function.cpp
+index 0b6df33c3fe9..db23eec9d379 100644
+--- a/src/function/function.cpp
++++ b/src/function/function.cpp
+@@ -52,6 +52,13 @@ void BuiltinFunctions::AddFunction(ScalarFunction function) {
+ 	catalog.CreateFunction(context, &info);
+ }
+ 
++void BuiltinFunctions::AddFunction(vector<string> names, ScalarFunction function) {
++	for(auto &name: names) {
++		function.name = name;
++		AddFunction(function);
++	}
++}
++
+ void BuiltinFunctions::AddFunction(ScalarFunctionSet set) {
+ 	CreateScalarFunctionInfo info(set);
+ 	catalog.CreateFunction(context, &info);
+diff --git a/src/function/scalar/date/current.cpp b/src/function/scalar/date/current.cpp
+index f1a34519f624..c2481fe05342 100644
+--- a/src/function/scalar/date/current.cpp
++++ b/src/function/scalar/date/current.cpp
+@@ -31,25 +31,15 @@ static void current_timestamp_function(DataChunk &input, ExpressionState &state,
+ }
+ 
+ void CurrentTimeFun::RegisterFunction(BuiltinFunctions &set) {
+-	ScalarFunctionSet current_time("current_time");
+-	current_time.AddFunction(ScalarFunction({}, SQLType::TIME, current_time_function));
+-	set.AddFunction(current_time);
++	set.AddFunction(ScalarFunction("current_time", {}, SQLType::TIME, current_time_function));
+ }
+ 
+ void CurrentDateFun::RegisterFunction(BuiltinFunctions &set) {
+-	ScalarFunctionSet current_date("current_date");
+-	current_date.AddFunction(ScalarFunction({}, SQLType::DATE, current_date_function));
+-	set.AddFunction(current_date);
++	set.AddFunction(ScalarFunction("current_date", {}, SQLType::DATE, current_date_function));
+ }
+ 
+ void CurrentTimestampFun::RegisterFunction(BuiltinFunctions &set) {
+-	ScalarFunctionSet current_timestamp("current_timestamp");
+-	current_timestamp.AddFunction(ScalarFunction({}, SQLType::TIMESTAMP, current_timestamp_function));
+-	set.AddFunction(current_timestamp);
+-
+-	ScalarFunctionSet now("now");
+-	now.AddFunction(ScalarFunction({}, SQLType::TIMESTAMP, current_timestamp_function));
+-	set.AddFunction(now);
++	set.AddFunction({"now", "current_timestamp"}, ScalarFunction({}, SQLType::TIMESTAMP, current_timestamp_function));
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/function/scalar/math/numeric.cpp b/src/function/scalar/math/numeric.cpp
+index 45082234f179..aba995b8d908 100644
+--- a/src/function/scalar/math/numeric.cpp
++++ b/src/function/scalar/math/numeric.cpp
+@@ -258,12 +258,7 @@ struct Log10Operator {
+ };
+ 
+ void Log10Fun::RegisterFunction(BuiltinFunctions &set) {
+-	ScalarFunction log_function("log10", {SQLType::DOUBLE}, SQLType::DOUBLE,
+-	                            UnaryDoubleFunctionWrapper<double, Log10Operator>);
+-	set.AddFunction(log_function);
+-	// "log" is an alias for "log10"
+-	log_function.name = "log";
+-	set.AddFunction(log_function);
++	set.AddFunction({"log10", "log"}, ScalarFunction({SQLType::DOUBLE}, SQLType::DOUBLE, UnaryDoubleFunctionWrapper<double, Log10Operator>));
+ }
+ 
+ //===--------------------------------------------------------------------===//
+diff --git a/src/function/scalar/string/CMakeLists.txt b/src/function/scalar/string/CMakeLists.txt
+index 576106cf45de..c0f3a0384a80 100644
+--- a/src/function/scalar/string/CMakeLists.txt
++++ b/src/function/scalar/string/CMakeLists.txt
+@@ -11,6 +11,7 @@ add_library_unity(
+   substring.cpp
+   instr.cpp
+   prefix.cpp
++  strip_accents.cpp
+   suffix.cpp
+   contains.cpp)
+ set(ALL_OBJECT_FILES
+diff --git a/src/function/scalar/string/caseconvert.cpp b/src/function/scalar/string/caseconvert.cpp
+index 2e75dc416566..57ea75e1a906 100644
+--- a/src/function/scalar/string/caseconvert.cpp
++++ b/src/function/scalar/string/caseconvert.cpp
+@@ -3,6 +3,7 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/common/vector_operations/unary_executor.hpp"
++#include "utf8proc.hpp"
+ 
+ #include <string.h>
+ 
+@@ -10,56 +11,84 @@ using namespace std;
+ 
+ namespace duckdb {
+ 
+-// TODO: this does not handle UTF characters yet.
+-template <class OP> static void strcase(const char *input_data, idx_t input_length, char *output) {
+-	for (idx_t i = 0; i < input_length; i++) {
+-		output[i] = OP::Operation(input_data[i]);
++template <bool IS_UPPER>
++static string_t strcase_unicode(Vector &result, const char *input_data, idx_t input_length) {
++	// first figure out the output length
++	// optimization: if only ascii then input_length = output_length
++	idx_t output_length = 0;
++	for (idx_t i = 0; i < input_length;) {
++		if (input_data[i] & 0x80) {
++			// unicode
++			int sz = 0;
++			int codepoint = utf8proc_codepoint(input_data + i, sz);
++			int converted_codepoint = IS_UPPER ? utf8proc_toupper(codepoint) : utf8proc_tolower(codepoint);
++			sz = utf8proc_codepoint_length(converted_codepoint);
++			if (sz < 0) {
++				throw InternalException("Invalid UTF8 encountered!");
++			}
++			output_length += sz;
++			i += sz;
++		} else {
++			// ascii
++			output_length++;
++			i++;
++		}
+ 	}
+-	output[input_length] = '\0';
++	auto result_str = StringVector::EmptyString(result, output_length);
++	auto result_data = result_str.GetData();
++
++	for (idx_t i = 0; i < input_length;) {
++		if (input_data[i] & 0x80) {
++			// non-ascii character
++			int sz = 0;
++			int codepoint = utf8proc_codepoint(input_data + i, sz);
++			int converted_codepoint = IS_UPPER ? utf8proc_toupper(codepoint) : utf8proc_tolower(codepoint);
++			if (!utf8proc_codepoint_to_utf8(converted_codepoint, sz, result_data)) {
++				throw InternalException("Invalid UTF8 encountered!");
++			}
++			result_data += sz;
++			i += sz;
++		} else {
++			// ascii
++			*result_data = IS_UPPER ? toupper(input_data[i]) : tolower(input_data[i]);
++			result_data++;
++			i++;
++		}
++	}
++	result_str.Finalize();
++	return result_str;
+ }
+ 
+-template <class OP> static void caseconvert_function(Vector &input, Vector &result, idx_t count) {
++template <bool IS_UPPER> static void caseconvert_function(Vector &input, Vector &result, idx_t count) {
+ 	assert(input.type == TypeId::VARCHAR);
+ 
+ 	UnaryExecutor::Execute<string_t, string_t, true>(input, result, count, [&](string_t input) {
+ 		auto input_data = input.GetData();
+ 		auto input_length = input.GetSize();
+-
+-		auto target = StringVector::EmptyString(result, input_length);
+-		strcase<OP>(input_data, input_length, target.GetData());
+-		target.Finalize();
+-		return target;
++		return strcase_unicode<IS_UPPER>(result, input_data, input_length);
+ 	});
+ }
+ 
+-struct StringToUpper {
+-	static char Operation(char input) {
+-		return toupper(input);
+-	}
+-};
+-
+-struct StringToLower {
+-	static char Operation(char input) {
+-		return tolower(input);
+-	}
+-};
+-
+ static void caseconvert_upper_function(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	assert(args.column_count() == 1);
+-	caseconvert_function<StringToUpper>(args.data[0], result, args.size());
++	caseconvert_function<true>(args.data[0], result, args.size());
+ }
+ 
+ static void caseconvert_lower_function(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	assert(args.column_count() == 1);
+-	caseconvert_function<StringToLower>(args.data[0], result, args.size());
++	caseconvert_function<false>(args.data[0], result, args.size());
++}
++
++ScalarFunction LowerFun::GetFunction() {
++	return ScalarFunction({SQLType::VARCHAR}, SQLType::VARCHAR, caseconvert_lower_function);
+ }
+ 
+ void LowerFun::RegisterFunction(BuiltinFunctions &set) {
+-	set.AddFunction(ScalarFunction("lower", {SQLType::VARCHAR}, SQLType::VARCHAR, caseconvert_lower_function));
++	set.AddFunction({"lower", "lcase"}, LowerFun::GetFunction());
+ }
+ 
+ void UpperFun::RegisterFunction(BuiltinFunctions &set) {
+-	set.AddFunction(ScalarFunction("upper", {SQLType::VARCHAR}, SQLType::VARCHAR, caseconvert_upper_function));
++	set.AddFunction({"upper", "ucase"}, ScalarFunction({SQLType::VARCHAR}, SQLType::VARCHAR, caseconvert_upper_function));
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/function/scalar/string/length.cpp b/src/function/scalar/string/length.cpp
+index af709e913565..d850d901abc1 100644
+--- a/src/function/scalar/string/length.cpp
++++ b/src/function/scalar/string/length.cpp
+@@ -2,26 +2,44 @@
+ 
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
++#include "utf8proc.hpp"
+ 
+ using namespace std;
+ 
+ namespace duckdb {
+ 
++// length returns the size in characters
+ struct StringLengthOperator {
+ 	template <class TA, class TR> static inline TR Operation(TA input) {
+-		int64_t length = 0;
+ 		auto input_data = input.GetData();
+ 		auto input_length = input.GetSize();
+ 		for (idx_t i = 0; i < input_length; i++) {
+-			length += (input_data[i] & 0xC0) != 0x80;
++			if (input_data[i] & 0x80) {
++				int64_t length = 0;
++				// non-ascii character: use grapheme iterator on remainder of string
++				utf8proc_grapheme_callback(input_data, input_length, [&](size_t start, size_t end) {
++					length++;
++					return true;
++				});
++				return length;
++			}
+ 		}
+-		return length;
++		return input_length;
++	}
++};
++
++// strlen returns the size in bytes
++struct StrLenOperator {
++	template <class TA, class TR> static inline TR Operation(TA input) {
++		return input.GetSize();
+ 	}
+ };
+ 
+ void LengthFun::RegisterFunction(BuiltinFunctions &set) {
+-	set.AddFunction(ScalarFunction("length", {SQLType::VARCHAR}, SQLType::BIGINT,
++	set.AddFunction({"length", "len"}, ScalarFunction({SQLType::VARCHAR}, SQLType::BIGINT,
+ 	                               ScalarFunction::UnaryFunction<string_t, int64_t, StringLengthOperator, true>));
++	set.AddFunction(ScalarFunction("strlen", {SQLType::VARCHAR}, SQLType::BIGINT,
++	                               ScalarFunction::UnaryFunction<string_t, int64_t, StrLenOperator, true>));
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/function/scalar/string/prefix.cpp b/src/function/scalar/string/prefix.cpp
+index b73a75087df6..1f95f08c1e0c 100644
+--- a/src/function/scalar/string/prefix.cpp
++++ b/src/function/scalar/string/prefix.cpp
+@@ -46,17 +46,14 @@ static bool prefix(const string_t &str, const string_t &pattern) {
+ 			}
+ 		}
+ 		// compare the rest of the prefix
+-		bool equal;
+-		uint32_t num_char_equals = string_t::PREFIX_LENGTH;
+ 		const char *str_data = str.GetData();
+ 		const char *patt_data = pattern.GetData();
+-
+ 		for (idx_t i = string_t::PREFIX_LENGTH; i < patt_length; ++i) {
+-			equal = (str_data[i] == patt_data[i]); // removed branch
+-			num_char_equals += equal;
++			if (str_data[i] != patt_data[i]) {
++				return false;
++			}
+ 		}
+-
+-		return (num_char_equals == patt_length);
++		return true;
+ 	}
+ }
+ 
+diff --git a/src/function/scalar/string/reverse.cpp b/src/function/scalar/string/reverse.cpp
+index 92749f048142..a17555978621 100644
+--- a/src/function/scalar/string/reverse.cpp
++++ b/src/function/scalar/string/reverse.cpp
+@@ -3,6 +3,7 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/common/vector_operations/unary_executor.hpp"
++#include "utf8proc.hpp"
+ 
+ #include <string.h>
+ 
+@@ -10,28 +11,24 @@ using namespace std;
+ 
+ namespace duckdb {
+ 
+-static void strreverse(const char *input, idx_t n, char *output) {
+-	idx_t bytes = 0;
+-
+-	output[n] = 0;
+-
+-	while (*input) {
+-		if (!(*input & 0x80)) { // !*input & 0b10000000
+-			bytes = 1;
+-		} else if ((*input & 0xe0) == 0xc0) { // (*input & 0b1110_0000 == 0b1100_0000)
+-			bytes = 2;
+-		} else if ((*input & 0xf0) == 0xe0) { // (*input & 0b1111_0000 == 0b1110_0000)
+-			bytes = 3;
+-		} else if ((*input & 0xf8) == 0xf0) { // (*input & 0b1111_1000 == 0b1111_0000)
+-			bytes = 4;
+-		} else {
+-			assert(false);
++//! Fast ASCII string reverse, returns false if the input data is not ascii
++static bool strreverse_ascii(const char *input, idx_t n, char *output) {
++	for (idx_t i = 0; i < n; i++) {
++		if (input[i] & 0x80) {
++			// non-ascii character
++			return false;
+ 		}
+-
+-		memcpy(&output[n - bytes], input, bytes);
+-		input += bytes;
+-		n -= bytes;
++		output[n - i - 1] = input[i];
+ 	}
++	return true;
++}
++
++//! Unicode string reverse using grapheme breakers
++static void strreverse_unicode(const char *input, idx_t n, char *output) {
++	utf8proc_grapheme_callback(input, n, [&](size_t start, size_t end) {
++		memcpy(output + n - end, input + start, end - start);
++		return true;
++	});
+ }
+ 
+ static void reverse_chunk_function(DataChunk &args, ExpressionState &state, Vector &result) {
+@@ -43,7 +40,10 @@ static void reverse_chunk_function(DataChunk &args, ExpressionState &state, Vect
+ 		auto input_length = input.GetSize();
+ 
+ 		auto target = StringVector::EmptyString(result, input_length);
+-		strreverse(input_data, input_length, target.GetData());
++		auto target_data = target.GetData();
++		if (!strreverse_ascii(input_data, input_length, target_data)) {
++			strreverse_unicode(input_data, input_length, target_data);
++		}
+ 		target.Finalize();
+ 		return target;
+ 	});
+diff --git a/src/function/scalar/string/strip_accents.cpp b/src/function/scalar/string/strip_accents.cpp
+new file mode 100644
+index 000000000000..48032dfffbe9
+--- /dev/null
++++ b/src/function/scalar/string/strip_accents.cpp
+@@ -0,0 +1,46 @@
++#include "duckdb/function/scalar/string_functions.hpp"
++
++#include "utf8proc.hpp"
++
++using namespace std;
++
++namespace duckdb {
++
++static bool is_ascii(const char *input, idx_t n) {
++	for (idx_t i = 0; i < n; i++) {
++		if (input[i] & 0x80) {
++			// non-ascii character
++			return false;
++		}
++	}
++	return true;
++}
++
++static void strip_accents_function(DataChunk &args, ExpressionState &state, Vector &result) {
++	assert(args.column_count() == 1);
++	assert(args.data[0].type == TypeId::VARCHAR);
++
++	UnaryExecutor::Execute<string_t, string_t, true>(args.data[0], result, args.size(), [&](string_t input) {
++		auto input_data = input.GetData();
++		auto input_length = input.GetSize();
++		if (is_ascii(input_data, input_length)) {
++			return input;
++		}
++		// non-ascii, perform collation
++		auto stripped = utf8proc_remove_accents((const utf8proc_uint8_t *) input_data);
++		auto result_str = StringVector::AddString(result, (const char*) stripped);
++		free(stripped);
++		return result_str;
++	});
++	StringVector::AddHeapReference(result, args.data[0]);
++}
++
++ScalarFunction StripAccentsFun::GetFunction() {
++	return ScalarFunction("strip_accents", {SQLType::VARCHAR}, SQLType::VARCHAR, strip_accents_function);
++}
++
++void StripAccentsFun::RegisterFunction(BuiltinFunctions &set) {
++	set.AddFunction(StripAccentsFun::GetFunction());
++}
++
++} // namespace duckdb
+diff --git a/src/function/scalar/string/substring.cpp b/src/function/scalar/string/substring.cpp
+index 835525e838f1..dbc8367b75da 100644
+--- a/src/function/scalar/string/substring.cpp
++++ b/src/function/scalar/string/substring.cpp
+@@ -3,47 +3,68 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/common/vector_operations/ternary_executor.hpp"
++#include "utf8proc.hpp"
+ 
+ using namespace std;
+ 
+ namespace duckdb {
+ 
+-static string_t substring_scalar_function(string_t input, int offset, int length, unique_ptr<char[]> &output,
+-                                          idx_t &current_len) {
++static string_t substring_ascii_only(Vector &result, const char *input_data, int offset, int length) {
++	auto result_string = StringVector::EmptyString(result, length);
++	auto result_data = result_string.GetData();
++	memcpy(result_data, input_data + offset, length);
++	result_string.Finalize();
++	return result_string;
++}
++
++static string_t substring_scalar_function(Vector &result, string_t input, int offset, int length,
++                                          unique_ptr<char[]> &output, idx_t &current_len) {
+ 	// reduce offset by one because SQL starts counting at 1
+ 	offset--;
+-
+ 	if (offset < 0 || length < 0) {
+ 		throw Exception("SUBSTRING cannot handle negative offsets");
+ 	}
++	auto input_data = input.GetData();
++	auto input_size = input.GetSize();
+ 
+-	idx_t required_len = input.GetSize() + 1;
++	// check if there is any non-ascii
++	bool ascii_only = true;
++	int ascii_end = std::min(offset + length + 1, (int)input_size);
++	for (int i = 0; i < ascii_end; i++) {
++		if (input_data[i] & 0x80) {
++			ascii_only = false;
++			break;
++		}
++	}
++	if (ascii_only) {
++		// ascii only
++		length = std::min(offset + length, (int)input_size) - offset;
++		return substring_ascii_only(result, input_data, offset, length);
++	}
++
++	// size is at most the input size: alloc it
++	idx_t required_len = input_size + 1;
+ 	if (required_len > current_len) {
+ 		// need a resize
+ 		current_len = required_len;
+ 		output = unique_ptr<char[]>{new char[required_len]};
+ 	}
+ 
+-	// UTF8 chars can use more than one byte
+-	idx_t input_char_offset = 0;
+-	idx_t input_byte_offset = 0;
+-	idx_t output_byte_offset = 0;
+-
+-	auto input_string = input.GetData();
+-
+-	while (input_string[input_byte_offset]) {
+-		char b = input_string[input_byte_offset++];
+-		input_char_offset += (b & 0xC0) != 0x80;
+-		if (input_char_offset > (idx_t)(offset + length)) {
+-			break;
+-		}
+-		if (input_char_offset > (idx_t)offset) {
+-			output[output_byte_offset++] = b;
++	// use grapheme iterator to iterate over the characters
++	int current_offset = 0;
++	int output_size = 0;
++	utf8proc_grapheme_callback(input_data, input_size, [&](size_t start, size_t end) {
++		if (current_offset >= offset) {
++			// this character belongs to the output: copy it there
++			memcpy(output.get() + output_size, input_data + start, end - start);
++			output_size += end - start;
+ 		}
+-	}
+-	// terminate output
+-	output[output_byte_offset] = '\0';
+-	return string_t(output.get(), output_byte_offset);
++		current_offset++;
++		// stop iterating after we have exceeded the required characters
++		return current_offset < offset + length;
++	});
++	output[output_size] = '\0';
++	return StringVector::AddString(result, output.get(), output_size);
+ }
+ 
+ static void substring_function(DataChunk &args, ExpressionState &state, Vector &result) {
+@@ -58,17 +79,12 @@ static void substring_function(DataChunk &args, ExpressionState &state, Vector &
+ 	TernaryExecutor::Execute<string_t, int, int, string_t>(
+ 	    input_vector, offset_vector, length_vector, result, args.size(),
+ 	    [&](string_t input_string, int offset, int length) {
+-		    return StringVector::AddString(
+-		        result, substring_scalar_function(input_string, offset, length, output, current_len));
++		    return substring_scalar_function(result, input_string, offset, length, output, current_len);
+ 	    });
+ }
+ 
+ void SubstringFun::RegisterFunction(BuiltinFunctions &set) {
+-	set.AddFunction(ScalarFunction("substring",       // name of function
+-	                               {SQLType::VARCHAR, // argument list
+-	                                SQLType::INTEGER, SQLType::INTEGER},
+-	                               SQLType::VARCHAR,     // return type
+-	                               substring_function)); // pointer to function implementation
++	set.AddFunction({"substring", "substr"}, ScalarFunction({SQLType::VARCHAR, SQLType::INTEGER, SQLType::INTEGER}, SQLType::VARCHAR, substring_function));
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/function/scalar/string_functions.cpp b/src/function/scalar/string_functions.cpp
+index 7c21b9a1a12f..d76cec2e9635 100644
+--- a/src/function/scalar/string_functions.cpp
++++ b/src/function/scalar/string_functions.cpp
+@@ -8,6 +8,7 @@ void BuiltinFunctions::RegisterStringFunctions() {
+ 	Register<ReverseFun>();
+ 	Register<LowerFun>();
+ 	Register<UpperFun>();
++	Register<StripAccentsFun>();
+ 	Register<ConcatFun>();
+ 	Register<LengthFun>();
+ 	Register<LikeFun>();
+diff --git a/src/include/duckdb/common/enums/expression_type.hpp b/src/include/duckdb/common/enums/expression_type.hpp
+index 82988cdcda86..9251536e341d 100644
+--- a/src/include/duckdb/common/enums/expression_type.hpp
++++ b/src/include/duckdb/common/enums/expression_type.hpp
+@@ -132,7 +132,8 @@ enum class ExpressionType : uint8_t {
+ 	COMMON_SUBEXPRESSION = 226,
+ 	BOUND_REF = 227,
+ 	BOUND_COLUMN_REF = 228,
+-	BOUND_UNNEST = 229
++	BOUND_UNNEST = 229,
++	COLLATE = 230
+ };
+ 
+ //===--------------------------------------------------------------------===//
+@@ -158,6 +159,7 @@ enum class ExpressionClass : uint8_t {
+ 	SUBQUERY = 13,
+ 	WINDOW = 14,
+ 	PARAMETER = 15,
++	COLLATE = 16,
+ 	//===--------------------------------------------------------------------===//
+ 	// Bound Expressions
+ 	//===--------------------------------------------------------------------===//
+diff --git a/src/include/duckdb/common/types.hpp b/src/include/duckdb/common/types.hpp
+index fed224333049..b638b5c335f9 100644
+--- a/src/include/duckdb/common/types.hpp
++++ b/src/include/duckdb/common/types.hpp
+@@ -169,6 +169,14 @@ enum class TypeId : uint8_t {
+ //===--------------------------------------------------------------------===//
+ // SQL Types
+ //===--------------------------------------------------------------------===//
++enum class CollationType : uint8_t {
++	COLLATE_DEFAULT = 0,
++	COLLATE_NONE = 1,
++	COLLATE_NOCASE = 2,
++	COLLATE_NOACCENT = 3,
++	COLLATE_NOCASE_NOACCENT = 4
++};
++
+ enum class SQLTypeId : uint8_t {
+ 	INVALID = 0,
+ 	SQLNULL = 1, /* NULL type, used for constant NULL */
+@@ -198,12 +206,13 @@ struct SQLType {
+ 	SQLTypeId id;
+ 	uint16_t width;
+ 	uint8_t scale;
++	CollationType collation;
+ 
+ 	// TODO serialize this
+ 	child_list_t<SQLType> child_type;
+ 
+-	SQLType(SQLTypeId id = SQLTypeId::INVALID, uint16_t width = 0, uint8_t scale = 0)
+-	    : id(id), width(width), scale(scale) {
++	SQLType(SQLTypeId id = SQLTypeId::INVALID, uint16_t width = 0, uint8_t scale = 0, CollationType collation = CollationType::COLLATE_DEFAULT)
++	    : id(id), width(width), scale(scale), collation(collation) {
+ 	}
+ 
+ 	bool operator==(const SQLType &rhs) const {
+@@ -252,6 +261,8 @@ string SQLTypeToString(SQLType type);
+ SQLType MaxSQLType(SQLType left, SQLType right);
+ SQLType TransformStringToSQLType(string str);
+ 
++CollationType ParseCollation(string collation, CollationType current = CollationType::COLLATE_DEFAULT);
++
+ //! Gets the internal type associated with the given SQL type
+ TypeId GetInternalType(SQLType type);
+ //! Returns the "simplest" SQL type corresponding to the given type id (e.g. TypeId::INT32 -> SQLTypeId::INTEGER)
+diff --git a/src/include/duckdb/function/function.hpp b/src/include/duckdb/function/function.hpp
+index 9f9d3a18077b..633c4a7b1c80 100644
+--- a/src/include/duckdb/function/function.hpp
++++ b/src/include/duckdb/function/function.hpp
+@@ -108,6 +108,7 @@ class BuiltinFunctions {
+ 	void AddFunction(AggregateFunction function);
+ 	void AddFunction(ScalarFunctionSet set);
+ 	void AddFunction(ScalarFunction function);
++	void AddFunction(vector<string> names, ScalarFunction function);
+ 	void AddFunction(TableFunction function);
+ 
+ private:
+diff --git a/src/include/duckdb/function/scalar/string_functions.hpp b/src/include/duckdb/function/scalar/string_functions.hpp
+index 48404f9db925..ab714e7aee09 100644
+--- a/src/include/duckdb/function/scalar/string_functions.hpp
++++ b/src/include/duckdb/function/scalar/string_functions.hpp
+@@ -22,6 +22,7 @@ struct ReverseFun {
+ };
+ 
+ struct LowerFun {
++	static ScalarFunction GetFunction();
+ 	static void RegisterFunction(BuiltinFunctions &set);
+ };
+ 
+@@ -29,6 +30,11 @@ struct UpperFun {
+ 	static void RegisterFunction(BuiltinFunctions &set);
+ };
+ 
++struct StripAccentsFun {
++	static ScalarFunction GetFunction();
++	static void RegisterFunction(BuiltinFunctions &set);
++};
++
+ struct ConcatFun {
+ 	static void RegisterFunction(BuiltinFunctions &set);
+ };
+diff --git a/src/include/duckdb/main/database.hpp b/src/include/duckdb/main/database.hpp
+index 398401858e2b..047e3c1088e6 100644
+--- a/src/include/duckdb/main/database.hpp
++++ b/src/include/duckdb/main/database.hpp
+@@ -43,6 +43,8 @@ struct DBConfig {
+ 	bool use_temporary_directory = true;
+ 	//! Directory to store temporary structures that do not fit in memory
+ 	string temporary_directory;
++	//! The collation type of the database
++	CollationType collation = CollationType::COLLATE_NONE;
+ 
+ private:
+ 	// FIXME: don't set this as a user: used internally (only for now)
+@@ -71,6 +73,7 @@ class DuckDB {
+ 	idx_t checkpoint_wal_size;
+ 	idx_t maximum_memory;
+ 	string temporary_directory;
++	CollationType collation;
+ 
+ private:
+ 	void Configure(DBConfig &config);
+diff --git a/src/include/duckdb/parser/expression/collate_expression.hpp b/src/include/duckdb/parser/expression/collate_expression.hpp
+new file mode 100644
+index 000000000000..7403c61ff3c5
+--- /dev/null
++++ b/src/include/duckdb/parser/expression/collate_expression.hpp
+@@ -0,0 +1,35 @@
++//===----------------------------------------------------------------------===//
++//                         DuckDB
++//
++// duckdb/parser/expression/collate_expression.hpp
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb/parser/parsed_expression.hpp"
++
++namespace duckdb {
++
++//! CollateExpression represents a COLLATE statement
++class CollateExpression : public ParsedExpression {
++public:
++	CollateExpression(CollationType collate, unique_ptr<ParsedExpression> child);
++
++	//! The child of the cast expression
++	unique_ptr<ParsedExpression> child;
++	//! The collation clause
++	CollationType collation;
++
++public:
++	string ToString() const override;
++
++	static bool Equals(const CollateExpression *a, const CollateExpression *b);
++
++	unique_ptr<ParsedExpression> Copy() const override;
++
++	void Serialize(Serializer &serializer) override;
++	static unique_ptr<ParsedExpression> Deserialize(ExpressionType type, Deserializer &source);
++};
++} // namespace duckdb
+diff --git a/src/include/duckdb/parser/expression/list.hpp b/src/include/duckdb/parser/expression/list.hpp
+index 275df01e960f..676948b1b476 100644
+--- a/src/include/duckdb/parser/expression/list.hpp
++++ b/src/include/duckdb/parser/expression/list.hpp
+@@ -1,6 +1,7 @@
+ #include "duckdb/parser/expression/bound_expression.hpp"
+ #include "duckdb/parser/expression/case_expression.hpp"
+ #include "duckdb/parser/expression/cast_expression.hpp"
++#include "duckdb/parser/expression/collate_expression.hpp"
+ #include "duckdb/parser/expression/columnref_expression.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/parser/expression/conjunction_expression.hpp"
+diff --git a/src/include/duckdb/parser/tokens.hpp b/src/include/duckdb/parser/tokens.hpp
+index 8163e8f89155..da281406f0ba 100644
+--- a/src/include/duckdb/parser/tokens.hpp
++++ b/src/include/duckdb/parser/tokens.hpp
+@@ -44,9 +44,9 @@ class RecursiveCTENode;
+ //===--------------------------------------------------------------------===//
+ class ParsedExpression;
+ 
+-class BetweenExpression;
+ class CaseExpression;
+ class CastExpression;
++class CollateExpression;
+ class ColumnRefExpression;
+ class ComparisonExpression;
+ class ConjunctionExpression;
+diff --git a/src/include/duckdb/parser/transformer.hpp b/src/include/duckdb/parser/transformer.hpp
+index 178c4e835c7f..f6e02cd39ece 100644
+--- a/src/include/duckdb/parser/transformer.hpp
++++ b/src/include/duckdb/parser/transformer.hpp
+@@ -144,6 +144,13 @@ class Transformer {
+ 
+ 	unique_ptr<Constraint> TransformConstraint(PGListCell *cell, ColumnDefinition &column, idx_t index);
+ 
++	//===--------------------------------------------------------------------===//
++	// Collation transform
++	//===--------------------------------------------------------------------===//
++	unique_ptr<ParsedExpression> TransformCollateExpr(PGCollateClause *collate);
++
++	CollationType TransformCollation(PGCollateClause *collate);
++
+ 	//===--------------------------------------------------------------------===//
+ 	// Helpers
+ 	//===--------------------------------------------------------------------===//
+diff --git a/src/include/duckdb/planner/binder.hpp b/src/include/duckdb/planner/binder.hpp
+index 61d356dcfcc6..9dccd4354637 100644
+--- a/src/include/duckdb/planner/binder.hpp
++++ b/src/include/duckdb/planner/binder.hpp
+@@ -173,7 +173,7 @@ class Binder {
+ 	BoundStatement BindCopyFrom(CopyStatement &stmt);
+ 
+ 	void BindModifiers(OrderBinder &order_binder, QueryNode &statement, BoundQueryNode &result);
+-	void BindModifierTypes(BoundQueryNode &result, const vector<TypeId> &types, idx_t projection_index);
++	void BindModifierTypes(BoundQueryNode &result, const vector<SQLType> &sql_types, idx_t projection_index);
+ 	unique_ptr<BoundResultModifier> BindLimit(LimitModifier &limit_mod);
+ 	unique_ptr<Expression> BindFilter(unique_ptr<ParsedExpression> condition);
+ 	unique_ptr<Expression> BindOrderExpression(OrderBinder &order_binder, unique_ptr<ParsedExpression> expr);
+diff --git a/src/include/duckdb/planner/expression/bound_function_expression.hpp b/src/include/duckdb/planner/expression/bound_function_expression.hpp
+index e5f800ef9c49..dc28a52a0848 100644
+--- a/src/include/duckdb/planner/expression/bound_function_expression.hpp
++++ b/src/include/duckdb/planner/expression/bound_function_expression.hpp
+@@ -17,7 +17,7 @@ class ScalarFunctionCatalogEntry;
+ //! Represents a function call that has been bound to a base function
+ class BoundFunctionExpression : public Expression {
+ public:
+-	BoundFunctionExpression(TypeId return_type, ScalarFunction bound_function, bool is_operator);
++	BoundFunctionExpression(TypeId return_type, ScalarFunction bound_function, bool is_operator = false);
+ 
+ 	// The bound function expression
+ 	ScalarFunction function;
+diff --git a/src/include/duckdb/planner/expression_binder.hpp b/src/include/duckdb/planner/expression_binder.hpp
+index f2d665757f3c..d2f4b0acc92f 100644
+--- a/src/include/duckdb/planner/expression_binder.hpp
++++ b/src/include/duckdb/planner/expression_binder.hpp
+@@ -56,6 +56,7 @@ class ExpressionBinder {
+ 
+ 	// Bind table names to ColumnRefExpressions
+ 	static void BindTableNames(Binder &binder, ParsedExpression &expr);
++	static unique_ptr<Expression> PushCollation(ClientContext &context, unique_ptr<Expression> source, CollationType collation);
+ 
+ 	bool BindCorrelatedColumns(unique_ptr<ParsedExpression> &expr);
+ 
+@@ -67,6 +68,7 @@ class ExpressionBinder {
+ 	virtual BindResult BindExpression(ParsedExpression &expr, idx_t depth, bool root_expression = false);
+ 
+ 	BindResult BindExpression(CaseExpression &expr, idx_t depth);
++	BindResult BindExpression(CollateExpression &expr, idx_t depth);
+ 	BindResult BindExpression(CastExpression &expr, idx_t depth);
+ 	BindResult BindExpression(ColumnRefExpression &expr, idx_t depth);
+ 	BindResult BindExpression(ComparisonExpression &expr, idx_t depth);
+diff --git a/src/main/database.cpp b/src/main/database.cpp
+index 3d2ec4714578..566bc15383ef 100644
+--- a/src/main/database.cpp
++++ b/src/main/database.cpp
+@@ -65,4 +65,8 @@ void DuckDB::Configure(DBConfig &config) {
+ 	use_direct_io = config.use_direct_io;
+ 	maximum_memory = config.maximum_memory;
+ 	temporary_directory = config.temporary_directory;
++	collation = config.collation;
++	if (config.collation == CollationType::COLLATE_DEFAULT) {
++		collation = CollationType::COLLATE_NONE;
++	}
+ }
+diff --git a/src/parser/expression/CMakeLists.txt b/src/parser/expression/CMakeLists.txt
+index 2a003ec6fcf8..83c1be282f6a 100644
+--- a/src/parser/expression/CMakeLists.txt
++++ b/src/parser/expression/CMakeLists.txt
+@@ -2,6 +2,7 @@ add_library_unity(duckdb_expression
+                   OBJECT
+                   case_expression.cpp
+                   cast_expression.cpp
++                  collate_expression.cpp
+                   conjunction_expression.cpp
+                   columnref_expression.cpp
+                   comparison_expression.cpp
+diff --git a/src/parser/expression/collate_expression.cpp b/src/parser/expression/collate_expression.cpp
+new file mode 100644
+index 000000000000..c250c3946c86
+--- /dev/null
++++ b/src/parser/expression/collate_expression.cpp
+@@ -0,0 +1,46 @@
++#include "duckdb/parser/expression/collate_expression.hpp"
++
++#include "duckdb/common/exception.hpp"
++#include "duckdb/common/serializer.hpp"
++
++namespace duckdb {
++
++CollateExpression::CollateExpression(CollationType collation, unique_ptr<ParsedExpression> child)
++    : ParsedExpression(ExpressionType::COLLATE, ExpressionClass::COLLATE), collation(collation) {
++	assert(child);
++	this->child = move(child);
++}
++
++string CollateExpression::ToString() const {
++	return "COLLATE(" + child->ToString() + ")";
++}
++
++bool CollateExpression::Equals(const CollateExpression *a, const CollateExpression *b) {
++	if (!a->child->Equals(b->child.get())) {
++		return false;
++	}
++	if (a->collation != b->collation) {
++		return false;
++	}
++	return true;
++}
++
++unique_ptr<ParsedExpression> CollateExpression::Copy() const {
++	auto copy = make_unique<CollateExpression>(collation, child->Copy());
++	copy->CopyProperties(*this);
++	return move(copy);
++}
++
++void CollateExpression::Serialize(Serializer &serializer) {
++	ParsedExpression::Serialize(serializer);
++	child->Serialize(serializer);
++	serializer.Write<CollationType>(collation);
++}
++
++unique_ptr<ParsedExpression> CollateExpression::Deserialize(ExpressionType type, Deserializer &source) {
++	auto child = ParsedExpression::Deserialize(source);
++	auto collation = source.Read<CollationType>();
++	return make_unique_base<ParsedExpression, CollateExpression>(collation, move(child));
++}
++
++}
+diff --git a/src/parser/parsed_expression.cpp b/src/parser/parsed_expression.cpp
+index 837e86fe78aa..6e0cc206c499 100644
+--- a/src/parser/parsed_expression.cpp
++++ b/src/parser/parsed_expression.cpp
+@@ -59,6 +59,8 @@ bool ParsedExpression::Equals(const BaseExpression *other) const {
+ 		return CaseExpression::Equals((CaseExpression *)this, (CaseExpression *)other);
+ 	case ExpressionClass::CAST:
+ 		return CastExpression::Equals((CastExpression *)this, (CastExpression *)other);
++	case ExpressionClass::COLLATE:
++		return CollateExpression::Equals((CollateExpression *)this, (CollateExpression *)other);
+ 	case ExpressionClass::COLUMN_REF:
+ 		return ColumnRefExpression::Equals((ColumnRefExpression *)this, (ColumnRefExpression *)other);
+ 	case ExpressionClass::COMPARISON:
+@@ -113,6 +115,9 @@ unique_ptr<ParsedExpression> ParsedExpression::Deserialize(Deserializer &source)
+ 	case ExpressionClass::CAST:
+ 		result = CastExpression::Deserialize(type, source);
+ 		break;
++	case ExpressionClass::COLLATE:
++		result = CollateExpression::Deserialize(type, source);
++		break;
+ 	case ExpressionClass::COLUMN_REF:
+ 		result = ColumnRefExpression::Deserialize(type, source);
+ 		break;
+diff --git a/src/parser/parsed_expression_iterator.cpp b/src/parser/parsed_expression_iterator.cpp
+index fe4356f2ad79..b6717e01e37e 100644
+--- a/src/parser/parsed_expression_iterator.cpp
++++ b/src/parser/parsed_expression_iterator.cpp
+@@ -20,6 +20,11 @@ void ParsedExpressionIterator::EnumerateChildren(const ParsedExpression &expr,
+ 		callback(*cast_expr.child);
+ 		break;
+ 	}
++	case ExpressionClass::COLLATE: {
++		auto &cast_expr = (const CollateExpression &)expr;
++		callback(*cast_expr.child);
++		break;
++	}
+ 	case ExpressionClass::COMPARISON: {
+ 		auto &comp_expr = (const ComparisonExpression &)expr;
+ 		callback(*comp_expr.left);
+diff --git a/src/parser/transform/expression/transform_expression.cpp b/src/parser/transform/expression/transform_expression.cpp
+index eb86a1028488..eb9142fc96de 100644
+--- a/src/parser/transform/expression/transform_expression.cpp
++++ b/src/parser/transform/expression/transform_expression.cpp
+@@ -66,7 +66,8 @@ unique_ptr<ParsedExpression> Transformer::TransformExpression(PGNode *node) {
+ 		return TransformSQLValueFunction(reinterpret_cast<PGSQLValueFunction *>(node));
+ 	case T_PGSetToDefault:
+ 		return make_unique<DefaultExpression>();
+-
++	case T_PGCollateClause:
++		return TransformCollateExpr(reinterpret_cast<PGCollateClause*>(node));
+ 	default:
+ 		throw NotImplementedException("Expr of type %d not implemented
+", (int)node->type);
+ 	}
+diff --git a/src/parser/transform/expression/transform_operator.cpp b/src/parser/transform/expression/transform_operator.cpp
+index 13ee2dc71054..09f000e67ea4 100644
+--- a/src/parser/transform/expression/transform_operator.cpp
++++ b/src/parser/transform/expression/transform_operator.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/parser/expression/case_expression.hpp"
++#include "duckdb/parser/expression/cast_expression.hpp"
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/parser/expression/conjunction_expression.hpp"
+ #include "duckdb/parser/expression/constant_expression.hpp"
+@@ -172,7 +173,6 @@ unique_ptr<ParsedExpression> Transformer::TransformAExpr(PGAExpr *root) {
+ 	default:
+ 		break;
+ 	}
+-
+ 	auto left_expr = TransformExpression(root->lexpr);
+ 	auto right_expr = TransformExpression(root->rexpr);
+ 
+diff --git a/src/parser/transform/statement/transform_create_table.cpp b/src/parser/transform/statement/transform_create_table.cpp
+index 9b3a2af5285e..b40b50c24f62 100644
+--- a/src/parser/transform/statement/transform_create_table.cpp
++++ b/src/parser/transform/statement/transform_create_table.cpp
+@@ -2,10 +2,33 @@
+ #include "duckdb/parser/parsed_data/create_table_info.hpp"
+ #include "duckdb/parser/transformer.hpp"
+ #include "duckdb/parser/constraint.hpp"
++#include "duckdb/parser/expression/collate_expression.hpp"
+ 
+ using namespace duckdb;
+ using namespace std;
+ 
++CollationType Transformer::TransformCollation(PGCollateClause *collate) {
++	if (!collate) {
++		return CollationType::COLLATE_DEFAULT;
++	}
++	CollationType collation = CollationType::COLLATE_DEFAULT;
++	for (auto c = collate->collname->head; c != NULL; c = lnext(c)) {
++		auto pgvalue = (PGValue*) c->data.ptr_value;
++		if (pgvalue->type != T_PGString) {
++			throw ParserException("Expected a string as collation type!");
++		}
++		auto collation_argument = string(pgvalue->val.str);
++		collation = ParseCollation(collation_argument, collation);
++	}
++	return collation;
++}
++
++unique_ptr<ParsedExpression> Transformer::TransformCollateExpr(PGCollateClause *collate) {
++	auto child = TransformExpression(collate->arg);
++	auto collation = TransformCollation(collate);
++	return make_unique<CollateExpression>(collation, move(child));
++}
++
+ unique_ptr<CreateStatement> Transformer::TransformCreateTable(PGNode *node) {
+ 	auto stmt = reinterpret_cast<PGCreateStmt *>(node);
+ 	assert(stmt);
+@@ -39,6 +62,8 @@ unique_ptr<CreateStatement> Transformer::TransformCreateTable(PGNode *node) {
+ 		case T_PGColumnDef: {
+ 			auto cdef = (PGColumnDef *)c->data.ptr_value;
+ 			SQLType target_type = TransformTypeName(cdef->typeName);
++			target_type.collation = TransformCollation(cdef->collClause);
++
+ 			auto centry = ColumnDefinition(cdef->colname, target_type);
+ 
+ 			if (cdef->constraints) {
+diff --git a/src/planner/binder/expression/CMakeLists.txt b/src/planner/binder/expression/CMakeLists.txt
+index 4ed4f7a264ef..9bf2d90415b1 100644
+--- a/src/planner/binder/expression/CMakeLists.txt
++++ b/src/planner/binder/expression/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_library_unity(duckdb_bind_expression
+                   bind_aggregate_expression.cpp
+                   bind_case_expression.cpp
+                   bind_cast_expression.cpp
++                  bind_collate_expression.cpp
+                   bind_columnref_expression.cpp
+                   bind_comparison_expression.cpp
+                   bind_conjunction_expression.cpp
+diff --git a/src/planner/binder/expression/bind_collate_expression.cpp b/src/planner/binder/expression/bind_collate_expression.cpp
+new file mode 100644
+index 000000000000..b19784961f78
+--- /dev/null
++++ b/src/planner/binder/expression/bind_collate_expression.cpp
+@@ -0,0 +1,19 @@
++#include "duckdb/parser/expression/collate_expression.hpp"
++#include "duckdb/planner/expression_binder.hpp"
++
++using namespace duckdb;
++using namespace std;
++
++BindResult ExpressionBinder::BindExpression(CollateExpression &expr, idx_t depth) {
++	// first try to bind the child of the cast expression
++	string error = Bind(&expr.child, depth);
++	if (!error.empty()) {
++		return BindResult(error);
++	}
++	auto &child = (BoundExpression &)*expr.child;
++	if (child.sql_type.id != SQLTypeId::VARCHAR) {
++		throw BinderException("collations are only supported for type varchar");
++	}
++	child.sql_type.collation = expr.collation;
++	return BindResult(move(child.expr), child.sql_type);
++}
+diff --git a/src/planner/binder/expression/bind_comparison_expression.cpp b/src/planner/binder/expression/bind_comparison_expression.cpp
+index d38b12b5b9d5..4aa78dbfe50c 100644
+--- a/src/planner/binder/expression/bind_comparison_expression.cpp
++++ b/src/planner/binder/expression/bind_comparison_expression.cpp
+@@ -1,11 +1,52 @@
+ #include "duckdb/parser/expression/comparison_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
+ #include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/expression_binder.hpp"
+ 
++#include "duckdb/function/scalar/string_functions.hpp"
++
++#include "duckdb/main/client_context.hpp"
++#include "duckdb/main/database.hpp"
++
+ using namespace duckdb;
+ using namespace std;
+ 
++unique_ptr<Expression> ExpressionBinder::PushCollation(ClientContext &context, unique_ptr<Expression> source, CollationType collation) {
++	// replace default collation with system collation
++	if (collation == CollationType::COLLATE_DEFAULT) {
++		collation = context.db.collation;
++	}
++	switch(collation) {
++	case CollationType::COLLATE_NONE: {
++		return move(source);
++	}
++	case CollationType::COLLATE_NOCASE: {
++		// push lower
++		auto function = make_unique<BoundFunctionExpression>(TypeId::VARCHAR, LowerFun::GetFunction());
++		function->children.push_back(move(source));
++		function->arguments.push_back({SQLType::VARCHAR});
++		function->sql_return_type = SQLType::VARCHAR;
++		return move(function);
++	}
++	case CollationType::COLLATE_NOACCENT: {
++		// push strip_accents
++		auto function = make_unique<BoundFunctionExpression>(TypeId::VARCHAR, StripAccentsFun::GetFunction());
++		function->children.push_back(move(source));
++		function->arguments.push_back({SQLType::VARCHAR});
++		function->sql_return_type = SQLType::VARCHAR;
++		return move(function);
++	}
++	case CollationType::COLLATE_NOCASE_NOACCENT: {
++		// push both NOCASE and NOACCENT
++		auto expr = PushCollation(context, move(source), CollationType::COLLATE_NOCASE);
++		return PushCollation(context, move(expr), CollationType::COLLATE_NOACCENT);
++	}
++	default:
++		throw BinderException("Unsupported collation type in binder");
++	}
++}
++
+ BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t depth) {
+ 	// first try to bind the children of the case expression
+ 	string error;
+@@ -24,9 +65,15 @@ BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t de
+ 		// for comparison with strings, we prefer to bind to the numeric types
+ 		if (left.sql_type.IsNumeric()) {
+ 			input_type = left.sql_type;
+-		}
+-		if (right.sql_type.IsNumeric()) {
++		} else if (right.sql_type.IsNumeric()) {
+ 			input_type = right.sql_type;
++		} else {
++			// else: check if collations are compatible
++			if (left.sql_type.collation != CollationType::COLLATE_DEFAULT &&
++			    right.sql_type.collation != CollationType::COLLATE_DEFAULT &&
++				left.sql_type.collation != right.sql_type.collation) {
++				throw BinderException("Cannot combine types with different collation!");
++			}
+ 		}
+ 	}
+ 	if (input_type.id == SQLTypeId::UNKNOWN) {
+@@ -35,6 +82,11 @@ BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t de
+ 	// add casts (if necessary)
+ 	left.expr = BoundCastExpression::AddCastToType(move(left.expr), left.sql_type, input_type);
+ 	right.expr = BoundCastExpression::AddCastToType(move(right.expr), right.sql_type, input_type);
++	if (input_type.id == SQLTypeId::VARCHAR && input_type.collation != CollationType::COLLATE_NONE) {
++		// handle collation
++		left.expr = PushCollation(context, move(left.expr), input_type.collation);
++		right.expr = PushCollation(context, move(right.expr), input_type.collation);
++	}
+ 	// now create the bound comparison expression
+ 	return BindResult(make_unique<BoundComparisonExpression>(expr.type, move(left.expr), move(right.expr)),
+ 	                  SQLType(SQLTypeId::BOOLEAN));
+diff --git a/src/planner/binder/query_node/bind_select_node.cpp b/src/planner/binder/query_node/bind_select_node.cpp
+index 5fb733ddae9f..d1d10c6d5192 100644
+--- a/src/planner/binder/query_node/bind_select_node.cpp
++++ b/src/planner/binder/query_node/bind_select_node.cpp
+@@ -109,16 +109,16 @@ void Binder::BindModifiers(OrderBinder &order_binder, QueryNode &statement, Boun
+ 	}
+ }
+ 
+-void Binder::BindModifierTypes(BoundQueryNode &result, const vector<TypeId> &types, idx_t projection_index) {
++void Binder::BindModifierTypes(BoundQueryNode &result, const vector<SQLType> &sql_types, idx_t projection_index) {
+ 	for (auto &bound_mod : result.modifiers) {
+ 		switch (bound_mod->type) {
+ 		case ResultModifierType::DISTINCT_MODIFIER: {
+ 			auto &distinct = (BoundDistinctModifier &)*bound_mod;
+ 			if (distinct.target_distincts.size() == 0) {
+ 				// DISTINCT without a target: push references to the standard select list
+-				for (idx_t i = 0; i < types.size(); i++) {
++				for (idx_t i = 0; i < sql_types.size(); i++) {
+ 					distinct.target_distincts.push_back(
+-					    make_unique<BoundColumnRefExpression>(types[i], ColumnBinding(projection_index, i)));
++					    make_unique<BoundColumnRefExpression>(GetInternalType(sql_types[i]), ColumnBinding(projection_index, i)));
+ 				}
+ 			} else {
+ 				// DISTINCT with target list: set types
+@@ -129,8 +129,15 @@ void Binder::BindModifierTypes(BoundQueryNode &result, const vector<TypeId> &typ
+ 					if (bound_colref.binding.column_index == INVALID_INDEX) {
+ 						throw BinderException("Ambiguous name in DISTINCT ON!");
+ 					}
+-					assert(bound_colref.binding.column_index < types.size());
+-					bound_colref.return_type = types[bound_colref.binding.column_index];
++					assert(bound_colref.binding.column_index < sql_types.size());
++					bound_colref.return_type = GetInternalType(sql_types[bound_colref.binding.column_index]);
++				}
++			}
++			for(idx_t i = 0; i < distinct.target_distincts.size(); i++) {
++				auto &bound_colref = (BoundColumnRefExpression &)*distinct.target_distincts[i];
++				auto sql_type = sql_types[bound_colref.binding.column_index];
++				if (sql_type.id == SQLTypeId::VARCHAR) {
++					distinct.target_distincts[i] = ExpressionBinder::PushCollation(context, move(distinct.target_distincts[i]), sql_type.collation);
+ 				}
+ 			}
+ 			break;
+@@ -144,8 +151,12 @@ void Binder::BindModifierTypes(BoundQueryNode &result, const vector<TypeId> &typ
+ 				if (bound_colref.binding.column_index == INVALID_INDEX) {
+ 					throw BinderException("Ambiguous name in ORDER BY!");
+ 				}
+-				assert(bound_colref.binding.column_index < types.size());
+-				bound_colref.return_type = types[bound_colref.binding.column_index];
++				assert(bound_colref.binding.column_index < sql_types.size());
++				auto sql_type = sql_types[bound_colref.binding.column_index];
++				bound_colref.return_type = GetInternalType(sql_types[bound_colref.binding.column_index]);
++				if (sql_type.id == SQLTypeId::VARCHAR) {
++					order.orders[i].expression = ExpressionBinder::PushCollation(context, move(order.orders[i].expression), sql_type.collation);
++				}
+ 			}
+ 			break;
+ 		}
+@@ -250,7 +261,7 @@ unique_ptr<BoundQueryNode> Binder::BindNode(SelectNode &statement) {
+ 
+ 	// after that, we bind to the SELECT list
+ 	SelectBinder select_binder(*this, context, *result, info);
+-	vector<TypeId> internal_types;
++	vector<SQLType> internal_sql_types;
+ 	for (idx_t i = 0; i < statement.select_list.size(); i++) {
+ 		SQLType result_type;
+ 		auto expr = select_binder.Bind(statement.select_list[i], &result_type);
+@@ -270,7 +281,7 @@ unique_ptr<BoundQueryNode> Binder::BindNode(SelectNode &statement) {
+ 		if (i < result->column_count) {
+ 			result->types.push_back(result_type);
+ 		}
+-		internal_types.push_back(GetInternalType(result_type));
++		internal_sql_types.push_back(result_type);
+ 		if (statement.aggregate_handling == AggregateHandling::FORCE_AGGREGATES) {
+ 			select_binder.ResetBindings();
+ 		}
+@@ -292,7 +303,7 @@ unique_ptr<BoundQueryNode> Binder::BindNode(SelectNode &statement) {
+ 	}
+ 
+ 	// now that the SELECT list is bound, we set the types of DISTINCT/ORDER BY expressions
+-	BindModifierTypes(*result, internal_types, result->projection_index);
++	BindModifierTypes(*result, internal_sql_types, result->projection_index);
+ 	return move(result);
+ }
+ 
+diff --git a/src/planner/binder/query_node/bind_setop_node.cpp b/src/planner/binder/query_node/bind_setop_node.cpp
+index ce123020c0d9..8a318d624b91 100644
+--- a/src/planner/binder/query_node/bind_setop_node.cpp
++++ b/src/planner/binder/query_node/bind_setop_node.cpp
+@@ -104,15 +104,13 @@ unique_ptr<BoundQueryNode> Binder::BindNode(SetOperationNode &statement) {
+ 	}
+ 
+ 	// figure out the types of the setop result by picking the max of both
+-	vector<TypeId> internal_types;
+ 	for (idx_t i = 0; i < result->left->types.size(); i++) {
+ 		auto result_type = MaxSQLType(result->left->types[i], result->right->types[i]);
+ 		result->types.push_back(result_type);
+-		internal_types.push_back(GetInternalType(result_type));
+ 	}
+ 
+ 	// finally bind the types of the ORDER/DISTINCT clause expressions
+-	BindModifierTypes(*result, internal_types, result->setop_index);
++	BindModifierTypes(*result, result->types, result->setop_index);
+ 	return move(result);
+ }
+ 
+diff --git a/src/planner/expression_binder.cpp b/src/planner/expression_binder.cpp
+index ac7dbc453207..95ae9020eedc 100644
+--- a/src/planner/expression_binder.cpp
++++ b/src/planner/expression_binder.cpp
+@@ -39,6 +39,8 @@ BindResult ExpressionBinder::BindExpression(ParsedExpression &expr, idx_t depth,
+ 		return BindExpression((CaseExpression &)expr, depth);
+ 	case ExpressionClass::CAST:
+ 		return BindExpression((CastExpression &)expr, depth);
++	case ExpressionClass::COLLATE:
++		return BindExpression((CollateExpression &)expr, depth);
+ 	case ExpressionClass::COLUMN_REF:
+ 		return BindExpression((ColumnRefExpression &)expr, depth);
+ 	case ExpressionClass::COMPARISON:
+diff --git a/third_party/utf8proc/include/utf8proc.hpp b/third_party/utf8proc/include/utf8proc.hpp
+index 0af832fe2b88..5b47289f2a70 100644
+--- a/third_party/utf8proc/include/utf8proc.hpp
++++ b/third_party/utf8proc/include/utf8proc.hpp
+@@ -616,6 +616,37 @@ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_grapheme_break_stateful(
+ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_grapheme_break(
+     utf8proc_int32_t codepoint1, utf8proc_int32_t codepoint2);
+ 
++//! Returns the current UTF8 codepoint in a UTF8 string. Assumes the string is valid UTF8.
++
++UTF8PROC_DLLEXPORT utf8proc_bool grapheme_break_extended(int lbc, int tbc, utf8proc_int32_t *state);
++UTF8PROC_DLLEXPORT utf8proc_int32_t utf8proc_codepoint(const char *u_input, int &sz);
++UTF8PROC_DLLEXPORT bool utf8proc_codepoint_to_utf8(int cp, int &sz, char *c);
++UTF8PROC_DLLEXPORT int utf8proc_codepoint_length(int cp);
++UTF8PROC_DLLEXPORT size_t utf8proc_next_grapheme(const char *s, size_t len, size_t cpos);
++UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_remove_accents(const utf8proc_uint8_t *str);
++template<class T>
++void utf8proc_grapheme_callback(const char *s, size_t len, T &&fun) {
++	int sz;
++	int boundclass = UTF8PROC_BOUNDCLASS_START;
++	int initial = utf8proc_get_property(utf8proc_codepoint(s, sz))->boundclass;
++	grapheme_break_extended(boundclass, initial, &boundclass);
++	size_t start = 0;
++	size_t cpos = 0;
++	while(true) {
++		cpos += sz;
++		if (cpos >= len) {
++			fun(start, cpos);
++			return;
++		}
++		int next = utf8proc_get_property(utf8proc_codepoint(s + cpos, sz))->boundclass;
++		if (grapheme_break_extended(boundclass, next, &boundclass)) {
++			if (!fun(start, cpos)) {
++				return;
++			}
++			start = cpos;
++		}
++	}
++}
+ 
+ /**
+  * Given a codepoint `c`, return the codepoint of the corresponding
+diff --git a/third_party/utf8proc/include/utf8proc_wrapper.h b/third_party/utf8proc/include/utf8proc_wrapper.h
+new file mode 100644
+index 000000000000..35221091f971
+--- /dev/null
++++ b/third_party/utf8proc/include/utf8proc_wrapper.h
+@@ -0,0 +1,23 @@
++// C wrapper of the utf8proc library
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++//! Returns whether or not the string is valid UTF8
++int utf8proc_is_valid(const char *s, size_t len);
++
++//! Returns the position (in bytes) of the next grapheme cluster
++size_t utf8proc_next_grapheme_cluster(const char *s, size_t len, size_t pos);
++
++//! Returns the position (in bytes) of the previous grapheme cluster
++size_t utf8proc_prev_grapheme_cluster(const char *s, size_t len, size_t pos);
++
++//! Returns the render width [0, 1 or 2] of the grapheme cluster as the specified position
++size_t utf8proc_render_width(const char *s, size_t len, size_t pos);
++
++#ifdef __cplusplus
++};
++#endif
+diff --git a/third_party/utf8proc/include/utf8proc_wrapper.hpp b/third_party/utf8proc/include/utf8proc_wrapper.hpp
+index ce6c4dfef0ef..e700ef5a12b8 100644
+--- a/third_party/utf8proc/include/utf8proc_wrapper.hpp
++++ b/third_party/utf8proc/include/utf8proc_wrapper.hpp
+@@ -11,7 +11,6 @@ enum class UnicodeType {INVALID, ASCII, UNICODE};
+ 
+ class Utf8Proc {
+ public:
+-
+ 	static UnicodeType Analyze(const char* s) {
+ 		return Analyze(s, std::strlen(s));
+ 	}
+@@ -27,5 +26,12 @@ class Utf8Proc {
+ 
+ 	static char* Normalize(const char* s);
+ 
++	//! Returns whether or not the UTF8 string is valid
++	static bool IsValid(const char *s, size_t len);
++	//! Returns the position (in bytes) of the next grapheme cluster
++	static size_t NextGraphemeCluster(const char *s, size_t len, size_t pos);
++	//! Returns the position (in bytes) of the previous grapheme cluster
++	static size_t PreviousGraphemeCluster(const char *s, size_t len, size_t pos);
+ };
++
+ }
+diff --git a/third_party/utf8proc/utf8proc.cpp b/third_party/utf8proc/utf8proc.cpp
+index 08430ac954c3..b34eb2c12c9f 100644
+--- a/third_party/utf8proc/utf8proc.cpp
++++ b/third_party/utf8proc/utf8proc.cpp
+@@ -54,22 +54,22 @@
+ 
+ 
+ UTF8PROC_DLLEXPORT const utf8proc_int8_t utf8proc_utf8class[256] = {
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+-  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+-  3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+-  4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0 };
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++	3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
++	4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+ #define UTF8PROC_HANGUL_SBASE 0xAC00
+ #define UTF8PROC_HANGUL_LBASE 0x1100
+@@ -92,682 +92,780 @@ UTF8PROC_DLLEXPORT const utf8proc_int8_t utf8proc_utf8class[256] = {
+ #define UTF8PROC_HANGUL_S_END    0xD7A4
+ 
+ /* Should follow semantic-versioning rules (semver.org) based on API
+-   compatibility.  (Note that the shared-library version number will
+-   be different, being based on ABI compatibility.): */
++	 compatibility.  (Note that the shared-library version number will
++	 be different, being based on ABI compatibility.): */
+ #define STRINGIZEx(x) #x
+ #define STRINGIZE(x) STRINGIZEx(x)
+ UTF8PROC_DLLEXPORT const char *utf8proc_version(void) {
+-  return STRINGIZE(UTF8PROC_VERSION_MAJOR) "." STRINGIZE(UTF8PROC_VERSION_MINOR) "." STRINGIZE(UTF8PROC_VERSION_PATCH) "";
++	return STRINGIZE(UTF8PROC_VERSION_MAJOR) "." STRINGIZE(UTF8PROC_VERSION_MINOR) "." STRINGIZE(UTF8PROC_VERSION_PATCH) "";
+ }
+ 
+ UTF8PROC_DLLEXPORT const char *utf8proc_unicode_version(void) {
+-  return "12.1.0";
++	return "12.1.0";
+ }
+ 
+ UTF8PROC_DLLEXPORT const char *utf8proc_errmsg(utf8proc_ssize_t errcode) {
+-  switch (errcode) {
+-    case UTF8PROC_ERROR_NOMEM:
+-    return "Memory for processing UTF-8 data could not be allocated.";
+-    case UTF8PROC_ERROR_OVERFLOW:
+-    return "UTF-8 string is too long to be processed.";
+-    case UTF8PROC_ERROR_INVALIDUTF8:
+-    return "Invalid UTF-8 string";
+-    case UTF8PROC_ERROR_NOTASSIGNED:
+-    return "Unassigned Unicode code point found in UTF-8 string.";
+-    case UTF8PROC_ERROR_INVALIDOPTS:
+-    return "Invalid options for UTF-8 processing chosen.";
+-    default:
+-    return "An unknown error occurred while processing UTF-8 data.";
+-  }
++	switch (errcode) {
++		case UTF8PROC_ERROR_NOMEM:
++		return "Memory for processing UTF-8 data could not be allocated.";
++		case UTF8PROC_ERROR_OVERFLOW:
++		return "UTF-8 string is too long to be processed.";
++		case UTF8PROC_ERROR_INVALIDUTF8:
++		return "Invalid UTF-8 string";
++		case UTF8PROC_ERROR_NOTASSIGNED:
++		return "Unassigned Unicode code point found in UTF-8 string.";
++		case UTF8PROC_ERROR_INVALIDOPTS:
++		return "Invalid options for UTF-8 processing chosen.";
++		default:
++		return "An unknown error occurred while processing UTF-8 data.";
++	}
+ }
+ 
+ #define utf_cont(ch)  (((ch) & 0xc0) == 0x80)
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_iterate(
+-  const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_int32_t *dst
++	const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_int32_t *dst
+ ) {
+-  utf8proc_uint32_t uc;
+-  const utf8proc_uint8_t *end;
+-
+-  *dst = -1;
+-  if (!strlen) return 0;
+-  end = str + ((strlen < 0) ? 4 : strlen);
+-  uc = *str++;
+-  if (uc < 0x80) {
+-    *dst = uc;
+-    return 1;
+-  }
+-  // Must be between 0xc2 and 0xf4 inclusive to be valid
+-  if ((uc - 0xc2) > (0xf4-0xc2)) return UTF8PROC_ERROR_INVALIDUTF8;
+-  if (uc < 0xe0) {         // 2-byte sequence
+-     // Must have valid continuation character
+-     if (str >= end || !utf_cont(*str)) return UTF8PROC_ERROR_INVALIDUTF8;
+-     *dst = ((uc & 0x1f)<<6) | (*str & 0x3f);
+-     return 2;
+-  }
+-  if (uc < 0xf0) {        // 3-byte sequence
+-     if ((str + 1 >= end) || !utf_cont(*str) || !utf_cont(str[1]))
+-        return UTF8PROC_ERROR_INVALIDUTF8;
+-     // Check for surrogate chars
+-     if (uc == 0xed && *str > 0x9f)
+-         return UTF8PROC_ERROR_INVALIDUTF8;
+-     uc = ((uc & 0xf)<<12) | ((*str & 0x3f)<<6) | (str[1] & 0x3f);
+-     if (uc < 0x800)
+-         return UTF8PROC_ERROR_INVALIDUTF8;
+-     *dst = uc;
+-     return 3;
+-  }
+-  // 4-byte sequence
+-  // Must have 3 valid continuation characters
+-  if ((str + 2 >= end) || !utf_cont(*str) || !utf_cont(str[1]) || !utf_cont(str[2]))
+-     return UTF8PROC_ERROR_INVALIDUTF8;
+-  // Make sure in correct range (0x10000 - 0x10ffff)
+-  if (uc == 0xf0) {
+-    if (*str < 0x90) return UTF8PROC_ERROR_INVALIDUTF8;
+-  } else if (uc == 0xf4) {
+-    if (*str > 0x8f) return UTF8PROC_ERROR_INVALIDUTF8;
+-  }
+-  *dst = ((uc & 7)<<18) | ((*str & 0x3f)<<12) | ((str[1] & 0x3f)<<6) | (str[2] & 0x3f);
+-  return 4;
++	utf8proc_uint32_t uc;
++	const utf8proc_uint8_t *end;
++
++	*dst = -1;
++	if (!strlen) return 0;
++	end = str + ((strlen < 0) ? 4 : strlen);
++	uc = *str++;
++	if (uc < 0x80) {
++		*dst = uc;
++		return 1;
++	}
++	// Must be between 0xc2 and 0xf4 inclusive to be valid
++	if ((uc - 0xc2) > (0xf4-0xc2)) return UTF8PROC_ERROR_INVALIDUTF8;
++	if (uc < 0xe0) {         // 2-byte sequence
++		 // Must have valid continuation character
++		 if (str >= end || !utf_cont(*str)) return UTF8PROC_ERROR_INVALIDUTF8;
++		 *dst = ((uc & 0x1f)<<6) | (*str & 0x3f);
++		 return 2;
++	}
++	if (uc < 0xf0) {        // 3-byte sequence
++		 if ((str + 1 >= end) || !utf_cont(*str) || !utf_cont(str[1]))
++				return UTF8PROC_ERROR_INVALIDUTF8;
++		 // Check for surrogate chars
++		 if (uc == 0xed && *str > 0x9f)
++				 return UTF8PROC_ERROR_INVALIDUTF8;
++		 uc = ((uc & 0xf)<<12) | ((*str & 0x3f)<<6) | (str[1] & 0x3f);
++		 if (uc < 0x800)
++				 return UTF8PROC_ERROR_INVALIDUTF8;
++		 *dst = uc;
++		 return 3;
++	}
++	// 4-byte sequence
++	// Must have 3 valid continuation characters
++	if ((str + 2 >= end) || !utf_cont(*str) || !utf_cont(str[1]) || !utf_cont(str[2]))
++		 return UTF8PROC_ERROR_INVALIDUTF8;
++	// Make sure in correct range (0x10000 - 0x10ffff)
++	if (uc == 0xf0) {
++		if (*str < 0x90) return UTF8PROC_ERROR_INVALIDUTF8;
++	} else if (uc == 0xf4) {
++		if (*str > 0x8f) return UTF8PROC_ERROR_INVALIDUTF8;
++	}
++	*dst = ((uc & 7)<<18) | ((*str & 0x3f)<<12) | ((str[1] & 0x3f)<<6) | (str[2] & 0x3f);
++	return 4;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_codepoint_valid(utf8proc_int32_t uc) {
+-    return (((utf8proc_uint32_t)uc)-0xd800 > 0x07ff) && ((utf8proc_uint32_t)uc < 0x110000);
++		return (((utf8proc_uint32_t)uc)-0xd800 > 0x07ff) && ((utf8proc_uint32_t)uc < 0x110000);
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_encode_char(utf8proc_int32_t uc, utf8proc_uint8_t *dst) {
+-  if (uc < 0x00) {
+-    return 0;
+-  } else if (uc < 0x80) {
+-    dst[0] = (utf8proc_uint8_t) uc;
+-    return 1;
+-  } else if (uc < 0x800) {
+-    dst[0] = (utf8proc_uint8_t)(0xC0 + (uc >> 6));
+-    dst[1] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-    return 2;
+-  // Note: we allow encoding 0xd800-0xdfff here, so as not to change
+-  // the API, however, these are actually invalid in UTF-8
+-  } else if (uc < 0x10000) {
+-    dst[0] = (utf8proc_uint8_t)(0xE0 + (uc >> 12));
+-    dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
+-    dst[2] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-    return 3;
+-  } else if (uc < 0x110000) {
+-    dst[0] = (utf8proc_uint8_t)(0xF0 + (uc >> 18));
+-    dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 12) & 0x3F));
+-    dst[2] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
+-    dst[3] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-    return 4;
+-  } else return 0;
++	if (uc < 0x00) {
++		return 0;
++	} else if (uc < 0x80) {
++		dst[0] = (utf8proc_uint8_t) uc;
++		return 1;
++	} else if (uc < 0x800) {
++		dst[0] = (utf8proc_uint8_t)(0xC0 + (uc >> 6));
++		dst[1] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++		return 2;
++	// Note: we allow encoding 0xd800-0xdfff here, so as not to change
++	// the API, however, these are actually invalid in UTF-8
++	} else if (uc < 0x10000) {
++		dst[0] = (utf8proc_uint8_t)(0xE0 + (uc >> 12));
++		dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
++		dst[2] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++		return 3;
++	} else if (uc < 0x110000) {
++		dst[0] = (utf8proc_uint8_t)(0xF0 + (uc >> 18));
++		dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 12) & 0x3F));
++		dst[2] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
++		dst[3] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++		return 4;
++	} else return 0;
+ }
+ 
+ /* internal version used for inserting 0xff bytes between graphemes */
+ static utf8proc_ssize_t charbound_encode_char(utf8proc_int32_t uc, utf8proc_uint8_t *dst) {
+-   if (uc < 0x00) {
+-      if (uc == -1) { /* internal value used for grapheme breaks */
+-        dst[0] = (utf8proc_uint8_t)0xFF;
+-        return 1;
+-      }
+-      return 0;
+-   } else if (uc < 0x80) {
+-      dst[0] = (utf8proc_uint8_t)uc;
+-      return 1;
+-   } else if (uc < 0x800) {
+-      dst[0] = (utf8proc_uint8_t)(0xC0 + (uc >> 6));
+-      dst[1] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-      return 2;
+-   } else if (uc < 0x10000) {
+-      dst[0] = (utf8proc_uint8_t)(0xE0 + (uc >> 12));
+-      dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
+-      dst[2] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-      return 3;
+-   } else if (uc < 0x110000) {
+-      dst[0] = (utf8proc_uint8_t)(0xF0 + (uc >> 18));
+-      dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 12) & 0x3F));
+-      dst[2] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
+-      dst[3] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
+-      return 4;
+-   } else return 0;
++	 if (uc < 0x00) {
++			if (uc == -1) { /* internal value used for grapheme breaks */
++				dst[0] = (utf8proc_uint8_t)0xFF;
++				return 1;
++			}
++			return 0;
++	 } else if (uc < 0x80) {
++			dst[0] = (utf8proc_uint8_t)uc;
++			return 1;
++	 } else if (uc < 0x800) {
++			dst[0] = (utf8proc_uint8_t)(0xC0 + (uc >> 6));
++			dst[1] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++			return 2;
++	 } else if (uc < 0x10000) {
++			dst[0] = (utf8proc_uint8_t)(0xE0 + (uc >> 12));
++			dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
++			dst[2] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++			return 3;
++	 } else if (uc < 0x110000) {
++			dst[0] = (utf8proc_uint8_t)(0xF0 + (uc >> 18));
++			dst[1] = (utf8proc_uint8_t)(0x80 + ((uc >> 12) & 0x3F));
++			dst[2] = (utf8proc_uint8_t)(0x80 + ((uc >> 6) & 0x3F));
++			dst[3] = (utf8proc_uint8_t)(0x80 + (uc & 0x3F));
++			return 4;
++	 } else return 0;
+ }
+ 
+ /* internal "unsafe" version that does not check whether uc is in range */
+ static const utf8proc_property_t *unsafe_get_property(utf8proc_int32_t uc) {
+-  /* ASSERT: uc >= 0 && uc < 0x110000 */
+-  return utf8proc_properties + (
+-    utf8proc_stage2table[
+-      utf8proc_stage1table[uc >> 8] + (uc & 0xFF)
+-    ]
+-  );
++	/* ASSERT: uc >= 0 && uc < 0x110000 */
++	return utf8proc_properties + (
++		utf8proc_stage2table[
++			utf8proc_stage1table[uc >> 8] + (uc & 0xFF)
++		]
++	);
+ }
+ 
+ UTF8PROC_DLLEXPORT const utf8proc_property_t *utf8proc_get_property(utf8proc_int32_t uc) {
+-  return uc < 0 || uc >= 0x110000 ? utf8proc_properties : unsafe_get_property(uc);
++	return uc < 0 || uc >= 0x110000 ? utf8proc_properties : unsafe_get_property(uc);
+ }
+ 
+ /* return whether there is a grapheme break between boundclasses lbc and tbc
+-   (according to the definition of extended grapheme clusters)
++	 (according to the definition of extended grapheme clusters)
+ 
+-  Rule numbering refers to TR29 Version 29 (Unicode 9.0.0):
+-  http://www.unicode.org/reports/tr29/tr29-29.html
++	Rule numbering refers to TR29 Version 29 (Unicode 9.0.0):
++	http://www.unicode.org/reports/tr29/tr29-29.html
+ 
+-  CAVEATS:
+-   Please note that evaluation of GB10 (grapheme breaks between emoji zwj sequences)
+-   and GB 12/13 (regional indicator code points) require knowledge of previous characters
+-   and are thus not handled by this function. This may result in an incorrect break before
+-   an E_Modifier class codepoint and an incorrectly missing break between two
+-   REGIONAL_INDICATOR class code points if such support does not exist in the caller.
++	CAVEATS:
++	 Please note that evaluation of GB10 (grapheme breaks between emoji zwj sequences)
++	 and GB 12/13 (regional indicator code points) require knowledge of previous characters
++	 and are thus not handled by this function. This may result in an incorrect break before
++	 an E_Modifier class codepoint and an incorrectly missing break between two
++	 REGIONAL_INDICATOR class code points if such support does not exist in the caller.
+ 
+-   See the special support in grapheme_break_extended, for required bookkeeping by the caller.
++	 See the special support in grapheme_break_extended, for required bookkeeping by the caller.
+ */
+ static utf8proc_bool grapheme_break_simple(int lbc, int tbc) {
+-  return
+-    (lbc == UTF8PROC_BOUNDCLASS_START) ? true :       // GB1
+-    (lbc == UTF8PROC_BOUNDCLASS_CR &&                 // GB3
+-     tbc == UTF8PROC_BOUNDCLASS_LF) ? false :         // ---
+-    (lbc >= UTF8PROC_BOUNDCLASS_CR && lbc <= UTF8PROC_BOUNDCLASS_CONTROL) ? true :  // GB4
+-    (tbc >= UTF8PROC_BOUNDCLASS_CR && tbc <= UTF8PROC_BOUNDCLASS_CONTROL) ? true :  // GB5
+-    (lbc == UTF8PROC_BOUNDCLASS_L &&                  // GB6
+-     (tbc == UTF8PROC_BOUNDCLASS_L ||                 // ---
+-      tbc == UTF8PROC_BOUNDCLASS_V ||                 // ---
+-      tbc == UTF8PROC_BOUNDCLASS_LV ||                // ---
+-      tbc == UTF8PROC_BOUNDCLASS_LVT)) ? false :      // ---
+-    ((lbc == UTF8PROC_BOUNDCLASS_LV ||                // GB7
+-      lbc == UTF8PROC_BOUNDCLASS_V) &&                // ---
+-     (tbc == UTF8PROC_BOUNDCLASS_V ||                 // ---
+-      tbc == UTF8PROC_BOUNDCLASS_T)) ? false :        // ---
+-    ((lbc == UTF8PROC_BOUNDCLASS_LVT ||               // GB8
+-      lbc == UTF8PROC_BOUNDCLASS_T) &&                // ---
+-     tbc == UTF8PROC_BOUNDCLASS_T) ? false :          // ---
+-    (tbc == UTF8PROC_BOUNDCLASS_EXTEND ||             // GB9
+-     tbc == UTF8PROC_BOUNDCLASS_ZWJ ||                // ---
+-     tbc == UTF8PROC_BOUNDCLASS_SPACINGMARK ||        // GB9a
+-     lbc == UTF8PROC_BOUNDCLASS_PREPEND) ? false :    // GB9b
+-    (lbc == UTF8PROC_BOUNDCLASS_E_ZWG &&              // GB11 (requires additional handling below)
+-     tbc == UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC) ? false : // ----
+-    (lbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR &&          // GB12/13 (requires additional handling below)
+-     tbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR) ? false :  // ----
+-    true; // GB999
+-}
+-
+-static utf8proc_bool grapheme_break_extended(int lbc, int tbc, utf8proc_int32_t *state)
++	return
++		(lbc == UTF8PROC_BOUNDCLASS_START) ? true :       // GB1
++		(lbc == UTF8PROC_BOUNDCLASS_CR &&                 // GB3
++		 tbc == UTF8PROC_BOUNDCLASS_LF) ? false :         // ---
++		(lbc >= UTF8PROC_BOUNDCLASS_CR && lbc <= UTF8PROC_BOUNDCLASS_CONTROL) ? true :  // GB4
++		(tbc >= UTF8PROC_BOUNDCLASS_CR && tbc <= UTF8PROC_BOUNDCLASS_CONTROL) ? true :  // GB5
++		(lbc == UTF8PROC_BOUNDCLASS_L &&                  // GB6
++		 (tbc == UTF8PROC_BOUNDCLASS_L ||                 // ---
++			tbc == UTF8PROC_BOUNDCLASS_V ||                 // ---
++			tbc == UTF8PROC_BOUNDCLASS_LV ||                // ---
++			tbc == UTF8PROC_BOUNDCLASS_LVT)) ? false :      // ---
++		((lbc == UTF8PROC_BOUNDCLASS_LV ||                // GB7
++			lbc == UTF8PROC_BOUNDCLASS_V) &&                // ---
++		 (tbc == UTF8PROC_BOUNDCLASS_V ||                 // ---
++			tbc == UTF8PROC_BOUNDCLASS_T)) ? false :        // ---
++		((lbc == UTF8PROC_BOUNDCLASS_LVT ||               // GB8
++			lbc == UTF8PROC_BOUNDCLASS_T) &&                // ---
++		 tbc == UTF8PROC_BOUNDCLASS_T) ? false :          // ---
++		(tbc == UTF8PROC_BOUNDCLASS_EXTEND ||             // GB9
++		 tbc == UTF8PROC_BOUNDCLASS_ZWJ ||                // ---
++		 tbc == UTF8PROC_BOUNDCLASS_SPACINGMARK ||        // GB9a
++		 lbc == UTF8PROC_BOUNDCLASS_PREPEND) ? false :    // GB9b
++		(lbc == UTF8PROC_BOUNDCLASS_E_ZWG &&              // GB11 (requires additional handling below)
++		 tbc == UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC) ? false : // ----
++		(lbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR &&          // GB12/13 (requires additional handling below)
++		 tbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR) ? false :  // ----
++		true; // GB999
++}
++
++utf8proc_bool grapheme_break_extended(int lbc, int tbc, utf8proc_int32_t *state)
+ {
+-  int lbc_override = ((state && *state != UTF8PROC_BOUNDCLASS_START)
+-                      ? *state : lbc);
+-  utf8proc_bool break_permitted = grapheme_break_simple(lbc_override, tbc);
+-  if (state) {
+-    // Special support for GB 12/13 made possible by GB999. After two RI
+-    // class codepoints we want to force a break. Do this by resetting the
+-    // second RI's bound class to UTF8PROC_BOUNDCLASS_OTHER, to force a break
+-    // after that character according to GB999 (unless of course such a break is
+-    // forbidden by a different rule such as GB9).
+-    if (*state == tbc && tbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR)
+-      *state = UTF8PROC_BOUNDCLASS_OTHER;
+-    // Special support for GB11 (emoji extend* zwj / emoji)
+-    else if (*state == UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC) {
+-      if (tbc == UTF8PROC_BOUNDCLASS_EXTEND) // fold EXTEND codepoints into emoji
+-        *state = UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC;
+-      else if (tbc == UTF8PROC_BOUNDCLASS_ZWJ)
+-        *state = UTF8PROC_BOUNDCLASS_E_ZWG; // state to record emoji+zwg combo
+-      else
+-        *state = tbc;
+-    }
+-    else
+-      *state = tbc;
+-  }
+-  return break_permitted;
++	int lbc_override = ((state && *state != UTF8PROC_BOUNDCLASS_START)
++											? *state : lbc);
++	utf8proc_bool break_permitted = grapheme_break_simple(lbc_override, tbc);
++	if (state) {
++		// Special support for GB 12/13 made possible by GB999. After two RI
++		// class codepoints we want to force a break. Do this by resetting the
++		// second RI's bound class to UTF8PROC_BOUNDCLASS_OTHER, to force a break
++		// after that character according to GB999 (unless of course such a break is
++		// forbidden by a different rule such as GB9).
++		if (*state == tbc && tbc == UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR)
++			*state = UTF8PROC_BOUNDCLASS_OTHER;
++		// Special support for GB11 (emoji extend* zwj / emoji)
++		else if (*state == UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC) {
++			if (tbc == UTF8PROC_BOUNDCLASS_EXTEND) // fold EXTEND codepoints into emoji
++				*state = UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC;
++			else if (tbc == UTF8PROC_BOUNDCLASS_ZWJ)
++				*state = UTF8PROC_BOUNDCLASS_E_ZWG; // state to record emoji+zwg combo
++			else
++				*state = tbc;
++		}
++		else
++			*state = tbc;
++	}
++	return break_permitted;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_grapheme_break_stateful(
+-    utf8proc_int32_t c1, utf8proc_int32_t c2, utf8proc_int32_t *state) {
++		utf8proc_int32_t c1, utf8proc_int32_t c2, utf8proc_int32_t *state) {
+ 
+-  return grapheme_break_extended(utf8proc_get_property(c1)->boundclass,
+-                                 utf8proc_get_property(c2)->boundclass,
+-                                 state);
++	return grapheme_break_extended(utf8proc_get_property(c1)->boundclass,
++																 utf8proc_get_property(c2)->boundclass,
++																 state);
+ }
+ 
+ 
+ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_grapheme_break(
+-    utf8proc_int32_t c1, utf8proc_int32_t c2) {
+-  return utf8proc_grapheme_break_stateful(c1, c2, NULL);
++		utf8proc_int32_t c1, utf8proc_int32_t c2) {
++	return utf8proc_grapheme_break_stateful(c1, c2, NULL);
++}
++
++// from http://www.zedwood.com/article/cpp-utf8-char-to-codepoint
++utf8proc_int32_t utf8proc_codepoint(const char *u_input, int &sz) {
++	auto u = (const unsigned char *) u_input;
++	unsigned char u0 = u[0];
++	if (u0>=0   && u0<=127) {
++		sz = 1;
++		return u0;
++	}
++	unsigned char u1 = u[1];
++	if (u0>=192 && u0<=223) {
++		sz = 2;
++		return (u0-192)*64 + (u1-128);
++	}
++	if (u[0]==0xed && (u[1] & 0xa0) == 0xa0) {
++		return -1; //code points, 0xd800 to 0xdfff
++	}
++	unsigned char u2 = u[2];
++	if (u0>=224 && u0<=239) {
++		sz = 3;
++		return (u0-224)*4096 + (u1-128)*64 + (u2-128);
++	}
++	unsigned char u3 = u[3];
++	if (u0>=240 && u0<=247) {
++		sz = 4;
++		return (u0-240)*262144 + (u1-128)*4096 + (u2-128)*64 + (u3-128);
++	}
++	return -1;
++}
++
++bool utf8proc_codepoint_to_utf8(int cp, int &sz, char *c) {
++	if (cp<=0x7F) {
++		sz = 1;
++		c[0] = cp;
++	} else if(cp<=0x7FF) {
++		sz = 2;
++		c[0] = (cp>>6)+192;
++		c[1] = (cp&63)+128;
++	} else if(0xd800<=cp && cp<=0xdfff) {
++		sz = -1;
++		// invalid block of utf
++		return false;
++	} else if(cp<=0xFFFF) {
++		sz = 3;
++		c[0] = (cp>>12)+224;
++		c[1]= ((cp>>6)&63)+128;
++		c[2]=(cp&63)+128;
++	} else if(cp<=0x10FFFF) {
++		sz = 4;
++		c[0] = (cp>>18)+240;
++		c[1] = ((cp>>12)&63)+128;
++		c[2] = ((cp>>6)&63)+128;
++		c[3]=(cp&63)+128;
++	} else {
++		sz = -1;
++		return false;
++	}
++	return true;
++}
++
++int utf8proc_codepoint_length(int cp) {
++	if (cp<=0x7F) {
++		return 1;
++	} else if(cp<=0x7FF) {
++		return 2;
++	} else if(0xd800<=cp && cp<=0xdfff) {
++		return -1;
++	} else if(cp<=0xFFFF) {
++		return 3;
++	} else if(cp<=0x10FFFF) {
++		return 4;
++	}
++	return -1;
++}
++
++size_t utf8proc_next_grapheme(const char *s, size_t len, size_t cpos) {
++	int sz;
++	int boundclass = UTF8PROC_BOUNDCLASS_START;
++	int initial = utf8proc_get_property(utf8proc_codepoint(s + cpos, sz))->boundclass;
++	grapheme_break_extended(boundclass, initial, &boundclass);
++	while(true) {
++		cpos += sz;
++		if (cpos >= len) {
++			return cpos;
++		}
++		int next = utf8proc_get_property(utf8proc_codepoint(s + cpos, sz))->boundclass;
++		if (grapheme_break_extended(boundclass, next, &boundclass)) {
++			return cpos;
++		}
++	}
+ }
+ 
+ static utf8proc_int32_t seqindex_decode_entry(const utf8proc_uint16_t **entry)
+ {
+-  utf8proc_int32_t entry_cp = **entry;
+-  if ((entry_cp & 0xF800) == 0xD800) {
+-    *entry = *entry + 1;
+-    entry_cp = ((entry_cp & 0x03FF) << 10) | (**entry & 0x03FF);
+-    entry_cp += 0x10000;
+-  }
+-  return entry_cp;
++	utf8proc_int32_t entry_cp = **entry;
++	if ((entry_cp & 0xF800) == 0xD800) {
++		*entry = *entry + 1;
++		entry_cp = ((entry_cp & 0x03FF) << 10) | (**entry & 0x03FF);
++		entry_cp += 0x10000;
++	}
++	return entry_cp;
+ }
+ 
+ static utf8proc_int32_t seqindex_decode_index(const utf8proc_uint32_t seqindex)
+ {
+-  const utf8proc_uint16_t *entry = &utf8proc_sequences[seqindex];
+-  return seqindex_decode_entry(&entry);
++	const utf8proc_uint16_t *entry = &utf8proc_sequences[seqindex];
++	return seqindex_decode_entry(&entry);
+ }
+ 
+ static utf8proc_ssize_t seqindex_write_char_decomposed(utf8proc_uint16_t seqindex, utf8proc_int32_t *dst, utf8proc_ssize_t bufsize, utf8proc_option_t options, int *last_boundclass) {
+-  utf8proc_ssize_t written = 0;
+-  const utf8proc_uint16_t *entry = &utf8proc_sequences[seqindex & 0x1FFF];
+-  int len = seqindex >> 13;
+-  if (len >= 7) {
+-    len = *entry;
+-    entry++;
+-  }
+-  for (; len >= 0; entry++, len--) {
+-    utf8proc_int32_t entry_cp = seqindex_decode_entry(&entry);
+-
+-    written += utf8proc_decompose_char(entry_cp, dst+written,
+-      (bufsize > written) ? (bufsize - written) : 0, options,
+-    last_boundclass);
+-    if (written < 0) return UTF8PROC_ERROR_OVERFLOW;
+-  }
+-  return written;
++	utf8proc_ssize_t written = 0;
++	const utf8proc_uint16_t *entry = &utf8proc_sequences[seqindex & 0x1FFF];
++	int len = seqindex >> 13;
++	if (len >= 7) {
++		len = *entry;
++		entry++;
++	}
++	for (; len >= 0; entry++, len--) {
++		utf8proc_int32_t entry_cp = seqindex_decode_entry(&entry);
++
++		written += utf8proc_decompose_char(entry_cp, dst+written,
++			(bufsize > written) ? (bufsize - written) : 0, options,
++		last_boundclass);
++		if (written < 0) return UTF8PROC_ERROR_OVERFLOW;
++	}
++	return written;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_int32_t utf8proc_tolower(utf8proc_int32_t c)
+ {
+-  utf8proc_int32_t cl = utf8proc_get_property(c)->lowercase_seqindex;
+-  return cl != UINT16_MAX ? seqindex_decode_index(cl) : c;
++	utf8proc_int32_t cl = utf8proc_get_property(c)->lowercase_seqindex;
++	return cl != UINT16_MAX ? seqindex_decode_index(cl) : c;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_int32_t utf8proc_toupper(utf8proc_int32_t c)
+ {
+-  utf8proc_int32_t cu = utf8proc_get_property(c)->uppercase_seqindex;
+-  return cu != UINT16_MAX ? seqindex_decode_index(cu) : c;
++	utf8proc_int32_t cu = utf8proc_get_property(c)->uppercase_seqindex;
++	return cu != UINT16_MAX ? seqindex_decode_index(cu) : c;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_int32_t utf8proc_totitle(utf8proc_int32_t c)
+ {
+-  utf8proc_int32_t cu = utf8proc_get_property(c)->titlecase_seqindex;
+-  return cu != UINT16_MAX ? seqindex_decode_index(cu) : c;
++	utf8proc_int32_t cu = utf8proc_get_property(c)->titlecase_seqindex;
++	return cu != UINT16_MAX ? seqindex_decode_index(cu) : c;
+ }
+ 
+ /* return a character width analogous to wcwidth (except portable and
+-   hopefully less buggy than most system wcwidth functions). */
++	 hopefully less buggy than most system wcwidth functions). */
+ UTF8PROC_DLLEXPORT int utf8proc_charwidth(utf8proc_int32_t c) {
+-  return utf8proc_get_property(c)->charwidth;
++	return utf8proc_get_property(c)->charwidth;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_category_t utf8proc_category(utf8proc_int32_t c) {
+-  return (utf8proc_category_t)utf8proc_get_property(c)->category;
++	return (utf8proc_category_t)utf8proc_get_property(c)->category;
+ }
+ 
+ UTF8PROC_DLLEXPORT const char *utf8proc_category_string(utf8proc_int32_t c) {
+-  static const char s[][3] = {"Cn","Lu","Ll","Lt","Lm","Lo","Mn","Mc","Me","Nd","Nl","No","Pc","Pd","Ps","Pe","Pi","Pf","Po","Sm","Sc","Sk","So","Zs","Zl","Zp","Cc","Cf","Cs","Co"};
+-  return s[utf8proc_category(c)];
++	static const char s[][3] = {"Cn","Lu","Ll","Lt","Lm","Lo","Mn","Mc","Me","Nd","Nl","No","Pc","Pd","Ps","Pe","Pi","Pf","Po","Sm","Sc","Sk","So","Zs","Zl","Zp","Cc","Cf","Cs","Co"};
++	return s[utf8proc_category(c)];
+ }
+ 
+ #define utf8proc_decompose_lump(replacement_uc) \
+-  return utf8proc_decompose_char((replacement_uc), dst, bufsize, \
+-  (utf8proc_option_t) (options & ~UTF8PROC_LUMP), last_boundclass)
++	return utf8proc_decompose_char((replacement_uc), dst, bufsize, \
++	(utf8proc_option_t) (options & ~UTF8PROC_LUMP), last_boundclass)
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose_char(utf8proc_int32_t uc, utf8proc_int32_t *dst, utf8proc_ssize_t bufsize, utf8proc_option_t options, int *last_boundclass) {
+-  const utf8proc_property_t *property;
+-  utf8proc_propval_t category;
+-  utf8proc_int32_t hangul_sindex;
+-  if (uc < 0 || uc >= 0x110000) return UTF8PROC_ERROR_NOTASSIGNED;
+-  property = unsafe_get_property(uc);
+-  category = property->category;
+-  hangul_sindex = uc - UTF8PROC_HANGUL_SBASE;
+-  if (options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) {
+-    if (hangul_sindex >= 0 && hangul_sindex < UTF8PROC_HANGUL_SCOUNT) {
+-      utf8proc_int32_t hangul_tindex;
+-      if (bufsize >= 1) {
+-        dst[0] = UTF8PROC_HANGUL_LBASE +
+-          hangul_sindex / UTF8PROC_HANGUL_NCOUNT;
+-        if (bufsize >= 2) dst[1] = UTF8PROC_HANGUL_VBASE +
+-          (hangul_sindex % UTF8PROC_HANGUL_NCOUNT) / UTF8PROC_HANGUL_TCOUNT;
+-      }
+-      hangul_tindex = hangul_sindex % UTF8PROC_HANGUL_TCOUNT;
+-      if (!hangul_tindex) return 2;
+-      if (bufsize >= 3) dst[2] = UTF8PROC_HANGUL_TBASE + hangul_tindex;
+-      return 3;
+-    }
+-  }
+-  if (options & UTF8PROC_REJECTNA) {
+-    if (!category) return UTF8PROC_ERROR_NOTASSIGNED;
+-  }
+-  if (options & UTF8PROC_IGNORE) {
+-    if (property->ignorable) return 0;
+-  }
+-  if (options & UTF8PROC_STRIPNA) {
+-    if (!category) return 0;
+-  }
+-  if (options & UTF8PROC_LUMP) {
+-    if (category == UTF8PROC_CATEGORY_ZS) utf8proc_decompose_lump(0x0020);
+-    if (uc == 0x2018 || uc == 0x2019 || uc == 0x02BC || uc == 0x02C8)
+-      utf8proc_decompose_lump(0x0027);
+-    if (category == UTF8PROC_CATEGORY_PD || uc == 0x2212)
+-      utf8proc_decompose_lump(0x002D);
+-    if (uc == 0x2044 || uc == 0x2215) utf8proc_decompose_lump(0x002F);
+-    if (uc == 0x2236) utf8proc_decompose_lump(0x003A);
+-    if (uc == 0x2039 || uc == 0x2329 || uc == 0x3008)
+-      utf8proc_decompose_lump(0x003C);
+-    if (uc == 0x203A || uc == 0x232A || uc == 0x3009)
+-      utf8proc_decompose_lump(0x003E);
+-    if (uc == 0x2216) utf8proc_decompose_lump(0x005C);
+-    if (uc == 0x02C4 || uc == 0x02C6 || uc == 0x2038 || uc == 0x2303)
+-      utf8proc_decompose_lump(0x005E);
+-    if (category == UTF8PROC_CATEGORY_PC || uc == 0x02CD)
+-      utf8proc_decompose_lump(0x005F);
+-    if (uc == 0x02CB) utf8proc_decompose_lump(0x0060);
+-    if (uc == 0x2223) utf8proc_decompose_lump(0x007C);
+-    if (uc == 0x223C) utf8proc_decompose_lump(0x007E);
+-    if ((options & UTF8PROC_NLF2LS) && (options & UTF8PROC_NLF2PS)) {
+-      if (category == UTF8PROC_CATEGORY_ZL ||
+-          category == UTF8PROC_CATEGORY_ZP)
+-        utf8proc_decompose_lump(0x000A);
+-    }
+-  }
+-  if (options & UTF8PROC_STRIPMARK) {
+-    if (category == UTF8PROC_CATEGORY_MN ||
+-      category == UTF8PROC_CATEGORY_MC ||
+-      category == UTF8PROC_CATEGORY_ME) return 0;
+-  }
+-  if (options & UTF8PROC_CASEFOLD) {
+-    if (property->casefold_seqindex != UINT16_MAX) {
+-      return seqindex_write_char_decomposed(property->casefold_seqindex, dst, bufsize, options, last_boundclass);
+-    }
+-  }
+-  if (options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) {
+-    if (property->decomp_seqindex != UINT16_MAX &&
+-        (!property->decomp_type || (options & UTF8PROC_COMPAT))) {
+-      return seqindex_write_char_decomposed(property->decomp_seqindex, dst, bufsize, options, last_boundclass);
+-    }
+-  }
+-  if (options & UTF8PROC_CHARBOUND) {
+-    utf8proc_bool boundary;
+-    int tbc = property->boundclass;
+-    boundary = grapheme_break_extended(*last_boundclass, tbc, last_boundclass);
+-    if (boundary) {
+-      if (bufsize >= 1) dst[0] = -1; /* sentinel value for grapheme break */
+-      if (bufsize >= 2) dst[1] = uc;
+-      return 2;
+-    }
+-  }
+-  if (bufsize >= 1) *dst = uc;
+-  return 1;
++	const utf8proc_property_t *property;
++	utf8proc_propval_t category;
++	utf8proc_int32_t hangul_sindex;
++	if (uc < 0 || uc >= 0x110000) return UTF8PROC_ERROR_NOTASSIGNED;
++	property = unsafe_get_property(uc);
++	category = property->category;
++	hangul_sindex = uc - UTF8PROC_HANGUL_SBASE;
++	if (options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) {
++		if (hangul_sindex >= 0 && hangul_sindex < UTF8PROC_HANGUL_SCOUNT) {
++			utf8proc_int32_t hangul_tindex;
++			if (bufsize >= 1) {
++				dst[0] = UTF8PROC_HANGUL_LBASE +
++					hangul_sindex / UTF8PROC_HANGUL_NCOUNT;
++				if (bufsize >= 2) dst[1] = UTF8PROC_HANGUL_VBASE +
++					(hangul_sindex % UTF8PROC_HANGUL_NCOUNT) / UTF8PROC_HANGUL_TCOUNT;
++			}
++			hangul_tindex = hangul_sindex % UTF8PROC_HANGUL_TCOUNT;
++			if (!hangul_tindex) return 2;
++			if (bufsize >= 3) dst[2] = UTF8PROC_HANGUL_TBASE + hangul_tindex;
++			return 3;
++		}
++	}
++	if (options & UTF8PROC_REJECTNA) {
++		if (!category) return UTF8PROC_ERROR_NOTASSIGNED;
++	}
++	if (options & UTF8PROC_IGNORE) {
++		if (property->ignorable) return 0;
++	}
++	if (options & UTF8PROC_STRIPNA) {
++		if (!category) return 0;
++	}
++	if (options & UTF8PROC_LUMP) {
++		if (category == UTF8PROC_CATEGORY_ZS) utf8proc_decompose_lump(0x0020);
++		if (uc == 0x2018 || uc == 0x2019 || uc == 0x02BC || uc == 0x02C8)
++			utf8proc_decompose_lump(0x0027);
++		if (category == UTF8PROC_CATEGORY_PD || uc == 0x2212)
++			utf8proc_decompose_lump(0x002D);
++		if (uc == 0x2044 || uc == 0x2215) utf8proc_decompose_lump(0x002F);
++		if (uc == 0x2236) utf8proc_decompose_lump(0x003A);
++		if (uc == 0x2039 || uc == 0x2329 || uc == 0x3008)
++			utf8proc_decompose_lump(0x003C);
++		if (uc == 0x203A || uc == 0x232A || uc == 0x3009)
++			utf8proc_decompose_lump(0x003E);
++		if (uc == 0x2216) utf8proc_decompose_lump(0x005C);
++		if (uc == 0x02C4 || uc == 0x02C6 || uc == 0x2038 || uc == 0x2303)
++			utf8proc_decompose_lump(0x005E);
++		if (category == UTF8PROC_CATEGORY_PC || uc == 0x02CD)
++			utf8proc_decompose_lump(0x005F);
++		if (uc == 0x02CB) utf8proc_decompose_lump(0x0060);
++		if (uc == 0x2223) utf8proc_decompose_lump(0x007C);
++		if (uc == 0x223C) utf8proc_decompose_lump(0x007E);
++		if ((options & UTF8PROC_NLF2LS) && (options & UTF8PROC_NLF2PS)) {
++			if (category == UTF8PROC_CATEGORY_ZL ||
++					category == UTF8PROC_CATEGORY_ZP)
++				utf8proc_decompose_lump(0x000A);
++		}
++	}
++	if (options & UTF8PROC_STRIPMARK) {
++		if (category == UTF8PROC_CATEGORY_MN ||
++			category == UTF8PROC_CATEGORY_MC ||
++			category == UTF8PROC_CATEGORY_ME) return 0;
++	}
++	if (options & UTF8PROC_CASEFOLD) {
++		if (property->casefold_seqindex != UINT16_MAX) {
++			return seqindex_write_char_decomposed(property->casefold_seqindex, dst, bufsize, options, last_boundclass);
++		}
++	}
++	if (options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) {
++		if (property->decomp_seqindex != UINT16_MAX &&
++				(!property->decomp_type || (options & UTF8PROC_COMPAT))) {
++			return seqindex_write_char_decomposed(property->decomp_seqindex, dst, bufsize, options, last_boundclass);
++		}
++	}
++	if (options & UTF8PROC_CHARBOUND) {
++		utf8proc_bool boundary;
++		int tbc = property->boundclass;
++		boundary = grapheme_break_extended(*last_boundclass, tbc, last_boundclass);
++		if (boundary) {
++			if (bufsize >= 1) dst[0] = -1; /* sentinel value for grapheme break */
++			if (bufsize >= 2) dst[1] = uc;
++			return 2;
++		}
++	}
++	if (bufsize >= 1) *dst = uc;
++	return 1;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose(
+-  const utf8proc_uint8_t *str, utf8proc_ssize_t strlen,
+-  utf8proc_int32_t *buffer, utf8proc_ssize_t bufsize, utf8proc_option_t options
++	const utf8proc_uint8_t *str, utf8proc_ssize_t strlen,
++	utf8proc_int32_t *buffer, utf8proc_ssize_t bufsize, utf8proc_option_t options
+ ) {
+-    return utf8proc_decompose_custom(str, strlen, buffer, bufsize, options, NULL, NULL);
++		return utf8proc_decompose_custom(str, strlen, buffer, bufsize, options, NULL, NULL);
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose_custom(
+-  const utf8proc_uint8_t *str, utf8proc_ssize_t strlen,
+-  utf8proc_int32_t *buffer, utf8proc_ssize_t bufsize, utf8proc_option_t options,
+-  utf8proc_custom_func custom_func, void *custom_data
++	const utf8proc_uint8_t *str, utf8proc_ssize_t strlen,
++	utf8proc_int32_t *buffer, utf8proc_ssize_t bufsize, utf8proc_option_t options,
++	utf8proc_custom_func custom_func, void *custom_data
+ ) {
+-  /* strlen will be ignored, if UTF8PROC_NULLTERM is set in options */
+-  utf8proc_ssize_t wpos = 0;
+-  if ((options & UTF8PROC_COMPOSE) && (options & UTF8PROC_DECOMPOSE))
+-    return UTF8PROC_ERROR_INVALIDOPTS;
+-  if ((options & UTF8PROC_STRIPMARK) &&
+-      !(options & UTF8PROC_COMPOSE) && !(options & UTF8PROC_DECOMPOSE))
+-    return UTF8PROC_ERROR_INVALIDOPTS;
+-  {
+-    utf8proc_int32_t uc;
+-    utf8proc_ssize_t rpos = 0;
+-    utf8proc_ssize_t decomp_result;
+-    int boundclass = UTF8PROC_BOUNDCLASS_START;
+-    while (1) {
+-      if (options & UTF8PROC_NULLTERM) {
+-        rpos += utf8proc_iterate(str + rpos, -1, &uc);
+-        /* checking of return value is not necessary,
+-           as 'uc' is < 0 in case of error */
+-        if (uc < 0) return UTF8PROC_ERROR_INVALIDUTF8;
+-        if (rpos < 0) return UTF8PROC_ERROR_OVERFLOW;
+-        if (uc == 0) break;
+-      } else {
+-        if (rpos >= strlen) break;
+-        rpos += utf8proc_iterate(str + rpos, strlen - rpos, &uc);
+-        if (uc < 0) return UTF8PROC_ERROR_INVALIDUTF8;
+-      }
+-      if (custom_func != NULL) {
+-        uc = custom_func(uc, custom_data);   /* user-specified custom mapping */
+-      }
+-      decomp_result = utf8proc_decompose_char(
+-        uc, buffer + wpos, (bufsize > wpos) ? (bufsize - wpos) : 0, options,
+-        &boundclass
+-      );
+-      if (decomp_result < 0) return decomp_result;
+-      wpos += decomp_result;
+-      /* prohibiting integer overflows due to too long strings: */
+-      if (wpos < 0 ||
+-          wpos > (utf8proc_ssize_t)(SSIZE_MAX/sizeof(utf8proc_int32_t)/2))
+-        return UTF8PROC_ERROR_OVERFLOW;
+-    }
+-  }
+-  if ((options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) && bufsize >= wpos) {
+-    utf8proc_ssize_t pos = 0;
+-    while (pos < wpos-1) {
+-      utf8proc_int32_t uc1, uc2;
+-      const utf8proc_property_t *property1, *property2;
+-      uc1 = buffer[pos];
+-      uc2 = buffer[pos+1];
+-      property1 = unsafe_get_property(uc1);
+-      property2 = unsafe_get_property(uc2);
+-      if (property1->combining_class > property2->combining_class &&
+-          property2->combining_class > 0) {
+-        buffer[pos] = uc2;
+-        buffer[pos+1] = uc1;
+-        if (pos > 0) pos--; else pos++;
+-      } else {
+-        pos++;
+-      }
+-    }
+-  }
+-  return wpos;
++	/* strlen will be ignored, if UTF8PROC_NULLTERM is set in options */
++	utf8proc_ssize_t wpos = 0;
++	if ((options & UTF8PROC_COMPOSE) && (options & UTF8PROC_DECOMPOSE))
++		return UTF8PROC_ERROR_INVALIDOPTS;
++	if ((options & UTF8PROC_STRIPMARK) &&
++			!(options & UTF8PROC_COMPOSE) && !(options & UTF8PROC_DECOMPOSE))
++		return UTF8PROC_ERROR_INVALIDOPTS;
++	{
++		utf8proc_int32_t uc;
++		utf8proc_ssize_t rpos = 0;
++		utf8proc_ssize_t decomp_result;
++		int boundclass = UTF8PROC_BOUNDCLASS_START;
++		while (1) {
++			if (options & UTF8PROC_NULLTERM) {
++				rpos += utf8proc_iterate(str + rpos, -1, &uc);
++				/* checking of return value is not necessary,
++					 as 'uc' is < 0 in case of error */
++				if (uc < 0) return UTF8PROC_ERROR_INVALIDUTF8;
++				if (rpos < 0) return UTF8PROC_ERROR_OVERFLOW;
++				if (uc == 0) break;
++			} else {
++				if (rpos >= strlen) break;
++				rpos += utf8proc_iterate(str + rpos, strlen - rpos, &uc);
++				if (uc < 0) return UTF8PROC_ERROR_INVALIDUTF8;
++			}
++			if (custom_func != NULL) {
++				uc = custom_func(uc, custom_data);   /* user-specified custom mapping */
++			}
++			decomp_result = utf8proc_decompose_char(
++				uc, buffer + wpos, (bufsize > wpos) ? (bufsize - wpos) : 0, options,
++				&boundclass
++			);
++			if (decomp_result < 0) return decomp_result;
++			wpos += decomp_result;
++			/* prohibiting integer overflows due to too long strings: */
++			if (wpos < 0 ||
++					wpos > (utf8proc_ssize_t)(SSIZE_MAX/sizeof(utf8proc_int32_t)/2))
++				return UTF8PROC_ERROR_OVERFLOW;
++		}
++	}
++	if ((options & (UTF8PROC_COMPOSE|UTF8PROC_DECOMPOSE)) && bufsize >= wpos) {
++		utf8proc_ssize_t pos = 0;
++		while (pos < wpos-1) {
++			utf8proc_int32_t uc1, uc2;
++			const utf8proc_property_t *property1, *property2;
++			uc1 = buffer[pos];
++			uc2 = buffer[pos+1];
++			property1 = unsafe_get_property(uc1);
++			property2 = unsafe_get_property(uc2);
++			if (property1->combining_class > property2->combining_class &&
++					property2->combining_class > 0) {
++				buffer[pos] = uc2;
++				buffer[pos+1] = uc1;
++				if (pos > 0) pos--; else pos++;
++			} else {
++				pos++;
++			}
++		}
++	}
++	return wpos;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(utf8proc_int32_t *buffer, utf8proc_ssize_t length, utf8proc_option_t options) {
+-  /* UTF8PROC_NULLTERM option will be ignored, 'length' is never ignored */
+-  if (options & (UTF8PROC_NLF2LS | UTF8PROC_NLF2PS | UTF8PROC_STRIPCC)) {
+-    utf8proc_ssize_t rpos;
+-    utf8proc_ssize_t wpos = 0;
+-    utf8proc_int32_t uc;
+-    for (rpos = 0; rpos < length; rpos++) {
+-      uc = buffer[rpos];
+-      if (uc == 0x000D && rpos < length-1 && buffer[rpos+1] == 0x000A) rpos++;
+-      if (uc == 0x000A || uc == 0x000D || uc == 0x0085 ||
+-          ((options & UTF8PROC_STRIPCC) && (uc == 0x000B || uc == 0x000C))) {
+-        if (options & UTF8PROC_NLF2LS) {
+-          if (options & UTF8PROC_NLF2PS) {
+-            buffer[wpos++] = 0x000A;
+-          } else {
+-            buffer[wpos++] = 0x2028;
+-          }
+-        } else {
+-          if (options & UTF8PROC_NLF2PS) {
+-            buffer[wpos++] = 0x2029;
+-          } else {
+-            buffer[wpos++] = 0x0020;
+-          }
+-        }
+-      } else if ((options & UTF8PROC_STRIPCC) &&
+-          (uc < 0x0020 || (uc >= 0x007F && uc < 0x00A0))) {
+-        if (uc == 0x0009) buffer[wpos++] = 0x0020;
+-      } else {
+-        buffer[wpos++] = uc;
+-      }
+-    }
+-    length = wpos;
+-  }
+-  if (options & UTF8PROC_COMPOSE) {
+-    utf8proc_int32_t *starter = NULL;
+-    utf8proc_int32_t current_char;
+-    const utf8proc_property_t *starter_property = NULL, *current_property;
+-    utf8proc_propval_t max_combining_class = -1;
+-    utf8proc_ssize_t rpos;
+-    utf8proc_ssize_t wpos = 0;
+-    utf8proc_int32_t composition;
+-    for (rpos = 0; rpos < length; rpos++) {
+-      current_char = buffer[rpos];
+-      current_property = unsafe_get_property(current_char);
+-      if (starter && current_property->combining_class > max_combining_class) {
+-        /* combination perhaps possible */
+-        utf8proc_int32_t hangul_lindex;
+-        utf8proc_int32_t hangul_sindex;
+-        hangul_lindex = *starter - UTF8PROC_HANGUL_LBASE;
+-        if (hangul_lindex >= 0 && hangul_lindex < UTF8PROC_HANGUL_LCOUNT) {
+-          utf8proc_int32_t hangul_vindex;
+-          hangul_vindex = current_char - UTF8PROC_HANGUL_VBASE;
+-          if (hangul_vindex >= 0 && hangul_vindex < UTF8PROC_HANGUL_VCOUNT) {
+-            *starter = UTF8PROC_HANGUL_SBASE +
+-              (hangul_lindex * UTF8PROC_HANGUL_VCOUNT + hangul_vindex) *
+-              UTF8PROC_HANGUL_TCOUNT;
+-            starter_property = NULL;
+-            continue;
+-          }
+-        }
+-        hangul_sindex = *starter - UTF8PROC_HANGUL_SBASE;
+-        if (hangul_sindex >= 0 && hangul_sindex < UTF8PROC_HANGUL_SCOUNT &&
+-            (hangul_sindex % UTF8PROC_HANGUL_TCOUNT) == 0) {
+-          utf8proc_int32_t hangul_tindex;
+-          hangul_tindex = current_char - UTF8PROC_HANGUL_TBASE;
+-          if (hangul_tindex >= 0 && hangul_tindex < UTF8PROC_HANGUL_TCOUNT) {
+-            *starter += hangul_tindex;
+-            starter_property = NULL;
+-            continue;
+-          }
+-        }
+-        if (!starter_property) {
+-          starter_property = unsafe_get_property(*starter);
+-        }
+-        if (starter_property->comb_index < 0x8000 &&
+-            current_property->comb_index != UINT16_MAX &&
+-            current_property->comb_index >= 0x8000) {
+-          int sidx = starter_property->comb_index;
+-          int idx = current_property->comb_index & 0x3FFF;
+-          if (idx >= utf8proc_combinations[sidx] && idx <= utf8proc_combinations[sidx + 1] ) {
+-            idx += sidx + 2 - utf8proc_combinations[sidx];
+-            if (current_property->comb_index & 0x4000) {
+-              composition = (utf8proc_combinations[idx] << 16) | utf8proc_combinations[idx+1];
+-            } else
+-              composition = utf8proc_combinations[idx];
+-
+-            if (composition > 0 && (!(options & UTF8PROC_STABLE) ||
+-                !(unsafe_get_property(composition)->comp_exclusion))) {
+-              *starter = composition;
+-              starter_property = NULL;
+-              continue;
+-            }
+-          }
+-        }
+-      }
+-      buffer[wpos] = current_char;
+-      if (current_property->combining_class) {
+-        if (current_property->combining_class > max_combining_class) {
+-          max_combining_class = current_property->combining_class;
+-        }
+-      } else {
+-        starter = buffer + wpos;
+-        starter_property = NULL;
+-        max_combining_class = -1;
+-      }
+-      wpos++;
+-    }
+-    length = wpos;
+-  }
+-  return length;
++	/* UTF8PROC_NULLTERM option will be ignored, 'length' is never ignored */
++	if (options & (UTF8PROC_NLF2LS | UTF8PROC_NLF2PS | UTF8PROC_STRIPCC)) {
++		utf8proc_ssize_t rpos;
++		utf8proc_ssize_t wpos = 0;
++		utf8proc_int32_t uc;
++		for (rpos = 0; rpos < length; rpos++) {
++			uc = buffer[rpos];
++			if (uc == 0x000D && rpos < length-1 && buffer[rpos+1] == 0x000A) rpos++;
++			if (uc == 0x000A || uc == 0x000D || uc == 0x0085 ||
++					((options & UTF8PROC_STRIPCC) && (uc == 0x000B || uc == 0x000C))) {
++				if (options & UTF8PROC_NLF2LS) {
++					if (options & UTF8PROC_NLF2PS) {
++						buffer[wpos++] = 0x000A;
++					} else {
++						buffer[wpos++] = 0x2028;
++					}
++				} else {
++					if (options & UTF8PROC_NLF2PS) {
++						buffer[wpos++] = 0x2029;
++					} else {
++						buffer[wpos++] = 0x0020;
++					}
++				}
++			} else if ((options & UTF8PROC_STRIPCC) &&
++					(uc < 0x0020 || (uc >= 0x007F && uc < 0x00A0))) {
++				if (uc == 0x0009) buffer[wpos++] = 0x0020;
++			} else {
++				buffer[wpos++] = uc;
++			}
++		}
++		length = wpos;
++	}
++	if (options & UTF8PROC_COMPOSE) {
++		utf8proc_int32_t *starter = NULL;
++		utf8proc_int32_t current_char;
++		const utf8proc_property_t *starter_property = NULL, *current_property;
++		utf8proc_propval_t max_combining_class = -1;
++		utf8proc_ssize_t rpos;
++		utf8proc_ssize_t wpos = 0;
++		utf8proc_int32_t composition;
++		for (rpos = 0; rpos < length; rpos++) {
++			current_char = buffer[rpos];
++			current_property = unsafe_get_property(current_char);
++			if (starter && current_property->combining_class > max_combining_class) {
++				/* combination perhaps possible */
++				utf8proc_int32_t hangul_lindex;
++				utf8proc_int32_t hangul_sindex;
++				hangul_lindex = *starter - UTF8PROC_HANGUL_LBASE;
++				if (hangul_lindex >= 0 && hangul_lindex < UTF8PROC_HANGUL_LCOUNT) {
++					utf8proc_int32_t hangul_vindex;
++					hangul_vindex = current_char - UTF8PROC_HANGUL_VBASE;
++					if (hangul_vindex >= 0 && hangul_vindex < UTF8PROC_HANGUL_VCOUNT) {
++						*starter = UTF8PROC_HANGUL_SBASE +
++							(hangul_lindex * UTF8PROC_HANGUL_VCOUNT + hangul_vindex) *
++							UTF8PROC_HANGUL_TCOUNT;
++						starter_property = NULL;
++						continue;
++					}
++				}
++				hangul_sindex = *starter - UTF8PROC_HANGUL_SBASE;
++				if (hangul_sindex >= 0 && hangul_sindex < UTF8PROC_HANGUL_SCOUNT &&
++						(hangul_sindex % UTF8PROC_HANGUL_TCOUNT) == 0) {
++					utf8proc_int32_t hangul_tindex;
++					hangul_tindex = current_char - UTF8PROC_HANGUL_TBASE;
++					if (hangul_tindex >= 0 && hangul_tindex < UTF8PROC_HANGUL_TCOUNT) {
++						*starter += hangul_tindex;
++						starter_property = NULL;
++						continue;
++					}
++				}
++				if (!starter_property) {
++					starter_property = unsafe_get_property(*starter);
++				}
++				if (starter_property->comb_index < 0x8000 &&
++						current_property->comb_index != UINT16_MAX &&
++						current_property->comb_index >= 0x8000) {
++					int sidx = starter_property->comb_index;
++					int idx = current_property->comb_index & 0x3FFF;
++					if (idx >= utf8proc_combinations[sidx] && idx <= utf8proc_combinations[sidx + 1] ) {
++						idx += sidx + 2 - utf8proc_combinations[sidx];
++						if (current_property->comb_index & 0x4000) {
++							composition = (utf8proc_combinations[idx] << 16) | utf8proc_combinations[idx+1];
++						} else
++							composition = utf8proc_combinations[idx];
++
++						if (composition > 0 && (!(options & UTF8PROC_STABLE) ||
++								!(unsafe_get_property(composition)->comp_exclusion))) {
++							*starter = composition;
++							starter_property = NULL;
++							continue;
++						}
++					}
++				}
++			}
++			buffer[wpos] = current_char;
++			if (current_property->combining_class) {
++				if (current_property->combining_class > max_combining_class) {
++					max_combining_class = current_property->combining_class;
++				}
++			} else {
++				starter = buffer + wpos;
++				starter_property = NULL;
++				max_combining_class = -1;
++			}
++			wpos++;
++		}
++		length = wpos;
++	}
++	return length;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_reencode(utf8proc_int32_t *buffer, utf8proc_ssize_t length, utf8proc_option_t options) {
+-  /* UTF8PROC_NULLTERM option will be ignored, 'length' is never ignored
+-     ASSERT: 'buffer' has one spare byte of free space at the end! */
+-  length = utf8proc_normalize_utf32(buffer, length, options);
+-  if (length < 0) return length;
+-  {
+-    utf8proc_ssize_t rpos, wpos = 0;
+-    utf8proc_int32_t uc;
+-    if (options & UTF8PROC_CHARBOUND) {
+-        for (rpos = 0; rpos < length; rpos++) {
+-            uc = buffer[rpos];
+-            wpos += charbound_encode_char(uc, ((utf8proc_uint8_t *)buffer) + wpos);
+-        }
+-    } else {
+-        for (rpos = 0; rpos < length; rpos++) {
+-            uc = buffer[rpos];
+-            wpos += utf8proc_encode_char(uc, ((utf8proc_uint8_t *)buffer) + wpos);
+-        }
+-    }
+-    ((utf8proc_uint8_t *)buffer)[wpos] = 0;
+-    return wpos;
+-  }
++	/* UTF8PROC_NULLTERM option will be ignored, 'length' is never ignored
++		 ASSERT: 'buffer' has one spare byte of free space at the end! */
++	length = utf8proc_normalize_utf32(buffer, length, options);
++	if (length < 0) return length;
++	{
++		utf8proc_ssize_t rpos, wpos = 0;
++		utf8proc_int32_t uc;
++		if (options & UTF8PROC_CHARBOUND) {
++				for (rpos = 0; rpos < length; rpos++) {
++						uc = buffer[rpos];
++						wpos += charbound_encode_char(uc, ((utf8proc_uint8_t *)buffer) + wpos);
++				}
++		} else {
++				for (rpos = 0; rpos < length; rpos++) {
++						uc = buffer[rpos];
++						wpos += utf8proc_encode_char(uc, ((utf8proc_uint8_t *)buffer) + wpos);
++				}
++		}
++		((utf8proc_uint8_t *)buffer)[wpos] = 0;
++		return wpos;
++	}
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_map(
+-  const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_uint8_t **dstptr, utf8proc_option_t options
++	const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_uint8_t **dstptr, utf8proc_option_t options
+ ) {
+-    return utf8proc_map_custom(str, strlen, dstptr, options, NULL, NULL);
++		return utf8proc_map_custom(str, strlen, dstptr, options, NULL, NULL);
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_map_custom(
+-  const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_uint8_t **dstptr, utf8proc_option_t options,
+-  utf8proc_custom_func custom_func, void *custom_data
++	const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_uint8_t **dstptr, utf8proc_option_t options,
++	utf8proc_custom_func custom_func, void *custom_data
+ ) {
+-  utf8proc_int32_t *buffer;
+-  utf8proc_ssize_t result;
+-  *dstptr = NULL;
+-  result = utf8proc_decompose_custom(str, strlen, NULL, 0, options, custom_func, custom_data);
+-  if (result < 0) return result;
+-  buffer = (utf8proc_int32_t *) malloc(result * sizeof(utf8proc_int32_t) + 1);
+-  if (!buffer) return UTF8PROC_ERROR_NOMEM;
+-  result = utf8proc_decompose_custom(str, strlen, buffer, result, options, custom_func, custom_data);
+-  if (result < 0) {
+-    free(buffer);
+-    return result;
+-  }
+-  result = utf8proc_reencode(buffer, result, options);
+-  if (result < 0) {
+-    free(buffer);
+-    return result;
+-  }
+-  {
+-    utf8proc_int32_t *newptr;
+-    newptr = (utf8proc_int32_t *) realloc(buffer, (size_t)result+1);
+-    if (newptr) buffer = newptr;
+-  }
+-  *dstptr = (utf8proc_uint8_t *)buffer;
+-  return result;
++	utf8proc_int32_t *buffer;
++	utf8proc_ssize_t result;
++	*dstptr = NULL;
++	result = utf8proc_decompose_custom(str, strlen, NULL, 0, options, custom_func, custom_data);
++	if (result < 0) return result;
++	buffer = (utf8proc_int32_t *) malloc(result * sizeof(utf8proc_int32_t) + 1);
++	if (!buffer) return UTF8PROC_ERROR_NOMEM;
++	result = utf8proc_decompose_custom(str, strlen, buffer, result, options, custom_func, custom_data);
++	if (result < 0) {
++		free(buffer);
++		return result;
++	}
++	result = utf8proc_reencode(buffer, result, options);
++	if (result < 0) {
++		free(buffer);
++		return result;
++	}
++	{
++		utf8proc_int32_t *newptr;
++		newptr = (utf8proc_int32_t *) realloc(buffer, (size_t)result+1);
++		if (newptr) buffer = newptr;
++	}
++	*dstptr = (utf8proc_uint8_t *)buffer;
++	return result;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFD(const utf8proc_uint8_t *str) {
+-  utf8proc_uint8_t *retval;
+-  utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
+-    UTF8PROC_DECOMPOSE));
+-  return retval;
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_DECOMPOSE));
++	return retval;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFC(const utf8proc_uint8_t *str) {
+-  utf8proc_uint8_t *retval;
+-  utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
+-    UTF8PROC_COMPOSE));
+-  return retval;
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_COMPOSE));
++	return retval;
++}
++
++UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_remove_accents(const utf8proc_uint8_t *str) {
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_COMPOSE | UTF8PROC_STRIPMARK));
++	return retval;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKD(const utf8proc_uint8_t *str) {
+-  utf8proc_uint8_t *retval;
+-  utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
+-    UTF8PROC_DECOMPOSE | UTF8PROC_COMPAT));
+-  return retval;
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_DECOMPOSE | UTF8PROC_COMPAT));
++	return retval;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKC(const utf8proc_uint8_t *str) {
+-  utf8proc_uint8_t *retval;
+-  utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
+-    UTF8PROC_COMPOSE | UTF8PROC_COMPAT));
+-  return retval;
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_COMPOSE | UTF8PROC_COMPAT));
++	return retval;
+ }
+ 
+ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKC_Casefold(const utf8proc_uint8_t *str) {
+-  utf8proc_uint8_t *retval;
+-  utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
+-    UTF8PROC_COMPOSE | UTF8PROC_COMPAT | UTF8PROC_CASEFOLD | UTF8PROC_IGNORE));
+-  return retval;
++	utf8proc_uint8_t *retval;
++	utf8proc_map(str, 0, &retval, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE |
++		UTF8PROC_COMPOSE | UTF8PROC_COMPAT | UTF8PROC_CASEFOLD | UTF8PROC_IGNORE));
++	return retval;
+ }
+diff --git a/third_party/utf8proc/utf8proc_wrapper.cpp b/third_party/utf8proc/utf8proc_wrapper.cpp
+index bc415458f391..e88605d053c1 100644
+--- a/third_party/utf8proc/utf8proc_wrapper.cpp
++++ b/third_party/utf8proc/utf8proc_wrapper.cpp
+@@ -1,4 +1,5 @@
+ #include "utf8proc_wrapper.hpp"
++#include "utf8proc_wrapper.h"
+ #include "utf8proc.hpp"
+ 
+ using namespace duckdb;
+@@ -54,13 +55,50 @@ std::string Utf8Proc::Normalize(std::string s) {
+ 	free(normalized);
+ 	return res;
+ }
+-;
+ 
+ char* Utf8Proc::Normalize(const char *s) {
+ 	assert(s);
+ 	assert(Utf8Proc::Analyze(s) != UnicodeType::INVALID);
+ 	return (char*) utf8proc_NFC((const utf8proc_uint8_t*) s);
+ }
+-;
+ 
+-;
++bool Utf8Proc::IsValid(const char *s, size_t len) {
++	return Utf8Proc::Analyze(s, len) != UnicodeType::INVALID;
++}
++
++size_t Utf8Proc::NextGraphemeCluster(const char *s, size_t len, size_t cpos) {
++	return utf8proc_next_grapheme(s, len, cpos);
++}
++
++size_t Utf8Proc::PreviousGraphemeCluster(const char *s, size_t len, size_t cpos) {
++	if (!Utf8Proc::IsValid(s, len)) {
++		return cpos - 1;
++	}
++	size_t current_pos = 0;
++	while(true) {
++		size_t new_pos = NextGraphemeCluster(s, len, current_pos);
++		if (new_pos <= current_pos || new_pos >= cpos) {
++			return current_pos;
++		}
++		current_pos = new_pos;
++	}
++}
++
++size_t utf8proc_next_grapheme_cluster(const char *s, size_t len, size_t pos) {
++	return Utf8Proc::NextGraphemeCluster(s, len, pos);
++}
++
++size_t utf8proc_prev_grapheme_cluster(const char *s, size_t len, size_t pos) {
++	return Utf8Proc::PreviousGraphemeCluster(s, len, pos);
++}
++
++size_t utf8proc_render_width(const char *s, size_t len, size_t pos) {
++	int sz;
++	auto codepoint = utf8proc_codepoint(s + pos, sz);
++	auto properties = utf8proc_get_property(codepoint);
++	return properties->charwidth;
++}
++
++int utf8proc_is_valid(const char *s, size_t len) {
++	return Utf8Proc::IsValid(s, len) ? 1 : 0;
++}
+diff --git a/tools/shell/CMakeLists.txt b/tools/shell/CMakeLists.txt
+index 9659c96230e7..154bb6ba935d 100644
+--- a/tools/shell/CMakeLists.txt
++++ b/tools/shell/CMakeLists.txt
+@@ -1,14 +1,19 @@
+ add_definitions(-DSQLITE_OMIT_LOAD_EXTENSION=1)
+ 
+-SET (SHELL_SOURCES shell.c)
++set(SHELL_SOURCES shell.c)
+ if(NOT WIN32)
+-	add_definitions(-DHAVE_LINENOISE=1)
+-	SET (SHELL_SOURCES ${SHELL_SOURCES} linenoise.c)
++  add_definitions(-DHAVE_LINENOISE=1)
++  set(SHELL_SOURCES ${SHELL_SOURCES} linenoise.c)
++  include_directories(../../third_party/third_party/utf8proc/include)
+ endif()
+ 
+ include_directories(include)
+ include_directories(../sqlite3_api_wrapper/include)
+ add_executable(shell ${SHELL_SOURCES})
+ target_link_libraries(shell sqlite3_api_wrapper_static)
++if(NOT AMALGAMATION_BUILD AND NOT WIN32)
++  target_link_libraries(shell utf8proc)
++endif()
+ set_target_properties(shell PROPERTIES OUTPUT_NAME duckdb_cli)
+-set_target_properties(shell PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
++set_target_properties(shell
++                      PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+diff --git a/tools/shell/linenoise.c b/tools/shell/linenoise.c
+index 813188ed12c9..265cb3cf4ed0 100644
+--- a/tools/shell/linenoise.c
++++ b/tools/shell/linenoise.c
+@@ -116,6 +116,7 @@
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ #include "linenoise.h"
++#include "utf8proc_wrapper.h"
+ 
+ #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
+ #define LINENOISE_MAX_LINE 4096
+@@ -516,26 +517,83 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int plen) {
+ 	}
+ }
+ 
++static size_t compute_render_width(const char *buf, size_t len) {
++	if (utf8proc_is_valid(buf, len)) {
++		// utf8 in prompt, get render width
++		size_t cpos = 0;
++		size_t render_width = 0;
++		while (cpos < len) {
++			size_t char_render_width = utf8proc_render_width(buf, len, cpos);
++			cpos = utf8proc_next_grapheme_cluster(buf, len, cpos);
++			render_width += char_render_width;
++		}
++		return render_width;
++	} else {
++		// invalid utf8 in prompt, use length in bytes
++		return len;
++	}
++}
++
+ /* Single line low level line refresh.
+  *
+  * Rewrite the currently edited line accordingly to the buffer content,
+  * cursor position, and number of columns of the terminal. */
+ static void refreshSingleLine(struct linenoiseState *l) {
+ 	char seq[64];
+-	size_t plen = strlen(l->prompt);
++	size_t plen = compute_render_width(l->prompt, strlen(l->prompt));
+ 	int fd = l->ofd;
+ 	char *buf = l->buf;
+ 	size_t len = l->len;
+ 	size_t pos = l->pos;
+ 	struct abuf ab;
+-
+-	while ((plen + pos) >= l->cols) {
+-		buf++;
+-		len--;
+-		pos--;
+-	}
+-	while (plen + len > l->cols) {
+-		len--;
++	size_t render_pos = 0;
++
++	if (utf8proc_is_valid(l->buf, l->len)) {
++		// utf8 in prompt, handle rendering
++		size_t remaining_render_width = l->cols - plen - 1;
++		size_t start_pos = 0;
++		size_t cpos = 0;
++		size_t prev_pos = 0;
++		size_t total_render_width = 0;
++		while (cpos < len) {
++			size_t char_render_width = utf8proc_render_width(buf, len, cpos);
++			prev_pos = cpos;
++			cpos = utf8proc_next_grapheme_cluster(buf, len, cpos);
++			total_render_width += cpos - prev_pos;
++			if (total_render_width >= remaining_render_width) {
++				// character does not fit anymore! we need to figure something out
++				if (prev_pos >= l->pos) {
++					// we passed the cursor: break
++					cpos = prev_pos;
++					break;
++				} else {
++					// we did not pass the cursor yet! remove characters from the start until it fits again
++					while(total_render_width >= remaining_render_width) {
++						size_t start_char_width = utf8proc_render_width(buf, len, start_pos);
++						size_t new_start = utf8proc_next_grapheme_cluster(buf, len, start_pos);
++						total_render_width -= new_start - start_pos;
++						start_pos = new_start;
++						render_pos -= start_char_width;
++					}
++				}
++			}
++			if (prev_pos < l->pos) {
++				render_pos += char_render_width;
++			}
++		}
++		buf = buf + start_pos;
++		len = cpos - start_pos;
++	} else {
++		// invalid UTF8: fallback
++		while ((plen + pos) >= l->cols) {
++			buf++;
++			len--;
++			pos--;
++		}
++		while (plen + len > l->cols) {
++			len--;
++		}
++		render_pos = pos;
+ 	}
+ 
+ 	abInit(&ab);
+@@ -551,7 +609,7 @@ static void refreshSingleLine(struct linenoiseState *l) {
+ 	snprintf(seq, 64, "\x1b[0K");
+ 	abAppend(&ab, seq, strlen(seq));
+ 	/* Move cursor to original position. */
+-	snprintf(seq, 64, "\r\x1b[%dC", (int)(pos + plen));
++	snprintf(seq, 64, "\r\x1b[%dC", (int)(render_pos + plen));
+ 	abAppend(&ab, seq, strlen(seq));
+ 	if (write(fd, ab.b, ab.len) == -1) {
+ 	} /* Can't recover from write error. */
+@@ -681,13 +739,22 @@ int linenoiseEditInsert(struct linenoiseState *l, char c) {
+ 			refreshLine(l);
+ 		}
+ 	}
++	refreshLine(l);
+ 	return 0;
+ }
+ 
++static size_t prev_char(struct linenoiseState *l) {
++	return utf8proc_prev_grapheme_cluster(l->buf, l->len, l->pos);
++}
++
++static size_t next_char(struct linenoiseState *l) {
++	return utf8proc_next_grapheme_cluster(l->buf, l->len, l->pos);
++}
++
+ /* Move cursor on the left. */
+ void linenoiseEditMoveLeft(struct linenoiseState *l) {
+ 	if (l->pos > 0) {
+-		l->pos--;
++		l->pos = prev_char(l);
+ 		refreshLine(l);
+ 	}
+ }
+@@ -695,7 +762,7 @@ void linenoiseEditMoveLeft(struct linenoiseState *l) {
+ /* Move cursor on the right. */
+ void linenoiseEditMoveRight(struct linenoiseState *l) {
+ 	if (l->pos != l->len) {
+-		l->pos++;
++		l->pos = next_char(l);
+ 		refreshLine(l);
+ 	}
+ }
+@@ -746,8 +813,10 @@ void linenoiseEditHistoryNext(struct linenoiseState *l, int dir) {
+  * position. Basically this is what happens with the "Delete" keyboard key. */
+ void linenoiseEditDelete(struct linenoiseState *l) {
+ 	if (l->len > 0 && l->pos < l->len) {
+-		memmove(l->buf + l->pos, l->buf + l->pos + 1, l->len - l->pos - 1);
+-		l->len--;
++		size_t new_pos = next_char(l);
++		size_t char_sz = new_pos - l->pos;
++		memmove(l->buf + l->pos, l->buf + new_pos, l->len - new_pos);
++		l->len -= char_sz;
+ 		l->buf[l->len] = '\0';
+ 		refreshLine(l);
+ 	}
+@@ -756,9 +825,11 @@ void linenoiseEditDelete(struct linenoiseState *l) {
+ /* Backspace implementation. */
+ void linenoiseEditBackspace(struct linenoiseState *l) {
+ 	if (l->pos > 0 && l->len > 0) {
+-		memmove(l->buf + l->pos - 1, l->buf + l->pos, l->len - l->pos);
+-		l->pos--;
+-		l->len--;
++		size_t new_pos = prev_char(l);
++		size_t char_sz = l->pos - new_pos;
++		memmove(l->buf + new_pos, l->buf + l->pos, l->len - l->pos);
++		l->len -= char_sz;
++		l->pos = new_pos;
+ 		l->buf[l->len] = '\0';
+ 		refreshLine(l);
+ 	}
+@@ -871,11 +942,15 @@ static int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen,
+ 			break;
+ 		case CTRL_T: /* ctrl-t, swaps current character with previous. */
+ 			if (l.pos > 0 && l.pos < l.len) {
+-				int aux = buf[l.pos - 1];
+-				buf[l.pos - 1] = buf[l.pos];
+-				buf[l.pos] = aux;
+-				if (l.pos != l.len - 1)
+-					l.pos++;
++				char temp_buffer[128];
++				int prev_pos = prev_char(&l);
++				int next_pos = next_char(&l);
++				int prev_char_size = l.pos - prev_pos;
++				int cur_char_size = next_pos - l.pos;
++				memcpy(temp_buffer, l.buf + prev_pos, prev_char_size);
++				memmove(l.buf + prev_pos, l.buf + l.pos, cur_char_size);
++				memcpy(l.buf + prev_pos + cur_char_size, temp_buffer, prev_char_size);
++				l.pos = next_pos;
+ 				refreshLine(&l);
+ 			}
+ 			break;

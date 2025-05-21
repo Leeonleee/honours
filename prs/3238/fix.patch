@@ -1,0 +1,466 @@
+diff --git a/extension/parquet/column_reader.cpp b/extension/parquet/column_reader.cpp
+index fe51325b83df..e87819c248e6 100644
+--- a/extension/parquet/column_reader.cpp
++++ b/extension/parquet/column_reader.cpp
+@@ -4,6 +4,7 @@
+ #include "parquet_reader.hpp"
+ 
+ #include "boolean_column_reader.hpp"
++#include "cast_column_reader.hpp"
+ #include "callback_column_reader.hpp"
+ #include "parquet_decimal_utils.hpp"
+ #include "list_column_reader.hpp"
+@@ -51,14 +52,30 @@ ColumnReader::ColumnReader(ParquetReader &reader, LogicalType type_p, const Sche
+ ColumnReader::~ColumnReader() {
+ }
+ 
+-const LogicalType &ColumnReader::Type() {
++ParquetReader &ColumnReader::Reader() {
++	return reader;
++}
++
++const LogicalType &ColumnReader::Type() const {
+ 	return type;
+ }
+ 
+-const SchemaElement &ColumnReader::Schema() {
++const SchemaElement &ColumnReader::Schema() const {
+ 	return schema;
+ }
+ 
++idx_t ColumnReader::FileIdx() const {
++	return file_idx;
++}
++
++idx_t ColumnReader::MaxDefine() const {
++	return max_define;
++}
++
++idx_t ColumnReader::MaxRepeat() const {
++	return max_repeat;
++}
++
+ idx_t ColumnReader::GroupRowsAvailable() {
+ 	return group_rows_available;
+ }
+@@ -118,9 +135,6 @@ void ColumnReader::PrepareRead(parquet_filter_t &filter) {
+ 	PageHeader page_hdr;
+ 	page_hdr.read(protocol);
+ 
+-	//		page_hdr.printTo(std::cout);
+-	//		std::cout << '
+';
+-
+ 	switch (page_hdr.type) {
+ 	case PageType::DATA_PAGE_V2:
+ 		PreparePageV2(page_hdr);
+@@ -620,6 +634,55 @@ ListColumnReader::ListColumnReader(ParquetReader &reader, LogicalType type_p, co
+ 	child_filter.set();
+ }
+ 
++//===--------------------------------------------------------------------===//
++// Cast Column Reader
++//===--------------------------------------------------------------------===//
++CastColumnReader::CastColumnReader(unique_ptr<ColumnReader> child_reader_p, LogicalType target_type_p)
++    : ColumnReader(child_reader_p->Reader(), move(target_type_p), child_reader_p->Schema(), child_reader_p->FileIdx(),
++                   child_reader_p->MaxDefine(), child_reader_p->MaxRepeat()),
++      child_reader(move(child_reader_p)) {
++	vector<LogicalType> intermediate_types {child_reader->Type()};
++	intermediate_chunk.Initialize(intermediate_types);
++}
++
++unique_ptr<BaseStatistics> CastColumnReader::Stats(const std::vector<ColumnChunk> &columns) {
++	// casting stats is not supported (yet)
++	return nullptr;
++}
++
++void CastColumnReader::InitializeRead(const std::vector<ColumnChunk> &columns, TProtocol &protocol_p) {
++	child_reader->InitializeRead(columns, protocol_p);
++}
++
++idx_t CastColumnReader::Read(uint64_t num_values, parquet_filter_t &filter, uint8_t *define_out, uint8_t *repeat_out,
++                             Vector &result) {
++	intermediate_chunk.Reset();
++	auto &intermediate_vector = intermediate_chunk.data[0];
++
++	auto amount = child_reader->Read(num_values, filter, define_out, repeat_out, intermediate_vector);
++	if (!filter.all()) {
++		// work-around for filters: set all values that are filtered to NULL to prevent the cast from failing on
++		// uninitialized data
++		intermediate_vector.Normalify(amount);
++		auto &validity = FlatVector::Validity(intermediate_vector);
++		for (idx_t i = 0; i < amount; i++) {
++			if (!filter[i]) {
++				validity.SetInvalid(i);
++			}
++		}
++	}
++	VectorOperations::Cast(intermediate_vector, result, amount);
++	return amount;
++}
++
++void CastColumnReader::Skip(idx_t num_values) {
++	child_reader->Skip(num_values);
++}
++
++idx_t CastColumnReader::GroupRowsAvailable() {
++	return child_reader->GroupRowsAvailable();
++}
++
+ //===--------------------------------------------------------------------===//
+ // Struct Column Reader
+ //===--------------------------------------------------------------------===//
+diff --git a/extension/parquet/include/cast_column_reader.hpp b/extension/parquet/include/cast_column_reader.hpp
+new file mode 100644
+index 000000000000..0cd54cb93da9
+--- /dev/null
++++ b/extension/parquet/include/cast_column_reader.hpp
+@@ -0,0 +1,35 @@
++//===----------------------------------------------------------------------===//
++//                         DuckDB
++//
++// cast_column_reader.hpp
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "column_reader.hpp"
++#include "templated_column_reader.hpp"
++
++namespace duckdb {
++
++//! A column reader that represents a cast over a child reader
++class CastColumnReader : public ColumnReader {
++public:
++	CastColumnReader(unique_ptr<ColumnReader> child_reader, LogicalType target_type);
++
++	unique_ptr<ColumnReader> child_reader;
++	DataChunk intermediate_chunk;
++
++public:
++	unique_ptr<BaseStatistics> Stats(const std::vector<ColumnChunk> &columns) override;
++	void InitializeRead(const std::vector<ColumnChunk> &columns, TProtocol &protocol_p) override;
++
++	idx_t Read(uint64_t num_values, parquet_filter_t &filter, uint8_t *define_out, uint8_t *repeat_out,
++	           Vector &result) override;
++
++	void Skip(idx_t num_values) override;
++	idx_t GroupRowsAvailable() override;
++};
++
++} // namespace duckdb
+diff --git a/extension/parquet/include/column_reader.hpp b/extension/parquet/include/column_reader.hpp
+index c16ce52c2bf5..4a21bebacdee 100644
+--- a/extension/parquet/include/column_reader.hpp
++++ b/extension/parquet/include/column_reader.hpp
+@@ -56,12 +56,16 @@ class ColumnReader {
+ 
+ 	virtual void Skip(idx_t num_values);
+ 
+-	const LogicalType &Type();
+-	const SchemaElement &Schema();
++	ParquetReader &Reader();
++	const LogicalType &Type() const;
++	const SchemaElement &Schema() const;
++	idx_t FileIdx() const;
++	idx_t MaxDefine() const;
++	idx_t MaxRepeat() const;
+ 
+ 	virtual idx_t GroupRowsAvailable();
+ 
+-	unique_ptr<BaseStatistics> Stats(const std::vector<ColumnChunk> &columns);
++	virtual unique_ptr<BaseStatistics> Stats(const std::vector<ColumnChunk> &columns);
+ 
+ protected:
+ 	// readers that use the default Read() need to implement those
+diff --git a/extension/parquet/include/parquet_reader.hpp b/extension/parquet/include/parquet_reader.hpp
+index 6223aa51d8b1..9bb5136e5214 100644
+--- a/extension/parquet/include/parquet_reader.hpp
++++ b/extension/parquet/include/parquet_reader.hpp
+@@ -69,10 +69,17 @@ class ParquetReader {
+ 	    : ParquetReader(allocator, move(file_handle_p), vector<LogicalType>(), string()) {
+ 	}
+ 
+-	ParquetReader(ClientContext &context, string file_name, const vector<LogicalType> &expected_types_p,
++	ParquetReader(ClientContext &context, string file_name, const vector<string> &names,
++	              const vector<LogicalType> &expected_types_p, const vector<column_t> &column_ids,
+ 	              ParquetOptions parquet_options, const string &initial_filename = string());
+ 	ParquetReader(ClientContext &context, string file_name, ParquetOptions parquet_options)
+-	    : ParquetReader(context, move(file_name), vector<LogicalType>(), parquet_options, string()) {
++	    : ParquetReader(context, move(file_name), vector<string>(), vector<LogicalType>(), vector<column_t>(),
++	                    parquet_options, string()) {
++	}
++	ParquetReader(ClientContext &context, string file_name, const vector<LogicalType> &expected_types_p,
++	              ParquetOptions parquet_options)
++	    : ParquetReader(context, move(file_name), vector<string>(), expected_types_p, vector<column_t>(),
++	                    parquet_options, string()) {
+ 	}
+ 	~ParquetReader();
+ 
+@@ -99,7 +106,8 @@ class ParquetReader {
+ 	static LogicalType DeriveLogicalType(const SchemaElement &s_ele, bool binary_as_string);
+ 
+ private:
+-	void InitializeSchema(const vector<LogicalType> &expected_types_p, const string &initial_filename_p);
++	void InitializeSchema(const vector<string> &names, const vector<LogicalType> &expected_types_p,
++	                      const vector<column_t> &column_ids, const string &initial_filename_p);
+ 	bool ScanInternal(ParquetReaderScanState &state, DataChunk &output);
+ 	unique_ptr<ColumnReader> CreateReader(const duckdb_parquet::format::FileMetaData *file_meta_data);
+ 
+@@ -118,6 +126,12 @@ class ParquetReader {
+ 
+ private:
+ 	unique_ptr<FileHandle> file_handle;
++	//! column-id map, used when reading multiple parquet files since separate parquet files might have columns at
++	//! different positions e.g. the first file might have column "a" at position 0, the second at position 1, etc
++	vector<column_t> column_id_map;
++	//! Map of column_id -> cast, used when reading multiple parquet files when parquet files have diverging types
++	//! for the same column
++	unordered_map<column_t, LogicalType> cast_map;
+ };
+ 
+ } // namespace duckdb
+diff --git a/extension/parquet/parquet-extension.cpp b/extension/parquet/parquet-extension.cpp
+index 6abe835974d1..c7941bdd5ec9 100644
+--- a/extension/parquet/parquet-extension.cpp
++++ b/extension/parquet/parquet-extension.cpp
+@@ -42,6 +42,8 @@ struct ParquetReadBindData : public FunctionData {
+ 	vector<column_t> column_ids;
+ 	atomic<idx_t> chunk_count;
+ 	atomic<idx_t> cur_file;
++	vector<string> names;
++	vector<LogicalType> types;
+ };
+ 
+ struct ParquetReadOperatorData : public FunctionOperatorData {
+@@ -88,6 +90,7 @@ class ParquetScanFunction {
+ 	static unique_ptr<FunctionData> ParquetReadBind(ClientContext &context, CopyInfo &info,
+ 	                                                vector<string> &expected_names,
+ 	                                                vector<LogicalType> &expected_types) {
++		D_ASSERT(expected_names.size() == expected_types.size());
+ 		for (auto &option : info.options) {
+ 			auto loption = StringUtil::Lower(option.first);
+ 			if (loption == "compression" || loption == "codec") {
+@@ -106,6 +109,8 @@ class ParquetScanFunction {
+ 		}
+ 		ParquetOptions parquet_options(context);
+ 		result->initial_reader = make_shared<ParquetReader>(context, result->files[0], expected_types, parquet_options);
++		result->names = result->initial_reader->names;
++		result->types = result->initial_reader->return_types;
+ 		return move(result);
+ 	}
+ 
+@@ -181,9 +186,8 @@ class ParquetScanFunction {
+ 		result->files = move(files);
+ 
+ 		result->initial_reader = make_shared<ParquetReader>(context, result->files[0], parquet_options);
+-		return_types = result->initial_reader->return_types;
+-
+-		names = result->initial_reader->names;
++		return_types = result->types = result->initial_reader->return_types;
++		names = result->names = result->initial_reader->names;
+ 		return move(result);
+ 	}
+ 
+@@ -309,8 +313,9 @@ class ParquetScanFunction {
+ 					bind_data.chunk_count = 0;
+ 					string file = bind_data.files[data.file_index];
+ 					// move to the next file
+-					data.reader = make_shared<ParquetReader>(context, file, data.reader->return_types,
+-					                                         data.reader->parquet_options, bind_data.files[0]);
++					data.reader =
++					    make_shared<ParquetReader>(context, file, bind_data.names, bind_data.types, data.column_ids,
++					                               data.reader->parquet_options, bind_data.files[0]);
+ 					vector<idx_t> group_ids;
+ 					for (idx_t i = 0; i < data.reader->NumRowGroups(); i++) {
+ 						group_ids.push_back(i);
+@@ -371,8 +376,8 @@ class ParquetScanFunction {
+ 				// read the next file
+ 				string file = bind_data.files[++parallel_state.file_index];
+ 				parallel_state.current_reader =
+-				    make_shared<ParquetReader>(context, file, parallel_state.current_reader->return_types,
+-				                               parallel_state.current_reader->parquet_options);
++				    make_shared<ParquetReader>(context, file, bind_data.names, bind_data.types, scan_data.column_ids,
++				                               parallel_state.current_reader->parquet_options, bind_data.files[0]);
+ 				if (parallel_state.current_reader->NumRowGroups() == 0) {
+ 					// empty parquet file, move to next file
+ 					continue;
+diff --git a/extension/parquet/parquet_reader.cpp b/extension/parquet/parquet_reader.cpp
+index 22207c649b19..46001103416b 100644
+--- a/extension/parquet/parquet_reader.cpp
++++ b/extension/parquet/parquet_reader.cpp
+@@ -4,6 +4,7 @@
+ #include "column_reader.hpp"
+ 
+ #include "boolean_column_reader.hpp"
++#include "cast_column_reader.hpp"
+ #include "callback_column_reader.hpp"
+ #include "list_column_reader.hpp"
+ #include "string_column_reader.hpp"
+@@ -24,6 +25,7 @@
+ #include "duckdb/common/string_util.hpp"
+ #include "duckdb/common/types/date.hpp"
+ #include "duckdb/common/pair.hpp"
++#include "duckdb/common/vector_operations/vector_operations.hpp"
+ 
+ #include "duckdb/storage/object_cache.hpp"
+ #endif
+@@ -340,10 +342,23 @@ unique_ptr<ColumnReader> ParquetReader::CreateReader(const duckdb_parquet::forma
+ 	auto ret = CreateReaderRecursive(file_meta_data, 0, 0, 0, next_schema_idx, next_file_idx);
+ 	D_ASSERT(next_schema_idx == file_meta_data->schema.size() - 1);
+ 	D_ASSERT(file_meta_data->row_groups.empty() || next_file_idx == file_meta_data->row_groups[0].columns.size());
++
++	// add casts if required
++	for (auto &entry : cast_map) {
++		auto column_idx = entry.first;
++		auto &expected_type = entry.second;
++
++		auto &root_struct_reader = (StructColumnReader &)*ret;
++		auto child_reader = move(root_struct_reader.child_readers[column_idx]);
++		auto cast_reader = make_unique<CastColumnReader>(move(child_reader), expected_type);
++		root_struct_reader.child_readers[column_idx] = move(cast_reader);
++	}
+ 	return ret;
+ }
+ 
+-void ParquetReader::InitializeSchema(const vector<LogicalType> &expected_types_p, const string &initial_filename_p) {
++void ParquetReader::InitializeSchema(const vector<string> &expected_names, const vector<LogicalType> &expected_types,
++                                     const vector<column_t> &column_ids, const string &initial_filename_p) {
++	D_ASSERT(expected_names.size() == expected_types.size() || (expected_names.empty() && column_ids.empty()));
+ 	auto file_meta_data = GetFileMetadata();
+ 
+ 	if (file_meta_data->__isset.encryption_algorithm) {
+@@ -354,36 +369,65 @@ void ParquetReader::InitializeSchema(const vector<LogicalType> &expected_types_p
+ 		throw FormatException("Need at least one non-root column in the file");
+ 	}
+ 
+-	bool has_expected_types = !expected_types_p.empty();
++	bool has_expected_names = !expected_names.empty();
++	bool has_expected_types = !expected_types.empty();
+ 	auto root_reader = CreateReader(file_meta_data);
+ 
+ 	auto &root_type = root_reader->Type();
+ 	auto &child_types = StructType::GetChildTypes(root_type);
+ 	D_ASSERT(root_type.id() == LogicalTypeId::STRUCT);
+-	if (has_expected_types && child_types.size() != expected_types_p.size()) {
+-		throw FormatException("column count mismatch");
+-	}
+-	idx_t col_idx = 0;
+ 	for (auto &type_pair : child_types) {
+-		if (has_expected_types && expected_types_p[col_idx] != type_pair.second) {
+-			if (initial_filename_p.empty()) {
+-				throw FormatException("column \"%d\" in parquet file is of type %s, could not auto cast to "
+-				                      "expected type %s for this column",
+-				                      col_idx, type_pair.second, expected_types_p[col_idx].ToString());
+-			} else {
+-				throw FormatException("schema mismatch in Parquet glob: column \"%d\" in parquet file is of type "
+-				                      "%s, but in the original file \"%s\" this column is of type \"%s\"",
+-				                      col_idx, type_pair.second, initial_filename_p,
+-				                      expected_types_p[col_idx].ToString());
+-			}
+-		} else {
+-			names.push_back(type_pair.first);
+-			return_types.push_back(type_pair.second);
+-		}
+-		col_idx++;
++		names.push_back(type_pair.first);
++		return_types.push_back(type_pair.second);
+ 	}
+ 	D_ASSERT(!names.empty());
+ 	D_ASSERT(!return_types.empty());
++	if (!has_expected_types) {
++		return;
++	}
++	if (!has_expected_names && has_expected_types) {
++		// we ONLY have expected types, but no expected names
++		// in this case we need all types to match in-order
++		if (return_types.size() != expected_types.size()) {
++			throw FormatException("column count mismatch: expected %d columns but found %d", expected_types.size(),
++			                      return_types.size());
++		}
++		for (idx_t col_idx = 0; col_idx < return_types.size(); col_idx++) {
++			if (return_types[col_idx] == expected_types[col_idx]) {
++				continue;
++			}
++			// type mismatch: have to add a cast
++			cast_map[col_idx] = expected_types[col_idx];
++		}
++		return;
++	}
++	D_ASSERT(column_ids.size() > 0);
++	// we have expected types: create a map of name -> column index
++	unordered_map<string, idx_t> name_map;
++	for (idx_t col_idx = 0; col_idx < names.size(); col_idx++) {
++		name_map[names[col_idx]] = col_idx;
++	}
++	// now for each of the expected names, look it up in the name map and fill the column_id_map
++	D_ASSERT(column_id_map.empty());
++	for (idx_t i = 0; i < column_ids.size(); i++) {
++		if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
++			continue;
++		}
++		auto &expected_name = expected_names[column_ids[i]];
++		auto &expected_type = expected_types[column_ids[i]];
++		auto entry = name_map.find(expected_name);
++		if (entry == name_map.end()) {
++			throw FormatException("schema mismatch in Parquet glob: column \"%s\" was read from the original file "
++			                      "\"%s\", but could not be found in file \"%s\"",
++			                      expected_name, initial_filename_p, file_name);
++		}
++		auto column_idx = entry->second;
++		column_id_map.push_back(column_idx);
++		if (expected_type != return_types[column_idx]) {
++			// type mismatch: have to add a cast
++			cast_map[column_idx] = expected_type;
++		}
++	}
+ }
+ 
+ ParquetOptions::ParquetOptions(ClientContext &context) {
+@@ -399,10 +443,13 @@ ParquetReader::ParquetReader(Allocator &allocator_p, unique_ptr<FileHandle> file
+ 	file_name = file_handle_p->path;
+ 	file_handle = move(file_handle_p);
+ 	metadata = LoadMetadata(allocator, *file_handle);
+-	InitializeSchema(expected_types_p, initial_filename_p);
++	vector<string> expected_names;
++	vector<column_t> expected_column_ids;
++	InitializeSchema(expected_names, expected_types_p, expected_column_ids, initial_filename_p);
+ }
+ 
+-ParquetReader::ParquetReader(ClientContext &context_p, string file_name_p, const vector<LogicalType> &expected_types_p,
++ParquetReader::ParquetReader(ClientContext &context_p, string file_name_p, const vector<string> &expected_names,
++                             const vector<LogicalType> &expected_types_p, const vector<column_t> &column_ids,
+                              ParquetOptions parquet_options_p, const string &initial_filename_p)
+     : allocator(Allocator::Get(context_p)), file_opener(FileSystem::GetFileOpener(context_p)),
+       parquet_options(parquet_options_p) {
+@@ -428,7 +475,7 @@ ParquetReader::ParquetReader(ClientContext &context_p, string file_name_p, const
+ 			ObjectCache::GetObjectCache(context_p).Put(file_name, metadata);
+ 		}
+ 	}
+-	InitializeSchema(expected_types_p, initial_filename_p);
++	InitializeSchema(expected_names, expected_types_p, column_ids, initial_filename_p);
+ }
+ 
+ ParquetReader::~ParquetReader() {
+@@ -487,9 +534,9 @@ void ParquetReader::PrepareRowGroupBuffer(ParquetReaderScanState &state, idx_t o
+ 				skip_chunk = true;
+ 			}
+ 			if (skip_chunk) {
++				// this effectively will skip this chunk
+ 				state.group_offset = group.num_rows;
+ 				return;
+-				// this effectively will skip this chunk
+ 			}
+ 		}
+ 	}
+@@ -509,7 +556,7 @@ void ParquetReader::InitializeScan(ParquetReaderScanState &state, vector<column_
+                                    vector<idx_t> groups_to_read, TableFilterSet *filters) {
+ 	state.current_group = -1;
+ 	state.finished = false;
+-	state.column_ids = move(column_ids);
++	state.column_ids = column_id_map.empty() ? move(column_ids) : column_id_map;
+ 	state.group_offset = 0;
+ 	state.group_idx_list = move(groups_to_read);
+ 	state.filters = filters;

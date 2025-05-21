@@ -1,7 +1,7 @@
 #!/bin/bash
 
 models=(
-    "4o"
+    "o3"
 )
 
 # number of completions per model

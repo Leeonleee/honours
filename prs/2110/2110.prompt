@@ -1,0 +1,466 @@
+You will be provided with a partial code base and an issue statement explaining a problem to resolve.
+In your output, give nothing but the code (no markdown) so that your output can be copy pasted and run immediately with no changes
+
+<issue>
+Missing Column Data After Adding Left Join To Query in DuckDB Version 0.2.8
+After upgrading to DuckDB version 0.2.8, column data is missing after adding a LEFT JOIN to a query.  This behavior is not seen in DuckDB version 0.2.7.
+
+If you run the following query (queryOne) on the sample set in the attachment, there are 6219 rows which have a null value for the date field.  This is the expected value.  This is seen in both DuckDB versions 0.2.7 and 0.2.8.
+
+```
+SELECT one.id AS id,
+    one.status AS schedule_status,
+    one.date AS date
+FROM 
+    view_one AS one
+```
+
+If you run a second query (queryTwo) that includes a left join, it is expected that there will be the same 6219 rows which have a null value for the date field.  When the second query is run on the sample data set in the attachment, DuckDB version 0.2.8 has 6260 rows with a null date field instead of 6219 rows.  DuckDB version 0.2.7 will return the correct values for the date field and will have 6219 rows with a null date field.
+
+```
+SELECT one.id AS id,
+    one.status AS schedule_status,
+    one.date AS date
+FROM 
+    view_one AS one
+LEFT JOIN
+    view_two two ON two.id = one.id AND two.line = 1
+```
+
+I tested the sample Python script using Python version 3.9.5.
+
+[DuckDB Missing Data in Query for 0.2.8.zip](https://github.com/duckdb/duckdb/files/6941094/DuckDB.Missing.Data.in.Query.for.0.2.8.zip)
+
+
+</issue>
+<code>
+[start of README.md]
+1: <img src="https://duckdb.org/images/DuckDB_Logo_dl.png" height="50">
+2: 
+3: ![.github/workflows/main.yml](https://github.com/cwida/duckdb/workflows/.github/workflows/main.yml/badge.svg?branch=master)
+4: [![CodeFactor](https://www.codefactor.io/repository/github/cwida/duckdb/badge)](https://www.codefactor.io/repository/github/cwida/duckdb)
+5: [![codecov](https://codecov.io/gh/duckdb/duckdb/branch/master/graph/badge.svg?token=FaxjcfFghN)](https://codecov.io/gh/duckdb/duckdb)
+6: 
+7: 
+8: ## Installation
+9: If you just want to install and use DuckDB, please see [our website](https://www.duckdb.org) for installation and usage instructions.
+10: 
+11: ## Development
+12: For development, DuckDB requires [CMake](https://cmake.org), Python3 and a `C++11` compliant compiler. Run `make` in the root directory to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`.
+13: 
+14: Please also refer to our [Contribution Guide](CONTRIBUTING.md).
+15: 
+16: 
+[end of README.md]
+[start of src/execution/operator/join/physical_hash_join.cpp]
+1: #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+2: #include "duckdb/parallel/thread_context.hpp"
+3: #include "duckdb/storage/storage_manager.hpp"
+4: #include "duckdb/common/vector_operations/vector_operations.hpp"
+5: #include "duckdb/execution/expression_executor.hpp"
+6: #include "duckdb/storage/buffer_manager.hpp"
+7: #include "duckdb/function/aggregate/distributive_functions.hpp"
+8: #include "duckdb/main/client_context.hpp"
+9: #include "duckdb/main/query_profiler.hpp"
+10: 
+11: namespace duckdb {
+12: 
+13: PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
+14:                                    unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
+15:                                    const vector<idx_t> &left_projection_map,
+16:                                    const vector<idx_t> &right_projection_map_p, vector<LogicalType> delim_types,
+17:                                    idx_t estimated_cardinality)
+18:     : PhysicalComparisonJoin(op, PhysicalOperatorType::HASH_JOIN, move(cond), join_type, estimated_cardinality),
+19:       right_projection_map(right_projection_map_p), delim_types(move(delim_types)) {
+20: 	children.push_back(move(left));
+21: 	children.push_back(move(right));
+22: 
+23: 	D_ASSERT(left_projection_map.size() == 0);
+24: 	for (auto &condition : conditions) {
+25: 		condition_types.push_back(condition.left->return_type);
+26: 	}
+27: 
+28: 	// for ANTI, SEMI and MARK join, we only need to store the keys, so for these the build types are empty
+29: 	if (join_type != JoinType::ANTI && join_type != JoinType::SEMI && join_type != JoinType::MARK) {
+30: 		build_types = LogicalOperator::MapTypes(children[1]->GetTypes(), right_projection_map);
+31: 	}
+32: }
+33: 
+34: PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
+35:                                    unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
+36:                                    idx_t estimated_cardinality)
+37:     : PhysicalHashJoin(op, move(left), move(right), move(cond), join_type, {}, {}, {}, estimated_cardinality) {
+38: }
+39: 
+40: //===--------------------------------------------------------------------===//
+41: // Sink
+42: //===--------------------------------------------------------------------===//
+43: class HashJoinLocalState : public LocalSinkState {
+44: public:
+45: 	DataChunk build_chunk;
+46: 	DataChunk join_keys;
+47: 	ExpressionExecutor build_executor;
+48: };
+49: 
+50: class HashJoinGlobalState : public GlobalOperatorState {
+51: public:
+52: 	HashJoinGlobalState() {
+53: 	}
+54: 
+55: 	//! The HT used by the join
+56: 	unique_ptr<JoinHashTable> hash_table;
+57: 	//! Only used for FULL OUTER JOIN: scan state of the final scan to find unmatched tuples in the build-side
+58: 	JoinHTScanState ht_scan_state;
+59: };
+60: 
+61: unique_ptr<GlobalOperatorState> PhysicalHashJoin::GetGlobalState(ClientContext &context) {
+62: 	auto state = make_unique<HashJoinGlobalState>();
+63: 	state->hash_table =
+64: 	    make_unique<JoinHashTable>(BufferManager::GetBufferManager(context), conditions, build_types, join_type);
+65: 	if (!delim_types.empty() && join_type == JoinType::MARK) {
+66: 		// correlated MARK join
+67: 		if (delim_types.size() + 1 == conditions.size()) {
+68: 			// the correlated MARK join has one more condition than the amount of correlated columns
+69: 			// this is the case in a correlated ANY() expression
+70: 			// in this case we need to keep track of additional entries, namely:
+71: 			// - (1) the total amount of elements per group
+72: 			// - (2) the amount of non-null elements per group
+73: 			// we need these to correctly deal with the cases of either:
+74: 			// - (1) the group being empty [in which case the result is always false, even if the comparison is NULL]
+75: 			// - (2) the group containing a NULL value [in which case FALSE becomes NULL]
+76: 			auto &info = state->hash_table->correlated_mark_join_info;
+77: 
+78: 			vector<LogicalType> payload_types;
+79: 			vector<BoundAggregateExpression *> correlated_aggregates;
+80: 			unique_ptr<BoundAggregateExpression> aggr;
+81: 
+82: 			// jury-rigging the GroupedAggregateHashTable
+83: 			// we need a count_star and a count to get counts with and without NULLs
+84: 			aggr = AggregateFunction::BindAggregateFunction(context, CountStarFun::GetFunction(), {}, nullptr, false);
+85: 			correlated_aggregates.push_back(&*aggr);
+86: 			payload_types.push_back(aggr->return_type);
+87: 			info.correlated_aggregates.push_back(move(aggr));
+88: 
+89: 			auto count_fun = CountFun::GetFunction();
+90: 			vector<unique_ptr<Expression>> children;
+91: 			// this is a dummy but we need it to make the hash table understand whats going on
+92: 			children.push_back(make_unique_base<Expression, BoundReferenceExpression>(count_fun.return_type, 0));
+93: 			aggr = AggregateFunction::BindAggregateFunction(context, count_fun, move(children), nullptr, false);
+94: 			correlated_aggregates.push_back(&*aggr);
+95: 			payload_types.push_back(aggr->return_type);
+96: 			info.correlated_aggregates.push_back(move(aggr));
+97: 
+98: 			info.correlated_counts = make_unique<GroupedAggregateHashTable>(
+99: 			    BufferManager::GetBufferManager(context), delim_types, payload_types, correlated_aggregates);
+100: 			info.correlated_types = delim_types;
+101: 			info.group_chunk.Initialize(delim_types);
+102: 			info.result_chunk.Initialize(payload_types);
+103: 		}
+104: 	}
+105: 	return move(state);
+106: }
+107: 
+108: unique_ptr<LocalSinkState> PhysicalHashJoin::GetLocalSinkState(ExecutionContext &context) {
+109: 	auto state = make_unique<HashJoinLocalState>();
+110: 	if (!right_projection_map.empty()) {
+111: 		state->build_chunk.Initialize(build_types);
+112: 	}
+113: 	for (auto &cond : conditions) {
+114: 		state->build_executor.AddExpression(*cond.right);
+115: 	}
+116: 	state->join_keys.Initialize(condition_types);
+117: 	return move(state);
+118: }
+119: 
+120: void PhysicalHashJoin::Sink(ExecutionContext &context, GlobalOperatorState &state, LocalSinkState &lstate_p,
+121:                             DataChunk &input) const {
+122: 	auto &sink = (HashJoinGlobalState &)state;
+123: 	auto &lstate = (HashJoinLocalState &)lstate_p;
+124: 	// resolve the join keys for the right chunk
+125: 	lstate.build_executor.Execute(input, lstate.join_keys);
+126: 	// build the HT
+127: 	if (!right_projection_map.empty()) {
+128: 		// there is a projection map: fill the build chunk with the projected columns
+129: 		lstate.build_chunk.Reset();
+130: 		lstate.build_chunk.SetCardinality(input);
+131: 		for (idx_t i = 0; i < right_projection_map.size(); i++) {
+132: 			lstate.build_chunk.data[i].Reference(input.data[right_projection_map[i]]);
+133: 		}
+134: 		sink.hash_table->Build(lstate.join_keys, lstate.build_chunk);
+135: 	} else if (!build_types.empty()) {
+136: 		// there is not a projected map: place the entire right chunk in the HT
+137: 		sink.hash_table->Build(lstate.join_keys, input);
+138: 	} else {
+139: 		// there are only keys: place an empty chunk in the payload
+140: 		lstate.build_chunk.SetCardinality(input.size());
+141: 		sink.hash_table->Build(lstate.join_keys, lstate.build_chunk);
+142: 	}
+143: }
+144: 
+145: //===--------------------------------------------------------------------===//
+146: // Finalize
+147: //===--------------------------------------------------------------------===//
+148: bool PhysicalHashJoin::Finalize(Pipeline &pipeline, ClientContext &context, unique_ptr<GlobalOperatorState> state) {
+149: 	auto &sink = (HashJoinGlobalState &)*state;
+150: 	sink.hash_table->Finalize();
+151: 
+152: 	PhysicalSink::Finalize(pipeline, context, move(state));
+153: 	return true;
+154: }
+155: 
+156: //===--------------------------------------------------------------------===//
+157: // GetChunkInternal
+158: //===--------------------------------------------------------------------===//
+159: class PhysicalHashJoinState : public PhysicalOperatorState {
+160: public:
+161: 	PhysicalHashJoinState(PhysicalOperator &op, PhysicalOperator *left, PhysicalOperator *right,
+162: 	                      vector<JoinCondition> &conditions)
+163: 	    : PhysicalOperatorState(op, left) {
+164: 	}
+165: 
+166: 	DataChunk cached_chunk;
+167: 	DataChunk join_keys;
+168: 	ExpressionExecutor probe_executor;
+169: 	unique_ptr<JoinHashTable::ScanStructure> scan_structure;
+170: };
+171: 
+172: unique_ptr<PhysicalOperatorState> PhysicalHashJoin::GetOperatorState() {
+173: 	auto state = make_unique<PhysicalHashJoinState>(*this, children[0].get(), children[1].get(), conditions);
+174: 	state->cached_chunk.Initialize(types);
+175: 	state->join_keys.Initialize(condition_types);
+176: 	for (auto &cond : conditions) {
+177: 		state->probe_executor.AddExpression(*cond.left);
+178: 	}
+179: 	return move(state);
+180: }
+181: 
+182: void PhysicalHashJoin::GetChunkInternal(ExecutionContext &context, DataChunk &chunk,
+183:                                         PhysicalOperatorState *state_p) const {
+184: 	auto state = reinterpret_cast<PhysicalHashJoinState *>(state_p);
+185: 	auto &sink = (HashJoinGlobalState &)*sink_state;
+186: 	bool join_is_inner_right_semi =
+187: 	    (sink.hash_table->join_type == JoinType::INNER || sink.hash_table->join_type == JoinType::RIGHT ||
+188: 	     sink.hash_table->join_type == JoinType::SEMI);
+189: 
+190: 	if (sink.hash_table->Count() == 0 && join_is_inner_right_semi) {
+191: 		// empty hash table with INNER, RIGHT or SEMI join means empty result set
+192: 		return;
+193: 	}
+194: 	do {
+195: 		ProbeHashTable(context, chunk, state);
+196: 		if (chunk.size() == 0) {
+197: #if STANDARD_VECTOR_SIZE >= 128
+198: 			if (state->cached_chunk.size() > 0) {
+199: 				// finished probing but cached data remains, return cached chunk
+200: 				chunk.Reference(state->cached_chunk);
+201: 				state->cached_chunk.SetCardinality(0);
+202: 			} else
+203: #endif
+204: 			    if (IsRightOuterJoin(join_type)) {
+205: 				// check if we need to scan any unmatched tuples from the RHS for the full/right outer join
+206: 				sink.hash_table->ScanFullOuter(chunk, sink.ht_scan_state);
+207: 			}
+208: 			return;
+209: 		} else {
+210: #if STANDARD_VECTOR_SIZE >= 128
+211: 			if (chunk.size() < 64) {
+212: 				// small chunk: add it to chunk cache and continue
+213: 				state->cached_chunk.Append(chunk);
+214: 				if (state->cached_chunk.size() >= (STANDARD_VECTOR_SIZE - 64)) {
+215: 					// chunk cache full: return it
+216: 					chunk.Reference(state->cached_chunk);
+217: 					state->cached_chunk.SetCardinality(0);
+218: 					return;
+219: 				} else {
+220: 					// chunk cache not full: probe again
+221: 					chunk.Reset();
+222: 				}
+223: 			} else {
+224: 				return;
+225: 			}
+226: #else
+227: 			return;
+228: #endif
+229: 		}
+230: 	} while (true);
+231: }
+232: 
+233: void PhysicalHashJoin::ProbeHashTable(ExecutionContext &context, DataChunk &chunk,
+234:                                       PhysicalOperatorState *state_p) const {
+235: 	auto state = reinterpret_cast<PhysicalHashJoinState *>(state_p);
+236: 	auto &sink = (HashJoinGlobalState &)*sink_state;
+237: 
+238: 	if (state->child_chunk.size() > 0 && state->scan_structure) {
+239: 		// still have elements remaining from the previous probe (i.e. we got
+240: 		// >1024 elements in the previous probe)
+241: 		state->scan_structure->Next(state->join_keys, state->child_chunk, chunk);
+242: 		if (chunk.size() > 0) {
+243: 			return;
+244: 		}
+245: 		state->scan_structure = nullptr;
+246: 	}
+247: 
+248: 	// probe the HT
+249: 	do {
+250: 		// fetch the chunk from the left side
+251: 		children[0]->GetChunk(context, state->child_chunk, state->child_state.get());
+252: 		if (state->child_chunk.size() == 0) {
+253: 			return;
+254: 		}
+255: 		if (sink.hash_table->Count() == 0) {
+256: 			ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, state->child_chunk, chunk);
+257: 			return;
+258: 		}
+259: 		// resolve the join keys for the left chunk
+260: 		state->probe_executor.Execute(state->child_chunk, state->join_keys);
+261: 
+262: 		// perform the actual probe
+263: 		state->scan_structure = sink.hash_table->Probe(state->join_keys);
+264: 		state->scan_structure->Next(state->join_keys, state->child_chunk, chunk);
+265: 	} while (chunk.size() == 0);
+266: }
+267: void PhysicalHashJoin::FinalizeOperatorState(PhysicalOperatorState &state, ExecutionContext &context) {
+268: 	auto &state_p = reinterpret_cast<PhysicalHashJoinState &>(state);
+269: 	context.thread.profiler.Flush(this, &state_p.probe_executor, "probe_executor", 0);
+270: 	if (!children.empty() && state.child_state) {
+271: 		children[0]->FinalizeOperatorState(*state.child_state, context);
+272: 	}
+273: }
+274: void PhysicalHashJoin::Combine(ExecutionContext &context, GlobalOperatorState &gstate, LocalSinkState &lstate) {
+275: 	auto &state = (HashJoinLocalState &)lstate;
+276: 	context.thread.profiler.Flush(this, &state.build_executor, "build_executor", 1);
+277: 	context.client.profiler->Flush(context.thread.profiler);
+278: }
+279: 
+280: } // namespace duckdb
+[end of src/execution/operator/join/physical_hash_join.cpp]
+[start of src/include/duckdb/execution/operator/join/physical_hash_join.hpp]
+1: //===----------------------------------------------------------------------===//
+2: //                         DuckDB
+3: //
+4: // duckdb/execution/operator/join/physical_hash_join.hpp
+5: //
+6: //
+7: //===----------------------------------------------------------------------===//
+8: 
+9: #pragma once
+10: 
+11: #include "duckdb/common/types/chunk_collection.hpp"
+12: #include "duckdb/execution/join_hashtable.hpp"
+13: #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
+14: #include "duckdb/execution/physical_operator.hpp"
+15: #include "duckdb/planner/operator/logical_join.hpp"
+16: 
+17: namespace duckdb {
+18: 
+19: //! PhysicalHashJoin represents a hash loop join between two tables
+20: class PhysicalHashJoin : public PhysicalComparisonJoin {
+21: public:
+22: 	PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left, unique_ptr<PhysicalOperator> right,
+23: 	                 vector<JoinCondition> cond, JoinType join_type, const vector<idx_t> &left_projection_map,
+24: 	                 const vector<idx_t> &right_projection_map, vector<LogicalType> delim_types,
+25: 	                 idx_t estimated_cardinality);
+26: 	PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left, unique_ptr<PhysicalOperator> right,
+27: 	                 vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality);
+28: 	void Combine(ExecutionContext &context, GlobalOperatorState &gstate, LocalSinkState &lstate) override;
+29: 
+30: 	vector<idx_t> right_projection_map;
+31: 	//! The types of the keys
+32: 	vector<LogicalType> condition_types;
+33: 	//! The types of all conditions
+34: 	vector<LogicalType> build_types;
+35: 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
+36: 	vector<LogicalType> delim_types;
+37: 
+38: public:
+39: 	unique_ptr<GlobalOperatorState> GetGlobalState(ClientContext &context) override;
+40: 
+41: 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) override;
+42: 	void Sink(ExecutionContext &context, GlobalOperatorState &state, LocalSinkState &lstate,
+43: 	          DataChunk &input) const override;
+44: 	bool Finalize(Pipeline &pipeline, ClientContext &context, unique_ptr<GlobalOperatorState> gstate) override;
+45: 
+46: 	void GetChunkInternal(ExecutionContext &context, DataChunk &chunk, PhysicalOperatorState *state) const override;
+47: 	unique_ptr<PhysicalOperatorState> GetOperatorState() override;
+48: 
+49: 	void FinalizeOperatorState(PhysicalOperatorState &state, ExecutionContext &context) override;
+50: 
+51: private:
+52: 	void ProbeHashTable(ExecutionContext &context, DataChunk &chunk, PhysicalOperatorState *state_p) const;
+53: };
+54: 
+55: } // namespace duckdb
+[end of src/include/duckdb/execution/operator/join/physical_hash_join.hpp]
+</code>
+Here is an example of a patch file. It consists of changes to the code base. It specifies the file names, the line numbers of each change, and the removed and added lines. A single patch file can contain changes to multiple files.
+<patch>
+--- a/file.cpp
++++ b/file.cpp
+@@ -3,35 +3,44 @@
+ #include <cstdlib>
+ 
+ int euclidean(int a, int b) {
+-    while (b) {
+-        int temp = b;
+-        b = a % b;
+-        a = temp;
++    if (b == 0) {
++        return a;
+     }
+-    return a;
++    return euclidean(b, a % b);
+ }
+ 
+ std::vector<std::pair<int, int>> bresenham(int x0, int y0, int x1, int y1) {
+     std::vector<std::pair<int, int>> points;
+     int dx = abs(x1 - x0);
+     int dy = abs(y1 - y0);
++    int x = x0, y = y0;
+     int sx = (x0 < x1) ? 1 : -1;
+     int sy = (y0 < y1) ? 1 : -1;
+-    int err = dx - dy;
+ 
+-    while (true) {
+-        points.emplace_back(x0, y0);
+-        if (x0 == x1 && y0 == y1) break;
+-        int e2 = 2 * err;
+-        if (e2 > -dy) {
++    if (dx > dy) {
++        int err = dx / 2;
++        while (x != x1) {
++            points.emplace_back(x, y);
+             err -= dy;
+-            x0 += sx;
++            if (err < 0) {
++                y += sy;
++                err += dx;
++            }
++            x += sx;
+         }
+-        if (e2 < dx) {
+-            err += dx;
+-            y0 += sy;
++    } else {
++        int err = dy / 2;
++        while (y != y1) {
++            points.emplace_back(x, y);
++            err -= dx;
++            if (err < 0) {
++                x += sx;
++                err += dy;
++            }
++            y += sy;
+         }
+     }
+ 
++    points.emplace_back(x, y);
+     return points;
+ }
+
+</patch>
+
+I need you to solve the provided issue by generating a single patch file that I can apply directly to this repository using git apply.
+Please respond with a single patch file in the format shown above.
+Make sure to only include the patch file contents so that the contents of your output can be copied into a patch file and applied directly
+
+Respond below:

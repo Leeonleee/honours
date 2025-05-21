@@ -1,0 +1,531 @@
+You will be provided with a partial code base and an issue statement explaining a problem to resolve.
+In your output, give nothing but the code (no markdown) so that your output can be copy pasted and run immediately with no changes
+
+<issue>
+Parquet export of booleans sometimes exports wrong values
+This is the final one for now, promise :)
+
+Booleans get mangled when exporting from duckdb. 0.2.5.
+EDIT: made the repro less convoluted.
+
+```py
+import duckdb
+import pandas as pd
+ddb = duckdb.connect(':memory:')
+
+# create data
+ddb.execute('''
+create table source as
+values (true), (false), (true), (false)
+''')
+
+# export
+ddb.execute("copy source to 'bool_export_bug.parquet' (format parquet)")
+
+# uh oh
+display(ddb.execute('select * from source').fetch_df()) # 1 0 1 0
+display(pd.read_parquet('bool_export_bug.parquet'))     # 1 0 0 0
+```
+
+</issue>
+<code>
+[start of README.md]
+1: <img src="https://duckdb.org/images/DuckDB_Logo_dl.png" height="50">
+2: 
+3: ![.github/workflows/main.yml](https://github.com/cwida/duckdb/workflows/.github/workflows/main.yml/badge.svg?branch=master)
+4: [![CodeFactor](https://www.codefactor.io/repository/github/cwida/duckdb/badge)](https://www.codefactor.io/repository/github/cwida/duckdb)
+5: [![codecov](https://codecov.io/gh/duckdb/duckdb/branch/master/graph/badge.svg?token=FaxjcfFghN)](https://codecov.io/gh/duckdb/duckdb)
+6: 
+7: 
+8: ## Installation
+9: If you just want to install and use DuckDB, please see [our website](https://www.duckdb.org) for installation and usage instructions.
+10: 
+11: ## Development
+12: For development, DuckDB requires [CMake](https://cmake.org), Python3 and a `C++11` compliant compiler. Run `make` in the root directory to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`.
+13: 
+14: Please also refer to our [Contribution Guide](CONTRIBUTING.md).
+15: 
+16: 
+[end of README.md]
+[start of extension/parquet/parquet_writer.cpp]
+1: #include "parquet_writer.hpp"
+2: #include "parquet_timestamp.hpp"
+3: 
+4: #include "duckdb.hpp"
+5: #ifndef DUCKDB_AMALGAMATION
+6: #include "duckdb/function/table_function.hpp"
+7: #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+8: #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
+9: #include "duckdb/main/client_context.hpp"
+10: #include "duckdb/main/connection.hpp"
+11: #include "duckdb/common/file_system.hpp"
+12: #include "duckdb/common/string_util.hpp"
+13: #include "duckdb/common/types/date.hpp"
+14: #include "duckdb/common/types/time.hpp"
+15: #include "duckdb/common/types/timestamp.hpp"
+16: #include "duckdb/common/serializer/buffered_file_writer.hpp"
+17: #include "duckdb/common/serializer/buffered_serializer.hpp"
+18: #endif
+19: 
+20: #include "snappy.h"
+21: #include "miniz_wrapper.hpp"
+22: #include "zstd.h"
+23: 
+24: namespace duckdb {
+25: 
+26: using namespace duckdb_parquet;                   // NOLINT
+27: using namespace duckdb_apache::thrift;            // NOLINT
+28: using namespace duckdb_apache::thrift::protocol;  // NOLINT
+29: using namespace duckdb_apache::thrift::transport; // NOLINT
+30: using namespace duckdb_miniz;                     // NOLINT
+31: 
+32: using duckdb_parquet::format::CompressionCodec;
+33: using duckdb_parquet::format::ConvertedType;
+34: using duckdb_parquet::format::Encoding;
+35: using duckdb_parquet::format::FieldRepetitionType;
+36: using duckdb_parquet::format::FileMetaData;
+37: using duckdb_parquet::format::PageHeader;
+38: using duckdb_parquet::format::PageType;
+39: using ParquetRowGroup = duckdb_parquet::format::RowGroup;
+40: using duckdb_parquet::format::Type;
+41: 
+42: class MyTransport : public TTransport {
+43: public:
+44: 	explicit MyTransport(Serializer &serializer) : serializer(serializer) {
+45: 	}
+46: 
+47: 	bool isOpen() const override {
+48: 		return true;
+49: 	}
+50: 
+51: 	void open() override {
+52: 	}
+53: 
+54: 	void close() override {
+55: 	}
+56: 
+57: 	void write_virt(const uint8_t *buf, uint32_t len) override {
+58: 		serializer.WriteData((const_data_ptr_t)buf, len);
+59: 	}
+60: 
+61: private:
+62: 	Serializer &serializer;
+63: };
+64: 
+65: static Type::type DuckDBTypeToParquetType(const LogicalType &duckdb_type) {
+66: 	switch (duckdb_type.id()) {
+67: 	case LogicalTypeId::BOOLEAN:
+68: 		return Type::BOOLEAN;
+69: 	case LogicalTypeId::TINYINT:
+70: 	case LogicalTypeId::SMALLINT:
+71: 	case LogicalTypeId::INTEGER:
+72: 		return Type::INT32;
+73: 	case LogicalTypeId::BIGINT:
+74: 		return Type::INT64;
+75: 	case LogicalTypeId::FLOAT:
+76: 		return Type::FLOAT;
+77: 	case LogicalTypeId::DECIMAL: // for now...
+78: 	case LogicalTypeId::DOUBLE:
+79: 		return Type::DOUBLE;
+80: 	case LogicalTypeId::VARCHAR:
+81: 	case LogicalTypeId::BLOB:
+82: 		return Type::BYTE_ARRAY;
+83: 	case LogicalTypeId::DATE:
+84: 	case LogicalTypeId::TIMESTAMP:
+85: 		return Type::INT96;
+86: 	default:
+87: 		throw NotImplementedException(duckdb_type.ToString());
+88: 	}
+89: }
+90: 
+91: static bool DuckDBTypeToConvertedType(const LogicalType &duckdb_type, ConvertedType::type &result) {
+92: 	switch (duckdb_type.id()) {
+93: 	case LogicalTypeId::VARCHAR:
+94: 		result = ConvertedType::UTF8;
+95: 		return true;
+96: 	default:
+97: 		return false;
+98: 	}
+99: }
+100: 
+101: static void VarintEncode(uint32_t val, Serializer &ser) {
+102: 	do {
+103: 		uint8_t byte = val & 127;
+104: 		val >>= 7;
+105: 		if (val != 0) {
+106: 			byte |= 128;
+107: 		}
+108: 		ser.Write<uint8_t>(byte);
+109: 	} while (val != 0);
+110: }
+111: 
+112: static uint8_t GetVarintSize(uint32_t val) {
+113: 	uint8_t res = 0;
+114: 	do {
+115: 		uint8_t byte = val & 127;
+116: 		val >>= 7;
+117: 		if (val != 0) {
+118: 			byte |= 128;
+119: 		}
+120: 		res++;
+121: 	} while (val != 0);
+122: 	return res;
+123: }
+124: 
+125: template <class SRC, class TGT>
+126: static void TemplatedWritePlain(Vector &col, idx_t length, ValidityMask &mask, Serializer &ser) {
+127: 	auto *ptr = FlatVector::GetData<SRC>(col);
+128: 	for (idx_t r = 0; r < length; r++) {
+129: 		if (mask.RowIsValid(r)) {
+130: 			ser.Write<TGT>((TGT)ptr[r]);
+131: 		}
+132: 	}
+133: }
+134: 
+135: ParquetWriter::ParquetWriter(FileSystem &fs, string file_name_p, vector<LogicalType> types_p, vector<string> names_p,
+136:                              CompressionCodec::type codec)
+137:     : file_name(move(file_name_p)), sql_types(move(types_p)), column_names(move(names_p)), codec(codec) {
+138: #if STANDARD_VECTOR_SIZE < 64
+139: 	throw NotImplementedException("Parquet writer is not supported for vector sizes < 64");
+140: #endif
+141: 
+142: 	// initialize the file writer
+143: 	writer = make_unique<BufferedFileWriter>(fs, file_name.c_str(),
+144: 	                                         FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+145: 	// parquet files start with the string "PAR1"
+146: 	writer->WriteData((const_data_ptr_t) "PAR1", 4);
+147: 	TCompactProtocolFactoryT<MyTransport> tproto_factory;
+148: 	protocol = tproto_factory.getProtocol(make_shared<MyTransport>(*writer));
+149: 
+150: 	file_meta_data.num_rows = 0;
+151: 	file_meta_data.version = 1;
+152: 
+153: 	file_meta_data.__isset.created_by = true;
+154: 	file_meta_data.created_by = "DuckDB";
+155: 
+156: 	file_meta_data.schema.resize(sql_types.size() + 1);
+157: 
+158: 	// populate root schema object
+159: 	file_meta_data.schema[0].name = "duckdb_schema";
+160: 	file_meta_data.schema[0].num_children = sql_types.size();
+161: 	file_meta_data.schema[0].__isset.num_children = true;
+162: 
+163: 	for (idx_t i = 0; i < sql_types.size(); i++) {
+164: 		auto &schema_element = file_meta_data.schema[i + 1];
+165: 
+166: 		schema_element.type = DuckDBTypeToParquetType(sql_types[i]);
+167: 		schema_element.repetition_type = FieldRepetitionType::OPTIONAL;
+168: 		schema_element.num_children = 0;
+169: 		schema_element.__isset.num_children = true;
+170: 		schema_element.__isset.type = true;
+171: 		schema_element.__isset.repetition_type = true;
+172: 		schema_element.name = column_names[i];
+173: 		schema_element.__isset.converted_type = DuckDBTypeToConvertedType(sql_types[i], schema_element.converted_type);
+174: 	}
+175: }
+176: 
+177: void ParquetWriter::Flush(ChunkCollection &buffer) {
+178: 	if (buffer.Count() == 0) {
+179: 		return;
+180: 	}
+181: 	lock_guard<mutex> glock(lock);
+182: 
+183: 	// set up a new row group for this chunk collection
+184: 	ParquetRowGroup row_group;
+185: 	row_group.num_rows = 0;
+186: 	row_group.file_offset = writer->GetTotalWritten();
+187: 	row_group.__isset.file_offset = true;
+188: 	row_group.columns.resize(buffer.ColumnCount());
+189: 
+190: 	// iterate over each of the columns of the chunk collection and write them
+191: 	for (idx_t i = 0; i < buffer.ColumnCount(); i++) {
+192: 		// we start off by writing everything into a temporary buffer
+193: 		// this is necessary to (1) know the total written size, and (2) to compress it afterwards
+194: 		BufferedSerializer temp_writer;
+195: 
+196: 		// set up some metadata
+197: 		PageHeader hdr;
+198: 		hdr.compressed_page_size = 0;
+199: 		hdr.uncompressed_page_size = 0;
+200: 		hdr.type = PageType::DATA_PAGE;
+201: 		hdr.__isset.data_page_header = true;
+202: 
+203: 		hdr.data_page_header.num_values = buffer.Count();
+204: 		hdr.data_page_header.encoding = Encoding::PLAIN;
+205: 		hdr.data_page_header.definition_level_encoding = Encoding::RLE;
+206: 		hdr.data_page_header.repetition_level_encoding = Encoding::BIT_PACKED;
+207: 
+208: 		// record the current offset of the writer into the file
+209: 		// this is the starting position of the current page
+210: 		auto start_offset = writer->GetTotalWritten();
+211: 
+212: 		// write the definition levels (i.e. the inverse of the nullmask)
+213: 		// we always bit pack everything
+214: 
+215: 		// first figure out how many bytes we need (1 byte per 8 rows, rounded up)
+216: 		auto define_byte_count = (buffer.Count() + 7) / 8;
+217: 		// we need to set up the count as a varint, plus an added marker for the RLE scheme
+218: 		// for this marker we shift the count left 1 and set low bit to 1 to indicate bit packed literals
+219: 		uint32_t define_header = (define_byte_count << 1) | 1;
+220: 		uint32_t define_size = GetVarintSize(define_header) + define_byte_count;
+221: 
+222: 		// we write the actual definitions into the temp_writer for now
+223: 		temp_writer.Write<uint32_t>(define_size);
+224: 		VarintEncode(define_header, temp_writer);
+225: 
+226: 		for (auto &chunk : buffer.Chunks()) {
+227: 			auto &validity = FlatVector::Validity(chunk->data[i]);
+228: 			auto validity_data = validity.GetData();
+229: 			auto chunk_define_byte_count = (chunk->size() + 7) / 8;
+230: 			if (!validity_data) {
+231: 				ValidityMask nop_mask(chunk->size());
+232: 				temp_writer.WriteData((const_data_ptr_t)nop_mask.GetData(), chunk_define_byte_count);
+233: 			} else {
+234: 				// write the bits of the nullmask
+235: 				temp_writer.WriteData((const_data_ptr_t)validity_data, chunk_define_byte_count);
+236: 			}
+237: 		}
+238: 
+239: 		// now write the actual payload: we write this as PLAIN values (for now? possibly for ever?)
+240: 		for (auto &chunk : buffer.Chunks()) {
+241: 			auto &input = *chunk;
+242: 			auto &input_column = input.data[i];
+243: 			auto &mask = FlatVector::Validity(input_column);
+244: 
+245: 			// write actual payload data
+246: 			switch (sql_types[i].id()) {
+247: 			case LogicalTypeId::BOOLEAN: {
+248: 				auto *ptr = FlatVector::GetData<bool>(input_column);
+249: 				uint8_t byte = 0;
+250: 				uint8_t byte_pos = 0;
+251: 				for (idx_t r = 0; r < input.size(); r++) {
+252: 					if (mask.RowIsValid(r)) { // only encode if non-null
+253: 						byte |= (ptr[r] & 1) << byte_pos;
+254: 						byte_pos++;
+255: 
+256: 						temp_writer.Write<uint8_t>(byte);
+257: 						if (byte_pos == 8) {
+258: 							temp_writer.Write<uint8_t>(byte);
+259: 							byte = 0;
+260: 							byte_pos = 0;
+261: 						}
+262: 					}
+263: 				}
+264: 				// flush last byte if req
+265: 				if (byte_pos > 0) {
+266: 					temp_writer.Write<uint8_t>(byte);
+267: 				}
+268: 				break;
+269: 			}
+270: 			case LogicalTypeId::TINYINT:
+271: 				TemplatedWritePlain<int8_t, int32_t>(input_column, input.size(), mask, temp_writer);
+272: 				break;
+273: 			case LogicalTypeId::SMALLINT:
+274: 				TemplatedWritePlain<int16_t, int32_t>(input_column, input.size(), mask, temp_writer);
+275: 				break;
+276: 			case LogicalTypeId::INTEGER:
+277: 				TemplatedWritePlain<int32_t, int32_t>(input_column, input.size(), mask, temp_writer);
+278: 				break;
+279: 			case LogicalTypeId::BIGINT:
+280: 				TemplatedWritePlain<int64_t, int64_t>(input_column, input.size(), mask, temp_writer);
+281: 				break;
+282: 			case LogicalTypeId::FLOAT:
+283: 				TemplatedWritePlain<float, float>(input_column, input.size(), mask, temp_writer);
+284: 				break;
+285: 			case LogicalTypeId::DECIMAL: {
+286: 				// FIXME: fixed length byte array...
+287: 				Vector double_vec(LogicalType::DOUBLE);
+288: 				VectorOperations::Cast(input_column, double_vec, input.size());
+289: 				TemplatedWritePlain<double, double>(double_vec, input.size(), mask, temp_writer);
+290: 				break;
+291: 			}
+292: 			case LogicalTypeId::DOUBLE:
+293: 				TemplatedWritePlain<double, double>(input_column, input.size(), mask, temp_writer);
+294: 				break;
+295: 			case LogicalTypeId::DATE: {
+296: 				auto *ptr = FlatVector::GetData<date_t>(input_column);
+297: 				for (idx_t r = 0; r < input.size(); r++) {
+298: 					if (mask.RowIsValid(r)) {
+299: 						auto ts = Timestamp::FromDatetime(ptr[r], dtime_t(0));
+300: 						temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ts));
+301: 					}
+302: 				}
+303: 				break;
+304: 			}
+305: 			case LogicalTypeId::TIMESTAMP: {
+306: 				auto *ptr = FlatVector::GetData<timestamp_t>(input_column);
+307: 				for (idx_t r = 0; r < input.size(); r++) {
+308: 					if (mask.RowIsValid(r)) {
+309: 						temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ptr[r]));
+310: 					}
+311: 				}
+312: 				break;
+313: 			}
+314: 			case LogicalTypeId::BLOB:
+315: 			case LogicalTypeId::VARCHAR: {
+316: 				auto *ptr = FlatVector::GetData<string_t>(input_column);
+317: 				for (idx_t r = 0; r < input.size(); r++) {
+318: 					if (mask.RowIsValid(r)) {
+319: 						temp_writer.Write<uint32_t>(ptr[r].GetSize());
+320: 						temp_writer.WriteData((const_data_ptr_t)ptr[r].GetDataUnsafe(), ptr[r].GetSize());
+321: 					}
+322: 				}
+323: 				break;
+324: 			}
+325: 			default:
+326: 				throw NotImplementedException((sql_types[i].ToString()));
+327: 			}
+328: 		}
+329: 
+330: 		// now that we have finished writing the data we know the uncompressed size
+331: 		hdr.uncompressed_page_size = temp_writer.blob.size;
+332: 
+333: 		// compress the data based
+334: 		size_t compressed_size;
+335: 		data_ptr_t compressed_data;
+336: 		unique_ptr<data_t[]> compressed_buf;
+337: 		switch (codec) {
+338: 		case CompressionCodec::UNCOMPRESSED:
+339: 			compressed_size = temp_writer.blob.size;
+340: 			compressed_data = temp_writer.blob.data.get();
+341: 			break;
+342: 		case CompressionCodec::SNAPPY: {
+343: 			compressed_size = snappy::MaxCompressedLength(temp_writer.blob.size);
+344: 			compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+345: 			snappy::RawCompress((const char *)temp_writer.blob.data.get(), temp_writer.blob.size,
+346: 			                    (char *)compressed_buf.get(), &compressed_size);
+347: 			compressed_data = compressed_buf.get();
+348: 			break;
+349: 		}
+350: 		case CompressionCodec::GZIP: {
+351: 			MiniZStream s;
+352: 			compressed_size = s.MaxCompressedLength(temp_writer.blob.size);
+353: 			compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+354: 			s.Compress((const char *)temp_writer.blob.data.get(), temp_writer.blob.size, (char *)compressed_buf.get(),
+355: 			           &compressed_size);
+356: 			compressed_data = compressed_buf.get();
+357: 			break;
+358: 		}
+359: 		case CompressionCodec::ZSTD: {
+360: 			compressed_size = duckdb_zstd::ZSTD_compressBound(temp_writer.blob.size);
+361: 			compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+362: 			compressed_size = duckdb_zstd::ZSTD_compress((void *)compressed_buf.get(), compressed_size,
+363: 			                                             (const void *)temp_writer.blob.data.get(),
+364: 			                                             temp_writer.blob.size, ZSTD_CLEVEL_DEFAULT);
+365: 			compressed_data = compressed_buf.get();
+366: 			break;
+367: 		}
+368: 		default:
+369: 			throw InternalException("Unsupported codec for Parquet Writer");
+370: 		}
+371: 
+372: 		hdr.compressed_page_size = compressed_size;
+373: 		// now finally write the data to the actual file
+374: 		hdr.write(protocol.get());
+375: 		writer->WriteData(compressed_data, compressed_size);
+376: 
+377: 		auto &column_chunk = row_group.columns[i];
+378: 		column_chunk.__isset.meta_data = true;
+379: 		column_chunk.meta_data.data_page_offset = start_offset;
+380: 		column_chunk.meta_data.total_compressed_size = writer->GetTotalWritten() - start_offset;
+381: 		column_chunk.meta_data.codec = codec;
+382: 		column_chunk.meta_data.path_in_schema.push_back(file_meta_data.schema[i + 1].name);
+383: 		column_chunk.meta_data.num_values = buffer.Count();
+384: 		column_chunk.meta_data.type = file_meta_data.schema[i + 1].type;
+385: 	}
+386: 	row_group.num_rows += buffer.Count();
+387: 
+388: 	// append the row group to the file meta data
+389: 	file_meta_data.row_groups.push_back(row_group);
+390: 	file_meta_data.num_rows += buffer.Count();
+391: }
+392: 
+393: void ParquetWriter::Finalize() {
+394: 	auto start_offset = writer->GetTotalWritten();
+395: 	file_meta_data.write(protocol.get());
+396: 
+397: 	writer->Write<uint32_t>(writer->GetTotalWritten() - start_offset);
+398: 
+399: 	// parquet files also end with the string "PAR1"
+400: 	writer->WriteData((const_data_ptr_t) "PAR1", 4);
+401: 
+402: 	// flush to disk
+403: 	writer->Sync();
+404: 	writer.reset();
+405: }
+406: 
+407: } // namespace duckdb
+[end of extension/parquet/parquet_writer.cpp]
+</code>
+Here is an example of a patch file. It consists of changes to the code base. It specifies the file names, the line numbers of each change, and the removed and added lines. A single patch file can contain changes to multiple files.
+<patch>
+--- a/file.cpp
++++ b/file.cpp
+@@ -3,35 +3,44 @@
+ #include <cstdlib>
+ 
+ int euclidean(int a, int b) {
+-    while (b) {
+-        int temp = b;
+-        b = a % b;
+-        a = temp;
++    if (b == 0) {
++        return a;
+     }
+-    return a;
++    return euclidean(b, a % b);
+ }
+ 
+ std::vector<std::pair<int, int>> bresenham(int x0, int y0, int x1, int y1) {
+     std::vector<std::pair<int, int>> points;
+     int dx = abs(x1 - x0);
+     int dy = abs(y1 - y0);
++    int x = x0, y = y0;
+     int sx = (x0 < x1) ? 1 : -1;
+     int sy = (y0 < y1) ? 1 : -1;
+-    int err = dx - dy;
+ 
+-    while (true) {
+-        points.emplace_back(x0, y0);
+-        if (x0 == x1 && y0 == y1) break;
+-        int e2 = 2 * err;
+-        if (e2 > -dy) {
++    if (dx > dy) {
++        int err = dx / 2;
++        while (x != x1) {
++            points.emplace_back(x, y);
+             err -= dy;
+-            x0 += sx;
++            if (err < 0) {
++                y += sy;
++                err += dx;
++            }
++            x += sx;
+         }
+-        if (e2 < dx) {
+-            err += dx;
+-            y0 += sy;
++    } else {
++        int err = dy / 2;
++        while (y != y1) {
++            points.emplace_back(x, y);
++            err -= dx;
++            if (err < 0) {
++                x += sx;
++                err += dy;
++            }
++            y += sy;
+         }
+     }
+ 
++    points.emplace_back(x, y);
+     return points;
+ }
+
+</patch>
+
+I need you to solve the provided issue by generating a single patch file that I can apply directly to this repository using git apply.
+Please respond with a single patch file in the format shown above.
+Make sure to only include the patch file contents so that the contents of your output can be copied into a patch file and applied directly
+
+Respond below:

@@ -46,11 +46,11 @@ def main():
     print("🧪 Testing patches...")
     test_all(args.m)
 
-    print("📦 Archiving generated patches and results...")
-    archive_results(args.m, benchmark_dir, logs_output_dir)
+    # print("📦 Archiving generated patches and results...")
+    # archive_results(args.m, benchmark_dir, logs_output_dir)
 
-    print("🧹 Cleaning up patches...")
-    cleanup_patches(benchmark_dir)
+    # print("🧹 Cleaning up patches...")
+    # cleanup_patches(benchmark_dir)
 
 
 
