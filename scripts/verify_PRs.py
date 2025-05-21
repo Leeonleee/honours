@@ -5,7 +5,7 @@ import sys
 
 # Configurations
 PR_FOLDER_PATH = "../test_in_progress_prs"
-# PR_FOLDER_PATH = "../prs"
+PR_FOLDER_PATH = "../prs"
 DUCKDB_REPO_PATH = "../duckdb"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
 
