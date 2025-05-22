@@ -119,3 +119,15 @@ Out of these tests, these are verified:
 ### Prerequisites
 - Ensure you have the `llm` Python library installed
   - Install any plugins for it if necessary (the library supports OpenAI models initially)
+
+## Valid PRs
+2639
+3004
+3120
+3463
+3964
+4131
+4713
+4740
+4910
+4973
