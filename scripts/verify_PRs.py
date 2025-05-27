@@ -103,7 +103,7 @@ def main():
 
     with open(log_path, "w") as log_file:
         valid_prs = []
-        max_prs_to_test = 10
+        max_prs_to_test = 1000
         tested_pr_count = 0
 
         for pr in sorted(os.listdir(PR_FOLDER_PATH), key=lambda x: int(x) if x.isdigit() else float('inf')):
