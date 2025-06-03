@@ -184,3 +184,12 @@ Out of these tests, these are verified:
 13415
 13685
 13908
+
+
+## Aider Test
+
+Example command:
+
+```bash
+aider --model o3 --no-gitignore -f ../aider_test/4713/4713.prompt src/function/table/read_csv.cpp
+```
