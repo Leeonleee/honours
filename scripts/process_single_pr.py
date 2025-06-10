@@ -1,3 +1,4 @@
+
 import os
 import json
 import re
@@ -6,13 +7,19 @@ import sys
 
 # Usage: python process_single_pr.py path/to/pr_folder path/to/repo
 
-"""
-This function will create the .prompt, fix.patch, and test.patch for each PR
-"""
-
 pr_folder = sys.argv[1]
 repo_path = sys.argv[2]
-template_path = "../template.prompt"
+template_header = """You will be provided with a partial code base and an issue statement explaining a problem to resolve.
+
+<issue>
+"""
+template_footer = """
+</issue>
+
+I need you to solve the provided issue by generating a code fix that can be applied directly to the repository
+
+Respond below:
+"""
 
 # Extract pull number
 pull_number = os.path.basename(pr_folder)
@@ -36,49 +43,23 @@ def git_checkout(commit_hash):
 def git_checkout_back():
     subprocess.run(["git", "checkout", "-"], cwd=repo_path, check=True)
 
-def load_file_with_line_numbers(filepath):
-    if not os.path.exists(filepath):
-        print(f"WARNING: File {filepath} not found — skipping.")
-        return None
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
-    numbered = [f"{idx}: {line.rstrip()}" for idx, line in enumerate(lines, 1)]
-    return "\n".join(numbered)
+def extract_modified_files_from_patch(patch_path):
+    try:
+        result = subprocess.run(
+            ["lsdiff", patch_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        return [line.strip() for line in result.stdout.splitlines()]
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: lsdiff failed on {patch_path}: {e.stderr}")
+        return []
 
-def build_prompt(instance):
-    with open(template_path) as f:
-        template = f.read()
-
-    problem_statement = instance["problem_statement"]
-    patch = instance["patch"]
-
-    filepaths = []
-    for line in patch.splitlines():
-        if line.startswith("diff --git"):
-            match = re.match(r"diff --git a/(.*?) b/", line)
-            if match:
-                filepaths.append(match.group(1))
-
-    readme_path = os.path.join(repo_path, "README.md")
-    readme_content = load_file_with_line_numbers(readme_path)
-    if not readme_content:
-        readme_content = ""
-
-    code_blocks = []
-    for filepath in filepaths:
-        abs_path = os.path.join(repo_path, filepath)
-        file_content = load_file_with_line_numbers(abs_path)
-        if file_content:
-            code_blocks.append(f"[start of {filepath}]\n{file_content}\n[end of {filepath}]")
-    full_code = f"[start of README.md]\n{readme_content}\n[end of README.md]\n" + "\n".join(code_blocks)
-
-    filled_prompt = template.replace("<issue>\n</issue>", f"<issue>\n{problem_statement}\n</issue>")
-    filled_prompt = filled_prompt.replace(
-        "<code>\n[start of README.md]\n[end of README.md]\n</code>",
-        f"<code>\n{full_code}\n</code>"
-    )
-
-    return filled_prompt
+def build_simple_prompt(instance):
+    issue = instance["problem_statement"].strip()
+    return f"{template_header}{issue}{template_footer}"
 
 print(f"Processing {pull_number}...")
 
@@ -97,8 +78,16 @@ try:
         with open(test_patch_path, 'w') as f:
             f.write(instance["test_patch"].replace('\\n', '\n'))
 
-    # Save prompt
-    prompt_text = build_prompt(instance)
+    # Update JSON with modified files
+    if os.path.exists(fix_patch_path):
+        modified_files = extract_modified_files_from_patch(fix_patch_path)
+        instance["modified_files"] = modified_files
+
+        with open(json_path, 'w') as f:
+            json.dump(instance, f, indent=2)
+
+    # Save simplified Aider-style prompt
+    prompt_text = build_simple_prompt(instance)
     prompt_path = os.path.join(pr_folder, f"{pull_number}.prompt")
     with open(prompt_path, 'w') as f:
         f.write(prompt_text)
@@ -108,4 +97,4 @@ except subprocess.CalledProcessError as e:
 finally:
     git_checkout_back()
 
-print(f"Finished processing {pull_number}.")
+print(f"✅ Finished processing {pull_number}.")
