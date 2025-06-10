@@ -52,7 +52,9 @@ def extract_modified_files_from_patch(patch_path):
             text=True,
             check=True
         )
-        return [line.strip() for line in result.stdout.splitlines()]
+        # strip leading a/ if present
+
+        return [line.strip()[2:] if line.startswith("a/") else line.strip() for line in result.stdout.splitlines()]
     except subprocess.CalledProcessError as e:
         print(f"ERROR: lsdiff failed on {patch_path}: {e.stderr}")
         return []
