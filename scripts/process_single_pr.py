@@ -52,8 +52,7 @@ def extract_modified_files_from_patch(patch_path):
             text=True,
             check=True
         )
-        # strip leading a/ if present
-
+        # Strip leading "a/" if present
         return [line.strip()[2:] if line.startswith("a/") else line.strip() for line in result.stdout.splitlines()]
     except subprocess.CalledProcessError as e:
         print(f"ERROR: lsdiff failed on {patch_path}: {e.stderr}")
@@ -69,24 +68,28 @@ try:
     git_checkout(base_commit)
 
     # Save fix.patch
+    fix_patch_path = None
     if "patch" in instance:
         fix_patch_path = os.path.join(pr_folder, "fix.patch")
         with open(fix_patch_path, 'w') as f:
             f.write(instance["patch"].replace('\\n', '\n'))
 
     # Save test.patch
+    test_patch_path = None
     if "test_patch" in instance:
         test_patch_path = os.path.join(pr_folder, "test.patch")
         with open(test_patch_path, 'w') as f:
             f.write(instance["test_patch"].replace('\\n', '\n'))
 
-    # Update JSON with modified files
-    if os.path.exists(fix_patch_path):
-        modified_files = extract_modified_files_from_patch(fix_patch_path)
-        instance["modified_files"] = modified_files
+    # Extract modified files and update JSON
+    if fix_patch_path and os.path.exists(fix_patch_path):
+        instance["modified_files"] = extract_modified_files_from_patch(fix_patch_path)
 
-        with open(json_path, 'w') as f:
-            json.dump(instance, f, indent=2)
+    if test_patch_path and os.path.exists(test_patch_path):
+        instance["modified_test_files"] = extract_modified_files_from_patch(test_patch_path)
+
+    with open(json_path, 'w') as f:
+        json.dump(instance, f, indent=2)
 
     # Save simplified Aider-style prompt
     prompt_text = build_simple_prompt(instance)

@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 
 # Configurations
-PR_FOLDER_PATH = "../benchmark_problems"
+PR_FOLDER_PATH = "../verified_prs"
 # PR_FOLDER_PATH = "../prs"
 DUCKDB_REPO_PATH = "../duckdb"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
