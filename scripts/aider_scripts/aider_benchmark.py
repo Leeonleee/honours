@@ -1,174 +1,144 @@
 """
-This script runs the benchmark
-
-Process:
-
-1. Parse command line arguments to get model, number of completions, benchmark directory, and output directory.
-2. Using Aider, generates code fixes for each of the specified problems in the benchmark directory.
-3. Tests the generated patches using the respective test cases
-4. Archives the results and generated patches into a specified output directory.
+Usage: python aider_benchmark.py -m <model_name>
 """
 
-import argparse, shutil, os, json
-import subprocess
+import argparse, shutil
 from pathlib import Path
+import subprocess
+from datetime import datetime
+import json
 
+debug = True
+
+# Constants
+HONOURS_DIR = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems")
+DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems").resolve()
 DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
-DUCKDB_REPO = (SCRIPT_DIR.parent.parent / "duckdb").resolve()
-AIDERIGNORE_SRC = SCRIPT_DIR / ".aiderignore"
 
-# print(SCRIPT_DIR)
-# print(DEFAULT_BENCHMARK_DIR)
-# print(DEFAULT_OUTPUT_DIR)
-# print(DUCKDB_REPO)
-# print(AIDERIGNORE_SRC)
+if debug:
+    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems_debug").resolve()
 
 def parse_arguments():
-    """
-    Parse command line arguments for the benchmark script.
-    Returns:
-        argparse.Namespace: Parsed command line arguments.
-    """
     parser = argparse.ArgumentParser(description="Run benchmark pipeline")
     parser.add_argument("--m", required=True, help="Model to use")
     parser.add_argument("--k", type=int, required=True, help="Number of completions per problem")
-    parser.add_argument("--dir", type=Path, default=DEFAULT_BENCHMARK_DIR, help="Path to benchmark directory")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where to move organized results")
+    parser.add_argument("--dir", type=str, default=DEFAULT_BENCHMARK_DIR, help="Path to benchmark directory")
+    parser.add_argument("--out", type=str, default=DEFAULT_OUTPUT_DIR, help="Where to move organized results")
     return parser.parse_args()
 
-def get_files_from_json(json_path, filter_string):
-    if filter_string not in ["modified_files", "modified_test_files"]:
-        raise ValueError("filter_string must be 'modified_files' or 'modified_test_files'")
-    # Load the JSON file
-    with open(json_path, 'r') as f:
-        data = json.load(f)
+def run(cmd, cwd=None, env=None, capture_output=False, check=True, log_file=None):
+    """
+    Run a shell command and log the output
 
-    # Return the list of files based on the filter_string
-    return data.get(filter_string, [])
+    :param cmd: List[str] or str - command and arguments
+    :param cwd: working directory
+    :param env: environment variables
+    :param capture_output: bool - whether to capture output
+    :param check: bool - whether to raise an error on non-zero exit code
+    :param log_file: file to log output
+    :return: CompletedProcess - result of the command execution
+    """
+    # Convert command to list if it's a string
+    if isinstance(cmd, str):
+        shell = True
+        printable_cmd = cmd
+    else:
+        shell = False
+        printable_cmd = " ".join(cmd)
+    print(f"Running command: {printable_cmd} in {cwd if cwd else 'current directory'}")
 
-def run(cmd, cwd=None, check=True, log_path=None, verbose=True):
-    print(f"Running command: {cmd}")
-    process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    stdout, stderr = process.communicate()
-    returncode = process.returncode
-    if log_path:
-        with open(log_path, "a") as f:
-            f.write(f"\n cwd: {cwd}")
-            f.write(f"\n$ {cmd}\n\n")
-            f.write("=== STDOUT ===\n")
-            f.write(stdout)
-            f.write("\n\n=== STDERR ===\n")
-            f.write(stderr)
-            f.write(f"\n\n=== EXIT CODE: {returncode} ===\n")
-    if check and returncode != 0:
-        print(f"[Error] Command failed: {cmd}")
-        return None
-    class Result:
-        def __init__(self, stdout, stderr, returncode):
-            self.stdout = stdout
-            self.stderr = stderr
-            self.returncode = returncode
-    return Result(stdout, stderr, returncode)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"[{timestamp}] Running command: {printable_cmd}\n"
 
-def reset_repo(repo_path, log_path=None):
-    run("git reset --hard", cwd=repo_path, log_path=log_path)
-    run("git clean -fd", cwd=repo_path, log_path=log_path)
-    run("make clean", cwd=repo_path, log_path=log_path)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            shell=shell,
+            text=True,
+            capture_output=capture_output,
+            check=check,
+        )
+    except subprocess.CalledProcessError as e:
+        result = e
 
-def run_aider(model, prompt_path, modified_files, problem_dir, attempt_num, log_path=None):
-    # convert modified_files to absolute paths within the repo
-    repo_files = [str(DUCKDB_REPO / file) for file in modified_files]
+    # Prepare output
+    stdout = result.stdout if hasattr(result, 'stdout') else ""
+    stderr = result.stderr if hasattr(result, 'stderr') else ""
+    return_code = result.returncode
 
-    # copy aiderignore to duckdb repo
-    aiderignore_dest = DUCKDB_REPO / ".aiderignore"
-    shutil.copy(AIDERIGNORE_SRC, aiderignore_dest)
+    footer = f"Exit code: {return_code}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}\n"
 
-    # build the aider command
-    aider_cmd = f"aider --model {model} --yes --no-gitignore -f {prompt_path} {' '.join(repo_files)}"
-    print(f"Running Aider command: {aider_cmd}")
-    print("Running Aider attempt: ", attempt_num)
-    result = run(aider_cmd, cwd=DUCKDB_REPO, check=False)
-
-    print(result)
-
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(header)
+            f.write(footer)
+    if check and return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd, output=stdout, stderr=stderr)
+    return result
+        
 def main():
     args = parse_arguments()
-    benchmark_dir = args.dir.resolve()
-    logs_output_dir = args.out.resolve()
-    model = args.m
-    k = args.k
+    print(f"Model: {args.m}, Completions: {args.k}, Benchmark Directory: {args.dir}, Output Directory: {args.out}")
 
-    for folder in sorted(benchmark_dir.iterdir(), key=lambda x: int(x.name)):
-        if not folder.is_dir():
-            print(f"Skipping {folder} as it is not a directory")
+    # Logging setup
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_path = Path(f"logs/{timestamp}.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # main loop
+    for problem in Path(args.dir).iterdir():
+        print(f"Processing problem: {problem.name}")
+
+        # Parse json file to get problem details
+        problem_json = problem / f"{problem.name}.json"
+        if not problem_json.exists():
+            print(f"Problem JSON file not found for {problem.name}, skipping.")
             continue
+        # Load problem details
+        with open(problem_json, 'r') as f:
+            problem_data = json.load(f)
         
-        print(f"🔍Processing {folder.name}...")
+        base_commit = problem_data.get("base_commit")
+        modified_files = problem_data.get("modified_files", [])
+        modified_test_files = problem_data.get("modified_test_files", [])
 
-        prompt_path = folder / f"{folder.name}.prompt"
-        json_path = folder / f"{folder.name}.json"
-        test_patch = folder / "test.patch"
-
-        print(f"📄 Prompt: {prompt_path}")
-        print(f"📄 JSON: {json_path}")
-        print(f"📄 Test Patch: {test_patch}")
-
-        if not prompt_path.exists() or not json_path.exists() or not test_patch.exists():
-            print(f"⚠️ Missing required files in {folder.name}, skipping")
-            continue
-
-        with open(json_path) as f:
-            base_commit = json.load(f)["base_commit"]
-
-        modified_code_files = get_files_from_json(json_path, "modified_files")
-        modified_test_files = get_files_from_json(json_path, "modified_test_files")
-        print(f"Modified code files: {modified_code_files}")
-        print(f"Modified test files: {modified_test_files}")
-
-        reset_repo(DUCKDB_REPO)
-        run(f"git checkout {base_commit}", cwd=DUCKDB_REPO)
-
-        print("🔧 Generating and testing model")
-        for i in range(1, k + 1):
-            # reset repo to base commit
-            reset_repo(DUCKDB_REPO)
-            run(f"git checkout {base_commit}", cwd=DUCKDB_REPO)
-
-            # apply test.patch
-            run(f"git apply {test_patch}", cwd=DUCKDB_REPO)
-
-            print(f"Attempt {i}/{k} for {folder.name}")
-
-            # run aider to generate code fix
-            aider_result = run_aider(
-                model=model,
-                prompt_path=prompt_path,
-                modified_files=modified_code_files,
-                problem_dir=folder,
-                attempt_num=i,
-                log_path=folder / f"aider_attempt_{i}.log"
+        for i in range(args.k):
+            print(f"Generating completion {i+1} for {problem.name} using model {args.m}")
+            
+            # cleanup repo for fresh start
+            run(
+                ["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)],
+                log_file=log_path
+            )
+            # checkout to correct commit
+            run(
+                ["bash", "scripts/aider_scripts/checkout.sh", str(HONOURS_DIR), base_commit],
+                log_file=log_path
             )
 
-        # Generate code fixes using aider k times, each time generating a fix, then running the tests
+            # apply test patches
+            test_patch_path = problem / "test.patch"
+            run(
+                ["bash", "scripts/aider_scripts/apply_test_patch.sh", str(HONOURS_DIR), str(test_patch_path)],
+                log_file=log_path
+            )
+            # generate fix
+            run(
+                ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
+                log_file=log_path
+            )
 
-        break # for debugging
-        
+            # build
 
-    # Ensure the problem directory exists
+            # test
+
+            # store results
     
+    # archive results
 
-    print("📦 Archiving generated patches and results...")
-
-    print("🧹 Cleaning up patches...")
-
+    # cleanup everything
 if __name__ == "__main__":
     main()

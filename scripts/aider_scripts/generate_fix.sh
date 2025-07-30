@@ -1,20 +1,24 @@
+# This script generates one completion
+
 #!/bin/bash
 
 set -e
 
-# Usage: ./apply_once.sh <problem_id> <model_name>
+# Usage: ./apply_once.sh <honours_dir> <problem_directory> <problem_id> <model_name>
 # Run from project root directory
 
 # Arguments
-PROBLEM_ID="$1"
-MODEL_NAME="$2"
+HONOURS_DIR="$1"
+PROBLEM_DIR="$2"
+PROBLEM_ID="$3"
+MODEL_NAME="$4"
 
 # Paths
-HONOURS_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DUCKDB_DIR="$HONOURS_DIR/duckdb"
 IGNORE_SRC="$HONOURS_DIR/scripts/aider_scripts/.aiderignore"
-PROMPT_PATH="$HONOURS_DIR/benchmark_problems/$PROBLEM_ID/$PROBLEM_ID.prompt"
-JSON_PATH="$HONOURS_DIR/benchmark_problems/$PROBLEM_ID/$PROBLEM_ID.json"
+PROMPT_PATH="$PROBLEM_DIR/$PROBLEM_ID.prompt"
+JSON_PATH="$PROBLEM_DIR/$PROBLEM_ID.json"
+
 
 # Extract modified files
 MODIFIED_FILES=$(jq -r '.modified_files[]' "$JSON_PATH")
