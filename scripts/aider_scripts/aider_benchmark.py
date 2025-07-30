@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 from datetime import datetime
 import json
+import csv
 
 debug = True
 
@@ -88,9 +89,20 @@ def main():
     log_path = Path(f"logs/{timestamp}.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Tracking results
+    results = {}
     # main loop
     for problem in Path(args.dir).iterdir():
         print(f"Processing problem: {problem.name}")
+
+        results[problem.name] = {
+            "problem": problem.name,
+            "total_generations": 0,
+            "successful_builds": 0,
+            "failed_builds": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+        }
 
         # Parse json file to get problem details
         problem_json = problem / f"{problem.name}.json"
@@ -127,7 +139,6 @@ def main():
             )
             # generate fix
 
-            ## TODO: check for failure
             res = run(
                 ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
                 log_file=log_path
@@ -135,8 +146,10 @@ def main():
 
             if res.returncode != 0:
                 print(f"Completion generation failed for {problem.name} completion {i+1}, skipping tests.")
+                results[problem.name]["total_generations"] += 1
                 continue
             print(f"Completion generated for {problem.name} completion {i+1}")
+            results[problem.name]["total_generations"] += 1
 
             # build
 
@@ -147,8 +160,10 @@ def main():
 
             if res.returncode != 0:
                 print(f"Build failed for {problem.name} completion {i+1}, skipping tests.")
+                results[problem.name]["failed_builds"] += 1
                 continue
             print(f"Build successful for {problem.name} completion {i+1}")
+            results[problem.name]["successful_builds"] += 1
 
             # test
             test_args = [str(HONOURS_DIR)] + modified_test_files
@@ -161,11 +176,13 @@ def main():
             tests_passed = (res.returncode == 0)
             if tests_passed:
                 print(f"Tests passed for {problem.name} completion {i+1}")
+                results[problem.name]["passed_tests"] += 1
             else:
                 print(f"Tests failed for {problem.name} completion {i+1}")
+                results[problem.name]["failed_tests"] += 1
 
             # store results
-    
+    print(results)
     # archive results
 
     # cleanup everything
