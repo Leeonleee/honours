@@ -2,6 +2,8 @@
 Usage: python aider_benchmark.py -m <model_name>
 """
 
+# TODO: add logging for built/test failures to try identify the cause
+
 import argparse, shutil
 from pathlib import Path
 import subprocess
@@ -28,7 +30,7 @@ def parse_arguments():
     parser.add_argument("--out", type=str, default=DEFAULT_OUTPUT_DIR, help="Where to move organized results")
     return parser.parse_args()
 
-def run(cmd, cwd=None, env=None, capture_output=False, check=True, log_file=None):
+def run(cmd, cwd=None, env=None, capture_output=True, check=True, log_file=None):
     """
     Run a shell command and log the output
 
@@ -141,7 +143,8 @@ def main():
 
             res = run(
                 ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
-                log_file=log_path
+                log_file=log_path,
+                check=False
             )
 
             if res.returncode != 0:
@@ -155,7 +158,8 @@ def main():
 
             res = run (
                 ["bash", "scripts/aider_scripts/build.sh", str(HONOURS_DIR)],
-                log_file=log_path
+                log_file=log_path,
+                check=False
             )
 
             if res.returncode != 0:
@@ -184,6 +188,20 @@ def main():
             # store results
     print(results)
     # archive results
+
+    csv_filename = f"{args.m}_{timestamp}.csv"
+    csv_path = Path("results") / csv_filename
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(
+            csvfile,
+            fieldnames=["problem", "total_generations", "successful_builds", "failed_builds", "passed_tests", "failed_tests"]
+        )
+        writer.writeheader()
+        for row in results.values():
+            writer.writerow(row)
+    print(f"Results saved to {csv_path}")
 
     # cleanup everything
 if __name__ == "__main__":
