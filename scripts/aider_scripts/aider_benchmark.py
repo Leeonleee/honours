@@ -126,14 +126,43 @@ def main():
                 log_file=log_path
             )
             # generate fix
-            run(
+
+            ## TODO: check for failure
+            res = run(
                 ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
                 log_file=log_path
             )
 
+            if res.returncode != 0:
+                print(f"Completion generation failed for {problem.name} completion {i+1}, skipping tests.")
+                continue
+            print(f"Completion generated for {problem.name} completion {i+1}")
+
             # build
 
+            res = run (
+                ["bash", "scripts/aider_scripts/build.sh", str(HONOURS_DIR)],
+                log_file=log_path
+            )
+
+            if res.returncode != 0:
+                print(f"Build failed for {problem.name} completion {i+1}, skipping tests.")
+                continue
+            print(f"Build successful for {problem.name} completion {i+1}")
+
             # test
+            test_args = [str(HONOURS_DIR)] + modified_test_files
+            res = run(
+                ["bash", "scripts/aider_scripts/run_tests.sh", str(HONOURS_DIR)] + modified_test_files,
+                log_file=log_path,
+                check=False
+            )
+
+            tests_passed = (res.returncode == 0)
+            if tests_passed:
+                print(f"Tests passed for {problem.name} completion {i+1}")
+            else:
+                print(f"Tests failed for {problem.name} completion {i+1}")
 
             # store results
     

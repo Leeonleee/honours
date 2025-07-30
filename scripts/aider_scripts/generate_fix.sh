@@ -42,3 +42,11 @@ echo "Copied .aiderignore into duckdb"
 cd "$DUCKDB_DIR" || exit 1
 aider --model "$MODEL_NAME" --no-gitignore --yes -f "$PROMPT_PATH" $MODIFIED_FILES
 
+# Track success
+if [ $? -eq 0 ]; then
+  echo "Fix generation succeeded"
+  exit 0
+else
+  echo "Fix generation failed"
+  exit 1
+fi
