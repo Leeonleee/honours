@@ -1,5 +1,5 @@
 """
-Usage: python aider_benchmark.py -m <model_name>
+Usage: python aider_benchmark.py --m <model_name>A --k <num_completions>
 """
 
 # TODO: add logging for built/test failures to try identify the cause
@@ -10,8 +10,13 @@ import subprocess
 from datetime import datetime
 import json
 import csv
+import smtplib
+from email.message import EmailMessage
+import os
+from dotenv import load_dotenv
+import time
 
-debug = False
+debug = True
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
@@ -19,8 +24,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems").resolve()
 DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
 
+load_dotenv(dotenv_path=HONOURS_DIR / ".env")
+
 if debug:
     DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems_debug").resolve()
+
+def send_email_notification(subject, body, sender_email, app_password, recipient_email):
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg['Subject'] = subject
+    msg['From'] = sender_email
+    msg['To'] = recipient_email
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login(sender_email, app_password)
+        smtp.send_message(msg)
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run benchmark pipeline")
@@ -49,7 +68,7 @@ def run(cmd, cwd=None, env=None, capture_output=True, check=True, log_file=None)
     else:
         shell = False
         printable_cmd = " ".join(cmd)
-    print(f"Running command: {printable_cmd} in {cwd if cwd else 'current directory'}")
+    # print(f"Running command: {printable_cmd} in {cwd if cwd else 'current directory'}")
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     header = f"[{timestamp}] Running command: {printable_cmd}\n"
@@ -84,6 +103,7 @@ def run(cmd, cwd=None, env=None, capture_output=True, check=True, log_file=None)
         
 def main():
     args = parse_arguments()
+    start_time = time.time()
     print(f"Model: {args.m}, Completions: {args.k}, Benchmark Directory: {args.dir}, Output Directory: {args.out}")
 
     # Logging setup
@@ -94,7 +114,11 @@ def main():
     # Tracking results
     results = {}
     # main loop
-    for problem in Path(args.dir).iterdir():
+    problems = sorted(
+        [p for p in Path(args.dir).iterdir() if p.is_dir()],
+        key=lambda p: int(p.name)
+    )
+    for problem in problems:
         print(f"Processing problem: {problem.name}")
 
         results[problem.name] = {
@@ -189,7 +213,7 @@ def main():
     print(results)
     # archive results
 
-    csv_filename = f"{args.m}_{timestamp}.csv"
+    csv_filename = f"{timestamp}_{args.m}.csv"
     csv_path = Path("results") / csv_filename
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -204,5 +228,36 @@ def main():
     print(f"Results saved to {csv_path}")
 
     # cleanup everything
+
+
+    # Send email notification
+    elapsed_seconds = int(time.time() - start_time)
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    elapsed_str = f"{hours}h {minutes}m {seconds}s"
+
+    body = (
+        f"Model: {args.m}\n"
+        f"Results saved to: {csv_path.resolve()}\n"
+        f"Total runtime: {elapsed_str}\n"
+        f"Results:\n"
+        + "\n".join(
+            f"{problem}: {data['total_generations']} generations, "
+            f"{data['successful_builds']} successful builds, "
+            f"{data['failed_builds']} failed builds, "
+            f"{data['passed_tests']} passed tests, "
+            f"{data['failed_tests']} failed tests"
+            for problem, data in results.items()
+        )
+    )
+
+
+    send_email_notification(
+        subject="✅ Benchmark Completed!",
+        body=body,
+        sender_email=os.getenv("EMAIL_USER"),
+        app_password=os.getenv("EMAIL_PASS"),
+        recipient_email=os.getenv("EMAIL_USER")
+    )
 if __name__ == "__main__":
     main()
