@@ -1,16 +1,15 @@
 #!/bin/bash
 
 models=(
-    "claude-3-7-sonnet-20250219",
-    "o3"
-    
+    "o3",
+    "gemini/gemini-2.5-pro"
 )
 
 # number of completions per model
-k=3
+k=1
 
 # path to benchmark script
-SCRIPT="scripts/benchmark/run_benchmark.py"
+SCRIPT="scripts/aider_scripts/aider_benchmark.py"
 
 # loop through models and run the benchmark
 for model in "${models[@]}"; do
