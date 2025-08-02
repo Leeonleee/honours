@@ -18,7 +18,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = True
+debug = False
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
@@ -105,7 +105,7 @@ def run(cmd, cwd=None, env=None, capture_output=True, check=True, log_file=None)
 """
 
 
-def run(cmd, cwd=None, env=None, check=True, log_file=None):
+def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
     if isinstance(cmd, str):
         shell = True
         printable_cmd = cmd
@@ -165,6 +165,85 @@ def run(cmd, cwd=None, env=None, check=True, log_file=None):
 
     return Result(return_code, ''.join(stdout_lines), ''.join(stderr_lines))
 
+
+
+"""
+def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
+    if isinstance(cmd, str):
+        shell = True
+        printable_cmd = cmd
+    else:
+        shell = False
+        printable_cmd = " ".join(cmd)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"[{timestamp}] Running command: {printable_cmd}\n"
+
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(header)
+
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        shell=shell,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    stdout_lines = []
+    stderr_lines = []
+
+    def read_stream(stream, buffer, prefix, log):
+        for line in stream:
+            log.write(f"{prefix}: {line}")
+            log.flush()
+            buffer.append(line)
+
+    timed_out = False
+    with open(log_file, 'a') if log_file else open(os.devnull, 'w') as log:
+        stdout_thread = Thread(target=read_stream, args=(process.stdout, stdout_lines, "STDOUT", log))
+        stderr_thread = Thread(target=read_stream, args=(process.stderr, stderr_lines, "STDERR", log))
+
+        stdout_thread.start()
+        stderr_thread.start()
+
+        def kill_proc():
+            nonlocal timed_out
+            timed_out = True
+            process.kill()
+            log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Command timed out after {timeout} seconds\n")
+            log.flush()
+
+        timer = None
+        if timeout:
+            timer = threading.Timer(timeout, kill_proc)
+            timer.start()
+
+        stdout_thread.join()
+        stderr_thread.join()
+        return_code = process.wait()
+
+        if timer:
+            timer.cancel()
+
+    if check and return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd, output=''.join(stdout_lines), stderr=''.join(stderr_lines))
+
+    class Result:
+        def __init__(self, returncode, stdout, stderr):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    # Use sentinel returncode -1 if killed due to timeout
+    return Result(-1 if timed_out else return_code, ''.join(stdout_lines), ''.join(stderr_lines))
+
+"""
         
 def main():
     args = parse_arguments()
@@ -329,10 +408,9 @@ def main():
         )
     except KeyboardInterrupt:
         print("Emergency stop requested. Writing results to CSV and exiting")
-    finally:
         # Add 'partial' to the filename if interrupted
         if not csv_path.exists():
-            csv_path = csv_path.with_name(f"partial_{csv_path.name}")
+            csv_path = csv_path.with_name(f"{csv_path.name}_partial.csv")
         # Ensure results are saved even if interrupted
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.DictWriter(
@@ -346,5 +424,6 @@ def main():
 
         # Cleanup
         run(["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)], log_file=log_path)
+        
 if __name__ == "__main__":
     main()
