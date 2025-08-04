@@ -1,0 +1,158 @@
+diff --git a/src/include/duckdb/main/config.hpp b/src/include/duckdb/main/config.hpp
+index 15986fc487e9..95e48495f5cf 100644
+--- a/src/include/duckdb/main/config.hpp
++++ b/src/include/duckdb/main/config.hpp
+@@ -228,7 +228,7 @@ struct DBConfigOptions {
+ 	//! The set of user-provided options
+ 	case_insensitive_map_t<Value> user_options;
+ 	//! The set of unrecognized (other) options
+-	unordered_map<string, Value> unrecognized_options;
++	case_insensitive_map_t<Value> unrecognized_options;
+ 	//! Whether or not the configuration settings can be altered
+ 	bool lock_configuration = false;
+ 	//! Whether to print bindings when printing the plan (debug mode only)
+diff --git a/src/include/duckdb/main/database.hpp b/src/include/duckdb/main/database.hpp
+index b7d6be0890da..222a36c0511c 100644
+--- a/src/include/duckdb/main/database.hpp
++++ b/src/include/duckdb/main/database.hpp
+@@ -76,6 +76,7 @@ class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
+ 
+ private:
+ 	void Initialize(const char *path, DBConfig *config);
++	void LoadExtensionSettings();
+ 	void CreateMainDatabase();
+ 
+ 	void Configure(DBConfig &config, const char *path);
+diff --git a/src/include/duckdb/main/extension_helper.hpp b/src/include/duckdb/main/extension_helper.hpp
+index d625f8698daa..4658357293df 100644
+--- a/src/include/duckdb/main/extension_helper.hpp
++++ b/src/include/duckdb/main/extension_helper.hpp
+@@ -14,8 +14,6 @@
+ 
+ #include <string>
+ 
+-#include <string>
+-
+ namespace duckdb {
+ 
+ class DuckDB;
+@@ -104,6 +102,7 @@ class ExtensionHelper {
+ 	static void AutoLoadExtension(DatabaseInstance &db, const string &extension_name);
+ 
+ 	//! Autoload an extension (depending on config, potentially a nop. Returns false on failure)
++	DUCKDB_API static bool TryAutoLoadExtension(DatabaseInstance &db, const string &extension_name) noexcept;
+ 	DUCKDB_API static bool TryAutoLoadExtension(ClientContext &context, const string &extension_name) noexcept;
+ 
+ 	//! Update all extensions, return a vector of extension names that were updated;
+diff --git a/src/main/database.cpp b/src/main/database.cpp
+index 3f22d29e26ab..0d13aece47f7 100644
+--- a/src/main/database.cpp
++++ b/src/main/database.cpp
+@@ -202,13 +202,60 @@ void DatabaseInstance::CreateMainDatabase() {
+ 	initial_database->Initialize();
+ }
+ 
+-void ThrowExtensionSetUnrecognizedOptions(const unordered_map<string, Value> &unrecognized_options) {
+-	auto unrecognized_options_iter = unrecognized_options.begin();
+-	string unrecognized_option_keys = unrecognized_options_iter->first;
+-	while (++unrecognized_options_iter != unrecognized_options.end()) {
+-		unrecognized_option_keys = "," + unrecognized_options_iter->first;
++static void ThrowExtensionSetUnrecognizedOptions(const case_insensitive_map_t<Value> &unrecognized_options) {
++	D_ASSERT(!unrecognized_options.empty());
++
++	vector<string> options;
++	for (auto &kv : unrecognized_options) {
++		options.push_back(kv.first);
++	}
++	auto concatenated = StringUtil::Join(options, ", ");
++	throw InvalidInputException("The following options were not recognized: " + concatenated);
++}
++
++void DatabaseInstance::LoadExtensionSettings() {
++	auto &unrecognized_options = config.options.unrecognized_options;
++
++	if (config.options.autoload_known_extensions) {
++		if (unrecognized_options.empty()) {
++			// Nothing to do
++			return;
++		}
++
++		Connection con(*this);
++		con.BeginTransaction();
++
++		vector<string> extension_options;
++		for (auto &option : unrecognized_options) {
++			auto &name = option.first;
++			auto &value = option.second;
++
++			auto extension_name = ExtensionHelper::FindExtensionInEntries(name, EXTENSION_SETTINGS);
++			if (extension_name.empty()) {
++				continue;
++			}
++			if (!ExtensionHelper::TryAutoLoadExtension(*this, extension_name)) {
++				throw InvalidInputException(
++				    "To set the %s setting, the %s extension needs to be loaded. But it could not be autoloaded.", name,
++				    extension_name);
++			}
++			auto it = config.extension_parameters.find(name);
++			if (it == config.extension_parameters.end()) {
++				throw InternalException("Extension %s did not provide the '%s' config setting", extension_name, name);
++			}
++			auto &context = *con.context;
++			PhysicalSet::SetExtensionVariable(context, it->second, name, SetScope::GLOBAL, value);
++			extension_options.push_back(name);
++		}
++
++		for (auto &option : extension_options) {
++			unrecognized_options.erase(option);
++		}
++		con.Commit();
++	}
++	if (!unrecognized_options.empty()) {
++		ThrowExtensionSetUnrecognizedOptions(unrecognized_options);
+ 	}
+-	throw InvalidInputException("Unrecognized configuration property \"%s\"", unrecognized_option_keys);
+ }
+ 
+ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_config) {
+@@ -254,9 +301,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
+ 		ExtensionHelper::LoadExternalExtension(*this, *config.file_system, config.options.database_type);
+ 	}
+ 
+-	if (!config.options.unrecognized_options.empty()) {
+-		ThrowExtensionSetUnrecognizedOptions(config.options.unrecognized_options);
+-	}
++	LoadExtensionSettings();
+ 
+ 	if (!db_manager->HasDefaultDatabase()) {
+ 		CreateMainDatabase();
+diff --git a/src/main/extension/extension_helper.cpp b/src/main/extension/extension_helper.cpp
+index d844c41f734e..17b7ccda4346 100644
+--- a/src/main/extension/extension_helper.cpp
++++ b/src/main/extension/extension_helper.cpp
+@@ -220,6 +220,25 @@ bool ExtensionHelper::TryAutoLoadExtension(ClientContext &context, const string
+ 	}
+ }
+ 
++bool ExtensionHelper::TryAutoLoadExtension(DatabaseInstance &instance, const string &extension_name) noexcept {
++	if (instance.ExtensionIsLoaded(extension_name)) {
++		return true;
++	}
++	auto &dbconfig = DBConfig::GetConfig(instance);
++	try {
++		auto &fs = FileSystem::GetFileSystem(instance);
++		if (dbconfig.options.autoinstall_known_extensions) {
++			auto autoinstall_repo =
++			    ExtensionRepository::GetRepositoryByUrl(dbconfig.options.autoinstall_extension_repo);
++			ExtensionHelper::InstallExtension(dbconfig, fs, extension_name, false, autoinstall_repo, false);
++		}
++		ExtensionHelper::LoadExternalExtension(instance, fs, extension_name);
++		return true;
++	} catch (...) {
++		return false;
++	}
++}
++
+ static ExtensionUpdateResult UpdateExtensionInternal(ClientContext &context, DatabaseInstance &db, FileSystem &fs,
+                                                      const string &full_extension_path, const string &extension_name) {
+ 	ExtensionUpdateResult result;

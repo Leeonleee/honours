@@ -2,22 +2,20 @@
 
 This folder contains helpful scripts
 
-## create_prompt.py
+## verify_PRs.py
 
-Creates a complete .prompt file given a .jsonl file
+This script generates all the `.patch` and `.prompt` files for each PR given in the specified folder 
 
-### Usage
+- Make sure paths in the script are set correctly
 
-```
-python create_prompt.py instance.json path_to_repo output.txt
-```
+## process_single_pr.py
+
+Generates the `.patch` and `.prompt` files for a single specified PR
+
+## generate_patches.py
+
+Generates `k` .patch files for each problem in the `benchmark_problems` directory
 
 ## tasks_to_json.py
 
-Given a `task-instances.jsonl` file (from SWE-bench script output), create individual folders for each PR containing a `<pull_number>.json` file
-
-### Usage
-
-```
-python tasks_to_json.py input.jsonl output_directory
-```
+Converts the output of the SWE-bench scraping script into JSONs

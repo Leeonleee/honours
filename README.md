@@ -75,6 +75,12 @@ project
 
 If the tests behave as expected after step 6, the PR has been verified and is ready for the LLM to test a fix
 
+## Automatically Verify Individual PRs
+
+1. Run the `scripts/verify_PRs.py` script
+    - Make sure the paths in the script are set correctly. They should be relative to the script's location
+2. The script should output the names of all valid PRs
+
 
 ## Manually Verified PRs
 
@@ -102,4 +108,88 @@ A PR is considered easy if:
 - 7443
 - 12942
 
+Out of these tests, these are verified:
+- 4713
+- 4973
+- 5805
+- 12942
 
+## Running the Benchmark
+
+### Prerequisites
+- Ensure you have the `llm` Python library installed
+  - Install any plugins for it if necessary (the library supports OpenAI models initially)
+
+## Valid PRs
+2639
+3004
+3120
+3463
+3964
+4131
+4713
+4740
+4910
+4973
+5690
+5805
+5855
+6068
+6190
+6693
+6857
+7075
+7110
+7163
+7259
+7419
+7467
+7501
+7546
+7638
+7836
+7858
+7872
+7907
+8559
+8655
+8799
+8963
+8974
+9279
+9821
+9842
+9872
+10152
+
+10505
+11056
+11171
+11327
+11667
+11674
+11821
+
+12090
+12206
+12736
+12762
+12847
+12859
+12942
+12982
+13076
+13090
+13240
+13415
+13685
+13908
+
+
+## Aider Test
+
+Example command:
+
+```bash
+aider --model o3 --no-gitignore -f ../aider_test/4713/4713.prompt src/function/table/read_csv.cpp
+```
