@@ -1,7 +1,12 @@
+"""
+Usage: python3 pass_k.py --dir <directory> --k <k_value> [--detailed]
 
+"""
 import csv
 import math
 import sys
+import os
+import argparse
 
 def comb(n, k):
     if k > n:
@@ -13,19 +18,19 @@ def pass_at_k(n, c, k):
         return 0.0
     return 1.0 - comb(n - c, k) / comb(n, k)
 
-def compute_pass_at_k_from_csv(file_path, k):
-    # check for maximum total_generations
+def compute_pass_at_k_for_file(file_path, k, detailed=False):
+    scores = []
+    problems = []
+
     with open(file_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         total_generations_list = [int(row["total_generations"]) for row in reader]
-    
+
     max_n = max(total_generations_list)
     if k > max_n:
-        print(f"Error: k = {k} exceeds the maximum total_generations = {max_n}")
-        sys.exit(1)
-
-    total_score = 0.0
-    count = 0
+        if detailed:
+            print(f"Skipping {os.path.basename(file_path)}: k = {k} > max total_generations = {max_n}")
+        return None
 
     with open(file_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
@@ -36,16 +41,41 @@ def compute_pass_at_k_from_csv(file_path, k):
 
             if n >= k:
                 score = pass_at_k(n, c, k)
-                print(f"Problem {problem_id}: pass@{k} = {score:.4f}")
-                total_score += score
-                count += 1
+                scores.append(score)
+                problems.append((problem_id, score))
             else:
-                print(f"Problem {problem_id}: skipped (n={n} < k={k})")
+                if detailed:
+                    print(f"Problem {problem_id} in {os.path.basename(file_path)}: skipped (n={n} < k={k})")
 
-    if count > 0:
-        avg = total_score / count
-        print(f"\nAverage pass@{k} = {avg:.4f} over {count} problems")
+    if not scores:
+        if detailed:
+            print(f"No valid problems in {os.path.basename(file_path)}\n")
+        return None
+
+    file_avg = sum(scores) / len(scores)
+
+    if detailed:
+        print(f"\nFile: {os.path.basename(file_path)}")
+        for pid, score in problems:
+            print(f"  Problem {pid}: pass@{k} = {score:.4f}")
+        print(f"Average pass@{k} for {os.path.basename(file_path)}: {file_avg:.4f}\n")
     else:
-        print(f"No problems with n ≥ k={k}, cannot compute pass@{k}.")
+        print(f"{os.path.basename(file_path)}: {file_avg:.4f}")
 
-compute_pass_at_k_from_csv("useful_results/2025-08-01_15:06:51_openai_o3_k3.csv", k=3)  
+    return file_avg
+
+def main():
+    parser = argparse.ArgumentParser(description="Compute pass@k for all CSV files in a directory.")
+    parser.add_argument('--dir', required=True, help="Directory containing CSV files")
+    parser.add_argument('--k', type=int, required=True, help="Value of k for pass@k")
+    parser.add_argument('--detailed', action='store_true', help="Print detailed per-problem output")
+
+    args = parser.parse_args()
+
+    for filename in sorted(os.listdir(args.dir)):
+        if filename.endswith(".csv"):
+            filepath = os.path.join(args.dir, filename)
+            compute_pass_at_k_for_file(filepath, args.k, args.detailed)
+
+if __name__ == "__main__":
+    main()
