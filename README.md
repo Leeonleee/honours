@@ -4,18 +4,49 @@
 
 - duckdb/duckdb
 
-## Docker
+## Environment Setup
 
-- To run the benchmark, run it using an Amazon Linux 2023 Docker Image
+- For maximum compatability, use an Amazon Linux 2023 image
 - Once setup, run these commands:
 
 ```bash
-dnf update -y
-dnf groupinstall "Development Tools" -y
-dnf install gcc cmake git wget -y
+sudo dnf update -y
+sudo dnf groupinstall "Development Tools" -y
+sudo dnf install gcc cmake git wget -y
+sudo dnf install cmake
+
+# Install ccache to speed up compilation times when rerunning benchmark
+git clone https://github.com/ccache/ccache.git
+cd ccache
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+sudo make install
+
+# Python dependencies
+```
+
+### Personal config stuff (optional)
+
+```bash
+export TERM=xterm-256color # makes kitty terminal work
+
 
 ```
 
+### Git setup
+
+```bash
+# Create ssh key for GitHub
+mkdir -p ~/.ssh
+ssh-keygen -t rsa -b 4096 # press enter for everything
+cat ~/.ssh/id_rsa.pub # copy the output and paste it into GitHub
+git clone git@github.com:Leeonleee/honours.git
+
+cd honours
+git clone git@github.com:duckdb/duckdb.git
+
+```
 ## Folder Structure
 
 ```none
@@ -119,71 +150,6 @@ Out of these tests, these are verified:
 ### Prerequisites
 - Ensure you have the `llm` Python library installed
   - Install any plugins for it if necessary (the library supports OpenAI models initially)
-
-## Valid PRs
-2639
-3004
-3120
-3463
-3964
-4131
-4713
-4740
-4910
-4973
-5690
-5805
-5855
-6068
-6190
-6693
-6857
-7075
-7110
-7163
-7259
-7419
-7467
-7501
-7546
-7638
-7836
-7858
-7872
-7907
-8559
-8655
-8799
-8963
-8974
-9279
-9821
-9842
-9872
-10152
-
-10505
-11056
-11171
-11327
-11667
-11674
-11821
-
-12090
-12206
-12736
-12762
-12847
-12859
-12942
-12982
-13076
-13090
-13240
-13415
-13685
-13908
 
 
 ## Aider Test
