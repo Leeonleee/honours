@@ -1,22 +1,7 @@
-# from math import comb
-
-# def pass_at_k(n: int, c: int, k: int) -> float:
-#     if k > n:
-#         raise ValueError(f"k={k} cannot be greater than n={n}")
-#     if c == 0:
-#         return 0.0
-#     if n == c:
-#         return 1.0
-    
-
-#     return 1.0 - comb(n - c, k) / comb(n, k)
-
-
-# print(pass_at_k(n=10, c=3, k=10)) 
-
 
 import csv
 import math
+import sys
 
 def comb(n, k):
     if k > n:
@@ -28,31 +13,39 @@ def pass_at_k(n, c, k):
         return 0.0
     return 1.0 - comb(n - c, k) / comb(n, k)
 
-def main(csv_path, k):
-    total_pass_at_k = 0.0
+def compute_pass_at_k_from_csv(file_path, k):
+    # check for maximum total_generations
+    with open(file_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        total_generations_list = [int(row["total_generations"]) for row in reader]
+    
+    max_n = max(total_generations_list)
+    if k > max_n:
+        print(f"Error: k = {k} exceeds the maximum total_generations = {max_n}")
+        sys.exit(1)
+
+    total_score = 0.0
     count = 0
 
-    with open(csv_path, newline='') as f:
-        reader = csv.DictReader(f)
+    with open(file_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
         for row in reader:
-            n = int(row["TotalPatches"])
-            c = int(row["PassedTest"])
+            problem_id = row["problem"]
+            n = int(row["total_generations"])
+            c = int(row["passed_tests"])
 
             if n >= k:
                 score = pass_at_k(n, c, k)
-                print(f"Problem {row['Problem']}: pass@{k} = {score:.4f}")
-                total_pass_at_k += score
+                print(f"Problem {problem_id}: pass@{k} = {score:.4f}")
+                total_score += score
                 count += 1
             else:
-                print(f"Problem {row['Problem']}: skipped (n={n} < k={k})")
+                print(f"Problem {problem_id}: skipped (n={n} < k={k})")
 
-    if count == 0:
-        print("No valid problems to compute pass@k")
+    if count > 0:
+        avg = total_score / count
+        print(f"\nAverage pass@{k} = {avg:.4f} over {count} problems")
     else:
-        avg = total_pass_at_k / count
-        print(f"\nAverage pass@{k}: {avg:.4f} over {count} problems")
+        print(f"No problems with n ≥ k={k}, cannot compute pass@{k}.")
 
-if __name__ == "__main__":
-    csv_path = "/root/Documents/university/honours/scripts/benchmark/ai_patch_test_results_o3.csv"
-    k = 2
-    main(csv_path, k)
+compute_pass_at_k_from_csv("useful_results/2025-08-01_15:06:51_openai_o3_k3.csv", k=3)  

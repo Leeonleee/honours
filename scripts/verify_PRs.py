@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 
 # Configurations
-PR_FOLDER_PATH = "../verified_prs"
+PR_FOLDER_PATH = "../prs"
 # PR_FOLDER_PATH = "../prs"
 DUCKDB_REPO_PATH = "../duckdb"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
@@ -125,7 +125,6 @@ def main():
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
                 continue
-            """
             # Checkout to PR commit
             with open(os.path.join(pr_path, f"{pr}.json")) as f:
                 commit_hash = json.load(f)["base_commit"]
@@ -234,6 +233,5 @@ def main():
         for pr in valid_prs:
             print(pr)
 
-    """
 if __name__ == "__main__":
     main()
