@@ -18,7 +18,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = False
+debug = True
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
@@ -29,7 +29,7 @@ DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
 load_dotenv(dotenv_path=HONOURS_DIR / ".env")
 
 if debug:
-    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmark_problems_debug").resolve()
+    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "test").resolve()
 
 def send_email_notification(subject, body, sender_email, app_password, recipient_email):
     msg = EmailMessage()
@@ -250,6 +250,7 @@ def main():
     start_time = time.time()
     print(f"Model: {args.m}, Completions: {args.k}, Benchmark Directory: {args.dir}, Output Directory: {args.out}")
 
+    """
     # Logging setup
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     log_path = Path(f"logs/{timestamp}.log")
@@ -261,6 +262,18 @@ def main():
     csv_filename = f"{timestamp}_{safe_model_name}_k{args.k}.csv"
     csv_path = Path("results") / csv_filename
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    """
+    results = {}
+    # Logging setup
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+    safe_model_name = args.m.replace("/", "_").replace(":", "_")
+    run_name = f"{timestamp}_{safe_model_name}_k{args.k}"
+
+    output_dir = Path("outputs") / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = output_dir / f"{run_name}.log"
+    csv_path = output_dir / f"{run_name}.csv"
 
     try:
         # main loop
@@ -372,7 +385,7 @@ def main():
             writer.writeheader()
             for row in results.values():
                 writer.writerow(row)
-        print(f"Results saved to {csv_path}")
+        print(f"Results and logs saved to {output_dir}")
 
         # cleanup everything
 
@@ -409,8 +422,8 @@ def main():
     except KeyboardInterrupt:
         print("Emergency stop requested. Writing results to CSV and exiting")
         # Add 'partial' to the filename if interrupted
-        if not csv_path.exists():
-            csv_path = csv_path.with_name(f"{csv_path.name}_partial.csv")
+        csv_path = csv_path.with_name(f"{csv_path.stem}_partial.csv")
+        log_path = log_path.with_name(f"{log_path.stem}_partial.log")
         # Ensure results are saved even if interrupted
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.DictWriter(
@@ -420,7 +433,7 @@ def main():
             writer.writeheader()
             for row in results.values():
                 writer.writerow(row)
-        print(f"Partial results saved to {csv_path}")
+        print(f"Partial results and logs saved to {output_dir}")
 
         # Cleanup
         run(["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)], log_file=log_path)
