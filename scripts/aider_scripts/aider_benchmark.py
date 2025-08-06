@@ -1,5 +1,5 @@
 """
-Usage: python aider_benchmark.py --m <model_name>A --k <num_completions>
+Usage: python aider_benchmark.py --m <model_name> --k <num_completions>
 """
 
 # TODO: add logging for built/test failures to try identify the cause
@@ -18,7 +18,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = True
+debug = False
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
