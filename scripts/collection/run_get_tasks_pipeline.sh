@@ -4,7 +4,7 @@
 # * Create a .env file in this folder
 # * Declare GITHUB_TOKENS=token1,token2,token3...
 
-python get_tasks_pipeline.py \
-    --repos 'scikit-learn/scikit-learn', 'pallets/flask' \
-    --path_prs '<path to folder to save PRs to>' \
-    --path_tasks '<path to folder to save tasks to>'
+python3 get_tasks_pipeline.py \
+    --repos 'ydb-platform/ydb' \
+    --path_prs '/home/ec2-user/Documents/university/honours/scripts/collection/output/prs' \
+    --path_tasks '/home/ec2-user/Documents/university/honours/scripts/collection/output/tasks'

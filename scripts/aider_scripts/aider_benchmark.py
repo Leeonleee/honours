@@ -23,7 +23,7 @@ debug = False
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "verified_prs").resolve()
+DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "duckdb_benchmark").resolve()
 DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
 
 load_dotenv(dotenv_path=HONOURS_DIR / ".env")
