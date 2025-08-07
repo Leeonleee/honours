@@ -1,0 +1,182 @@
+diff --git a/ydb/core/tx/columnshard/blobs_action/bs/gc.cpp b/ydb/core/tx/columnshard/blobs_action/bs/gc.cpp
+index a72c6fb413de..0dd30b5be84e 100644
+--- a/ydb/core/tx/columnshard/blobs_action/bs/gc.cpp
++++ b/ydb/core/tx/columnshard/blobs_action/bs/gc.cpp
+@@ -45,7 +45,9 @@ TGCTask::TGCTask(const TString& storageId, TGCListsByGroup&& listsByGroupId, con
+ }
+ 
+ void TGCTask::OnGCResult(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev) {
+-    AFL_VERIFY(ev->Get()->Status == NKikimrProto::OK)("status", ev->Get()->Status)("details", ev->Get()->ToString())("action_id", GetActionGuid());
++    if (ev->Get()->Status != NKikimrProto::OK) {
++        Failures++;
++    }
+     TBlobAddress bAddress(ev->Cookie, ev->Get()->Channel);
+     auto itGroup = ListsByGroupId.find(bAddress);
+     AFL_VERIFY(itGroup != ListsByGroupId.end())("address", bAddress.DebugString());
+@@ -59,8 +61,14 @@ static TAtomicCounter PerGenerationCounter = 1;
+ std::unique_ptr<TEvBlobStorage::TEvCollectGarbage> TGCTask::BuildRequest(const TBlobAddress& address) const {
+     auto it = ListsByGroupId.find(address);
+     AFL_VERIFY(it != ListsByGroupId.end());
+-    AFL_VERIFY(++it->second.RequestsCount < 10)("event", "build_gc_request")("address", address.DebugString())("current_gen", CurrentGen)("gen", CollectGenStepInFlight)
+-        ("count", it->second.RequestsCount);
++    if (++it->second.RequestsCount >= TGCLists::RequestsLimit) {
++         AFL_CRIT(NKikimrServices::TX_COLUMNSHARD_BLOBS_BS)
++             ("event", "build_gc_request")
++             ("address", address.DebugString())("current_gen", CurrentGen)
++             ("gen", CollectGenStepInFlight)
++             ("count", it->second.RequestsCount);
++         return nullptr;
++     }
+     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_BLOBS_BS)("event", "build_gc_request")("address", address.DebugString())("current_gen", CurrentGen)("gen", CollectGenStepInFlight)
+         ("count", it->second.RequestsCount);
+     auto result = std::make_unique<TEvBlobStorage::TEvCollectGarbage>(
+diff --git a/ydb/core/tx/columnshard/blobs_action/bs/gc.h b/ydb/core/tx/columnshard/blobs_action/bs/gc.h
+index 5471fc04c0dd..70b872ddb634 100644
+--- a/ydb/core/tx/columnshard/blobs_action/bs/gc.h
++++ b/ydb/core/tx/columnshard/blobs_action/bs/gc.h
+@@ -17,6 +17,8 @@ class TGCTask: public IBlobsGCAction {
+         THashSet<TLogoBlobID> KeepList;
+         THashSet<TLogoBlobID> DontKeepList;
+         mutable ui32 RequestsCount = 0;
++        
++        constexpr static ui32 RequestsLimit = 10;
+     };
+     using TGCListsByGroup = THashMap<TBlobAddress, TGCLists>;
+ private:
+@@ -26,6 +28,7 @@ class TGCTask: public IBlobsGCAction {
+     const ui64 CurrentGen;
+     std::deque<TUnifiedBlobId> KeepsToErase;
+     std::shared_ptr<TBlobManager> Manager;
++    size_t Failures = 0;
+ protected:
+     virtual void RemoveBlobIdFromDB(const TTabletId tabletId, const TUnifiedBlobId& blobId, TBlobManagerDb& dbBlobs) override;
+     virtual void DoOnExecuteTxAfterCleaning(NColumnShard::TColumnShard& self, TBlobManagerDb& dbBlobs) override;
+@@ -54,6 +57,10 @@ class TGCTask: public IBlobsGCAction {
+         return ListsByGroupId.empty();
+     }
+ 
++    bool HasFailures() const {
++        return Failures != 0;
++    }
++
+     void OnGCResult(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev);
+ 
+     std::unique_ptr<TEvBlobStorage::TEvCollectGarbage> BuildRequest(const TBlobAddress& address) const;
+diff --git a/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.cpp b/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.cpp
+index b198114d0be7..8667060928a7 100644
+--- a/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.cpp
++++ b/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.cpp
+@@ -1,9 +1,11 @@
+ #include "gc_actor.h"
+ #include <ydb/core/tx/columnshard/columnshard_private_events.h>
++#include <ydb/core/tx/columnshard/hooks/abstract/abstract.h>
+ 
+ namespace NKikimr::NOlap::NBlobOperations::NBlobStorage {
+ 
+ void TGarbageCollectionActor::Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr& ev) {
++    NYDBTest::TControllers::GetColumnShardController()->OnCollectGarbageResult(ev);
+     ACFL_DEBUG("actor", "TEvCollectGarbageResult");
+     if (ev->Get()->Status == NKikimrProto::BLOCKED) {
+         auto g = PassAwayGuard();
+@@ -14,7 +16,13 @@ void TGarbageCollectionActor::Handle(TEvBlobStorage::TEvCollectGarbageResult::TP
+         CheckFinished();
+     } else {
+         ACFL_ERROR()("event", "GC_ERROR")("details", ev->Get()->Print(true));
+-        SendToBSProxy(NActors::TActivationContext::AsActorContext(), ev->Cookie, GCTask->BuildRequest(TBlobAddress(ev->Cookie, ev->Get()->Channel)).release(), ev->Cookie);
++        auto request = GCTask->BuildRequest(TBlobAddress(ev->Cookie, ev->Get()->Channel));
++        if (request) {
++            SendToBSProxy(NActors::TActivationContext::AsActorContext(), ev->Cookie, request.release(), ev->Cookie);
++        } else {
++            GCTask->OnGCResult(ev);
++            CheckFinished();
++        }
+     }
+ }
+ 
+@@ -22,7 +30,11 @@ void TGarbageCollectionActor::CheckFinished() {
+     if (SharedRemovingFinished && GCTask->IsFinished()) {
+         auto g = PassAwayGuard();
+         ACFL_DEBUG("actor", "TGarbageCollectionActor")("event", "finished");
+-        TActorContext::AsActorContext().Send(TabletActorId, std::make_unique<NColumnShard::TEvPrivate::TEvGarbageCollectionFinished>(GCTask));
++        if (GCTask->HasFailures()) {
++            Send(TabletActorId, new TEvents::TEvPoison);
++        } else {
++            TActorContext::AsActorContext().Send(TabletActorId, std::make_unique<NColumnShard::TEvPrivate::TEvGarbageCollectionFinished>(GCTask));
++        }
+     }
+ }
+ 
+diff --git a/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.h b/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.h
+index 006c4ceb4bfc..4dee1e4f4e79 100644
+--- a/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.h
++++ b/ydb/core/tx/columnshard/blobs_action/bs/gc_actor.h
+@@ -12,6 +12,7 @@ class TGarbageCollectionActor: public TSharedBlobsCollectionActor<TGarbageCollec
+     using TBase = TSharedBlobsCollectionActor<TGarbageCollectionActor>;
+     const NActors::TActorId TabletActorId;
+     std::shared_ptr<TGCTask> GCTask;
++
+     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr& ev);
+     void CheckFinished();
+ 
+@@ -41,7 +42,7 @@ class TGarbageCollectionActor: public TSharedBlobsCollectionActor<TGarbageCollec
+         AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_BLOBS_BS)("actor", "TGarbageCollectionActor")("event", "starting")("action_id", GCTask->GetActionGuid());
+         for (auto&& i : GCTask->GetListsByGroupId()) {
+             auto request = GCTask->BuildRequest(i.first);
+-            AFL_VERIFY(request);
++            AFL_VERIFY(request); // Cannot fail on the first time
+             SendToBSProxy(ctx, i.first.GetGroupId(), request.release(), i.first.GetGroupId());
+         }
+         TBase::Bootstrap(ctx);
+diff --git a/ydb/core/tx/columnshard/hooks/abstract/abstract.h b/ydb/core/tx/columnshard/hooks/abstract/abstract.h
+index 1c8d70a9444d..76ae364e13ce 100644
+--- a/ydb/core/tx/columnshard/hooks/abstract/abstract.h
++++ b/ydb/core/tx/columnshard/hooks/abstract/abstract.h
+@@ -89,6 +89,8 @@ class ICSController {
+     }
+     virtual void DoOnDataSharingStarted(const ui64 /*tabletId*/, const TString& /*sessionId*/) {
+     }
++    virtual void DoOnCollectGarbageResult(TEvBlobStorage::TEvCollectGarbageResult::TPtr& /*result*/) {
++    }
+ 
+     virtual TDuration DoGetUsedSnapshotLivetime(const TDuration defaultValue) const {
+         return defaultValue;
+@@ -267,6 +269,10 @@ class ICSController {
+         DoOnAfterGCAction(shard, action);
+     }
+ 
++    void OnCollectGarbageResult(TEvBlobStorage::TEvCollectGarbageResult::TPtr& result) {
++        DoOnCollectGarbageResult(result);
++    }
++
+     bool OnAfterFilterAssembling(const std::shared_ptr<arrow::RecordBatch>& batch) {
+         return DoOnAfterFilterAssembling(batch);
+     }
+diff --git a/ydb/core/tx/columnshard/ut_rw/ut_columnshard_read_write.cpp b/ydb/core/tx/columnshard/ut_rw/ut_columnshard_read_write.cpp
+index 6dc0c82ed5ff..374dfe23da6c 100644
+--- a/ydb/core/tx/columnshard/ut_rw/ut_columnshard_read_write.cpp
++++ b/ydb/core/tx/columnshard/ut_rw/ut_columnshard_read_write.cpp
+@@ -2421,9 +2421,10 @@ Y_UNIT_TEST_SUITE(TColumnShardTestReadWrite) {
+         }
+     }
+ 
++    template<typename Controller>
+     void TestCompactionGC() {
+         TTestBasicRuntime runtime;
+-        auto csDefaultControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<TDefaultTestsController>();
++        auto csDefaultControllerGuard = NKikimr::NYDBTest::TControllers::RegisterCSControllerGuard<Controller>();
+         csDefaultControllerGuard->DisableBackground(NKikimr::NYDBTest::ICSController::EBackground::Indexation);
+         csDefaultControllerGuard->SetOverridePeriodicWakeupActivationPeriod(TDuration::Seconds(1));
+         csDefaultControllerGuard->SetOverrideBlobSplitSettings(NOlap::NSplitter::TSplitSettings());
+@@ -2687,7 +2688,11 @@ Y_UNIT_TEST_SUITE(TColumnShardTestReadWrite) {
+     }
+ 
+     Y_UNIT_TEST(CompactionGC) {
+-        TestCompactionGC();
++        TestCompactionGC<TDefaultTestsController>();
++    }
++
++    Y_UNIT_TEST(CompactionGCFailingBs) {
++        TestCompactionGC<NOlap::TFailingBSController>();
+     }
+ 
+     Y_UNIT_TEST(PortionInfoSize) {

@@ -1,0 +1,1273 @@
+diff --git a/ydb/core/tablet_flat/flat_database.cpp b/ydb/core/tablet_flat/flat_database.cpp
+index 8f36d068db12..b87ee8056d59 100644
+--- a/ydb/core/tablet_flat/flat_database.cpp
++++ b/ydb/core/tablet_flat/flat_database.cpp
+@@ -84,8 +84,6 @@ TAutoPtr<TTableIter> TDatabase::Iterate(ui32 table, TRawVals key, TTagsRef tags,
+         Y_ABORT("Don't know how to convert ELookup to ESeek mode");
+     };
+ 
+-    IteratedTables.insert(table);
+-
+     return Require(table)->Iterate(key, tags, Env, seekBy(key, mode), TRowVersion::Max());
+ }
+ 
+@@ -96,8 +94,6 @@ TAutoPtr<TTableIter> TDatabase::IterateExact(ui32 table, TRawVals key, TTagsRef
+ {
+     Y_ABORT_UNLESS(!NoMoreReadsFlag, "Trying to read after reads prohibited, table %u", table);
+ 
+-    IteratedTables.insert(table);
+-
+     auto iter = Require(table)->Iterate(key, tags, Env, ESeek::Exact, snapshot, visible, observer);
+ 
+     // N.B. ESeek::Exact produces iterators with limit=1
+@@ -153,8 +149,6 @@ TAutoPtr<TTableIter> TDatabase::IterateRange(ui32 table, const TKeyRange& range,
+     Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Require(table)->GetScheme()->Keys->Size()),
+         "%s", IsAmbiguousRangeReason(range, Require(table)->GetScheme()->Keys->Size()));
+ 
+-    IteratedTables.insert(table);
+-
+     ESeek seek = !range.MinKey || range.MinInclusive ? ESeek::Lower : ESeek::Upper;
+ 
+     auto iter = Require(table)->Iterate(range.MinKey, tags, Env, seek, snapshot, visible, observer);
+@@ -182,8 +176,6 @@ TAutoPtr<TTableReverseIter> TDatabase::IterateRangeReverse(ui32 table, const TKe
+     Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Require(table)->GetScheme()->Keys->Size()),
+         "%s", IsAmbiguousRangeReason(range, Require(table)->GetScheme()->Keys->Size()));
+ 
+-    IteratedTables.insert(table);
+-
+     ESeek seek = !range.MaxKey || range.MaxInclusive ? ESeek::Lower : ESeek::Upper;
+ 
+     auto iter = Require(table)->IterateReverse(range.MaxKey, tags, Env, seek, snapshot, visible, observer);
+@@ -699,18 +691,6 @@ TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator
+ 
+     TempIterators.clear();
+ 
+-    if (IteratedTables) {
+-        for (ui32 table : IteratedTables) {
+-            if (auto& wrap = DatabaseImpl->Get(table, false)) {
+-                if (auto* cache = wrap->GetErasedKeysCache()) {
+-                    cache->CollectGarbage();
+-                }
+-            }
+-        }
+-
+-        IteratedTables.clear();
+-    }
+-
+     if (commit && HasChanges()) {
+         Y_ABORT_UNLESS(stamp >= Change->Stamp);
+         Y_ABORT_UNLESS(DatabaseImpl->Serial() == Change->Serial);
+@@ -794,6 +774,8 @@ TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator
+         DatabaseImpl->RollbackTransaction();
+     }
+ 
++    DatabaseImpl->RunGC();
++
+     Redo = nullptr;
+     Annex = nullptr;
+     Alter_ = nullptr;
+diff --git a/ydb/core/tablet_flat/flat_database.h b/ydb/core/tablet_flat/flat_database.h
+index 8b22577e2c6d..ec4e9945e246 100644
+--- a/ydb/core/tablet_flat/flat_database.h
++++ b/ydb/core/tablet_flat/flat_database.h
+@@ -304,7 +304,6 @@ class TDatabase {
+     TVector<TUpdateOp> ModifiedOps;
+ 
+     mutable TDeque<TPartIter> TempIterators; // Keeps the last result of Select() valid
+-    mutable THashSet<ui32> IteratedTables;
+ 
+     TVector<std::function<void()>> OnCommit_;
+     TVector<std::function<void()>> OnRollback_;
+diff --git a/ydb/core/tablet_flat/flat_dbase_naked.h b/ydb/core/tablet_flat/flat_dbase_naked.h
+index e67d6da7b097..5323ca91d3fe 100644
+--- a/ydb/core/tablet_flat/flat_dbase_naked.h
++++ b/ydb/core/tablet_flat/flat_dbase_naked.h
+@@ -24,6 +24,7 @@ namespace NTable {
+             ui32 Table;
+             TEpoch Head;
+             TTxStamp Edge;
++            const TIntrusivePtr<TKeyRangeCacheNeedGCList>& GCList;
+         };
+ 
+         struct TTableWrapper {
+@@ -32,7 +33,7 @@ namespace NTable {
+ 
+             TTableWrapper(TArgs args)
+                 : Table(args.Table)
+-                , Self(new TTable(args.Head))
++                , Self(new TTable(args.Head, args.GCList))
+                 , Edge(args.Edge)
+             {
+ 
+@@ -127,7 +128,8 @@ namespace NTable {
+         using TMemGlob = NPageCollection::TMemGlob;
+ 
+         TDatabaseImpl(TTxStamp weak, TAutoPtr<TScheme> scheme, const TEdges *edges)
+-            : Weak(weak)
++            : GCList(new TKeyRangeCacheNeedGCList)
++            , Weak(weak)
+             , Redo(*this)
+             , Scheme(scheme)
+         {
+@@ -445,6 +447,10 @@ namespace NTable {
+             SchemeRollbackState.Tables.clear();
+         }
+ 
++        void RunGC() {
++            GCList->RunGC();
++        }
++
+         TDatabaseImpl& Switch(TTxStamp stamp) noexcept
+         {
+             Y_ABORT_UNLESS(!InTransaction, "Unexpected switch inside a transaction");
+@@ -582,7 +588,7 @@ namespace NTable {
+                 edge.Head = TEpoch(i64(head));
+             }
+ 
+-            TArgs args{ table, edge.Head, edge.TxStamp };
++            TArgs args{ table, edge.Head, edge.TxStamp, GCList };
+ 
+             auto result = Tables.emplace(table, args);
+ 
+@@ -776,6 +782,7 @@ namespace NTable {
+         }
+ 
+     private:
++        const TIntrusivePtr<TKeyRangeCacheNeedGCList> GCList;
+         const TTxStamp Weak;    /* db bootstrap upper stamp         */
+         ui64 Stamp = 0;
+         ui64 Serial_ = 1;       /* db global change serial number    */
+diff --git a/ydb/core/tablet_flat/flat_iterator.h b/ydb/core/tablet_flat/flat_iterator.h
+index e63ede3a5f29..970cc0dd0fa2 100644
+--- a/ydb/core/tablet_flat/flat_iterator.h
++++ b/ydb/core/tablet_flat/flat_iterator.h
+@@ -282,12 +282,19 @@ class TTableIterBase : TNonCopyable {
+             } else if (Stage == EStage::Snap) {
+                 if (mode != ENext::Uncommitted) {
+                     Ready = Snap();
+-                    if (ErasedKeysCache && mode == ENext::Data &&
+-                        (Stats.InvisibleRowSkips != SnapInvisibleRowSkips || Stage != EStage::Fill))
+-                    {
+-                        // Interrupt range when key is not at a head version, or skipped entirely
++                    // Interrupt range when key state might change between iterations
++                    if (ErasedKeysCache && mode == ENext::Data && Stats.UncertainErase) {
+                         eraseCache.Flush();
+                     }
++                    // Handle keys that don't exist at current snapshot version
++                    if (Stage == EStage::Turn) {
++                        InitLastKey(ERowOp::Absent);
++                        ++Stats.DeletedRowSkips; /* skip this invisible key */
++                        if (ErasedKeysCache && mode == ENext::Data && !Stats.UncertainErase) {
++                            // Erase cache should treat this key as a cachable erase
++                            eraseCache.OnEraseKey(GetKey().Cells(), TRowVersion::Min());
++                        }
++                    }
+                 } else {
+                     Y_DEBUG_ABORT_UNLESS(Active != Inactive);
+                     Stage = EStage::Fill;
+@@ -300,7 +307,7 @@ class TTableIterBase : TNonCopyable {
+             } else {
+                 InitLastKey(ERowOp::Erase);
+                 ++Stats.DeletedRowSkips; /* skip internal technical row states w/o data */
+-                if (ErasedKeysCache && Stats.InvisibleRowSkips == SnapInvisibleRowSkips) {
++                if (ErasedKeysCache && !Stats.UncertainErase) {
+                     // Try to cache erases that are at a head version
+                     eraseCache.OnEraseKey(GetKey().Cells(), GetRowVersion());
+                 }
+@@ -341,6 +348,7 @@ class TTableIterBase : TNonCopyable {
+     const TRowScheme* Scheme;
+     const TRemap Remap;
+     TIntrusivePtr<TKeyRangeCache> ErasedKeysCache;
++    NTable::TTransactionSet DecidedTransactions; // Needed for ErasedKeysCache
+     TIteratorStats Stats;
+ 
+ private:
+@@ -435,7 +443,6 @@ class TTableIterBase : TNonCopyable {
+     TIterators Iterators;
+     TForwardIter Active;
+     TForwardIter Inactive;
+-    ui64 SnapInvisibleRowSkips = 0;
+     ui64 DeltaTxId = 0;
+     TRowVersion DeltaVersion;
+     bool Delta = false;
+@@ -609,7 +616,7 @@ inline EReady TTableIterBase<TIteratorOps>::Start() noexcept
+     }
+ 
+     Stage = EStage::Snap;
+-    SnapInvisibleRowSkips = Stats.InvisibleRowSkips;
++    Stats.UncertainErase = false;
+     Inactive = Iterators.end();
+     return EReady::Data;
+ }
+@@ -792,8 +799,6 @@ inline EReady TTableIterBase<TIteratorOps>::Snap() noexcept
+             return EReady::Data;
+ 
+         case EReady::Gone:
+-            InitLastKey(ERowOp::Absent);
+-            ++Stats.DeletedRowSkips;
+             Stage = EStage::Turn;
+             return EReady::Data;
+ 
+@@ -811,14 +816,14 @@ inline EReady TTableIterBase<TIteratorOps>::Snap(TRowVersion rowVersion) noexcep
+         TIteratorId ai = i->IteratorId;
+         switch (ai.Type) {
+             case EType::Mem: {
+-                auto ready = MemIters[ai.Index]->SkipToRowVersion(rowVersion, Stats, CommittedTransactions, TransactionObserver);
++                auto ready = MemIters[ai.Index]->SkipToRowVersion(rowVersion, Stats, CommittedTransactions, TransactionObserver, DecidedTransactions);
+                 if (ready) {
+                     return EReady::Data;
+                 }
+                 break;
+             }
+             case EType::Run: {
+-                auto ready = RunIters[ai.Index]->SkipToRowVersion(rowVersion, Stats, CommittedTransactions, TransactionObserver);
++                auto ready = RunIters[ai.Index]->SkipToRowVersion(rowVersion, Stats, CommittedTransactions, TransactionObserver, DecidedTransactions);
+                 if (ready == EReady::Data) {
+                     return EReady::Data;
+                 } else if (ready != EReady::Gone) {
+diff --git a/ydb/core/tablet_flat/flat_mem_iter.h b/ydb/core/tablet_flat/flat_mem_iter.h
+index 1fec8da2b087..b1781885237b 100644
+--- a/ydb/core/tablet_flat/flat_mem_iter.h
++++ b/ydb/core/tablet_flat/flat_mem_iter.h
+@@ -240,7 +240,8 @@ namespace NTable {
+          */
+         bool SkipToRowVersion(TRowVersion rowVersion, TIteratorStats& stats,
+                               NTable::ITransactionMapSimplePtr committedTransactions,
+-                              NTable::ITransactionObserverSimplePtr transactionObserver) noexcept
++                              NTable::ITransactionObserverSimplePtr transactionObserver,
++                              const NTable::ITransactionSet& decidedTransactions) noexcept
+         {
+             Y_DEBUG_ABORT_UNLESS(IsValid(), "Attempt to access an invalid row");
+ 
+@@ -250,6 +251,10 @@ namespace NTable {
+             // Skip uncommitted deltas
+             while (chain->RowVersion.Step == Max<ui64>() && !committedTransactions.Find(chain->RowVersion.TxId)) {
+                 transactionObserver.OnSkipUncommitted(chain->RowVersion.TxId);
++                if (chain->Rop != ERowOp::Erase && !decidedTransactions.Contains(chain->RowVersion.TxId)) {
++                    // This change may commit and change the iteration result
++                    stats.UncertainErase = true;
++                }
+                 if (!(chain = chain->Next)) {
+                     CurrentVersion = nullptr;
+                     return false;
+@@ -267,12 +272,20 @@ namespace NTable {
+                 auto* commitVersion = committedTransactions.Find(chain->RowVersion.TxId);
+                 Y_ABORT_UNLESS(commitVersion);
+                 if (*commitVersion <= rowVersion) {
++                    if (!decidedTransactions.Contains(chain->RowVersion.TxId)) {
++                        // This change may rollback and change the iteration result
++                        stats.UncertainErase = true;
++                    }
+                     return true;
+                 }
+                 transactionObserver.OnSkipCommitted(*commitVersion, chain->RowVersion.TxId);
+             }
+ 
+             stats.InvisibleRowSkips++;
++            if (chain->Rop != ERowOp::Erase) {
++                // We are skipping non-erase op, so any erase below cannot be trusted
++                stats.UncertainErase = true;
++            }
+ 
+             while ((chain = chain->Next)) {
+                 if (chain->RowVersion.Step != Max<ui64>()) {
+@@ -286,6 +299,10 @@ namespace NTable {
+                 } else {
+                     auto* commitVersion = committedTransactions.Find(chain->RowVersion.TxId);
+                     if (commitVersion && *commitVersion <= rowVersion) {
++                        if (!decidedTransactions.Contains(chain->RowVersion.TxId)) {
++                            // This change may rollback and change the iteration result
++                            stats.UncertainErase = true;
++                        }
+                         CurrentVersion = chain;
+                         return true;
+                     }
+@@ -295,8 +312,17 @@ namespace NTable {
+                         stats.InvisibleRowSkips++;
+                     } else {
+                         transactionObserver.OnSkipUncommitted(chain->RowVersion.TxId);
++                        if (decidedTransactions.Contains(chain->RowVersion.TxId)) {
++                            // This is a decided uncommitted change and will never be committed
++                            // Make sure we don't mark possible erase below as uncertain
++                            continue;
++                        }
+                     }
+                 }
++                if (chain->Rop != ERowOp::Erase) {
++                    // We are skipping non-erase op, so any erase below cannot be trusted
++                    stats.UncertainErase = true;
++                }
+             }
+ 
+             CurrentVersion = nullptr;
+diff --git a/ydb/core/tablet_flat/flat_part_iter.h b/ydb/core/tablet_flat/flat_part_iter.h
+index 20db44c14357..84c2843a4c14 100644
+--- a/ydb/core/tablet_flat/flat_part_iter.h
++++ b/ydb/core/tablet_flat/flat_part_iter.h
+@@ -923,7 +923,8 @@ namespace NTable {
+ 
+         EReady SkipToRowVersion(TRowVersion rowVersion, TIteratorStats& stats,
+                                 NTable::ITransactionMapSimplePtr committedTransactions,
+-                                NTable::ITransactionObserverSimplePtr transactionObserver) noexcept
++                                NTable::ITransactionObserverSimplePtr transactionObserver,
++                                const NTable::ITransactionSet& decidedTransactions) noexcept
+         {
+             Y_DEBUG_ABORT_UNLESS(Main.IsValid(), "Attempt to use an invalid iterator");
+ 
+@@ -948,6 +949,7 @@ namespace NTable {
+                             transactionObserver.OnSkipCommitted(Part->MinRowVersion);
+                         }
+                         stats.InvisibleRowSkips++;
++                        stats.UncertainErase = true;
+                     }
+                     return EReady::Gone;
+                 }
+@@ -964,15 +966,27 @@ namespace NTable {
+                     const auto* commitVersion = committedTransactions.Find(txId);
+                     if (commitVersion && *commitVersion <= rowVersion) {
+                         // Already committed and correct version
++                        if (!decidedTransactions.Contains(txId)) {
++                            // This change may rollback and change the iteration result
++                            stats.UncertainErase = true;
++                        }
+                         return EReady::Data;
+                     }
+                     if (commitVersion) {
+                         // Skipping a newer committed delta
+                         transactionObserver.OnSkipCommitted(*commitVersion, txId);
+                         stats.InvisibleRowSkips++;
++                        if (data->GetRop() != ERowOp::Erase) {
++                            // Skipping non-erase delta, so any erase below cannot be trusted
++                            stats.UncertainErase = true;
++                        }
+                     } else {
+                         // Skipping an uncommitted delta
+                         transactionObserver.OnSkipUncommitted(txId);
++                        if (data->GetRop() != ERowOp::Erase && !decidedTransactions.Contains(txId)) {
++                            // This change may commit and change the iteration result
++                            stats.UncertainErase = true;
++                        }
+                     }
+                     data = Main.GetRecord()->GetAltRecord(++SkipMainDeltas);
+                     if (!data) {
+@@ -991,6 +1005,7 @@ namespace NTable {
+                     SkipEraseVersion = true;
+                     transactionObserver.OnSkipCommitted(current);
+                     stats.InvisibleRowSkips++;
++                    stats.UncertainErase = true;
+                 }
+ 
+                 TRowVersion current = data->IsVersioned() ? data->GetMinVersion(info) : Part->MinRowVersion;
+@@ -1001,6 +1016,7 @@ namespace NTable {
+ 
+                 transactionObserver.OnSkipCommitted(current);
+                 stats.InvisibleRowSkips++;
++                stats.UncertainErase = true;
+ 
+                 if (!data->HasHistory()) {
+                     // There is no history, reset
+@@ -1661,10 +1677,11 @@ namespace NTable {
+ 
+         EReady SkipToRowVersion(TRowVersion rowVersion, TIteratorStats& stats,
+                                 NTable::ITransactionMapSimplePtr committedTransactions,
+-                                NTable::ITransactionObserverSimplePtr transactionObserver) noexcept
++                                NTable::ITransactionObserverSimplePtr transactionObserver,
++                                const NTable::ITransactionSet& decidedTransactions) noexcept
+         {
+             Y_DEBUG_ABORT_UNLESS(CurrentIt);
+-            auto ready = CurrentIt->SkipToRowVersion(rowVersion, stats, committedTransactions, transactionObserver);
++            auto ready = CurrentIt->SkipToRowVersion(rowVersion, stats, committedTransactions, transactionObserver, decidedTransactions);
+             return ready;
+         }
+ 
+diff --git a/ydb/core/tablet_flat/flat_range_cache.cpp b/ydb/core/tablet_flat/flat_range_cache.cpp
+index 65101be07885..af7a6d03014c 100644
+--- a/ydb/core/tablet_flat/flat_range_cache.cpp
++++ b/ydb/core/tablet_flat/flat_range_cache.cpp
+@@ -4,9 +4,31 @@
+ namespace NKikimr {
+ namespace NTable {
+ 
+-TKeyRangeCache::TKeyRangeCache(const TKeyCellDefaults& keyDefaults, const TKeyRangeCacheConfig& config)
++TKeyRangeCacheNeedGCList::~TKeyRangeCacheNeedGCList()
++{ }
++
++void TKeyRangeCacheNeedGCList::Add(TKeyRangeCache* cache) {
++    TListItem* item = static_cast<TListItem*>(cache);
++    if (item->Empty()) {
++        List.PushBack(item);
++    }
++}
++
++void TKeyRangeCacheNeedGCList::RunGC() {
++    while (List) {
++        auto* item = List.Front();
++        // Note: we call CollectGarbage while item is still in the list
++        // This way item is not re-added by internal invalidations
++        item->CollectGarbage();
++        List.Remove(item);
++    }
++}
++
++TKeyRangeCache::TKeyRangeCache(const TKeyCellDefaults& keyDefaults, const TKeyRangeCacheConfig& config,
++        const TIntrusivePtr<TKeyRangeCacheNeedGCList>& gcList)
+     : KeyCellDefaults(keyDefaults)
+     , Config(config)
++    , GCList(gcList)
+     , Pool(new TSpecialMemoryPool())
+     , Entries(TKeyRangeEntryCompare(KeyCellDefaults.Types), TAllocator(&UsedHeapMemory))
+ { }
+@@ -50,6 +72,9 @@ TArrayRef<TCell> TKeyRangeCache::AllocateKey(TArrayRef<const TCell> key) {
+     }
+ 
+     ++Stats_.Allocations;
++    if (GCList) {
++        GCList->Add(this);
++    }
+ 
+     auto copy = AllocateArrayCopy(Pool.Get(), key);
+     for (TCell& cell : copy) {
+@@ -66,6 +91,9 @@ void TKeyRangeCache::DeallocateKey(TArrayRef<TCell> key) {
+     }
+ 
+     ++Stats_.Deallocations;
++    if (GCList) {
++        GCList->Add(this);
++    }
+ 
+     size_t index = key.size() - 1;
+     do {
+@@ -104,6 +132,9 @@ TKeyRangeCache::const_iterator TKeyRangeCache::Merge(const_iterator left, const_
+     Entries.erase(right);
+     DeallocateKey(rightCopy.FromKey);
+     ExtendRight(left, rightCopy.ToKey, rightCopy.ToInclusive, ::Max(rightCopy.MaxVersion, version));
++    if (GCList) {
++        GCList->Add(this);
++    }
+     return left;
+ }
+ 
+@@ -112,6 +143,9 @@ TKeyRangeCache::const_iterator TKeyRangeCache::Add(TKeyRangeEntry entry) {
+     Y_DEBUG_ABORT_UNLESS(res.second);
+     TKeyRangeEntryLRU& newEntry = const_cast<TKeyRangeEntryLRU&>(*res.first);
+     Fresh.PushBack(&newEntry);
++    if (GCList) {
++        GCList->Add(this);
++    }
+     return res.first;
+ }
+ 
+@@ -121,6 +155,24 @@ void TKeyRangeCache::Invalidate(const_iterator it) {
+     Entries.erase(it);
+     DeallocateKey(entryCopy.FromKey);
+     DeallocateKey(entryCopy.ToKey);
++    if (GCList) {
++        GCList->Add(this);
++    }
++}
++
++void TKeyRangeCache::InvalidateKey(const_iterator it, TArrayRef<const TCell> key) {
++    Y_DEBUG_ABORT_UNLESS(it != end());
++    TKeyRangeEntryLRU& entry = const_cast<TKeyRangeEntryLRU&>(*it);
++    int cmp = Entries.key_comp().CompareKeys(entry.FromKey, key);
++    Y_DEBUG_ABORT_UNLESS(cmp <= 0);
++    if (cmp == 0) {
++        Y_DEBUG_ABORT_UNLESS(entry.FromInclusive);
++        Invalidate(it);
++        return;
++    }
++    DeallocateKey(entry.ToKey);
++    entry.ToKey = AllocateKey(key);
++    entry.ToInclusive = false;
+ }
+ 
+ void TKeyRangeCache::Touch(const_iterator it) {
+diff --git a/ydb/core/tablet_flat/flat_range_cache.h b/ydb/core/tablet_flat/flat_range_cache.h
+index b3bb654fff08..0772ceb3da66 100644
+--- a/ydb/core/tablet_flat/flat_range_cache.h
++++ b/ydb/core/tablet_flat/flat_range_cache.h
+@@ -65,6 +65,12 @@ class TKeyRangeEntryCompare {
+         TArrayRef<const TCell> Key;
+     };
+ 
++    int CompareKeys(TArrayRef<const TCell> a, TArrayRef<const TCell> b) const noexcept {
++        Y_DEBUG_ABORT_UNLESS(a.size() == KeyTypes.size());
++        Y_DEBUG_ABORT_UNLESS(b.size() == KeyTypes.size());
++        return CompareTypedCellVectors(a.data(), b.data(), KeyTypes.data(), KeyTypes.size());
++    }
++
+     template<class TPoint>
+     bool PointLessThanLeftBorder(const TPoint& a, const TKeyRangeEntry& b) const noexcept {
+         Y_DEBUG_ABORT_UNLESS(a.Key.size() == KeyTypes.size());
+@@ -311,9 +317,30 @@ struct TKeyRangeCacheConfig {
+     size_t MaxBytes = 128 * 1024; // maximum 128KB by default
+ };
+ 
++class TKeyRangeCache;
++struct TKeyRangeCacheNeedGCTag;
++
++class TKeyRangeCacheNeedGCList final
++    : public TSimpleRefCount<TKeyRangeCacheNeedGCList>
++{
++public:
++    ~TKeyRangeCacheNeedGCList();
++
++    void Add(TKeyRangeCache* cache);
++
++    void RunGC();
++
++private:
++    using TListItem = TIntrusiveListItem<TKeyRangeCache, TKeyRangeCacheNeedGCTag>;
++    TIntrusiveList<TKeyRangeCache, TKeyRangeCacheNeedGCTag> List;
++};
++
+ class TKeyRangeCache final
+     : public TSimpleRefCount<TKeyRangeCache>
++    , public TIntrusiveListItem<TKeyRangeCache, TKeyRangeCacheNeedGCTag>
+ {
++    friend class TKeyRangeCacheNeedGCList;
++
+ private:
+     template<class T>
+     class TAccountingAllocator
+@@ -387,7 +414,8 @@ class TKeyRangeCache final
+     };
+ 
+ public:
+-    TKeyRangeCache(const TKeyCellDefaults& keyDefaults, const TKeyRangeCacheConfig& config);
++    TKeyRangeCache(const TKeyCellDefaults& keyDefaults, const TKeyRangeCacheConfig& config,
++        const TIntrusivePtr<TKeyRangeCacheNeedGCList>& gcList = nullptr);
+ 
+     ~TKeyRangeCache();
+ 
+@@ -514,6 +542,13 @@ class TKeyRangeCache final
+      */
+     void Invalidate(const_iterator it);
+ 
++    /**
++     * Invalidates the specified key from the entry.
++     * Entry may or may not become invalidated after this call.
++     * The key doesn't need to be previously allocated with AllocateKey.
++     */
++    void InvalidateKey(const_iterator it, TArrayRef<const TCell> key);
++
+     /**
+      * Marks the specified entry as most recently used
+      */
+@@ -554,6 +589,7 @@ class TKeyRangeCache final
+ private:
+     const TKeyCellDefaults& KeyCellDefaults;
+     const TKeyRangeCacheConfig Config;
++    const TIntrusivePtr<TKeyRangeCacheNeedGCList> GCList;
+     THolder<TSpecialMemoryPool> Pool;
+     size_t UsedHeapMemory = 0;
+     TContainer Entries;
+diff --git a/ydb/core/tablet_flat/flat_range_cache_ut.cpp b/ydb/core/tablet_flat/flat_range_cache_ut.cpp
+index 2674e00212c4..ae0c1d79e48c 100644
+--- a/ydb/core/tablet_flat/flat_range_cache_ut.cpp
++++ b/ydb/core/tablet_flat/flat_range_cache_ut.cpp
+@@ -235,7 +235,7 @@ Y_UNIT_TEST_SUITE(TFlatEraseCacheTest) {
+             DB.Commit(8, true);
+ 
+             // We touched an erased range, it should become invalidated
+-            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ }");
++            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1, 2}, {2, 5}) }");
+         }
+ 
+         {
+@@ -249,7 +249,7 @@ Y_UNIT_TEST_SUITE(TFlatEraseCacheTest) {
+             DB.Commit(9, true);
+ 
+             // We've seen all rows, expect correct erased ranges
+-            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1, 2}, {2, 4}], [{2, 6}, {2, 31}] }");
++            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1, 2}, {2, 5}), [{2, 6}, {2, 31}] }");
+         }
+     }
+ 
+@@ -423,7 +423,7 @@ Y_UNIT_TEST_SUITE(TFlatEraseCacheTest) {
+             DB.Commit(8, true);
+ 
+             // We touched an erased range, it should become invalidated
+-            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ }");
++            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{2, 2}, {2, 28}) }");
+         }
+ 
+         {
+@@ -437,7 +437,7 @@ Y_UNIT_TEST_SUITE(TFlatEraseCacheTest) {
+             DB.Commit(9, true);
+ 
+             // We've seen all rows, expect correct erased ranges
+-            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{2, 2}, {2, 27}], [{2, 29}, {3, 31}] }");
++            UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{2, 2}, {2, 28}), [{2, 29}, {3, 31}] }");
+         }
+     }
+ 
+diff --git a/ydb/core/tablet_flat/flat_table.cpp b/ydb/core/tablet_flat/flat_table.cpp
+index 19b830e99cd3..354bccbcaefc 100644
+--- a/ydb/core/tablet_flat/flat_table.cpp
++++ b/ydb/core/tablet_flat/flat_table.cpp
+@@ -16,7 +16,10 @@
+ namespace NKikimr {
+ namespace NTable {
+ 
+-TTable::TTable(TEpoch epoch) : Epoch(epoch) { }
++TTable::TTable(TEpoch epoch, const TIntrusivePtr<TKeyRangeCacheNeedGCList>& gcList)
++    : Epoch(epoch)
++    , EraseCacheGCList(gcList)
++{ }
+ 
+ TTable::~TTable() { }
+ 
+@@ -30,6 +33,7 @@ void TTable::PrepareRollback()
+     state.EraseCacheConfig = EraseCacheConfig;
+     state.MutableExisted = bool(Mutable);
+     state.MutableUpdated = false;
++    state.DisableEraseCache = false;
+ }
+ 
+ void TTable::RollbackChanges()
+@@ -37,6 +41,8 @@ void TTable::RollbackChanges()
+     Y_ABORT_UNLESS(RollbackState, "PrepareRollback needed to rollback changes");
+     auto& state = *RollbackState;
+ 
++    CommitOps.clear();
++
+     while (!RollbackOps.empty()) {
+         struct TApplyRollbackOp {
+             TTable* Self;
+@@ -80,20 +86,12 @@ void TTable::RollbackChanges()
+ 
+     if (Epoch != state.Epoch) {
+         // We performed a snapshot, roll it back
+-        if (Mutable) {
+-            ErasedKeysCache.Reset();
+-            Mutable = nullptr;
+-        }
+         Y_ABORT_UNLESS(MutableBackup, "Previous mem table missing");
+         Mutable = std::move(MutableBackup);
+     } else if (!state.MutableExisted) {
+         // New memtable doesn't need rollback
+-        if (Mutable) {
+-            ErasedKeysCache.Reset();
+-            Mutable = nullptr;
+-        }
++        Mutable = nullptr;
+     } else if (state.MutableUpdated) {
+-        ErasedKeysCache.Reset();
+         Y_ABORT_UNLESS(Mutable, "Mutable was updated, but it is missing");
+         Mutable->RollbackChanges();
+     }
+@@ -103,7 +101,6 @@ void TTable::RollbackChanges()
+     Annexed = state.Annexed;
+     if (state.Scheme) {
+         Levels.Reset();
+-        ErasedKeysCache.Reset();
+         Scheme = std::move(state.Scheme);
+         EraseCacheEnabled = state.EraseCacheEnabled;
+         EraseCacheConfig = state.EraseCacheConfig;
+@@ -116,6 +113,19 @@ void TTable::CommitChanges(TArrayRef<const TMemGlob> blobs)
+     Y_ABORT_UNLESS(RollbackState, "PrepareRollback needed to rollback changes");
+     auto& state = *RollbackState;
+ 
++    for (auto& op : CommitOps) {
++        struct TApplyCommitOp {
++            TTable* Self;
++
++            void operator()(const TCommitAddDecidedTx& op) const {
++                Self->DecidedTransactions.Add(op.TxId);
++            }
++        };
++
++        std::visit(TApplyCommitOp{ this }, op);
++    }
++
++    CommitOps.clear();
+     RollbackOps.clear();
+ 
+     if (Epoch != state.Epoch) {
+@@ -162,6 +172,11 @@ void TTable::SetScheme(const TScheme::TTableInfo &table)
+ 
+     Y_ABORT_UNLESS(!Mutable && table.Columns);
+ 
++    if (RollbackState) {
++        // Make sure we don't populate erase cache with keys based on a schema
++        // which may end up rolling back.
++        RollbackState->DisableEraseCache = true;
++    }
+     if (RollbackState && !RollbackState->Scheme) {
+         RollbackState->Scheme = Scheme;
+         RollbackState->EraseCacheEnabled = EraseCacheEnabled;
+@@ -362,7 +377,8 @@ void TTable::ReplaceSlices(TBundleSlicesMap slices) noexcept
+     }
+     if (slices) {
+         Levels.Reset();
+-        ErasedKeysCache.Reset();
++        // Note: ReplaceSlices does not introduce any new rows, so we don't
++        // have to invalidate current erase cache.
+     }
+ }
+ 
+@@ -383,9 +399,12 @@ void TTable::Replace(TArrayRef<const TPartView> partViews, const TSubset &subset
+         Levels.Reset();
+     }
+ 
++    bool removingOld = false;
++    bool addingNew = false;
+     THashSet<ui64> checkNewTransactions;
+ 
+     for (auto &memTable : subset.Frozen) {
++        removingOld = true;
+         const auto found = Frozen.erase(memTable.MemTable);
+ 
+         Y_ABORT_UNLESS(found == 1, "Got an unknown TMemTable table in TSubset");
+@@ -406,6 +425,7 @@ void TTable::Replace(TArrayRef<const TPartView> partViews, const TSubset &subset
+     }
+ 
+     for (auto &part : subset.Flatten) {
++        removingOld = true;
+         Y_ABORT_UNLESS(part.Slices && *part.Slices,
+             "Got an empty TPart subset in TSubset");
+ 
+@@ -454,12 +474,14 @@ void TTable::Replace(TArrayRef<const TPartView> partViews, const TSubset &subset
+     }
+ 
+     for (auto &part : subset.ColdParts) {
++        removingOld = true;
+         auto it = ColdParts.find(part->Label);
+         Y_ABORT_UNLESS(it != ColdParts.end(), "Got an unknown TColdPart in TSubset");
+         ColdParts.erase(it);
+     }
+ 
+     for (const auto &partView : partViews) {
++        addingNew = true;
+         if (Mutable && partView->Epoch >= Mutable->Epoch) {
+             Y_Fail("Replace with " << NFmt::Do(*partView) << " after mutable epoch " << Mutable->Epoch);
+         }
+@@ -481,6 +503,7 @@ void TTable::Replace(TArrayRef<const TPartView> partViews, const TSubset &subset
+             if (!ColdParts) {
+                 CommittedTransactions.Remove(txId);
+                 RemovedTransactions.Remove(txId);
++                DecidedTransactions.Remove(txId);
+             } else {
+                 CheckTransactions.insert(txId);
+             }
+@@ -491,7 +514,14 @@ void TTable::Replace(TArrayRef<const TPartView> partViews, const TSubset &subset
+ 
+     ProcessCheckTransactions();
+ 
+-    ErasedKeysCache.Reset();
++    if (!removingOld && addingNew) {
++        // Note: we invalidate erase cache when nothing old is removed,
++        // because followers always call Replace, even when leader called
++        // Merge. When something is removed we can assume it's a compaction
++        // and compactions don't add new rows to the table, keeping erase
++        // cache valid.
++        ErasedKeysCache.Reset();
++    }
+ }
+ 
+ void TTable::ReplaceTxStatus(TArrayRef<const TIntrusiveConstPtr<TTxStatusPart>> newTxStatus, const TSubset &subset) noexcept
+@@ -551,6 +581,8 @@ void TTable::Merge(TPartView partView) noexcept
+         it->second.Slices = TSlices::Merge(it->second.Slices, partView.Slices);
+     }
+ 
++    // Note: Merge is called when borrowing data, which may introduce new rows
++    // and invalidate current erase cache.
+     ErasedKeysCache.Reset();
+ }
+ 
+@@ -579,8 +611,11 @@ void TTable::Merge(TIntrusiveConstPtr<TColdPart> part) noexcept
+     Epoch = Max(Epoch, part->Epoch + 1);
+     ColdParts.emplace(label, std::move(part));
+ 
+-    ErasedKeysCache.Reset();
+     Levels.Reset();
++
++    // Note: Merge is called when borrowing data, which may introduce new rows
++    // and invalidate current erase cache.
++    ErasedKeysCache.Reset();
+ }
+ 
+ void TTable::Merge(TIntrusiveConstPtr<TTxStatusPart> txStatus) noexcept
+@@ -601,6 +636,7 @@ void TTable::Merge(TIntrusiveConstPtr<TTxStatusPart> txStatus) noexcept
+         if (!TxRefs.contains(txId)) {
+             CheckTransactions.insert(txId);
+         }
++        DecidedTransactions.Add(txId);
+         OpenTxs.erase(txId);
+     }
+     for (auto& item : txStatus->TxStatusPage->GetRemovedItems()) {
+@@ -611,6 +647,7 @@ void TTable::Merge(TIntrusiveConstPtr<TTxStatusPart> txStatus) noexcept
+         if (!TxRefs.contains(txId)) {
+             CheckTransactions.insert(txId);
+         }
++        DecidedTransactions.Add(txId);
+         OpenTxs.erase(txId);
+     }
+ 
+@@ -627,7 +664,9 @@ void TTable::Merge(TIntrusiveConstPtr<TTxStatusPart> txStatus) noexcept
+     auto res = TxStatus.emplace(txStatus->Label, txStatus);
+     Y_ABORT_UNLESS(res.second, "Unexpected failure to add a new TTxStatusPart");
+ 
+-    ErasedKeysCache.Reset();
++    // Note: Merge is called when borrowing data, but new tx status may commit
++    // or rollback some transactions, and erase cache already accounts for that
++    // eventuality, so doesn't need to be invalidated.
+ }
+ 
+ void TTable::ProcessCheckTransactions() noexcept
+@@ -638,6 +677,7 @@ void TTable::ProcessCheckTransactions() noexcept
+             if (it == TxRefs.end()) {
+                 CommittedTransactions.Remove(txId);
+                 RemovedTransactions.Remove(txId);
++                DecidedTransactions.Remove(txId);
+             }
+         }
+         CheckTransactions.clear();
+@@ -825,7 +865,7 @@ void TTable::Update(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMemG
+         const TCelled cells(key, *Scheme->Keys, true);
+         auto res = ErasedKeysCache->FindKey(cells);
+         if (res.second) {
+-            ErasedKeysCache->Invalidate(res.first);
++            ErasedKeysCache->InvalidateKey(res.first, cells);
+         }
+     }
+ 
+@@ -842,6 +882,8 @@ void TTable::AddTxRef(ui64 txId)
+     if (addOpenTx) {
+         auto res = OpenTxs.insert(txId);
+         Y_ABORT_UNLESS(res.second);
++        Y_DEBUG_ABORT_UNLESS(!DecidedTransactions.Contains(txId),
++            "Decided transaction %" PRIu64 " is both open and decided", txId);
+     }
+     if (RollbackState) {
+         RollbackOps.emplace_back(TRollbackRemoveTxRef{ txId });
+@@ -856,6 +898,14 @@ void TTable::UpdateTx(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMe
+     auto& memTable = MemTable();
+     bool hadTxRef = memTable.GetTxIdStats().contains(txId);
+ 
++    if (ErasedKeysCache && rop != ERowOp::Erase) {
++        const TCelled cells(key, *Scheme->Keys, true);
++        auto res = ErasedKeysCache->FindKey(cells);
++        if (res.second) {
++            ErasedKeysCache->InvalidateKey(res.first, cells);
++        }
++    }
++
+     // Use a special row version that marks this update as uncommitted
+     TRowVersion rowVersion(Max<ui64>(), txId);
+     MemTable().Update(rop, key, ops, apart, rowVersion, CommittedTransactions);
+@@ -897,13 +947,15 @@ void TTable::CommitTx(ui64 txId, TRowVersion rowVersion)
+         if (auto it = OpenTxs.find(txId); it != OpenTxs.end()) {
+             if (RollbackState) {
+                 RollbackOps.emplace_back(TRollbackAddOpenTx{ txId });
++                CommitOps.emplace_back(TCommitAddDecidedTx{ txId });
++            } else {
++                DecidedTransactions.Add(txId);
+             }
+             OpenTxs.erase(it);
+         }
+     }
+ 
+-    // We don't know which keys have been commited, invalidate everything
+-    ErasedKeysCache.Reset();
++    // Note: erase cache accounts for changes that may commit, no need to invalidate
+ }
+ 
+ void TTable::RemoveTx(ui64 txId)
+@@ -922,6 +974,9 @@ void TTable::RemoveTx(ui64 txId)
+         if (auto it = OpenTxs.find(txId); it != OpenTxs.end()) {
+             if (RollbackState) {
+                 RollbackOps.emplace_back(TRollbackAddOpenTx{ txId });
++                CommitOps.emplace_back(TCommitAddDecidedTx{ txId });
++            } else {
++                DecidedTransactions.Add(txId);
+             }
+             OpenTxs.erase(it);
+         }
+@@ -963,6 +1018,11 @@ TMemTable& TTable::MemTable()
+     if (!Mutable) {
+         Mutable = new TMemTable(Scheme, Epoch, Annexed);
+     }
++    if (RollbackState) {
++        // MemTable() is only called when we want to apply updates
++        // Make sure we don't taint erase cache with changes that may rollback
++        RollbackState->DisableEraseCache = true;
++    }
+     if (RollbackState && Epoch == RollbackState->Epoch && RollbackState->MutableExisted) {
+         if (!RollbackState->MutableUpdated) {
+             RollbackState->MutableUpdated = true;
+@@ -1009,11 +1069,12 @@ TAutoPtr<TTableIter> TTable::Iterate(TRawVals key_, TTagsRef tags, IPages* env,
+         }
+     }
+ 
+-    if (EraseCacheEnabled && !visible) {
++    if (EraseCacheEnabled && (!RollbackState || !RollbackState->DisableEraseCache)) {
+         if (!ErasedKeysCache) {
+-            ErasedKeysCache = new TKeyRangeCache(*Scheme->Keys, EraseCacheConfig);
++            ErasedKeysCache = new TKeyRangeCache(*Scheme->Keys, EraseCacheConfig, EraseCacheGCList);
+         }
+         dbIter->ErasedKeysCache = ErasedKeysCache;
++        dbIter->DecidedTransactions = DecidedTransactions;
+     }
+ 
+     return dbIter;
+@@ -1056,11 +1117,12 @@ TAutoPtr<TTableReverseIter> TTable::IterateReverse(TRawVals key_, TTagsRef tags,
+         }
+     }
+ 
+-    if (EraseCacheEnabled && !visible) {
++    if (EraseCacheEnabled && (!RollbackState || !RollbackState->DisableEraseCache)) {
+         if (!ErasedKeysCache) {
+-            ErasedKeysCache = new TKeyRangeCache(*Scheme->Keys, EraseCacheConfig);
++            ErasedKeysCache = new TKeyRangeCache(*Scheme->Keys, EraseCacheConfig, EraseCacheGCList);
+         }
+         dbIter->ErasedKeysCache = ErasedKeysCache;
++        dbIter->DecidedTransactions = DecidedTransactions;
+     }
+ 
+     return dbIter;
+@@ -1098,7 +1160,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
+     if (Mutable) {
+         lastEpoch = Mutable->Epoch;
+         if (auto it = TMemIter::Make(*Mutable, Mutable->Immediate(), key, ESeek::Exact, Scheme->Keys, &remap, env, EDirection::Forward)) {
+-            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer))) {
++            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer, DecidedTransactions))) {
+                 // N.B. stop looking for snapshot after the first hit
+                 snapshotFound = true;
+                 it->Apply(row, committed, observer);
+@@ -1110,7 +1172,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
+     if (MutableBackup && !row.IsFinalized()) {
+         lastEpoch = MutableBackup->Epoch;
+         if (auto it = TMemIter::Make(*MutableBackup, MutableBackup->Immediate(), key, ESeek::Exact, Scheme->Keys, &remap, env, EDirection::Forward)) {
+-            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer))) {
++            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer, DecidedTransactions))) {
+                 // N.B. stop looking for snapshot after the first hit
+                 snapshotFound = true;
+                 it->Apply(row, committed, observer);
+@@ -1124,7 +1186,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
+         Y_ABORT_UNLESS(lastEpoch > memTable->Epoch, "Ordering of epochs is incorrect");
+         lastEpoch = memTable->Epoch;
+         if (auto it = TMemIter::Make(*memTable, memTable->Immediate(), key, ESeek::Exact, Scheme->Keys, &remap, env, EDirection::Forward)) {
+-            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer))) {
++            if (it->IsValid() && (snapshotFound || it->SkipToRowVersion(snapshot, stats, committed, observer, DecidedTransactions))) {
+                 // N.B. stop looking for snapshot after the first hit
+                 snapshotFound = true;
+                 it->Apply(row, committed, observer);
+@@ -1150,7 +1212,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
+                         Y_ABORT_UNLESS(lastEpoch > part->Epoch, "Ordering of epochs is incorrect");
+                         lastEpoch = part->Epoch;
+                         if (!snapshotFound) {
+-                            res = it.SkipToRowVersion(snapshot, stats, committed, observer);
++                            res = it.SkipToRowVersion(snapshot, stats, committed, observer, DecidedTransactions);
+                             if (res == EReady::Data) {
+                                 // N.B. stop looking for snapshot after the first hit
+                                 snapshotFound = true;
+diff --git a/ydb/core/tablet_flat/flat_table.h b/ydb/core/tablet_flat/flat_table.h
+index 47f8567527bc..24af7c23d346 100644
+--- a/ydb/core/tablet_flat/flat_table.h
++++ b/ydb/core/tablet_flat/flat_table.h
+@@ -31,6 +31,7 @@ namespace NTable {
+ 
+ class TTableEpochs;
+ class TKeyRangeCache;
++class TKeyRangeCacheNeedGCList;
+ 
+ class TTable: public TAtomicRefCount<TTable> {
+ public:
+@@ -64,7 +65,7 @@ class TTable: public TAtomicRefCount<TTable> {
+         TIteratorStats Stats;
+     };
+ 
+-    explicit TTable(TEpoch);
++    explicit TTable(TEpoch, const TIntrusivePtr<TKeyRangeCacheNeedGCList>& gcList = nullptr);
+     ~TTable();
+ 
+     void PrepareRollback();
+@@ -351,6 +352,7 @@ class TTable: public TAtomicRefCount<TTable> {
+ 
+     bool EraseCacheEnabled = false;
+     TKeyRangeCacheConfig EraseCacheConfig;
++    const TIntrusivePtr<TKeyRangeCacheNeedGCList> EraseCacheGCList;
+ 
+     TRowVersionRanges RemovedRowVersions;
+ 
+@@ -359,6 +361,7 @@ class TTable: public TAtomicRefCount<TTable> {
+     absl::flat_hash_set<ui64> CheckTransactions;
+     TTransactionMap CommittedTransactions;
+     TTransactionSet RemovedTransactions;
++    TTransactionSet DecidedTransactions;
+     TIntrusivePtr<ITableObserver> TableObserver;
+ 
+ private:
+@@ -400,6 +403,13 @@ class TTable: public TAtomicRefCount<TTable> {
+         TRollbackAddOpenTx,
+         TRollbackRemoveOpenTx>;
+ 
++    struct TCommitAddDecidedTx {
++        ui64 TxId;
++    };
++
++    using TCommitOp = std::variant<
++        TCommitAddDecidedTx>;
++
+     struct TRollbackState {
+         TEpoch Epoch;
+         TIntrusiveConstPtr<TRowScheme> Scheme;
+@@ -408,6 +418,7 @@ class TTable: public TAtomicRefCount<TTable> {
+         bool EraseCacheEnabled;
+         bool MutableExisted;
+         bool MutableUpdated;
++        bool DisableEraseCache;
+ 
+         TRollbackState(TEpoch epoch)
+             : Epoch(epoch)
+@@ -415,6 +426,7 @@ class TTable: public TAtomicRefCount<TTable> {
+     };
+ 
+     std::optional<TRollbackState> RollbackState;
++    std::vector<TCommitOp> CommitOps;
+     std::vector<TRollbackOp> RollbackOps;
+     TIntrusivePtr<TMemTable> MutableBackup;
+ };
+diff --git a/ydb/core/tablet_flat/flat_table_committed.cpp b/ydb/core/tablet_flat/flat_table_committed.cpp
+new file mode 100644
+index 000000000000..80a85d39ce0f
+--- /dev/null
++++ b/ydb/core/tablet_flat/flat_table_committed.cpp
+@@ -0,0 +1,15 @@
++#include "flat_table_committed.h"
++
++namespace NKikimr::NTable {
++
++    class TEmptyTransactionSet : public ITransactionSet {
++    public:
++        bool Contains(ui64) const {
++            return false;
++        }
++    };
++
++    // Note: binding to reference extends the object lifetime
++    const ITransactionSet& ITransactionSet::None = TEmptyTransactionSet();
++
++} // namespace NKikimr::NTable
+diff --git a/ydb/core/tablet_flat/flat_table_committed.h b/ydb/core/tablet_flat/flat_table_committed.h
+index 8cb202c60fb7..8df020d59f3b 100644
+--- a/ydb/core/tablet_flat/flat_table_committed.h
++++ b/ydb/core/tablet_flat/flat_table_committed.h
+@@ -290,6 +290,26 @@ namespace NTable {
+         TIntrusivePtr<TState> State_;
+     };
+ 
++    /**
++     * An interface for a collection of TxIds
++     */
++    class ITransactionSet {
++    protected:
++        ~ITransactionSet() = default;
++
++    public:
++        /**
++         * Returns true when the specified txId is in the set
++         */
++        virtual bool Contains(ui64 txId) const = 0;
++
++    public:
++        /**
++         * A special read-only object that implements an empty transaction set
++         */
++        static const ITransactionSet& None;
++    };
++
+     /**
+      * A simple copy-on-write data structure for a TxId set
+      */
+@@ -297,7 +317,14 @@ namespace NTable {
+     private:
+         using TTxSet = absl::flat_hash_set<ui64>;
+ 
+-        struct TState : public TThrRefBase, TTxSet {
++        struct TState final
++            : public TThrRefBase
++            , public ITransactionSet
++            , public TTxSet
++        {
++            bool Contains(ui64 txId) const override {
++                return TTxSet::contains(txId);
++            }
+         };
+ 
+     public:
+@@ -328,6 +355,14 @@ namespace NTable {
+             }
+         }
+ 
++        operator const ITransactionSet&() const {
++            if (State_) {
++                return *State_;
++            } else {
++                return ITransactionSet::None;
++            }
++        }
++
+     public:
+         const_iterator begin() const {
+             if (State_) {
+diff --git a/ydb/core/tablet_flat/flat_table_stats.h b/ydb/core/tablet_flat/flat_table_stats.h
+index a83e1f7bcbd6..172c777ac3dd 100644
+--- a/ydb/core/tablet_flat/flat_table_stats.h
++++ b/ydb/core/tablet_flat/flat_table_stats.h
+@@ -34,6 +34,11 @@ namespace NTable {
+     struct TIteratorStats {
+         ui64 DeletedRowSkips = 0;
+         ui64 InvisibleRowSkips = 0;
++        // When true an observed erase may possibly change due to undecided or
++        // skipped changes above. This is a special case to simplify erase
++        // cache updates, i.e. when UncertainErase is true observed erases
++        // cannot be cached, since it might change in a different query.
++        bool UncertainErase = false;
+     };
+ 
+     struct TSelectStats : TIteratorStats {
+diff --git a/ydb/core/tablet_flat/ut/ut_db_iface.cpp b/ydb/core/tablet_flat/ut/ut_db_iface.cpp
+index ebfee8e134fc..b82252553f46 100644
+--- a/ydb/core/tablet_flat/ut/ut_db_iface.cpp
++++ b/ydb/core/tablet_flat/ut/ut_db_iface.cpp
+@@ -821,7 +821,7 @@ Y_UNIT_TEST_SUITE(DBase) {
+         me.WriteVer({4, 50}).Put(table, *me.SchemedCookRow(table).Col(9_u64, 9_u64));
+         me.Commit();
+ 
+-        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ }");
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {9}) }");
+ 
+         // Verify we can only see 2 last rows at v3/50 (erased range shouldn't be cached incorrectly)
+         me.To(24).ReadVer({3, 50}).IterData(table)
+@@ -829,7 +829,7 @@ Y_UNIT_TEST_SUITE(DBase) {
+             .Next().Is(*me.SchemedCookRow(table).Col(18_u64, 18_u64))
+             .Next().Is(EReady::Gone);
+ 
+-        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {8}], [{10}, {16}] }");
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {9}), [{10}, {16}] }");
+ 
+         // Verify we can see all 3 rows at v5/50 (bug would cause as to skip over the key 9)
+         me.To(25).ReadVer({5, 50}).IterData(table)
+@@ -839,6 +839,106 @@ Y_UNIT_TEST_SUITE(DBase) {
+             .Next().Is(EReady::Gone);
+     }
+ 
++    void TestEraseCacheWithUncommittedChanges(bool compact) {
++        TDbExec me;
++
++        const ui32 table = 1;
++        me.To(10)
++            .Begin()
++            .Apply(*TAlter()
++                .AddTable("me_1", table)
++                .AddColumn(table, "key", 1, ETypes::Uint64, false)
++                .AddColumn(table, "val", 2, ETypes::Uint64, false, Cimple(0_u64))
++                .AddColumnToKey(table, 1)
++                .SetEraseCache(table, true, 2, 8192))
++            .Commit();
++
++        auto dumpCache = [&]() -> TString {
++            if (auto* cache = me->DebugGetTableErasedKeysCache(table)) {
++                TStringStream stream;
++                stream << cache->DumpRanges();
++                return stream.Str();
++            } else {
++                return nullptr;
++            }
++        };
++
++        // Write a bunch of rows at v1/50
++        me.To(20).Begin();
++        for (ui64 i = 1; i <= 18; ++i) {
++            if (i != 9) {
++                me.WriteVer({1, 50}).Put(table, *me.SchemedCookRow(table).Col(i, i));
++            }
++        }
++        me.Commit();
++        if (compact) {
++            me.Compact(table, false);
++        }
++
++        // Erase a bunch of rows at v2/50
++        me.To(21).Begin();
++        for (ui64 i = 1; i <= 16; ++i) {
++            if (i != 9) {
++                me.WriteVer({2, 50}).Add(table, *me.SchemedCookRow(table).Col(i), ERowOp::Erase);
++            }
++        }
++        me.Commit();
++        if (compact) {
++            me.Compact(table, false);
++        }
++
++        // Verify we can only see 2 last rows at v3/50 (all other are deleted)
++        me.To(22).ReadVer({3, 50}).IterData(table)
++            .Seek({ }, ESeek::Lower).Is(*me.SchemedCookRow(table).Col(17_u64, 17_u64))
++            .Next().Is(*me.SchemedCookRow(table).Col(18_u64, 18_u64))
++            .Next().Is(EReady::Gone);
++
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {16}] }");
++
++        // Write an uncommitted row in tx 123
++        me.To(23).Begin();
++        me.WriteTx(123).Put(table, *me.SchemedCookRow(table).Col(9_u64, 9_u64));
++        me.Commit();
++        if (compact) {
++            me.Compact(table, false);
++        }
++
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {9}) }");
++
++        // Verify we can only see all 3 rows in tx 123 and erase cache is correct
++        me.To(24).ReadTx(123).IterData(table)
++            .Seek({ }, ESeek::Lower).Is(*me.SchemedCookRow(table).Col(9_u64, 9_u64))
++            .Next().Is(*me.SchemedCookRow(table).Col(17_u64, 17_u64))
++            .Next().Is(*me.SchemedCookRow(table).Col(18_u64, 18_u64))
++            .Next().Is(EReady::Gone);
++
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {9}), [{10}, {16}] }");
++
++        // Rollback tx 123
++        me.To(25).Begin();
++        me.RemoveTx(table, 123);
++        me.Commit();
++        if (compact) {
++            me.Compact(table, false);
++        }
++
++        // Verify we can only see 2 last rows at v3/50 (all other are deleted)
++        me.To(26).ReadVer({3, 50}).IterData(table)
++            .Seek({ }, ESeek::Lower).Is(*me.SchemedCookRow(table).Col(17_u64, 17_u64))
++            .Next().Is(*me.SchemedCookRow(table).Col(18_u64, 18_u64))
++            .Next().Is(EReady::Gone);
++
++        UNIT_ASSERT_VALUES_EQUAL(dumpCache(), "TKeyRangeCache{ [{1}, {16}] }");
++    }
++
++    Y_UNIT_TEST(EraseCacheWithUncommittedChanges) {
++        TestEraseCacheWithUncommittedChanges(false);
++    }
++
++    Y_UNIT_TEST(EraseCacheWithUncommittedChangesCompacted) {
++        TestEraseCacheWithUncommittedChanges(true);
++    }
++
+     Y_UNIT_TEST(AlterAndUpsertChangesVisibility) {
+         TDbExec me;
+ 
+diff --git a/ydb/core/tablet_flat/ya.make b/ydb/core/tablet_flat/ya.make
+index 1512b90c5d5b..e5f02f16af21 100644
+--- a/ydb/core/tablet_flat/ya.make
++++ b/ydb/core/tablet_flat/ya.make
+@@ -65,6 +65,8 @@ SRCS(
+     flat_table_misc.cpp
+     flat_table_observer.cpp
+     flat_table_observer.h
++    flat_table_committed.cpp
++    flat_table_committed.h
+     flat_update_op.h
+     probes.cpp
+     shared_handle.cpp
