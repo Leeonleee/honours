@@ -14,7 +14,7 @@ PROBLEM_ID="$3"
 MODEL_NAME="$4"
 
 # Paths
-DUCKDB_DIR="$HONOURS_DIR/duckdb"
+DUCKDB_DIR="$HONOURS_DIR/repos/duckdb"
 IGNORE_SRC="$HONOURS_DIR/scripts/aider_scripts/.aiderignore"
 PROMPT_PATH="$PROBLEM_DIR/$PROBLEM_ID.prompt"
 JSON_PATH="$PROBLEM_DIR/$PROBLEM_ID.json"

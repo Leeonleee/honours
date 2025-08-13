@@ -23,13 +23,13 @@ debug = True
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "duckdb_benchmark").resolve()
+DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmarks/duckdb_benchmark").resolve()
 DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
 
 load_dotenv(dotenv_path=HONOURS_DIR / ".env")
 
 if debug:
-    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "testbenchmark").resolve()
+    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmarks/testbenchmark").resolve()
 
 def send_email_notification(subject, body, sender_email, app_password, recipient_email):
     msg = EmailMessage()
@@ -50,59 +50,6 @@ def parse_arguments():
     parser.add_argument("--dir", type=str, default=DEFAULT_BENCHMARK_DIR, help="Path to benchmark directory")
     parser.add_argument("--out", type=str, default=DEFAULT_OUTPUT_DIR, help="Where to move organized results")
     return parser.parse_args()
-"""
-def run(cmd, cwd=None, env=None, capture_output=True, check=True, log_file=None):
-    
-    Run a shell command and log the output
-
-    :param cmd: List[str] or str - command and arguments
-    :param cwd: working directory
-    :param env: environment variables
-    :param capture_output: bool - whether to capture output
-    :param check: bool - whether to raise an error on non-zero exit code
-    :param log_file: file to log output
-    :return: CompletedProcess - result of the command execution
-    
-    # Convert command to list if it's a string
-    if isinstance(cmd, str):
-        shell = True
-        printable_cmd = cmd
-    else:
-        shell = False
-        printable_cmd = " ".join(cmd)
-    # print(f"Running command: {printable_cmd} in {cwd if cwd else 'current directory'}")
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"[{timestamp}] Running command: {printable_cmd}\n"
-
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=env,
-            shell=shell,
-            text=True,
-            capture_output=capture_output,
-            check=check,
-        )
-    except subprocess.CalledProcessError as e:
-        result = e
-
-    # Prepare output
-    stdout = result.stdout if hasattr(result, 'stdout') else ""
-    stderr = result.stderr if hasattr(result, 'stderr') else ""
-    return_code = result.returncode
-
-    footer = f"Exit code: {return_code}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}\n"
-
-    if log_file:
-        with open(log_file, 'a') as f:
-            f.write(header)
-            f.write(footer)
-    if check and return_code != 0:
-        raise subprocess.CalledProcessError(return_code, cmd, output=stdout, stderr=stderr)
-    return result
-"""
 
 
 def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
@@ -165,104 +112,11 @@ def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
 
     return Result(return_code, ''.join(stdout_lines), ''.join(stderr_lines))
 
-
-
-"""
-def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
-    if isinstance(cmd, str):
-        shell = True
-        printable_cmd = cmd
-    else:
-        shell = False
-        printable_cmd = " ".join(cmd)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"[{timestamp}] Running command: {printable_cmd}\n"
-
-    if log_file:
-        with open(log_file, 'a') as f:
-            f.write(header)
-
-    process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        shell=shell,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        universal_newlines=True
-    )
-
-    stdout_lines = []
-    stderr_lines = []
-
-    def read_stream(stream, buffer, prefix, log):
-        for line in stream:
-            log.write(f"{prefix}: {line}")
-            log.flush()
-            buffer.append(line)
-
-    timed_out = False
-    with open(log_file, 'a') if log_file else open(os.devnull, 'w') as log:
-        stdout_thread = Thread(target=read_stream, args=(process.stdout, stdout_lines, "STDOUT", log))
-        stderr_thread = Thread(target=read_stream, args=(process.stderr, stderr_lines, "STDERR", log))
-
-        stdout_thread.start()
-        stderr_thread.start()
-
-        def kill_proc():
-            nonlocal timed_out
-            timed_out = True
-            process.kill()
-            log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Command timed out after {timeout} seconds\n")
-            log.flush()
-
-        timer = None
-        if timeout:
-            timer = threading.Timer(timeout, kill_proc)
-            timer.start()
-
-        stdout_thread.join()
-        stderr_thread.join()
-        return_code = process.wait()
-
-        if timer:
-            timer.cancel()
-
-    if check and return_code != 0:
-        raise subprocess.CalledProcessError(return_code, cmd, output=''.join(stdout_lines), stderr=''.join(stderr_lines))
-
-    class Result:
-        def __init__(self, returncode, stdout, stderr):
-            self.returncode = returncode
-            self.stdout = stdout
-            self.stderr = stderr
-
-    # Use sentinel returncode -1 if killed due to timeout
-    return Result(-1 if timed_out else return_code, ''.join(stdout_lines), ''.join(stderr_lines))
-
-"""
-        
 def main():
     args = parse_arguments()
     start_time = time.time()
     print(f"Model: {args.m}, Completions: {args.k}, Benchmark Directory: {args.dir}, Output Directory: {args.out}")
 
-    """
-    # Logging setup
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    log_path = Path(f"logs/{timestamp}.log")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Tracking results
-    results = {}
-    safe_model_name = args.m.replace("/", "_").replace(":", "_")
-    csv_filename = f"{timestamp}_{safe_model_name}_k{args.k}.csv"
-    csv_path = Path("results") / csv_filename
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    """
     results = {}
     # Logging setup
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
