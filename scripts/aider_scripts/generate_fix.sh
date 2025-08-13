@@ -14,7 +14,7 @@ PROBLEM_ID="$3"
 MODEL_NAME="$4"
 
 # Paths
-DUCKDB_DIR="$HONOURS_DIR/duckdb"
+DUCKDB_DIR="$HONOURS_DIR/repos/duckdb"
 IGNORE_SRC="$HONOURS_DIR/scripts/aider_scripts/.aiderignore"
 PROMPT_PATH="$PROBLEM_DIR/$PROBLEM_ID.prompt"
 JSON_PATH="$PROBLEM_DIR/$PROBLEM_ID.json"
@@ -41,6 +41,7 @@ echo "Copied .aiderignore into duckdb"
 # Run aider from within duckdb
 cd "$DUCKDB_DIR" || exit 1
 aider --model "$MODEL_NAME" --no-gitignore --yes --disable-playwright -f "$PROMPT_PATH" $MODIFIED_FILES
+
 
 # Track success
 if [ $? -eq 0 ]; then

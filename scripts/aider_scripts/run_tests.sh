@@ -7,7 +7,7 @@ HONOURS_DIR="$1"
 shift
 TEST_FILES=("$@")
 
-DUCKDB_DIR="$HONOURS_DIR/duckdb"
+DUCKDB_DIR="$HONOURS_DIR/repos/duckdb"
 UNITTEST_BINARY="$DUCKDB_DIR/build/release/test/unittest"
 
 ALL_PASSED=true
