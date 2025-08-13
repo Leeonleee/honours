@@ -18,7 +18,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = False
+debug = True
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
@@ -29,7 +29,7 @@ DEFAULT_OUTPUT_DIR = (SCRIPT_DIR.parent.parent / "archive").resolve()
 load_dotenv(dotenv_path=HONOURS_DIR / ".env")
 
 if debug:
-    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "test").resolve()
+    DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "testbenchmark").resolve()
 
 def send_email_notification(subject, body, sender_email, app_password, recipient_email):
     msg = EmailMessage()
