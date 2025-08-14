@@ -1,0 +1,170 @@
+diff --git a/src/Common/CurrentMetrics.cpp b/src/Common/CurrentMetrics.cpp
+index 3d6a2d6f99c5..c48e76e1d983 100644
+--- a/src/Common/CurrentMetrics.cpp
++++ b/src/Common/CurrentMetrics.cpp
+@@ -9,7 +9,8 @@
+     M(ReplicatedFetch, "Number of data parts being fetched from replica") \
+     M(ReplicatedSend, "Number of data parts being sent to replicas") \
+     M(ReplicatedChecks, "Number of data parts checking for consistency") \
+-    M(BackgroundPoolTask, "Number of active tasks in BackgroundProcessingPool (merges, mutations, fetches, or replication queue bookkeeping)") \
++    M(BackgroundPoolTask, "Number of active tasks in BackgroundProcessingPool (merges, mutations, or replication queue bookkeeping)") \
++    M(BackgroundFetchesPoolTask, "Number of active tasks in BackgroundFetchesPool") \
+     M(BackgroundMovePoolTask, "Number of active tasks in BackgroundProcessingPool for moves") \
+     M(BackgroundSchedulePoolTask, "Number of active tasks in BackgroundSchedulePool. This pool is used for periodic ReplicatedMergeTree tasks, like cleaning old data parts, altering data parts, replica re-initialization, etc.") \
+     M(BackgroundBufferFlushSchedulePoolTask, "Number of active tasks in BackgroundBufferFlushSchedulePool. This pool is used for periodic Buffer flushes") \
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 580756361b1e..e7141677f783 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -71,6 +71,7 @@ class IColumn;
+     M(UInt64, background_buffer_flush_schedule_pool_size, 16, "Number of threads performing background flush for tables with Buffer engine. Only has meaning at server startup.", 0) \
+     M(UInt64, background_pool_size, 16, "Number of threads performing background work for tables (for example, merging in merge tree). Only has meaning at server startup.", 0) \
+     M(UInt64, background_move_pool_size, 8, "Number of threads performing background moves for tables. Only has meaning at server startup.", 0) \
++    M(UInt64, background_fetches_pool_size, 3, "Number of threads performing background fetches for replicated tables. Only has meaning at server startup.", 0) \
+     M(UInt64, background_schedule_pool_size, 16, "Number of threads performing background tasks for replicated tables, dns cache updates. Only has meaning at server startup.", 0) \
+     M(UInt64, background_message_broker_schedule_pool_size, 16, "Number of threads performing background tasks for message streaming. Only has meaning at server startup.", 0) \
+     M(UInt64, background_distributed_schedule_pool_size, 16, "Number of threads performing background tasks for distributed sends. Only has meaning at server startup.", 0) \
+diff --git a/src/Storages/MergeTree/BackgroundJobsExecutor.cpp b/src/Storages/MergeTree/BackgroundJobsExecutor.cpp
+index 5aba208a86e2..a2eede8a0db1 100644
+--- a/src/Storages/MergeTree/BackgroundJobsExecutor.cpp
++++ b/src/Storages/MergeTree/BackgroundJobsExecutor.cpp
+@@ -9,6 +9,7 @@ namespace CurrentMetrics
+ {
+     extern const Metric BackgroundPoolTask;
+     extern const Metric BackgroundMovePoolTask;
++    extern const Metric BackgroundFetchesPoolTask;
+ }
+ 
+ namespace DB
+@@ -183,7 +184,8 @@ BackgroundJobsExecutor::BackgroundJobsExecutor(
+     : IBackgroundJobExecutor(
+         global_context_,
+         global_context_.getBackgroundProcessingTaskSchedulingSettings(),
+-        {PoolConfig{PoolType::MERGE_MUTATE, global_context_.getSettingsRef().background_pool_size, CurrentMetrics::BackgroundPoolTask}})
++        {PoolConfig{PoolType::MERGE_MUTATE, global_context_.getSettingsRef().background_pool_size, CurrentMetrics::BackgroundPoolTask},
++         PoolConfig{PoolType::FETCH, global_context_.getSettingsRef().background_fetches_pool_size, CurrentMetrics::BackgroundFetchesPoolTask}})
+     , data(data_)
+ {
+ }
+diff --git a/src/Storages/MergeTree/BackgroundJobsExecutor.h b/src/Storages/MergeTree/BackgroundJobsExecutor.h
+index 537a6064c862..de81472012ec 100644
+--- a/src/Storages/MergeTree/BackgroundJobsExecutor.h
++++ b/src/Storages/MergeTree/BackgroundJobsExecutor.h
+@@ -33,6 +33,7 @@ enum class PoolType
+ {
+     MERGE_MUTATE,
+     MOVE,
++    FETCH,
+ };
+ 
+ /// Result from background job providers. Function which will be executed in pool and pool type.
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 9263dab638a7..3b1c063df531 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1039,6 +1039,16 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
+         }
+     }
+ 
++    /// Check that fetches pool is not overloaded
++    if (entry.type == LogEntry::GET_PART)
++    {
++        if (!storage.canExecuteFetch(entry, out_postpone_reason))
++        {
++            LOG_TRACE(log, out_postpone_reason);
++            return false;
++        }
++    }
++
+     if (entry.type == LogEntry::MERGE_PARTS || entry.type == LogEntry::MUTATE_PART)
+     {
+         /** If any of the required parts are now fetched or in merge process, wait for the end of this operation.
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 93febf919c90..3652cd2dea02 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -77,6 +77,10 @@ namespace ProfileEvents
+     extern const Event NotCreatedLogEntryForMutation;
+ }
+ 
++namespace CurrentMetrics
++{
++    extern const Metric BackgroundFetchesPoolTask;
++}
+ 
+ namespace DB
+ {
+@@ -206,6 +210,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
+     , part_check_thread(*this)
+     , restarting_thread(*this)
+     , allow_renaming(allow_renaming_)
++    , replicated_fetches_pool_size(global_context.getSettingsRef().background_fetches_pool_size)
+ {
+     queue_updating_task = global_context.getSchedulePool().createTask(
+         getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::queueUpdatingTask)", [this]{ queueUpdatingTask(); });
+@@ -2604,10 +2609,37 @@ std::optional<JobAndPool> StorageReplicatedMergeTree::getDataProcessingJob()
+     if (!selected_entry)
+         return {};
+ 
++    PoolType pool_type;
++
++    /// Depending on entry type execute in fetches (small) pool or big merge_mutate pool
++    if (selected_entry->log_entry->type == LogEntry::GET_PART)
++        pool_type = PoolType::FETCH;
++    else
++        pool_type = PoolType::MERGE_MUTATE;
++
+     return JobAndPool{[this, selected_entry] () mutable
+     {
+         processQueueEntry(selected_entry);
+-    }, PoolType::MERGE_MUTATE};
++    }, pool_type};
++}
++
++
++bool StorageReplicatedMergeTree::canExecuteFetch(const ReplicatedMergeTreeLogEntry & entry, String & disable_reason) const
++{
++    if (fetcher.blocker.isCancelled())
++    {
++        disable_reason = fmt::format("Not executing fetch of part {} because replicated fetches are cancelled now.", entry.new_part_name);
++        return false;
++    }
++
++    size_t busy_threads_in_pool = CurrentMetrics::values[CurrentMetrics::BackgroundFetchesPoolTask].load(std::memory_order_relaxed);
++    if (busy_threads_in_pool >= replicated_fetches_pool_size)
++    {
++        disable_reason = fmt::format("Not executing fetch of part {} because {} fetches already executing, max {}.", entry.new_part_name, busy_threads_in_pool, replicated_fetches_pool_size);
++        return false;
++    }
++
++    return true;
+ }
+ 
+ bool StorageReplicatedMergeTree::partIsAssignedToBackgroundOperation(const DataPartPtr & part) const
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index e0eaacf5e71d..a8b44da7b689 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -207,8 +207,13 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+      */
+     static void dropReplica(zkutil::ZooKeeperPtr zookeeper, const String & zookeeper_path, const String & replica, Poco::Logger * logger);
+ 
++    /// Get job to execute in background pool (merge, mutate, drop range and so on)
+     std::optional<JobAndPool> getDataProcessingJob() override;
+ 
++    /// Checks that fetches are not disabled with action blocker and pool for fetches
++    /// is not overloaded
++    bool canExecuteFetch(const ReplicatedMergeTreeLogEntry & entry, String & disable_reason) const;
++
+ private:
+ 
+     /// Get a sequential consistent view of current parts.
+@@ -319,6 +324,8 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+     /// Do not allow RENAME TABLE if zookeeper_path contains {database} or {table} macro
+     const bool allow_renaming;
+ 
++    const size_t replicated_fetches_pool_size;
++
+     template <class Func>
+     void foreachCommittedParts(const Func & func) const;
+ 

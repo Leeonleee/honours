@@ -1,0 +1,148 @@
+diff --git a/src/Common/ErrorCodes.cpp b/src/Common/ErrorCodes.cpp
+index 0c305075c660..7fcd75720399 100644
+--- a/src/Common/ErrorCodes.cpp
++++ b/src/Common/ErrorCodes.cpp
+@@ -497,6 +497,7 @@ namespace ErrorCodes
+     extern const int CASSANDRA_INTERNAL_ERROR = 528;
+     extern const int NOT_A_LEADER = 529;
+     extern const int CANNOT_CONNECT_RABBITMQ = 530;
++    extern const int CANNOT_FSTAT = 531;
+ 
+     extern const int KEEPER_EXCEPTION = 999;
+     extern const int POCO_EXCEPTION = 1000;
+diff --git a/src/IO/WriteBufferFromFileDescriptor.cpp b/src/IO/WriteBufferFromFileDescriptor.cpp
+index 9710c5a979bb..a59ae20c588f 100644
+--- a/src/IO/WriteBufferFromFileDescriptor.cpp
++++ b/src/IO/WriteBufferFromFileDescriptor.cpp
+@@ -1,6 +1,8 @@
+ #include <unistd.h>
+ #include <errno.h>
+ #include <cassert>
++#include <sys/types.h>
++#include <sys/stat.h>
+ 
+ #include <Common/Exception.h>
+ #include <Common/ProfileEvents.h>
+@@ -33,6 +35,7 @@ namespace ErrorCodes
+     extern const int CANNOT_FSYNC;
+     extern const int CANNOT_SEEK_THROUGH_FILE;
+     extern const int CANNOT_TRUNCATE_FILE;
++    extern const int CANNOT_FSTAT;
+ }
+ 
+ 
+@@ -130,4 +133,14 @@ void WriteBufferFromFileDescriptor::truncate(off_t length)
+         throwFromErrnoWithPath("Cannot truncate file " + getFileName(), getFileName(), ErrorCodes::CANNOT_TRUNCATE_FILE);
+ }
+ 
++
++off_t WriteBufferFromFileDescriptor::size()
++{
++    struct stat buf;
++    int res = fstat(fd, &buf);
++    if (-1 == res)
++        throwFromErrnoWithPath("Cannot execute fstat " + getFileName(), getFileName(), ErrorCodes::CANNOT_FSTAT);
++    return buf.st_size;
++}
++
+ }
+diff --git a/src/IO/WriteBufferFromFileDescriptor.h b/src/IO/WriteBufferFromFileDescriptor.h
+index d7df04ee9409..18c0ac64f633 100644
+--- a/src/IO/WriteBufferFromFileDescriptor.h
++++ b/src/IO/WriteBufferFromFileDescriptor.h
+@@ -44,6 +44,8 @@ class WriteBufferFromFileDescriptor : public WriteBufferFromFileBase
+ 
+     off_t seek(off_t offset, int whence);
+     void truncate(off_t length);
++
++    off_t size();
+ };
+ 
+ }
+diff --git a/src/Processors/Formats/Impl/CSVRowOutputFormat.cpp b/src/Processors/Formats/Impl/CSVRowOutputFormat.cpp
+index 27d022250f29..2ff8defd3b00 100644
+--- a/src/Processors/Formats/Impl/CSVRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/CSVRowOutputFormat.cpp
+@@ -19,7 +19,7 @@ CSVRowOutputFormat::CSVRowOutputFormat(WriteBuffer & out_, const Block & header_
+ }
+ 
+ 
+-void CSVRowOutputFormat::writePrefix()
++void CSVRowOutputFormat::doWritePrefix()
+ {
+     const auto & sample = getPort(PortKind::Main).getHeader();
+     size_t columns = sample.columns();
+diff --git a/src/Processors/Formats/Impl/CSVRowOutputFormat.h b/src/Processors/Formats/Impl/CSVRowOutputFormat.h
+index 28bd8edf31ad..05b097f75149 100644
+--- a/src/Processors/Formats/Impl/CSVRowOutputFormat.h
++++ b/src/Processors/Formats/Impl/CSVRowOutputFormat.h
+@@ -27,10 +27,11 @@ class CSVRowOutputFormat : public IRowOutputFormat
+     void writeField(const IColumn & column, const IDataType & type, size_t row_num) override;
+     void writeFieldDelimiter() override;
+     void writeRowEndDelimiter() override;
+-    void writePrefix() override;
+     void writeBeforeTotals() override;
+     void writeBeforeExtremes() override;
+ 
++    void doWritePrefix() override;
++
+     /// https://www.iana.org/assignments/media-types/text/csv
+     String getContentType() const override
+     {
+diff --git a/src/Storages/StorageFile.cpp b/src/Storages/StorageFile.cpp
+index c7671fd87593..221e9db94286 100644
+--- a/src/Storages/StorageFile.cpp
++++ b/src/Storages/StorageFile.cpp
+@@ -435,6 +435,7 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+         , metadata_snapshot(metadata_snapshot_)
+         , lock(storage.rwlock)
+     {
++        std::unique_ptr<WriteBufferFromFileDescriptor> naked_buffer = nullptr;
+         if (storage.use_table_fd)
+         {
+             /** NOTE: Using real file binded to FD may be misleading:
+@@ -442,17 +443,21 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+               * INSERT data; SELECT *; last SELECT returns only insert_data
+               */
+             storage.table_fd_was_used = true;
+-            write_buf = wrapWriteBufferWithCompressionMethod(std::make_unique<WriteBufferFromFileDescriptor>(storage.table_fd), compression_method, 3);
++            naked_buffer = std::make_unique<WriteBufferFromFileDescriptor>(storage.table_fd);
+         }
+         else
+         {
+             if (storage.paths.size() != 1)
+                 throw Exception("Table '" + storage.getStorageID().getNameForLogs() + "' is in readonly mode because of globs in filepath", ErrorCodes::DATABASE_ACCESS_DENIED);
+-            write_buf = wrapWriteBufferWithCompressionMethod(
+-                std::make_unique<WriteBufferFromFile>(storage.paths[0], DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT),
+-                compression_method, 3);
++            naked_buffer = std::make_unique<WriteBufferFromFile>(storage.paths[0], DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT);
+         }
+ 
++        /// In case of CSVWithNames we have already written prefix.
++        if (naked_buffer->size())
++            prefix_written = true;
++
++        write_buf = wrapWriteBufferWithCompressionMethod(std::move(naked_buffer), compression_method, 3);
++
+         writer = FormatFactory::instance().getOutput(storage.format_name, *write_buf, metadata_snapshot->getSampleBlock(), context);
+     }
+ 
+@@ -465,7 +470,9 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+ 
+     void writePrefix() override
+     {
+-        writer->writePrefix();
++        if (!prefix_written)
++            writer->writePrefix();
++        prefix_written = true;
+     }
+ 
+     void writeSuffix() override
+@@ -484,6 +491,7 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+     std::unique_lock<std::shared_mutex> lock;
+     std::unique_ptr<WriteBuffer> write_buf;
+     BlockOutputStreamPtr writer;
++    bool prefix_written{false};
+ };
+ 
+ BlockOutputStreamPtr StorageFile::write(

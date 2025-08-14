@@ -1,0 +1,202 @@
+diff --git a/docs/en/operations/system-tables/query_log.md b/docs/en/operations/system-tables/query_log.md
+index 7143520835f3..ced971667021 100644
+--- a/docs/en/operations/system-tables/query_log.md
++++ b/docs/en/operations/system-tables/query_log.md
+@@ -101,7 +101,8 @@ Columns:
+ - `ProfileEvents` ([Map(String, UInt64)](../../sql-reference/data-types/map.md)) — ProfileEvents that measure different metrics. The description of them could be found in the table [system.events](../../operations/system-tables/events.md#system_tables-events)
+ - `Settings` ([Map(String, String)](../../sql-reference/data-types/map.md)) — Settings that were changed when the client ran the query. To enable logging changes to settings, set the `log_query_settings` parameter to 1.
+ - `log_comment` ([String](../../sql-reference/data-types/string.md)) — Log comment. It can be set to arbitrary string no longer than [max_query_size](../../operations/settings/settings.md#settings-max_query_size). An empty string if it is not defined.
+-- `thread_ids` ([Array(UInt64)](../../sql-reference/data-types/array.md)) — Thread ids that are participating in query execution.
++- `thread_ids` ([Array(UInt64)](../../sql-reference/data-types/array.md)) — Thread ids that are participating in query execution. These threads may not have run simultaneously.
++- `peak_threads_usage` ([UInt64)](../../sql-reference/data-types/int-uint.md)) — Maximum count of simultaneous threads executing the query.
+ - `used_aggregate_functions` ([Array(String)](../../sql-reference/data-types/array.md)) — Canonical names of `aggregate functions`, which were used during query execution.
+ - `used_aggregate_function_combinators` ([Array(String)](../../sql-reference/data-types/array.md)) — Canonical names of `aggregate functions combinators`, which were used during query execution.
+ - `used_database_engines` ([Array(String)](../../sql-reference/data-types/array.md)) — Canonical names of `database engines`, which were used during query execution.
+diff --git a/docs/ru/operations/system-tables/query_log.md b/docs/ru/operations/system-tables/query_log.md
+index 29793188d3db..8d79aa0eef70 100644
+--- a/docs/ru/operations/system-tables/query_log.md
++++ b/docs/ru/operations/system-tables/query_log.md
+@@ -99,7 +99,8 @@ ClickHouse не удаляет данные из таблица автомати
+ -   `ProfileEvents` ([Map(String, UInt64)](../../sql-reference/data-types/array.md)) — счетчики для изменения различных метрик. Описание метрик можно получить из таблицы [system.events](#system_tables-events)(#system_tables-events
+ -   `Settings` ([Map(String, String)](../../sql-reference/data-types/array.md)) — имена настроек, которые меняются, когда клиент выполняет запрос. Чтобы разрешить логирование изменений настроек, установите параметр `log_query_settings` равным 1.
+ -   `log_comment` ([String](../../sql-reference/data-types/string.md)) — комментарий к записи в логе. Представляет собой произвольную строку, длина которой должна быть не больше, чем [max_query_size](../../operations/settings/settings.md#settings-max_query_size). Если нет комментария, то пустая строка.
+--   `thread_ids` ([Array(UInt64)](../../sql-reference/data-types/array.md)) — идентификаторы потоков, участвующих в обработке запросов.
++-   `thread_ids` ([Array(UInt64)](../../sql-reference/data-types/array.md)) — идентификаторы потоков, участвующих в обработке запросов, эти потоки не обязательно выполняются одновременно.
++- `peak_threads_usage` ([UInt64)](../../sql-reference/data-types/int-uint.md)) — максимальное количество одновременно работавших потоков, участвоваших в обработке запроса.
+ -   `used_aggregate_functions` ([Array(String)](../../sql-reference/data-types/array.md)) — канонические имена `агрегатных функций`, использованных при выполнении запроса.
+ -   `used_aggregate_function_combinators` ([Array(String)](../../sql-reference/data-types/array.md)) — канонические имена `комбинаторов агрегатных функций`, использованных при выполнении запроса.
+ -   `used_database_engines` ([Array(String)](../../sql-reference/data-types/array.md)) — канонические имена `движков баз данных`, использованных при выполнении запроса.
+diff --git a/src/Common/ConcurrencyControl.cpp b/src/Common/ConcurrencyControl.cpp
+index de46f0e90cab..c9fe51550dcb 100644
+--- a/src/Common/ConcurrencyControl.cpp
++++ b/src/Common/ConcurrencyControl.cpp
+@@ -57,7 +57,7 @@ ConcurrencyControl::Allocation::Allocation(ConcurrencyControl & parent_, SlotCou
+         *waiter = this;
+ }
+ 
+-// Grant single slot to allocation, returns true iff more slot(s) are required
++// Grant single slot to allocation returns true iff more slot(s) are required
+ bool ConcurrencyControl::Allocation::grant()
+ {
+     std::unique_lock lock{mutex};
+diff --git a/src/Common/ThreadStatus.h b/src/Common/ThreadStatus.h
+index 7c8dbdb68bdf..970bb5cd6e60 100644
+--- a/src/Common/ThreadStatus.h
++++ b/src/Common/ThreadStatus.h
+@@ -107,15 +107,25 @@ class ThreadGroup
+     static ThreadGroupPtr createForBackgroundProcess(ContextPtr storage_context);
+ 
+     std::vector<UInt64> getInvolvedThreadIds() const;
+-    void linkThread(UInt64 thread_it);
++    size_t getPeakThreadsUsage() const;
++
++    void linkThread(UInt64 thread_id);
++    void unlinkThread();
+ 
+ private:
+     mutable std::mutex mutex;
+ 
+     /// Set up at creation, no race when reading
+-    SharedData shared_data;
++    SharedData shared_data TSA_GUARDED_BY(mutex);
++
+     /// Set of all thread ids which has been attached to the group
+-    std::unordered_set<UInt64> thread_ids;
++    std::unordered_set<UInt64> thread_ids TSA_GUARDED_BY(mutex);
++
++    /// Count of simultaneously working threads
++    size_t active_thread_count TSA_GUARDED_BY(mutex) = 0;
++
++    /// Peak threads count in the group
++    size_t peak_threads_usage TSA_GUARDED_BY(mutex) = 0;
+ };
+ 
+ /**
+diff --git a/src/Interpreters/ProcessList.cpp b/src/Interpreters/ProcessList.cpp
+index c299572ef41d..8572470abc1f 100644
+--- a/src/Interpreters/ProcessList.cpp
++++ b/src/Interpreters/ProcessList.cpp
+@@ -590,8 +590,10 @@ QueryStatusInfo QueryStatus::getInfo(bool get_thread_list, bool get_profile_even
+         res.peak_memory_usage = thread_group->memory_tracker.getPeak();
+ 
+         if (get_thread_list)
++        {
+             res.thread_ids = thread_group->getInvolvedThreadIds();
+-
++            res.peak_threads_usage = thread_group->getPeakThreadsUsage();
++        }
+         if (get_profile_events)
+             res.profile_counters = std::make_shared<ProfileEvents::Counters::Snapshot>(thread_group->performance_counters.getPartiallyAtomicSnapshot());
+     }
+diff --git a/src/Interpreters/ProcessList.h b/src/Interpreters/ProcessList.h
+index 2eea49e1267b..75a0eaa34bce 100644
+--- a/src/Interpreters/ProcessList.h
++++ b/src/Interpreters/ProcessList.h
+@@ -67,6 +67,7 @@ struct QueryStatusInfo
+ 
+     /// Optional fields, filled by query
+     std::vector<UInt64> thread_ids;
++    size_t peak_threads_usage;
+     std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters;
+     std::shared_ptr<Settings> query_settings;
+     std::string current_database;
+diff --git a/src/Interpreters/QueryLog.cpp b/src/Interpreters/QueryLog.cpp
+index df21e82305a7..57f3968fba13 100644
+--- a/src/Interpreters/QueryLog.cpp
++++ b/src/Interpreters/QueryLog.cpp
+@@ -118,6 +118,7 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
+         {"log_comment", std::make_shared<DataTypeString>()},
+ 
+         {"thread_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())},
++        {"peak_threads_usage", std::make_shared<DataTypeUInt64>()},
+         {"ProfileEvents", std::make_shared<DataTypeMap>(low_cardinality_string, std::make_shared<DataTypeUInt64>())},
+         {"Settings", std::make_shared<DataTypeMap>(low_cardinality_string, low_cardinality_string)},
+ 
+@@ -230,6 +231,8 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
+         columns[i++]->insert(threads_array);
+     }
+ 
++    columns[i++]->insert(peak_threads_usage);
++
+     if (profile_counters)
+     {
+         auto * column = columns[i++].get();
+diff --git a/src/Interpreters/QueryLog.h b/src/Interpreters/QueryLog.h
+index 5bc80280eac9..fe9b7cbdbc88 100644
+--- a/src/Interpreters/QueryLog.h
++++ b/src/Interpreters/QueryLog.h
+@@ -91,6 +91,7 @@ struct QueryLogElement
+     String log_comment;
+ 
+     std::vector<UInt64> thread_ids;
++    UInt64 peak_threads_usage = 0;
+     std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters;
+     std::shared_ptr<AsyncReadCounters> async_read_counters;
+     std::shared_ptr<Settings> query_settings;
+diff --git a/src/Interpreters/ThreadStatusExt.cpp b/src/Interpreters/ThreadStatusExt.cpp
+index 6ee8ec987db2..efb8c6792bcc 100644
+--- a/src/Interpreters/ThreadStatusExt.cpp
++++ b/src/Interpreters/ThreadStatusExt.cpp
+@@ -61,10 +61,27 @@ std::vector<UInt64> ThreadGroup::getInvolvedThreadIds() const
+     return res;
+ }
+ 
+-void ThreadGroup::linkThread(UInt64 thread_it)
++size_t ThreadGroup::getPeakThreadsUsage() const
+ {
+     std::lock_guard lock(mutex);
+-    thread_ids.insert(thread_it);
++    return peak_threads_usage;
++}
++
++
++void ThreadGroup::linkThread(UInt64 thread_id)
++{
++    std::lock_guard lock(mutex);
++    thread_ids.insert(thread_id);
++
++    ++active_thread_count;
++    peak_threads_usage = std::max(peak_threads_usage, active_thread_count);
++}
++
++void ThreadGroup::unlinkThread()
++{
++    std::lock_guard lock(mutex);
++    chassert(active_thread_count > 0);
++    --active_thread_count;
+ }
+ 
+ ThreadGroupPtr ThreadGroup::createForQuery(ContextPtr query_context_, std::function<void()> fatal_error_callback_)
+@@ -243,6 +260,8 @@ void ThreadStatus::detachFromGroup()
+     /// Extract MemoryTracker out from query and user context
+     memory_tracker.setParent(&total_memory_tracker);
+ 
++    thread_group->unlinkThread();
++
+     thread_group.reset();
+ 
+     query_id_from_query_context.clear();
+diff --git a/src/Interpreters/executeQuery.cpp b/src/Interpreters/executeQuery.cpp
+index bac6807b6821..1bfeeaa8ad49 100644
+--- a/src/Interpreters/executeQuery.cpp
++++ b/src/Interpreters/executeQuery.cpp
+@@ -241,6 +241,7 @@ addStatusInfoToQueryLogElement(QueryLogElement & element, const QueryStatusInfo
+     element.memory_usage = info.peak_memory_usage > 0 ? info.peak_memory_usage : 0;
+ 
+     element.thread_ids = info.thread_ids;
++    element.peak_threads_usage = info.peak_threads_usage;
+     element.profile_counters = info.profile_counters;
+ 
+     /// We need to refresh the access info since dependent views might have added extra information, either during
+diff --git a/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp b/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
+index 3f5753a0c95d..c218acce903c 100644
+--- a/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
++++ b/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
+@@ -40,7 +40,6 @@ bool MergePlainMergeTreeTask::executeStep()
+     if (merge_list_entry)
+     {
+         switcher.emplace((*merge_list_entry)->thread_group);
+-
+     }
+ 
+     switch (state)

@@ -1,0 +1,200 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index b4313d9af561..f80bf1e4e3e3 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -1006,6 +1006,7 @@ class IColumn;
+     M(Bool, input_format_tsv_empty_as_default, false, "Treat empty fields in TSV input as default values.", 0) \
+     M(Bool, input_format_tsv_enum_as_number, false, "Treat inserted enum values in TSV formats as enum indices.", 0) \
+     M(Bool, input_format_null_as_default, true, "Initialize null fields with default values if the data type of this field is not nullable and it is supported by the input format", 0) \
++    M(Bool, input_format_force_null_for_omitted_fields, false, "Force initialize omitted fields with null values", 0) \
+     M(Bool, input_format_arrow_case_insensitive_column_matching, false, "Ignore case when matching Arrow columns with CH columns.", 0) \
+     M(Int64, input_format_orc_row_batch_size, 100'000, "Batch size when reading ORC stripes.", 0) \
+     M(Bool, input_format_orc_case_insensitive_column_matching, false, "Ignore case when matching ORC columns with CH columns.", 0) \
+diff --git a/src/Core/SettingsChangesHistory.h b/src/Core/SettingsChangesHistory.h
+index cd1cd341c294..5ea99aa01920 100644
+--- a/src/Core/SettingsChangesHistory.h
++++ b/src/Core/SettingsChangesHistory.h
+@@ -91,6 +91,7 @@ static std::map<ClickHouseVersion, SettingsChangesHistory::SettingsChanges> sett
+               {"cross_join_min_rows_to_compress", 0, 10000000, "A new setting."},
+               {"cross_join_min_bytes_to_compress", 0, 1_GiB, "A new setting."},
+               {"prefer_external_sort_block_bytes", 0, DEFAULT_BLOCK_SIZE * 256, "Prefer maximum block bytes for external sort, reduce the memory usage during merging."},
++              {"input_format_force_null_for_omitted_fields", false, false, "Disable type-defaults for omitted fields when needed"},
+               }},
+     {"24.4", {{"input_format_json_throw_on_bad_escape_sequence", true, true, "Allow to save JSON strings with bad escape sequences"},
+               {"max_parsing_threads", 0, 0, "Add a separate setting to control number of threads in parallel parsing from files"},
+diff --git a/src/Formats/FormatFactory.cpp b/src/Formats/FormatFactory.cpp
+index b7e9899da46d..3199445864d9 100644
+--- a/src/Formats/FormatFactory.cpp
++++ b/src/Formats/FormatFactory.cpp
+@@ -146,6 +146,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
+     format_settings.json.throw_on_bad_escape_sequence = settings.input_format_json_throw_on_bad_escape_sequence;
+     format_settings.json.ignore_unnecessary_fields = settings.input_format_json_ignore_unnecessary_fields;
+     format_settings.null_as_default = settings.input_format_null_as_default;
++    format_settings.force_null_for_omitted_fields = settings.input_format_force_null_for_omitted_fields;
+     format_settings.decimal_trailing_zeros = settings.output_format_decimal_trailing_zeros;
+     format_settings.parquet.row_group_rows = settings.output_format_parquet_row_group_size;
+     format_settings.parquet.row_group_bytes = settings.output_format_parquet_row_group_size_bytes;
+diff --git a/src/Formats/FormatSettings.h b/src/Formats/FormatSettings.h
+index da225a39ec9b..83b5c5342973 100644
+--- a/src/Formats/FormatSettings.h
++++ b/src/Formats/FormatSettings.h
+@@ -32,6 +32,7 @@ struct FormatSettings
+     bool write_statistics = true;
+     bool import_nested_json = false;
+     bool null_as_default = true;
++    bool force_null_for_omitted_fields = false;
+     bool decimal_trailing_zeros = false;
+     bool defaults_for_omitted_fields = true;
+     bool is_writing_to_terminal = false;
+diff --git a/src/Processors/Formats/Impl/BSONEachRowRowInputFormat.cpp b/src/Processors/Formats/Impl/BSONEachRowRowInputFormat.cpp
+index 340bcc8aae5c..6a3475a1830b 100644
+--- a/src/Processors/Formats/Impl/BSONEachRowRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/BSONEachRowRowInputFormat.cpp
+@@ -39,6 +39,7 @@ namespace ErrorCodes
+     extern const int ILLEGAL_COLUMN;
+     extern const int TOO_LARGE_STRING_SIZE;
+     extern const int UNKNOWN_TYPE;
++    extern const int TYPE_MISMATCH;
+ }
+ 
+ namespace
+@@ -820,7 +821,13 @@ bool BSONEachRowRowInputFormat::readRow(MutableColumns & columns, RowReadExtensi
+     /// Fill non-visited columns with the default values.
+     for (size_t i = 0; i < num_columns; ++i)
+         if (!seen_columns[i])
+-            header.getByPosition(i).type->insertDefaultInto(*columns[i]);
++        {
++            const auto & type = header.getByPosition(i).type;
++            if (format_settings.force_null_for_omitted_fields && !isNullableOrLowCardinalityNullable(type))
++                throw Exception(ErrorCodes::TYPE_MISMATCH, "Cannot insert NULL value into a column of type '{}' at index {}", type->getName(), i);
++            else
++                type->insertDefaultInto(*columns[i]);
++        }
+ 
+     if (format_settings.defaults_for_omitted_fields)
+         ext.read_columns = read_columns;
+diff --git a/src/Processors/Formats/Impl/JSONColumnsBlockInputFormatBase.cpp b/src/Processors/Formats/Impl/JSONColumnsBlockInputFormatBase.cpp
+index faa4f36bbb04..e61e55efc8e4 100644
+--- a/src/Processors/Formats/Impl/JSONColumnsBlockInputFormatBase.cpp
++++ b/src/Processors/Formats/Impl/JSONColumnsBlockInputFormatBase.cpp
+@@ -13,6 +13,7 @@ namespace ErrorCodes
+ {
+     extern const int INCORRECT_DATA;
+     extern const int EMPTY_DATA_PASSED;
++    extern const int TYPE_MISMATCH;
+ }
+ 
+ 
+@@ -194,6 +195,8 @@ Chunk JSONColumnsBlockInputFormatBase::read()
+     {
+         if (!seen_columns[i])
+         {
++            if (format_settings.force_null_for_omitted_fields && !isNullableOrLowCardinalityNullable(fields[i].type))
++                throw Exception(ErrorCodes::TYPE_MISMATCH, "Cannot insert NULL value into a column `{}` of type '{}'", fields[i].name, fields[i].type->getName());
+             columns[i]->insertManyDefaults(rows);
+             if (format_settings.defaults_for_omitted_fields)
+                 block_missing_values.setBits(i, rows);
+diff --git a/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp b/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
+index a78d8d016cd9..8855a1bc28d7 100644
+--- a/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
+@@ -18,6 +18,7 @@ namespace ErrorCodes
+     extern const int INCORRECT_DATA;
+     extern const int CANNOT_READ_ALL_DATA;
+     extern const int LOGICAL_ERROR;
++    extern const int TYPE_MISMATCH;
+ }
+ 
+ namespace
+@@ -233,7 +234,14 @@ bool JSONEachRowRowInputFormat::readRow(MutableColumns & columns, RowReadExtensi
+     /// Fill non-visited columns with the default values.
+     for (size_t i = 0; i < num_columns; ++i)
+         if (!seen_columns[i])
+-            header.getByPosition(i).type->insertDefaultInto(*columns[i]);
++        {
++            const auto & type = header.getByPosition(i).type;
++            if (format_settings.force_null_for_omitted_fields && !isNullableOrLowCardinalityNullable(type))
++                throw Exception(ErrorCodes::TYPE_MISMATCH, "Cannot insert NULL value into a column `{}` of type '{}'", columnName(i), type->getName());
++            else
++                type->insertDefaultInto(*columns[i]);
++        }
++
+ 
+     /// Return info about defaults set.
+     /// If defaults_for_omitted_fields is set to 0, we should just leave already inserted defaults.
+diff --git a/src/Processors/Formats/Impl/TSKVRowInputFormat.cpp b/src/Processors/Formats/Impl/TSKVRowInputFormat.cpp
+index 29bc0012dc0a..5382527fcdcc 100644
+--- a/src/Processors/Formats/Impl/TSKVRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/TSKVRowInputFormat.cpp
+@@ -15,6 +15,7 @@ namespace ErrorCodes
+     extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+     extern const int CANNOT_READ_ALL_DATA;
+     extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
++    extern const int TYPE_MISMATCH;
+ }
+ 
+ 
+@@ -190,7 +191,16 @@ bool TSKVRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & ex
+     /// Fill in the not met columns with default values.
+     for (size_t i = 0; i < num_columns; ++i)
+         if (!seen_columns[i])
+-            header.getByPosition(i).type->insertDefaultInto(*columns[i]);
++        {
++            const auto & type = header.getByPosition(i).type;
++            if (format_settings.force_null_for_omitted_fields && !isNullableOrLowCardinalityNullable(type))
++                throw Exception(
++                    ErrorCodes::TYPE_MISMATCH,
++                    "Cannot insert NULL value into a column `{}` of type '{}'",
++                    header.getByPosition(i).name,
++                    type->getName());
++            type->insertDefaultInto(*columns[i]);
++        }
+ 
+     /// return info about defaults set
+     if (format_settings.defaults_for_omitted_fields)
+diff --git a/src/Processors/Formats/RowInputFormatWithNamesAndTypes.cpp b/src/Processors/Formats/RowInputFormatWithNamesAndTypes.cpp
+index 2ad6a825c8fb..ae30d741c2f6 100644
+--- a/src/Processors/Formats/RowInputFormatWithNamesAndTypes.cpp
++++ b/src/Processors/Formats/RowInputFormatWithNamesAndTypes.cpp
+@@ -18,6 +18,7 @@ namespace ErrorCodes
+ {
+     extern const int INCORRECT_DATA;
+     extern const int LOGICAL_ERROR;
++    extern const int TYPE_MISMATCH;
+ }
+ 
+ namespace
+@@ -124,6 +125,17 @@ void RowInputFormatWithNamesAndTypes::readPrefix()
+             }
+         }
+     }
++
++    if (format_settings.force_null_for_omitted_fields)
++    {
++        for (auto index : column_mapping->not_presented_columns)
++            if (!isNullableOrLowCardinalityNullable(data_types[index]))
++                throw Exception(
++                    ErrorCodes::TYPE_MISMATCH,
++                    "Cannot insert NULL value into a column type '{}' at index {}",
++                    data_types[index]->getName(),
++                    index);
++    }
+ }
+ 
+ void RowInputFormatWithNamesAndTypes::tryDetectHeader(std::vector<String> & column_names_out, std::vector<String> & type_names_out)
+@@ -217,7 +229,15 @@ bool RowInputFormatWithNamesAndTypes::readRow(MutableColumns & columns, RowReadE
+             {
+                 const auto & rem_column_index = column_mapping->column_indexes_for_input_fields[file_column];
+                 if (rem_column_index)
++                {
++                    if (format_settings.force_null_for_omitted_fields && !isNullableOrLowCardinalityNullable(data_types[*rem_column_index]))
++                        throw Exception(
++                            ErrorCodes::TYPE_MISMATCH,
++                            "Cannot insert NULL value into a column type '{}' at index {}",
++                            data_types[*rem_column_index]->getName(),
++                            *rem_column_index);
+                     columns[*rem_column_index]->insertDefault();
++                }
+                 ++file_column;
+             }
+             break;

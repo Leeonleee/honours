@@ -1,0 +1,178 @@
+diff --git a/dbms/src/Interpreters/Cluster.cpp b/dbms/src/Interpreters/Cluster.cpp
+index 2c75bd821fe8..aaa6b31ab36a 100644
+--- a/dbms/src/Interpreters/Cluster.cpp
++++ b/dbms/src/Interpreters/Cluster.cpp
+@@ -10,6 +10,7 @@
+ #include <IO/ReadHelpers.h>
+ #include <Poco/Util/AbstractConfiguration.h>
+ #include <Poco/Util/Application.h>
++#include <ext/range.h>
+ 
+ namespace DB
+ {
+@@ -449,6 +450,10 @@ void Cluster::initMisc()
+     }
+ }
+ 
++std::unique_ptr<Cluster> Cluster::getClusterWithReplicasAsShards(const Settings & settings) const
++{
++    return std::unique_ptr<Cluster>{ new Cluster(settings, *this)};
++}
+ 
+ std::unique_ptr<Cluster> Cluster::getClusterWithSingleShard(size_t index) const
+ {
+@@ -460,6 +465,55 @@ std::unique_ptr<Cluster> Cluster::getClusterWithMultipleShards(const std::vector
+     return std::unique_ptr<Cluster>{ new Cluster(*this, indices) };
+ }
+ 
++Cluster::Cluster(const Settings & settings, const Cluster & from) : shards_info{}, addresses_with_failover{}
++{
++    std::set<std::tuple<String, int>> hosts;
++    if (!from.addresses_with_failover.empty())
++    {
++        for (size_t shard_index : ext::range(0, from.shards_info.size()))
++        {
++            const auto & replicas = from.addresses_with_failover[shard_index];
++            for (size_t replica_index : ext::range(0, replicas.size()))
++            {
++                ShardInfo info;
++                Address address = replicas[replica_index];
++                auto position = find_if(hosts.begin(), hosts.end(), [=](auto item) {return std::get<0>(item) == address.host_name && std::get<1>(item) == address.port;});
++                if (position == hosts.end())
++                {
++                    if (address.is_local)
++                        info.local_addresses.push_back(replicas[replica_index]);
++                    hosts.insert(std::tuple<String, int>(address.host_name, address.port));
++                    ConnectionPoolPtr pool = std::make_shared<ConnectionPool>(
++                        settings.distributed_connections_pool_size,
++                        address.host_name,
++                        address.port,
++                        address.default_database,
++                        address.user,
++                        address.password,
++                        "server",
++                        address.compression,
++                        address.secure);
++
++                    info.pool = std::make_shared<ConnectionPoolWithFailover>(ConnectionPoolPtrs{pool}, settings.load_balancing);
++                    info.per_replica_pools = {std::move(pool)};
++                    std ::vector<Cluster::Address> newAddress = {address};
++                    addresses_with_failover.emplace_back(newAddress);
++                    shards_info.emplace_back(std::move(info));
++                }
++                else
++                {
++                    continue;
++                }
++            }
++        }
++    }
++    else
++    {
++        throw Exception("There must be either 'node' or 'shard' elements in the cluster", ErrorCodes::EXCESSIVE_ELEMENT_IN_CONFIG);
++    }
++    initMisc();
++}
++
+ Cluster::Cluster(const Cluster & from, const std::vector<size_t> & indices)
+     : shards_info{}
+ {
+diff --git a/dbms/src/Interpreters/Cluster.h b/dbms/src/Interpreters/Cluster.h
+index e778c9bcf6f4..8b95b1ce986c 100644
+--- a/dbms/src/Interpreters/Cluster.h
++++ b/dbms/src/Interpreters/Cluster.h
+@@ -26,7 +26,7 @@ class Cluster
+             const String & username, const String & password,
+             UInt16 clickhouse_port, bool treat_local_as_remote, bool secure = false);
+ 
+-    Cluster(const Cluster &) = delete;
++    Cluster(const Cluster &)= delete;
+     Cluster & operator=(const Cluster &) = delete;
+ 
+     /// is used to set a limit on the size of the timeout
+@@ -148,6 +148,9 @@ class Cluster
+     /// Get a subcluster consisting of one or multiple shards - indexes by count (from 0) of the shard of this cluster.
+     std::unique_ptr<Cluster> getClusterWithMultipleShards(const std::vector<size_t> & indices) const;
+ 
++    /// Get a new Cluster From the existing cluster
++    std::unique_ptr<Cluster> getClusterWithReplicasAsShards(const Settings & settings) const;
++
+ private:
+     using SlotToShard = std::vector<UInt64>;
+     SlotToShard slot_to_shard;
+@@ -161,6 +164,9 @@ class Cluster
+     /// For getClusterWithMultipleShards implementation.
+     Cluster(const Cluster & from, const std::vector<size_t> & indices);
+ 
++    /// For getClusterWithReplicasAsShards implementation
++    Cluster(const Settings & settings, const Cluster &);
++
+     String hash_of_addresses;
+     /// Description of the cluster shards.
+     ShardsInfo shards_info;
+diff --git a/dbms/src/TableFunctions/TableFunctionRemote.cpp b/dbms/src/TableFunctions/TableFunctionRemote.cpp
+index 87c8989cbe29..033839009bb4 100644
+--- a/dbms/src/TableFunctions/TableFunctionRemote.cpp
++++ b/dbms/src/TableFunctions/TableFunctionRemote.cpp
+@@ -14,6 +14,7 @@
+ #include <Common/parseRemoteDescription.h>
+ #include <TableFunctions/TableFunctionFactory.h>
+ #include <Core/Defines.h>
++#include <ext/range.h>
+ #include "registerTableFunctions.h"
+ 
+ 
+@@ -140,7 +141,10 @@ StoragePtr TableFunctionRemote::executeImpl(const ASTPtr & ast_function, const C
+     if (!cluster_name.empty())
+     {
+         /// Use an existing cluster from the main config
+-        cluster = context.getCluster(cluster_name);
++        if (name != "clusterAllReplicas")
++            cluster = context.getCluster(cluster_name);
++        else
++            cluster = context.getCluster(cluster_name)->getClusterWithReplicasAsShards(context.getSettings());
+     }
+     else
+     {
+@@ -164,13 +168,22 @@ StoragePtr TableFunctionRemote::executeImpl(const ASTPtr & ast_function, const C
+             {
+                 size_t colon = host.find(':');
+                 if (colon == String::npos)
+-                    context.getRemoteHostFilter().checkHostAndPort(host, toString((secure ? (maybe_secure_port ? *maybe_secure_port : DBMS_DEFAULT_SECURE_PORT) : context.getTCPPort())));
++                    context.getRemoteHostFilter().checkHostAndPort(
++                        host,
++                        toString((secure ? (maybe_secure_port ? *maybe_secure_port : DBMS_DEFAULT_SECURE_PORT) : context.getTCPPort())));
+                 else
+                     context.getRemoteHostFilter().checkHostAndPort(host.substr(0, colon), host.substr(colon + 1));
+             }
+         }
+ 
+-        cluster = std::make_shared<Cluster>(context.getSettings(), names, username, password, (secure ? (maybe_secure_port ? *maybe_secure_port : DBMS_DEFAULT_SECURE_PORT) : context.getTCPPort()), false, secure);
++        cluster = std::make_shared<Cluster>(
++            context.getSettings(),
++            names,
++            username,
++            password,
++            (secure ? (maybe_secure_port ? *maybe_secure_port : DBMS_DEFAULT_SECURE_PORT) : context.getTCPPort()),
++            false,
++            secure);
+     }
+ 
+     auto structure_remote_table = getStructureOfRemoteTable(*cluster, remote_database, remote_table, context, remote_table_function_ptr);
+@@ -198,7 +211,7 @@ StoragePtr TableFunctionRemote::executeImpl(const ASTPtr & ast_function, const C
+ TableFunctionRemote::TableFunctionRemote(const std::string & name_, bool secure_)
+     : name{name_}, secure{secure_}
+ {
+-    is_cluster_function = name == "cluster";
++    is_cluster_function = (name == "cluster" || name == "clusterAllReplicas");
+ 
+     std::stringstream ss;
+     ss << "Table function '" << name + "' requires from 2 to " << (is_cluster_function ? 3 : 5) << " parameters"
+@@ -213,6 +226,7 @@ void registerTableFunctionRemote(TableFunctionFactory & factory)
+     factory.registerFunction("remote", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("remote"); });
+     factory.registerFunction("remoteSecure", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("remote", /* secure = */ true); });
+     factory.registerFunction("cluster", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("cluster"); });
++    factory.registerFunction("clusterAllReplicas", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("clusterAllReplicas"); });
+ }
+ 
+ }

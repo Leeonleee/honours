@@ -1,0 +1,1065 @@
+diff --git a/contrib/zlib-ng b/contrib/zlib-ng
+index 5673222fbd37..bba56a73be24 160000
+--- a/contrib/zlib-ng
++++ b/contrib/zlib-ng
+@@ -1,1 +1,1 @@
+-Subproject commit 5673222fbd37ea89afb2ea73096f9bf5ec68ea31
++Subproject commit bba56a73be249514acfbc7d49aa2a68994dad8ab
+diff --git a/dbms/programs/server/HTTPHandler.cpp b/dbms/programs/server/HTTPHandler.cpp
+index 29d186def2d6..b2b3298693ed 100644
+--- a/dbms/programs/server/HTTPHandler.cpp
++++ b/dbms/programs/server/HTTPHandler.cpp
+@@ -20,8 +20,6 @@
+ #include <Compression/CompressedReadBuffer.h>
+ #include <Compression/CompressedWriteBuffer.h>
+ #include <IO/ReadBufferFromIStream.h>
+-#include <IO/ZlibInflatingReadBuffer.h>
+-#include <IO/BrotliReadBuffer.h>
+ #include <IO/ReadBufferFromString.h>
+ #include <IO/WriteBufferFromString.h>
+ #include <IO/WriteBufferFromHTTPServerResponse.h>
+@@ -300,32 +298,24 @@ void HTTPHandler::processQuery(
+ 
+     /// The client can pass a HTTP header indicating supported compression method (gzip or deflate).
+     String http_response_compression_methods = request.get("Accept-Encoding", "");
+-    bool client_supports_http_compression = false;
+-    CompressionMethod http_response_compression_method {};
++    CompressionMethod http_response_compression_method = CompressionMethod::None;
+ 
+     if (!http_response_compression_methods.empty())
+     {
++        /// If client supports brotli - it's preferred.
+         /// Both gzip and deflate are supported. If the client supports both, gzip is preferred.
+         /// NOTE parsing of the list of methods is slightly incorrect.
+-        if (std::string::npos != http_response_compression_methods.find("gzip"))
+-        {
+-            client_supports_http_compression = true;
++
++        if (std::string::npos != http_response_compression_methods.find("br"))
++            http_response_compression_method = CompressionMethod::Brotli;
++        else if (std::string::npos != http_response_compression_methods.find("gzip"))
+             http_response_compression_method = CompressionMethod::Gzip;
+-        }
+         else if (std::string::npos != http_response_compression_methods.find("deflate"))
+-        {
+-            client_supports_http_compression = true;
+             http_response_compression_method = CompressionMethod::Zlib;
+-        }
+-#if USE_BROTLI
+-        else if (http_response_compression_methods == "br")
+-        {
+-            client_supports_http_compression = true;
+-            http_response_compression_method = CompressionMethod::Brotli;
+-        }
+-#endif
+     }
+ 
++    bool client_supports_http_compression = http_response_compression_method != CompressionMethod::None;
++
+     /// Client can pass a 'compress' flag in the query string. In this case the query result is
+     /// compressed using internal algorithm. This is not reflected in HTTP headers.
+     bool internal_compression = params.getParsed<bool>("compress", false);
+@@ -344,8 +334,8 @@ void HTTPHandler::processQuery(
+     unsigned keep_alive_timeout = config.getUInt("keep_alive_timeout", 10);
+ 
+     used_output.out = std::make_shared<WriteBufferFromHTTPServerResponse>(
+-        request, response, keep_alive_timeout,
+-        client_supports_http_compression, http_response_compression_method, buffer_size_http);
++        request, response, keep_alive_timeout, client_supports_http_compression, http_response_compression_method);
++
+     if (internal_compression)
+         used_output.out_maybe_compressed = std::make_shared<CompressedWriteBuffer>(*used_output.out);
+     else
+@@ -400,32 +390,9 @@ void HTTPHandler::processQuery(
+     std::unique_ptr<ReadBuffer> in_post_raw = std::make_unique<ReadBufferFromIStream>(istr);
+ 
+     /// Request body can be compressed using algorithm specified in the Content-Encoding header.
+-    std::unique_ptr<ReadBuffer> in_post;
+     String http_request_compression_method_str = request.get("Content-Encoding", "");
+-    if (!http_request_compression_method_str.empty())
+-    {
+-        if (http_request_compression_method_str == "gzip")
+-        {
+-            in_post = std::make_unique<ZlibInflatingReadBuffer>(std::move(in_post_raw), CompressionMethod::Gzip);
+-        }
+-        else if (http_request_compression_method_str == "deflate")
+-        {
+-            in_post = std::make_unique<ZlibInflatingReadBuffer>(std::move(in_post_raw), CompressionMethod::Zlib);
+-        }
+-#if USE_BROTLI
+-        else if (http_request_compression_method_str == "br")
+-        {
+-            in_post = std::make_unique<BrotliReadBuffer>(std::move(in_post_raw));
+-        }
+-#endif
+-        else
+-        {
+-            throw Exception("Unknown Content-Encoding of HTTP request: " + http_request_compression_method_str,
+-                    ErrorCodes::UNKNOWN_COMPRESSION_METHOD);
+-        }
+-    }
+-    else
+-        in_post = std::move(in_post_raw);
++    std::unique_ptr<ReadBuffer> in_post = wrapReadBufferWithCompressionMethod(
++        std::make_unique<ReadBufferFromIStream>(istr), chooseCompressionMethod({}, http_request_compression_method_str));
+ 
+     /// The data can also be compressed using incompatible internal algorithm. This is indicated by
+     /// 'decompress' query parameter.
+diff --git a/dbms/src/IO/BrotliWriteBuffer.cpp b/dbms/src/IO/BrotliWriteBuffer.cpp
+index 0a0eeb52956d..ac1e2b3c1886 100644
+--- a/dbms/src/IO/BrotliWriteBuffer.cpp
++++ b/dbms/src/IO/BrotliWriteBuffer.cpp
+@@ -30,14 +30,14 @@ class BrotliWriteBuffer::BrotliStateWrapper
+     BrotliEncoderState * state;
+ };
+ 
+-BrotliWriteBuffer::BrotliWriteBuffer(WriteBuffer & out_, int compression_level, size_t buf_size, char * existing_memory, size_t alignment)
+-        : BufferWithOwnMemory<WriteBuffer>(buf_size, existing_memory, alignment)
+-        , brotli(std::make_unique<BrotliStateWrapper>())
+-        , in_available(0)
+-        , in_data(nullptr)
+-        , out_capacity(0)
+-        , out_data(nullptr)
+-        , out(out_)
++BrotliWriteBuffer::BrotliWriteBuffer(std::unique_ptr<WriteBuffer> out_, int compression_level, size_t buf_size, char * existing_memory, size_t alignment)
++    : BufferWithOwnMemory<WriteBuffer>(buf_size, existing_memory, alignment)
++    , brotli(std::make_unique<BrotliStateWrapper>())
++    , in_available(0)
++    , in_data(nullptr)
++    , out_capacity(0)
++    , out_data(nullptr)
++    , out(std::move(out_))
+ {
+     BrotliEncoderSetParameter(brotli->state, BROTLI_PARAM_QUALITY, static_cast<uint32_t>(compression_level));
+     // Set LZ77 window size. According to brotli sources default value is 24 (c/tools/brotli.c:81)
+@@ -68,9 +68,9 @@ void BrotliWriteBuffer::nextImpl()
+ 
+     do
+     {
+-        out.nextIfAtEnd();
+-        out_data = reinterpret_cast<unsigned char *>(out.position());
+-        out_capacity = out.buffer().end() - out.position();
++        out->nextIfAtEnd();
++        out_data = reinterpret_cast<unsigned char *>(out->position());
++        out_capacity = out->buffer().end() - out->position();
+ 
+         int result = BrotliEncoderCompressStream(
+                 brotli->state,
+@@ -81,7 +81,7 @@ void BrotliWriteBuffer::nextImpl()
+                 &out_data,
+                 nullptr);
+ 
+-        out.position() = out.buffer().end() - out_capacity;
++        out->position() = out->buffer().end() - out_capacity;
+ 
+         if (result == 0)
+         {
+@@ -100,9 +100,9 @@ void BrotliWriteBuffer::finish()
+ 
+     while (true)
+     {
+-        out.nextIfAtEnd();
+-        out_data = reinterpret_cast<unsigned char *>(out.position());
+-        out_capacity = out.buffer().end() - out.position();
++        out->nextIfAtEnd();
++        out_data = reinterpret_cast<unsigned char *>(out->position());
++        out_capacity = out->buffer().end() - out->position();
+ 
+         int result = BrotliEncoderCompressStream(
+                 brotli->state,
+@@ -113,7 +113,7 @@ void BrotliWriteBuffer::finish()
+                 &out_data,
+                 nullptr);
+ 
+-        out.position() = out.buffer().end() - out_capacity;
++        out->position() = out->buffer().end() - out_capacity;
+ 
+         if (BrotliEncoderIsFinished(brotli->state))
+         {
+diff --git a/dbms/src/IO/BrotliWriteBuffer.h b/dbms/src/IO/BrotliWriteBuffer.h
+index 6cc2a4ec4b73..5a294354f49f 100644
+--- a/dbms/src/IO/BrotliWriteBuffer.h
++++ b/dbms/src/IO/BrotliWriteBuffer.h
+@@ -10,11 +10,11 @@ class BrotliWriteBuffer : public BufferWithOwnMemory<WriteBuffer>
+ {
+ public:
+     BrotliWriteBuffer(
+-            WriteBuffer & out_,
+-            int compression_level,
+-            size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
+-            char * existing_memory = nullptr,
+-            size_t alignment = 0);
++        std::unique_ptr<WriteBuffer> out_,
++        int compression_level,
++        size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
++        char * existing_memory = nullptr,
++        size_t alignment = 0);
+ 
+     ~BrotliWriteBuffer() override;
+ 
+@@ -30,9 +30,9 @@ class BrotliWriteBuffer : public BufferWithOwnMemory<WriteBuffer>
+     const uint8_t * in_data;
+ 
+     size_t out_capacity;
+-    uint8_t  * out_data;
++    uint8_t * out_data;
+ 
+-    WriteBuffer & out;
++    std::unique_ptr<WriteBuffer> out;
+ 
+     bool finished = false;
+ };
+diff --git a/dbms/src/IO/CompressionMethod.cpp b/dbms/src/IO/CompressionMethod.cpp
+new file mode 100644
+index 000000000000..20f1ea443011
+--- /dev/null
++++ b/dbms/src/IO/CompressionMethod.cpp
+@@ -0,0 +1,104 @@
++#include <IO/CompressionMethod.h>
++
++#include <IO/ReadBuffer.h>
++#include <IO/WriteBuffer.h>
++#include <IO/ZlibInflatingReadBuffer.h>
++#include <IO/ZlibDeflatingWriteBuffer.h>
++#include <IO/BrotliReadBuffer.h>
++#include <IO/BrotliWriteBuffer.h>
++
++#include <Common/config.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int NOT_IMPLEMENTED;
++}
++
++
++std::string toContentEncodingName(CompressionMethod method)
++{
++    switch (method)
++    {
++        case CompressionMethod::Gzip:   return "gzip";
++        case CompressionMethod::Zlib:   return "deflate";
++        case CompressionMethod::Brotli: return "br";
++        case CompressionMethod::None:   return "";
++    }
++    __builtin_unreachable();
++}
++
++
++CompressionMethod chooseCompressionMethod(const std::string & path, const std::string & hint)
++{
++    std::string file_extension;
++    if (hint.empty() || hint == "auto")
++    {
++        auto pos = path.find_last_of('.');
++        if (pos != std::string::npos)
++            file_extension = path.substr(pos + 1, std::string::npos);
++    }
++
++    const std::string * method_str = file_extension.empty() ? &hint : &file_extension;
++
++    if (*method_str == "gzip" || *method_str == "gz")
++        return CompressionMethod::Gzip;
++    if (*method_str == "deflate")
++        return CompressionMethod::Zlib;
++    if (*method_str == "brotli" || *method_str == "br")
++        return CompressionMethod::Brotli;
++    if (hint.empty() || hint == "auto" || hint == "none")
++        return CompressionMethod::None;
++
++    throw Exception("Unknown compression method " + hint + ". Only 'auto', 'none', 'gzip', 'br' are supported as compression methods",
++        ErrorCodes::NOT_IMPLEMENTED);
++}
++
++
++std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
++    std::unique_ptr<ReadBuffer> nested,
++    CompressionMethod method,
++    size_t buf_size,
++    char * existing_memory,
++    size_t alignment)
++{
++    if (method == CompressionMethod::Gzip || method == CompressionMethod::Zlib)
++        return std::make_unique<ZlibInflatingReadBuffer>(std::move(nested), method, buf_size, existing_memory, alignment);
++#if USE_BROTLI
++    if (method == CompressionMethod::Brotli)
++        return std::make_unique<BrotliReadBuffer>(std::move(nested), buf_size, existing_memory, alignment);
++#endif
++
++    if (method == CompressionMethod::None)
++        return nested;
++
++    throw Exception("Unsupported compression method", ErrorCodes::NOT_IMPLEMENTED);
++}
++
++
++std::unique_ptr<WriteBuffer> wrapWriteBufferWithCompressionMethod(
++    std::unique_ptr<WriteBuffer> nested,
++    CompressionMethod method,
++    int level,
++    size_t buf_size,
++    char * existing_memory,
++    size_t alignment)
++{
++    if (method == DB::CompressionMethod::Gzip || method == CompressionMethod::Zlib)
++        return std::make_unique<ZlibDeflatingWriteBuffer>(std::move(nested), method, level, buf_size, existing_memory, alignment);
++
++#if USE_BROTLI
++    if (method == DB::CompressionMethod::Brotli)
++        return std::make_unique<BrotliWriteBuffer>(std::move(nested), level, buf_size, existing_memory, alignment);
++#endif
++
++    if (method == CompressionMethod::None)
++        return nested;
++
++    throw Exception("Unsupported compression method", ErrorCodes::NOT_IMPLEMENTED);
++}
++
++}
+diff --git a/dbms/src/IO/CompressionMethod.h b/dbms/src/IO/CompressionMethod.h
+index c54d2b581fd1..64c2ba3341f7 100644
+--- a/dbms/src/IO/CompressionMethod.h
++++ b/dbms/src/IO/CompressionMethod.h
+@@ -1,18 +1,57 @@
+ #pragma once
+ 
++#include <string>
++#include <memory>
++
++#include <Core/Defines.h>
++
++
+ namespace DB
+ {
+ 
++class ReadBuffer;
++class WriteBuffer;
++
++/** These are "generally recognizable" compression methods for data import/export.
++  * Do not mess with more efficient compression methods used by ClickHouse internally
++  *  (they use non-standard framing, indexes, checksums...)
++  */
++
+ enum class CompressionMethod
+ {
++    None,
+     /// DEFLATE compression with gzip header and CRC32 checksum.
+     /// This option corresponds to files produced by gzip(1) or HTTP Content-Encoding: gzip.
+     Gzip,
+     /// DEFLATE compression with zlib header and Adler32 checksum.
+     /// This option corresponds to HTTP Content-Encoding: deflate.
+     Zlib,
+-    Brotli,
+-    None
++    Brotli
+ };
+ 
++/// How the compression method is named in HTTP.
++std::string toContentEncodingName(CompressionMethod method);
++
++/** Choose compression method from path and hint.
++  * if hint is "auto" or empty string, then path is analyzed,
++  *  otherwise path parameter is ignored and hint is used as compression method name.
++  * path is arbitrary string that will be analyzed for file extension (gz, br...) that determines compression.
++  */
++CompressionMethod chooseCompressionMethod(const std::string & path, const std::string & hint);
++
++std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
++    std::unique_ptr<ReadBuffer> nested,
++    CompressionMethod method,
++    size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
++    char * existing_memory = nullptr,
++    size_t alignment = 0);
++
++std::unique_ptr<WriteBuffer> wrapWriteBufferWithCompressionMethod(
++    std::unique_ptr<WriteBuffer> nested,
++    CompressionMethod method,
++    int level,
++    size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
++    char * existing_memory = nullptr,
++    size_t alignment = 0);
++
+ }
+diff --git a/dbms/src/IO/ReadHelpers.h b/dbms/src/IO/ReadHelpers.h
+index 472060394355..7e5b5ce804fa 100644
+--- a/dbms/src/IO/ReadHelpers.h
++++ b/dbms/src/IO/ReadHelpers.h
+@@ -29,22 +29,13 @@
+ #include <IO/CompressionMethod.h>
+ #include <IO/ReadBuffer.h>
+ #include <IO/ReadBufferFromMemory.h>
++#include <IO/BufferWithOwnMemory.h>
+ #include <IO/VarInt.h>
+-#include <IO/ZlibInflatingReadBuffer.h>
+ 
+ #include <DataTypes/DataTypeDateTime.h>
+ 
+-#ifdef __clang__
+-#pragma clang diagnostic push
+-#pragma clang diagnostic ignored "-Wdouble-promotion"
+-#endif
+-
+ #include <double-conversion/double-conversion.h>
+ 
+-#ifdef __clang__
+-#pragma clang diagnostic pop
+-#endif
+-
+ 
+ /// 1 GiB
+ #define DEFAULT_MAX_STRING_SIZE (1ULL << 30)
+@@ -1024,21 +1015,11 @@ void skipToNextLineOrEOF(ReadBuffer & buf);
+ /// Skip to next character after next unescaped 
+. If no 
+ in stream, skip to end. Does not throw on invalid escape sequences.
+ void skipToUnescapedNextLineOrEOF(ReadBuffer & buf);
+ 
+-template <class TReadBuffer, class... Types>
+-std::unique_ptr<ReadBuffer> getReadBuffer(const DB::CompressionMethod method, Types&&... args)
+-{
+-    if (method == DB::CompressionMethod::Gzip)
+-    {
+-        auto read_buf = std::make_unique<TReadBuffer>(std::forward<Types>(args)...);
+-        return std::make_unique<ZlibInflatingReadBuffer>(std::move(read_buf), method);
+-    }
+-    return std::make_unique<TReadBuffer>(args...);
+-}
+ 
+ /** This function just copies the data from buffer's internal position (in.position())
+   * to current position (from arguments) into memory.
+   */
+-void saveUpToPosition(ReadBuffer & in, DB::Memory<> & memory, char * current);
++void saveUpToPosition(ReadBuffer & in, Memory<> & memory, char * current);
+ 
+ /** This function is negative to eof().
+   * In fact it returns whether the data was loaded to internal ReadBuffers's buffer or not.
+@@ -1047,6 +1028,6 @@ void saveUpToPosition(ReadBuffer & in, DB::Memory<> & memory, char * current);
+   * of our buffer and the current cursor in the end of the buffer. When we call eof() it calls next().
+   * And this function can fill the buffer with new data, so we will lose the data from previous buffer state.
+   */
+-bool loadAtPosition(ReadBuffer & in, DB::Memory<> & memory, char * & current);
++bool loadAtPosition(ReadBuffer & in, Memory<> & memory, char * & current);
+ 
+ }
+diff --git a/dbms/src/IO/WriteBufferFromHTTPServerResponse.cpp b/dbms/src/IO/WriteBufferFromHTTPServerResponse.cpp
+index f8bd166a4dde..24b7d905dcdf 100644
+--- a/dbms/src/IO/WriteBufferFromHTTPServerResponse.cpp
++++ b/dbms/src/IO/WriteBufferFromHTTPServerResponse.cpp
+@@ -105,67 +105,41 @@ void WriteBufferFromHTTPServerResponse::nextImpl()
+         {
+             if (compress)
+             {
+-                if (compression_method == CompressionMethod::Gzip)
+-                {
+-#if defined(POCO_CLICKHOUSE_PATCH)
+-                    *response_header_ostr << "Content-Encoding: gzip\r
+";
+-#else
+-                    response.set("Content-Encoding", "gzip");
+-                    response_body_ostr = &(response.send());
+-#endif
+-                    out_raw = std::make_unique<WriteBufferFromOStream>(*response_body_ostr);
+-                    deflating_buf.emplace(std::move(out_raw), compression_method, compression_level, working_buffer.size(), working_buffer.begin());
+-                    out = &*deflating_buf;
+-                }
+-                else if (compression_method == CompressionMethod::Zlib)
+-                {
+-#if defined(POCO_CLICKHOUSE_PATCH)
+-                    *response_header_ostr << "Content-Encoding: deflate\r
+";
+-#else
+-                    response.set("Content-Encoding", "deflate");
+-                    response_body_ostr = &(response.send());
+-#endif
+-                    out_raw = std::make_unique<WriteBufferFromOStream>(*response_body_ostr);
+-                    deflating_buf.emplace(std::move(out_raw), compression_method, compression_level, working_buffer.size(), working_buffer.begin());
+-                    out = &*deflating_buf;
+-                }
+-#if USE_BROTLI
+-                else if (compression_method == CompressionMethod::Brotli)
+-                {
++                auto content_encoding_name = toContentEncodingName(compression_method);
++
+ #if defined(POCO_CLICKHOUSE_PATCH)
+-                    *response_header_ostr << "Content-Encoding: br\r
+";
++                *response_header_ostr << "Content-Encoding: " << content_encoding_name << "\r
+";
+ #else
+-                    response.set("Content-Encoding", "br");
+-                    response_body_ostr = &(response.send());
++                response.set("Content-Encoding", content_encoding_name);
+ #endif
+-                    out_raw = std::make_unique<WriteBufferFromOStream>(*response_body_ostr);
+-                    brotli_buf.emplace(*out_raw, compression_level, working_buffer.size(), working_buffer.begin());
+-                    out = &*brotli_buf;
+-                }
+-#endif
+-
+-                else
+-                    throw Exception("Logical error: unknown compression method passed to WriteBufferFromHTTPServerResponse",
+-                                    ErrorCodes::LOGICAL_ERROR);
+-                /// Use memory allocated for the outer buffer in the buffer pointed to by out. This avoids extra allocation and copy.
+             }
+-            else
+-            {
++
+ #if !defined(POCO_CLICKHOUSE_PATCH)
+-                response_body_ostr = &(response.send());
++            response_body_ostr = &(response.send());
+ #endif
+ 
+-                out_raw = std::make_unique<WriteBufferFromOStream>(*response_body_ostr, working_buffer.size(), working_buffer.begin());
+-                out = &*out_raw;
+-            }
++            /// We reuse our buffer in "out" to avoid extra allocations and copies.
++
++            if (compress)
++                out = wrapWriteBufferWithCompressionMethod(
++                    std::make_unique<WriteBufferFromOStream>(*response_body_ostr),
++                    compress ? compression_method : CompressionMethod::None,
++                    compression_level,
++                    working_buffer.size(),
++                    working_buffer.begin());
++            else
++                out = std::make_unique<WriteBufferFromOStream>(
++                    *response_body_ostr,
++                    working_buffer.size(),
++                    working_buffer.begin());
+         }
+ 
+         finishSendHeaders();
+-
+     }
+ 
+     if (out)
+     {
++        out->buffer() = buffer();
+         out->position() = position();
+         out->next();
+     }
+@@ -177,9 +151,8 @@ WriteBufferFromHTTPServerResponse::WriteBufferFromHTTPServerResponse(
+     Poco::Net::HTTPServerResponse & response_,
+     unsigned keep_alive_timeout_,
+     bool compress_,
+-    CompressionMethod compression_method_,
+-    size_t size)
+-    : BufferWithOwnMemory<WriteBuffer>(size)
++    CompressionMethod compression_method_)
++    : BufferWithOwnMemory<WriteBuffer>(DBMS_DEFAULT_BUFFER_SIZE)
+     , request(request_)
+     , response(response_)
+     , keep_alive_timeout(keep_alive_timeout_)
+diff --git a/dbms/src/IO/WriteBufferFromHTTPServerResponse.h b/dbms/src/IO/WriteBufferFromHTTPServerResponse.h
+index 642e59e49212..f0b614c74063 100644
+--- a/dbms/src/IO/WriteBufferFromHTTPServerResponse.h
++++ b/dbms/src/IO/WriteBufferFromHTTPServerResponse.h
+@@ -8,8 +8,6 @@
+ #include <IO/WriteBuffer.h>
+ #include <IO/BufferWithOwnMemory.h>
+ #include <IO/WriteBufferFromOStream.h>
+-#include <IO/ZlibDeflatingWriteBuffer.h>
+-#include <IO/BrotliWriteBuffer.h>
+ #include <IO/HTTPCommon.h>
+ #include <IO/Progress.h>
+ #include <Common/NetException.h>
+@@ -52,7 +50,7 @@ class WriteBufferFromHTTPServerResponse : public BufferWithOwnMemory<WriteBuffer
+     unsigned keep_alive_timeout = 0;
+     bool compress = false;
+     CompressionMethod compression_method;
+-    int compression_level = Z_DEFAULT_COMPRESSION;
++    int compression_level = 1;
+ 
+     std::ostream * response_body_ostr = nullptr;
+ 
+@@ -60,13 +58,7 @@ class WriteBufferFromHTTPServerResponse : public BufferWithOwnMemory<WriteBuffer
+     std::ostream * response_header_ostr = nullptr;
+ #endif
+ 
+-    std::unique_ptr<WriteBufferFromOStream> out_raw;
+-    std::optional<ZlibDeflatingWriteBuffer> deflating_buf;
+-#if USE_BROTLI
+-    std::optional<BrotliWriteBuffer> brotli_buf;
+-#endif
+-
+-    WriteBuffer * out = nullptr;     /// Uncompressed HTTP body is written to this buffer. Points to out_raw or possibly to deflating_buf.
++    std::unique_ptr<WriteBuffer> out;
+ 
+     bool headers_started_sending = false;
+     bool headers_finished_sending = false;    /// If true, you could not add any headers.
+@@ -99,8 +91,7 @@ class WriteBufferFromHTTPServerResponse : public BufferWithOwnMemory<WriteBuffer
+         Poco::Net::HTTPServerResponse & response_,
+         unsigned keep_alive_timeout_,
+         bool compress_ = false,        /// If true - set Content-Encoding header and compress the result.
+-        CompressionMethod compression_method_ = CompressionMethod::Gzip,
+-        size_t size = DBMS_DEFAULT_BUFFER_SIZE);
++        CompressionMethod compression_method_ = CompressionMethod::None);
+ 
+     /// Writes progess in repeating HTTP headers.
+     void onProgress(const Progress & progress);
+diff --git a/dbms/src/IO/WriteHelpers.h b/dbms/src/IO/WriteHelpers.h
+index 082bf63e6b75..328f7b030cce 100644
+--- a/dbms/src/IO/WriteHelpers.h
++++ b/dbms/src/IO/WriteHelpers.h
+@@ -26,7 +26,6 @@
+ #include <IO/VarInt.h>
+ #include <IO/DoubleConverter.h>
+ #include <IO/WriteBufferFromString.h>
+-#include <IO/ZlibDeflatingWriteBuffer.h>
+ 
+ #include <Formats/FormatSettings.h>
+ 
+@@ -955,15 +954,4 @@ inline String toString(const T & x)
+     return buf.str();
+ }
+ 
+-template <class TWriteBuffer, class... Types>
+-std::unique_ptr<WriteBuffer> getWriteBuffer(const DB::CompressionMethod method, Types&&... args)
+-{
+-    if (method == DB::CompressionMethod::Gzip)
+-    {
+-        auto write_buf = std::make_unique<TWriteBuffer>(std::forward<Types>(args)...);
+-        return std::make_unique<ZlibDeflatingWriteBuffer>(std::move(write_buf), method, 1 /* compression level */);
+-    }
+-    return std::make_unique<TWriteBuffer>(args...);
+-}
+-
+ }
+diff --git a/dbms/src/IO/ZlibDeflatingWriteBuffer.cpp b/dbms/src/IO/ZlibDeflatingWriteBuffer.cpp
+index c4d7fac56a6c..8efe96877e43 100644
+--- a/dbms/src/IO/ZlibDeflatingWriteBuffer.cpp
++++ b/dbms/src/IO/ZlibDeflatingWriteBuffer.cpp
+@@ -5,6 +5,12 @@
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int ZLIB_DEFLATE_FAILED;
++}
++
++
+ ZlibDeflatingWriteBuffer::ZlibDeflatingWriteBuffer(
+         std::unique_ptr<WriteBuffer> out_,
+         CompressionMethod compression_method,
+@@ -84,6 +90,21 @@ void ZlibDeflatingWriteBuffer::finish()
+ 
+     next();
+ 
++    /// https://github.com/zlib-ng/zlib-ng/issues/494
++    do
++    {
++        out->nextIfAtEnd();
++        zstr.next_out = reinterpret_cast<unsigned char *>(out->position());
++        zstr.avail_out = out->buffer().end() - out->position();
++
++        int rc = deflate(&zstr, Z_FULL_FLUSH);
++        out->position() = out->buffer().end() - zstr.avail_out;
++
++        if (rc != Z_OK)
++            throw Exception(std::string("deflate failed: ") + zError(rc), ErrorCodes::ZLIB_DEFLATE_FAILED);
++    }
++    while (zstr.avail_out == 0);
++
+     while (true)
+     {
+         out->nextIfAtEnd();
+diff --git a/dbms/src/IO/ZlibDeflatingWriteBuffer.h b/dbms/src/IO/ZlibDeflatingWriteBuffer.h
+index 86eee1cffe55..f9df8f8157bd 100644
+--- a/dbms/src/IO/ZlibDeflatingWriteBuffer.h
++++ b/dbms/src/IO/ZlibDeflatingWriteBuffer.h
+@@ -10,11 +10,6 @@
+ namespace DB
+ {
+ 
+-namespace ErrorCodes
+-{
+-    extern const int ZLIB_DEFLATE_FAILED;
+-}
+-
+ /// Performs compression using zlib library and writes compressed data to out_ WriteBuffer.
+ class ZlibDeflatingWriteBuffer : public BufferWithOwnMemory<WriteBuffer>
+ {
+diff --git a/dbms/src/Storages/IStorage.cpp b/dbms/src/Storages/IStorage.cpp
+index 9dabfe0b604b..e48e98965974 100644
+--- a/dbms/src/Storages/IStorage.cpp
++++ b/dbms/src/Storages/IStorage.cpp
+@@ -425,21 +425,4 @@ BlockInputStreams IStorage::read(
+     return res;
+ }
+ 
+-DB::CompressionMethod IStorage::chooseCompressionMethod(const String & uri, const String & compression_method)
+-{
+-    if (compression_method == "auto" || compression_method == "")
+-    {
+-        if (endsWith(uri, ".gz"))
+-            return DB::CompressionMethod::Gzip;
+-        else
+-            return DB::CompressionMethod::None;
+-    }
+-    else if (compression_method == "gzip")
+-        return DB::CompressionMethod::Gzip;
+-    else if (compression_method == "none")
+-        return DB::CompressionMethod::None;
+-    else
+-        throw Exception("Only auto, none, gzip supported as compression method", ErrorCodes::NOT_IMPLEMENTED);
+-}
+-
+ }
+diff --git a/dbms/src/Storages/IStorage.h b/dbms/src/Storages/IStorage.h
+index 8f8a363aec11..69bbca868798 100644
+--- a/dbms/src/Storages/IStorage.h
++++ b/dbms/src/Storages/IStorage.h
+@@ -5,7 +5,6 @@
+ #include <DataStreams/IBlockStream_fwd.h>
+ #include <Databases/IDatabase.h>
+ #include <Interpreters/CancellationCode.h>
+-#include <IO/CompressionMethod.h>
+ #include <Storages/IStorage_fwd.h>
+ #include <Storages/SelectQueryInfo.h>
+ #include <Storages/TableStructureLockHolder.h>
+@@ -440,8 +439,6 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+         return {};
+     }
+ 
+-    static DB::CompressionMethod chooseCompressionMethod(const String & uri, const String & compression_method);
+-
+ private:
+     /// You always need to take the next three locks in this order.
+ 
+diff --git a/dbms/src/Storages/StorageFile.cpp b/dbms/src/Storages/StorageFile.cpp
+index 64a603717e24..e640d08beb00 100644
+--- a/dbms/src/Storages/StorageFile.cpp
++++ b/dbms/src/Storages/StorageFile.cpp
+@@ -23,6 +23,8 @@
+ #include <Common/parseGlobs.h>
+ 
+ #include <fcntl.h>
++#include <unistd.h>
++#include <sys/types.h>
+ 
+ #include <Poco/Path.h>
+ #include <Poco/File.h>
+@@ -39,6 +41,7 @@ namespace ErrorCodes
+ {
+     extern const int CANNOT_WRITE_TO_FILE_DESCRIPTOR;
+     extern const int CANNOT_SEEK_THROUGH_FILE;
++    extern const int CANNOT_TRUNCATE_FILE;
+     extern const int DATABASE_ACCESS_DENIED;
+     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+     extern const int UNKNOWN_IDENTIFIER;
+@@ -61,11 +64,13 @@ static std::vector<std::string> listFilesWithRegexpMatching(const std::string &
+     const std::string suffix_with_globs = for_match.substr(end_of_path_without_globs);   /// begin with '/'
+ 
+     const size_t next_slash = suffix_with_globs.find('/', 1);
+-    re2::RE2 matcher(makeRegexpPatternFromGlobs(suffix_with_globs.substr(0, next_slash)));
++    auto regexp = makeRegexpPatternFromGlobs(suffix_with_globs.substr(0, next_slash));
++    std::cerr << regexp << "
+";
++    re2::RE2 matcher(regexp);
+ 
+     std::vector<std::string> result;
+     const std::string prefix_without_globs = path_for_ls + for_match.substr(1, end_of_path_without_globs);
+-    if (!fs::exists(fs::path(prefix_without_globs.data())))
++    if (!fs::exists(fs::path(prefix_without_globs)))
+     {
+         return result;
+     }
+@@ -110,11 +115,11 @@ static void checkCreationIsAllowed(const Context & context_global, const std::st
+ 
+     /// "/dev/null" is allowed for perf testing
+     if (!startsWith(table_path, db_dir_path) && table_path != "/dev/null")
+-        throw Exception("Part path " + table_path + " is not inside " + db_dir_path, ErrorCodes::DATABASE_ACCESS_DENIED);
++        throw Exception("File is not inside " + db_dir_path, ErrorCodes::DATABASE_ACCESS_DENIED);
+ 
+     Poco::File table_path_poco_file = Poco::File(table_path);
+     if (table_path_poco_file.exists() && table_path_poco_file.isDirectory())
+-        throw Exception("File " + table_path + " must not be a directory", ErrorCodes::INCORRECT_FILE_NAME);
++        throw Exception("File must not be a directory", ErrorCodes::INCORRECT_FILE_NAME);
+ }
+ }
+ 
+@@ -145,11 +150,10 @@ StorageFile::StorageFile(const std::string & table_path_, const std::string & us
+ 
+     const std::string path = poco_path.absolute().toString();
+     if (path.find_first_of("*?{") == std::string::npos)
+-    {
+         paths.push_back(path);
+-    }
+     else
+         paths = listFilesWithRegexpMatching("/", path);
++
+     for (const auto & cur_path : paths)
+         checkCreationIsAllowed(args.context, user_files_absolute_path, cur_path);
+ }
+@@ -200,12 +204,12 @@ class StorageFileBlockInputStream : public IBlockInputStream
+             }
+ 
+             storage->table_fd_was_used = true;
+-            read_buf = getReadBuffer<ReadBufferFromFileDescriptor>(compression_method, storage->table_fd);
++            read_buf = wrapReadBufferWithCompressionMethod(std::make_unique<ReadBufferFromFileDescriptor>(storage->table_fd), compression_method);
+         }
+         else
+         {
+             shared_lock = std::shared_lock(storage->rwlock);
+-            read_buf = getReadBuffer<ReadBufferFromFile>(compression_method, file_path);
++            read_buf = wrapReadBufferWithCompressionMethod(std::make_unique<ReadBufferFromFile>(file_path), compression_method);
+         }
+ 
+         reader = FormatFactory::instance().getInput(storage->format_name, *read_buf, storage->getSampleBlock(), context, max_block_size);
+@@ -266,7 +270,7 @@ BlockInputStreams StorageFile::read(
+     for (const auto & file_path : paths)
+     {
+         BlockInputStreamPtr cur_block = std::make_shared<StorageFileBlockInputStream>(
+-                std::static_pointer_cast<StorageFile>(shared_from_this()), context, max_block_size, file_path, IStorage::chooseCompressionMethod(file_path, compression_method));
++            std::static_pointer_cast<StorageFile>(shared_from_this()), context, max_block_size, file_path, chooseCompressionMethod(file_path, compression_method));
+         blocks_input.push_back(column_defaults.empty() ? cur_block : std::make_shared<AddingDefaultsBlockInputStream>(cur_block, column_defaults, context));
+     }
+     return narrowBlockInputStreams(blocks_input, num_streams);
+@@ -288,13 +292,15 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+               * INSERT data; SELECT *; last SELECT returns only insert_data
+               */
+             storage.table_fd_was_used = true;
+-            write_buf = getWriteBuffer<WriteBufferFromFileDescriptor>(compression_method, storage.table_fd);
++            write_buf = wrapWriteBufferWithCompressionMethod(std::make_unique<WriteBufferFromFileDescriptor>(storage.table_fd), compression_method, 3);
+         }
+         else
+         {
+             if (storage.paths.size() != 1)
+                 throw Exception("Table '" + storage.table_name + "' is in readonly mode because of globs in filepath", ErrorCodes::DATABASE_ACCESS_DENIED);
+-            write_buf = getWriteBuffer<WriteBufferFromFile>(compression_method, storage.paths[0], DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT);
++            write_buf = wrapWriteBufferWithCompressionMethod(
++                std::make_unique<WriteBufferFromFile>(storage.paths[0], DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT),
++                compression_method, 3);
+         }
+ 
+         writer = FormatFactory::instance().getOutput(storage.format_name, *write_buf, storage.getSampleBlock(), context);
+@@ -333,8 +339,7 @@ BlockOutputStreamPtr StorageFile::write(
+     const ASTPtr & /*query*/,
+     const Context & context)
+ {
+-    return std::make_shared<StorageFileBlockOutputStream>(*this,
+-        IStorage::chooseCompressionMethod(paths[0], compression_method), context);
++    return std::make_shared<StorageFileBlockOutputStream>(*this, chooseCompressionMethod(paths[0], compression_method), context);
+ }
+ 
+ Strings StorageFile::getDataPaths() const
+@@ -363,6 +368,28 @@ void StorageFile::rename(const String & new_path_to_table_data, const String & n
+     database_name = new_database_name;
+ }
+ 
++void StorageFile::truncate(const ASTPtr & /*query*/, const Context & /* context */, TableStructureWriteLockHolder &)
++{
++    if (paths.size() != 1)
++        throw Exception("Can't truncate table '" + table_name + "' in readonly mode", ErrorCodes::DATABASE_ACCESS_DENIED);
++
++    std::unique_lock<std::shared_mutex> lock(rwlock);
++
++    if (use_table_fd)
++    {
++        if (0 != ::ftruncate(table_fd, 0))
++            throwFromErrno("Cannot truncate file at fd " + toString(table_fd), ErrorCodes::CANNOT_TRUNCATE_FILE);
++    }
++    else
++    {
++        if (!Poco::File(paths[0]).exists())
++            return;
++
++        if (0 != ::truncate(paths[0].c_str(), 0))
++            throwFromErrnoWithPath("Cannot truncate file " + paths[0], paths[0], ErrorCodes::CANNOT_TRUNCATE_FILE);
++    }
++}
++
+ 
+ void registerStorageFile(StorageFactory & factory)
+ {
+diff --git a/dbms/src/Storages/StorageFile.h b/dbms/src/Storages/StorageFile.h
+index e3871166f03c..23a6d6e7ff5a 100644
+--- a/dbms/src/Storages/StorageFile.h
++++ b/dbms/src/Storages/StorageFile.h
+@@ -38,6 +38,8 @@ class StorageFile : public ext::shared_ptr_helper<StorageFile>, public IStorage
+         const ASTPtr & query,
+         const Context & context) override;
+ 
++    void truncate(const ASTPtr & /*query*/, const Context & /* context */, TableStructureWriteLockHolder &) override;
++
+     void rename(const String & new_path_to_table_data, const String & new_database_name, const String & new_table_name, TableStructureWriteLockHolder &) override;
+ 
+     Strings getDataPaths() const override;
+diff --git a/dbms/src/Storages/StorageHDFS.cpp b/dbms/src/Storages/StorageHDFS.cpp
+index 3f1386cca5e2..8e5db9100926 100644
+--- a/dbms/src/Storages/StorageHDFS.cpp
++++ b/dbms/src/Storages/StorageHDFS.cpp
+@@ -67,7 +67,7 @@ class HDFSBlockInputStream : public IBlockInputStream
+         UInt64 max_block_size,
+         const CompressionMethod compression_method)
+     {
+-        auto read_buf = getReadBuffer<ReadBufferFromHDFS>(compression_method, uri);
++        auto read_buf = wrapReadBufferWithCompressionMethod(std::make_unique<ReadBufferFromHDFS>(uri), compression_method);
+ 
+         auto input_stream = FormatFactory::instance().getInput(format, *read_buf, sample_block, context, max_block_size);
+         reader = std::make_shared<OwningBlockInputStream<ReadBuffer>>(input_stream, std::move(read_buf));
+@@ -112,7 +112,7 @@ class HDFSBlockOutputStream : public IBlockOutputStream
+         const CompressionMethod compression_method)
+         : sample_block(sample_block_)
+     {
+-        write_buf = getWriteBuffer<WriteBufferFromHDFS>(compression_method, uri);
++        write_buf = wrapWriteBufferWithCompressionMethod(std::make_unique<WriteBufferFromHDFS>(uri), compression_method, 3);
+         writer = FormatFactory::instance().getOutput(format, *write_buf, sample_block, context);
+     }
+ 
+@@ -213,7 +213,7 @@ BlockInputStreams StorageHDFS::read(
+     for (const auto & res_path : res_paths)
+     {
+         result.push_back(std::make_shared<HDFSBlockInputStream>(uri_without_path + res_path, format_name, getSampleBlock(), context_,
+-                                                               max_block_size, IStorage::chooseCompressionMethod(res_path, compression_method)));
++                                                               max_block_size, chooseCompressionMethod(res_path, compression_method)));
+     }
+ 
+     return narrowBlockInputStreams(result, num_streams);
+@@ -231,7 +231,7 @@ BlockOutputStreamPtr StorageHDFS::write(const ASTPtr & /*query*/, const Context
+         format_name,
+         getSampleBlock(),
+         context,
+-        IStorage::chooseCompressionMethod(uri, compression_method));
++        chooseCompressionMethod(uri, compression_method));
+ }
+ 
+ void registerStorageHDFS(StorageFactory & factory)
+diff --git a/dbms/src/Storages/StorageS3.cpp b/dbms/src/Storages/StorageS3.cpp
+index cf0b3df44fd3..14732a291b1d 100644
+--- a/dbms/src/Storages/StorageS3.cpp
++++ b/dbms/src/Storages/StorageS3.cpp
+@@ -49,7 +49,7 @@ namespace
+             const String & key)
+             : name(name_)
+         {
+-            read_buf = getReadBuffer<ReadBufferFromS3>(compression_method, client, bucket, key);
++            read_buf = wrapReadBufferWithCompressionMethod(std::make_unique<ReadBufferFromS3>(client, bucket, key), compression_method);
+             reader = FormatFactory::instance().getInput(format, *read_buf, sample_block, context, max_block_size);
+         }
+ 
+@@ -98,7 +98,8 @@ namespace
+             const String & key)
+             : sample_block(sample_block_)
+         {
+-            write_buf = getWriteBuffer<WriteBufferFromS3>(compression_method, client, bucket, key, min_upload_part_size);
++            write_buf = wrapWriteBufferWithCompressionMethod(
++                std::make_unique<WriteBufferFromS3>(client, bucket, key, min_upload_part_size), compression_method, 3);
+             writer = FormatFactory::instance().getOutput(format, *write_buf, sample_block, context);
+         }
+ 
+@@ -173,7 +174,7 @@ BlockInputStreams StorageS3::read(
+         getHeaderBlock(column_names),
+         context,
+         max_block_size,
+-        IStorage::chooseCompressionMethod(uri.endpoint, compression_method),
++        chooseCompressionMethod(uri.endpoint, compression_method),
+         client,
+         uri.bucket,
+         uri.key);
+@@ -194,7 +195,7 @@ BlockOutputStreamPtr StorageS3::write(const ASTPtr & /*query*/, const Context &
+ {
+     return std::make_shared<StorageS3BlockOutputStream>(
+         format_name, min_upload_part_size, getSampleBlock(), context_global,
+-        IStorage::chooseCompressionMethod(uri.endpoint, compression_method),
++        chooseCompressionMethod(uri.endpoint, compression_method),
+         client, uri.bucket, uri.key);
+ }
+ 
+diff --git a/dbms/src/Storages/StorageURL.cpp b/dbms/src/Storages/StorageURL.cpp
+index 907e18b21cf5..efe15dc19281 100644
+--- a/dbms/src/Storages/StorageURL.cpp
++++ b/dbms/src/Storages/StorageURL.cpp
+@@ -60,17 +60,18 @@ namespace
+             const CompressionMethod compression_method)
+             : name(name_)
+         {
+-            read_buf = getReadBuffer<ReadWriteBufferFromHTTP>(
+-                compression_method,
+-                uri,
+-                method,
+-                callback,
+-                timeouts,
+-                context.getSettingsRef().max_http_get_redirects,
+-                Poco::Net::HTTPBasicCredentials{},
+-                DBMS_DEFAULT_BUFFER_SIZE,
+-                ReadWriteBufferFromHTTP::HTTPHeaderEntries{},
+-                context.getRemoteHostFilter());
++            read_buf = wrapReadBufferWithCompressionMethod(
++                std::make_unique<ReadWriteBufferFromHTTP>(
++                    uri,
++                    method,
++                    callback,
++                    timeouts,
++                    context.getSettingsRef().max_http_get_redirects,
++                    Poco::Net::HTTPBasicCredentials{},
++                    DBMS_DEFAULT_BUFFER_SIZE,
++                    ReadWriteBufferFromHTTP::HTTPHeaderEntries{},
++                    context.getRemoteHostFilter()),
++                compression_method);
+ 
+             reader = FormatFactory::instance().getInput(format, *read_buf, sample_block, context, max_block_size);
+         }
+@@ -117,7 +118,9 @@ namespace
+             const CompressionMethod compression_method)
+             : sample_block(sample_block_)
+         {
+-            write_buf = getWriteBuffer<WriteBufferFromHTTP>(compression_method, uri, Poco::Net::HTTPRequest::HTTP_POST, timeouts);
++            write_buf = wrapWriteBufferWithCompressionMethod(
++                std::make_unique<WriteBufferFromHTTP>(uri, Poco::Net::HTTPRequest::HTTP_POST, timeouts),
++                compression_method, 3);
+             writer = FormatFactory::instance().getOutput(format, *write_buf, sample_block, context);
+         }
+ 
+@@ -196,7 +199,7 @@ BlockInputStreams IStorageURLBase::read(const Names & column_names,
+         context,
+         max_block_size,
+         ConnectionTimeouts::getHTTPTimeouts(context),
+-        IStorage::chooseCompressionMethod(request_uri.getPath(), compression_method));
++        chooseCompressionMethod(request_uri.getPath(), compression_method));
+ 
+     auto column_defaults = getColumns().getDefaults();
+     if (column_defaults.empty())
+@@ -215,7 +218,7 @@ BlockOutputStreamPtr IStorageURLBase::write(const ASTPtr & /*query*/, const Cont
+     return std::make_shared<StorageURLBlockOutputStream>(
+         uri, format_name, getSampleBlock(), context_global,
+         ConnectionTimeouts::getHTTPTimeouts(context_global),
+-        IStorage::chooseCompressionMethod(uri.toString(), compression_method));
++        chooseCompressionMethod(uri.toString(), compression_method));
+ }
+ 
+ void registerStorageURL(StorageFactory & factory)
+diff --git a/dbms/src/Storages/StorageXDBC.cpp b/dbms/src/Storages/StorageXDBC.cpp
+index 222eebd63771..0dcbf372b28f 100644
+--- a/dbms/src/Storages/StorageXDBC.cpp
++++ b/dbms/src/Storages/StorageXDBC.cpp
+@@ -7,7 +7,6 @@
+ #include <Poco/Util/AbstractConfiguration.h>
+ #include <common/logger_useful.h>
+ #include <Formats/FormatFactory.h>
+-#include <IO/CompressionMethod.h>
+ #include <IO/ReadHelpers.h>
+ #include <IO/ReadWriteBufferFromHTTP.h>
+ #include <Poco/File.h>
+diff --git a/dbms/src/TableFunctions/ITableFunctionFileLike.cpp b/dbms/src/TableFunctions/ITableFunctionFileLike.cpp
+index 3e0ddafaa906..7b1d342a64a6 100644
+--- a/dbms/src/TableFunctions/ITableFunctionFileLike.cpp
++++ b/dbms/src/TableFunctions/ITableFunctionFileLike.cpp
+@@ -42,12 +42,10 @@ StoragePtr ITableFunctionFileLike::executeImpl(const ASTPtr & ast_function, cons
+     std::string filename = args[0]->as<ASTLiteral &>().value.safeGet<String>();
+     std::string format = args[1]->as<ASTLiteral &>().value.safeGet<String>();
+     std::string structure = args[2]->as<ASTLiteral &>().value.safeGet<String>();
+-    std::string compression_method;
++    std::string compression_method = "auto";
+ 
+     if (args.size() == 4)
+-    {
+         compression_method = args[3]->as<ASTLiteral &>().value.safeGet<String>();
+-    } else compression_method = "auto";
+ 
+     ColumnsDescription columns = parseColumnsListFromString(structure, context);
+ 

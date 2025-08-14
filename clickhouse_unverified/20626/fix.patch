@@ -1,0 +1,199 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index f501e182cb7f..8fa535ab179b 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -704,7 +704,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+         config().getString("path", ""),
+         std::move(main_config_zk_node_cache),
+         main_config_zk_changed_event,
+-        [&](ConfigurationPtr config)
++        [&](ConfigurationPtr config, bool initial_loading)
+         {
+             Settings::checkNoSettingNamesAtTopLevel(*config, config_path);
+ 
+@@ -754,14 +754,19 @@ int Server::main(const std::vector<std::string> & /*args*/)
+             if (config->has("max_partition_size_to_drop"))
+                 global_context->setMaxPartitionSizeToDrop(config->getUInt64("max_partition_size_to_drop"));
+ 
+-            if (config->has("zookeeper"))
+-                global_context->reloadZooKeeperIfChanged(config);
++            if (!initial_loading)
++            {
++                /// We do not load ZooKeeper configuration on the first config loading
++                /// because TestKeeper server is not started yet.
++                if (config->has("zookeeper"))
++                    global_context->reloadZooKeeperIfChanged(config);
+ 
+-            global_context->reloadAuxiliaryZooKeepersConfigIfChanged(config);
++                global_context->reloadAuxiliaryZooKeepersConfigIfChanged(config);
++            }
+ 
+             global_context->updateStorageConfiguration(*config);
+         },
+-        /* already_loaded = */ true);
++        /* already_loaded = */ false);  /// Reload it right now (initial loading)
+ 
+     auto & access_control = global_context->getAccessControlManager();
+     if (config().has("custom_settings_prefixes"))
+diff --git a/src/Access/UsersConfigAccessStorage.cpp b/src/Access/UsersConfigAccessStorage.cpp
+index b3f151c30308..33efd71d0d0c 100644
+--- a/src/Access/UsersConfigAccessStorage.cpp
++++ b/src/Access/UsersConfigAccessStorage.cpp
+@@ -518,7 +518,7 @@ void UsersConfigAccessStorage::load(
+         preprocessed_dir,
+         zkutil::ZooKeeperNodeCache(get_zookeeper_function),
+         std::make_shared<Poco::Event>(),
+-        [&](Poco::AutoPtr<Poco::Util::AbstractConfiguration> new_config)
++        [&](Poco::AutoPtr<Poco::Util::AbstractConfiguration> new_config, bool /*initial_loading*/)
+         {
+             parseFromConfig(*new_config);
+             Settings::checkNoSettingNamesAtTopLevel(*new_config, users_config_path);
+diff --git a/src/Common/Config/ConfigReloader.cpp b/src/Common/Config/ConfigReloader.cpp
+index 677448e03ae4..afff08e82bb0 100644
+--- a/src/Common/Config/ConfigReloader.cpp
++++ b/src/Common/Config/ConfigReloader.cpp
+@@ -27,7 +27,7 @@ ConfigReloader::ConfigReloader(
+     , updater(std::move(updater_))
+ {
+     if (!already_loaded)
+-        reloadIfNewer(/* force = */ true, /* throw_on_error = */ true, /* fallback_to_preprocessed = */ true);
++        reloadIfNewer(/* force = */ true, /* throw_on_error = */ true, /* fallback_to_preprocessed = */ true, /* initial_loading = */ true);
+ }
+ 
+ 
+@@ -66,7 +66,7 @@ void ConfigReloader::run()
+             if (quit)
+                 return;
+ 
+-            reloadIfNewer(zk_changed, /* throw_on_error = */ false, /* fallback_to_preprocessed = */ false);
++            reloadIfNewer(zk_changed, /* throw_on_error = */ false, /* fallback_to_preprocessed = */ false, /* initial_loading = */ false);
+         }
+         catch (...)
+         {
+@@ -76,7 +76,7 @@ void ConfigReloader::run()
+     }
+ }
+ 
+-void ConfigReloader::reloadIfNewer(bool force, bool throw_on_error, bool fallback_to_preprocessed)
++void ConfigReloader::reloadIfNewer(bool force, bool throw_on_error, bool fallback_to_preprocessed, bool initial_loading)
+ {
+     std::lock_guard lock(reload_mutex);
+ 
+@@ -131,7 +131,7 @@ void ConfigReloader::reloadIfNewer(bool force, bool throw_on_error, bool fallbac
+ 
+         try
+         {
+-            updater(loaded_config.configuration);
++            updater(loaded_config.configuration, initial_loading);
+         }
+         catch (...)
+         {
+diff --git a/src/Common/Config/ConfigReloader.h b/src/Common/Config/ConfigReloader.h
+index 489f062e2fec..2e4399d3c4eb 100644
+--- a/src/Common/Config/ConfigReloader.h
++++ b/src/Common/Config/ConfigReloader.h
+@@ -27,7 +27,7 @@ class Context;
+ class ConfigReloader
+ {
+ public:
+-    using Updater = std::function<void(ConfigurationPtr)>;
++    using Updater = std::function<void(ConfigurationPtr, bool)>;
+ 
+     /** include_from_path is usually /etc/metrika.xml (i.e. value of <include_from> tag)
+       */
+@@ -46,12 +46,12 @@ class ConfigReloader
+     void start();
+ 
+     /// Reload immediately. For SYSTEM RELOAD CONFIG query.
+-    void reload() { reloadIfNewer(/* force */ true, /* throw_on_error */ true, /* fallback_to_preprocessed */ false); }
++    void reload() { reloadIfNewer(/* force */ true, /* throw_on_error */ true, /* fallback_to_preprocessed */ false, /* initial_loading = */ false); }
+ 
+ private:
+     void run();
+ 
+-    void reloadIfNewer(bool force, bool throw_on_error, bool fallback_to_preprocessed);
++    void reloadIfNewer(bool force, bool throw_on_error, bool fallback_to_preprocessed, bool initial_loading);
+ 
+     struct FileWithTimestamp;
+ 
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index 71e0effb2d2f..e0078da57b7a 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -108,6 +108,13 @@ StoragePtr DatabaseAtomic::detachTable(const String & name)
+ 
+ void DatabaseAtomic::dropTable(const Context & context, const String & table_name, bool no_delay)
+ {
++    if (auto * mv = dynamic_cast<StorageMaterializedView *>(tryGetTable(table_name, context).get()))
++    {
++        /// Remove the inner table (if any) to avoid deadlock
++        /// (due to attempt to execute DROP from the worker thread)
++        mv->dropInnerTable(no_delay, context);
++    }
++
+     String table_metadata_path = getObjectMetadataPath(table_name);
+     String table_metadata_path_drop;
+     StoragePtr table;
+@@ -131,10 +138,7 @@ void DatabaseAtomic::dropTable(const Context & context, const String & table_nam
+     }
+     if (table->storesDataOnDisk())
+         tryRemoveSymlink(table_name);
+-    /// Remove the inner table (if any) to avoid deadlock
+-    /// (due to attempt to execute DROP from the worker thread)
+-    if (auto * mv = dynamic_cast<StorageMaterializedView *>(table.get()))
+-        mv->dropInnerTable(no_delay, context);
++
+     /// Notify DatabaseCatalog that table was dropped. It will remove table data in background.
+     /// Cleanup is performed outside of database to allow easily DROP DATABASE without waiting for cleanup to complete.
+     DatabaseCatalog::instance().enqueueDroppedTableCleanup(table->getStorageID(), table, table_metadata_path_drop, no_delay);
+diff --git a/src/Storages/StorageMaterializedView.cpp b/src/Storages/StorageMaterializedView.cpp
+index 325bf3d2f742..24fce6ca8d98 100644
+--- a/src/Storages/StorageMaterializedView.cpp
++++ b/src/Storages/StorageMaterializedView.cpp
+@@ -402,32 +402,6 @@ Strings StorageMaterializedView::getDataPaths() const
+     return {};
+ }
+ 
+-void StorageMaterializedView::checkTableCanBeDropped() const
+-{
+-    /// Don't drop the target table if it was created manually via 'TO inner_table' statement
+-    if (!has_inner_table)
+-        return;
+-
+-    auto target_table = tryGetTargetTable();
+-    if (!target_table)
+-        return;
+-
+-    target_table->checkTableCanBeDropped();
+-}
+-
+-void StorageMaterializedView::checkPartitionCanBeDropped(const ASTPtr & partition)
+-{
+-    /// Don't drop the partition in target table if it was created manually via 'TO inner_table' statement
+-    if (!has_inner_table)
+-        return;
+-
+-    auto target_table = tryGetTargetTable();
+-    if (!target_table)
+-        return;
+-
+-    target_table->checkPartitionCanBeDropped(partition);
+-}
+-
+ ActionLock StorageMaterializedView::getActionLock(StorageActionBlockType type)
+ {
+     return has_inner_table ? getTargetTable()->getActionLock(type) : ActionLock{};
+diff --git a/src/Storages/StorageMaterializedView.h b/src/Storages/StorageMaterializedView.h
+index 94e4295cd343..5dc53a3c68f0 100644
+--- a/src/Storages/StorageMaterializedView.h
++++ b/src/Storages/StorageMaterializedView.h
+@@ -64,9 +64,6 @@ class StorageMaterializedView final : public ext::shared_ptr_helper<StorageMater
+ 
+     void shutdown() override;
+ 
+-    void checkTableCanBeDropped() const override;
+-    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+-
+     QueryProcessingStage::Enum getQueryProcessingStage(const Context &, QueryProcessingStage::Enum /*to_stage*/, SelectQueryInfo &) const override;
+ 
+     StoragePtr getTargetTable() const;

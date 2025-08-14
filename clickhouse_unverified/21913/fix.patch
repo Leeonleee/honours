@@ -1,0 +1,205 @@
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index d1af86e7b11c..f8bcbf02ab48 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -260,7 +260,8 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
+             renamed = true;
+         }
+ 
+-        database->loadStoredObjects(context, has_force_restore_data_flag, create.attach && force_attach);
++        /// We use global context here, because storages lifetime is bigger than query context lifetime
++        database->loadStoredObjects(context.getGlobalContext(), has_force_restore_data_flag, create.attach && force_attach);
+     }
+     catch (...)
+     {
+@@ -970,7 +971,8 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
+     if (create.as_table_function)
+     {
+         const auto & factory = TableFunctionFactory::instance();
+-        res = factory.get(create.as_table_function, context)->execute(create.as_table_function, context, create.table, properties.columns);
++        auto table_func = factory.get(create.as_table_function, context);
++        res = table_func->execute(create.as_table_function, context, create.table, properties.columns);
+         res->renameInMemory({create.database, create.table, create.uuid});
+     }
+     else
+diff --git a/src/Storages/StorageFactory.cpp b/src/Storages/StorageFactory.cpp
+index 85f3bea9e0c8..7aaec9b7e764 100644
+--- a/src/Storages/StorageFactory.cpp
++++ b/src/Storages/StorageFactory.cpp
+@@ -179,6 +179,7 @@ StoragePtr StorageFactory::get(
+         .attach = query.attach,
+         .has_force_restore_data_flag = has_force_restore_data_flag
+     };
++    assert(&arguments.context == &arguments.context.getGlobalContext());
+ 
+     auto res = storages.at(name).creator_fn(arguments);
+     if (!empty_engine_args.empty())
+diff --git a/src/Storages/StorageURL.cpp b/src/Storages/StorageURL.cpp
+index ca984f9ece9e..2d3879340dcd 100644
+--- a/src/Storages/StorageURL.cpp
++++ b/src/Storages/StorageURL.cpp
+@@ -33,7 +33,7 @@ namespace ErrorCodes
+ 
+ IStorageURLBase::IStorageURLBase(
+     const Poco::URI & uri_,
+-    const Context & context_,
++    const Context & /*context_*/,
+     const StorageID & table_id_,
+     const String & format_name_,
+     const std::optional<FormatSettings> & format_settings_,
+@@ -42,13 +42,10 @@ IStorageURLBase::IStorageURLBase(
+     const String & compression_method_)
+     : IStorage(table_id_)
+     , uri(uri_)
+-    , context_global(context_)
+     , compression_method(compression_method_)
+     , format_name(format_name_)
+     , format_settings(format_settings_)
+ {
+-    context_global.getRemoteHostFilter().checkURL(uri);
+-
+     StorageInMemoryMetadata storage_metadata;
+     storage_metadata.setColumns(columns_);
+     storage_metadata.setConstraints(constraints_);
+@@ -237,14 +234,28 @@ Pipe IStorageURLBase::read(
+         chooseCompressionMethod(request_uri.getPath(), compression_method)));
+ }
+ 
+-BlockOutputStreamPtr IStorageURLBase::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, const Context & /*context*/)
++BlockOutputStreamPtr IStorageURLBase::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, const Context & context)
+ {
+     return std::make_shared<StorageURLBlockOutputStream>(uri, format_name,
+-        format_settings, metadata_snapshot->getSampleBlock(), context_global,
+-        ConnectionTimeouts::getHTTPTimeouts(context_global),
++        format_settings, metadata_snapshot->getSampleBlock(), context,
++        ConnectionTimeouts::getHTTPTimeouts(context),
+         chooseCompressionMethod(uri.toString(), compression_method));
+ }
+ 
++StorageURL::StorageURL(const Poco::URI & uri_,
++           const StorageID & table_id_,
++           const String & format_name_,
++           const std::optional<FormatSettings> & format_settings_,
++           const ColumnsDescription & columns_,
++           const ConstraintsDescription & constraints_,
++           Context & context_,
++           const String & compression_method_)
++    : IStorageURLBase(uri_, context_, table_id_, format_name_,
++                      format_settings_, columns_, constraints_, compression_method_)
++{
++    context_.getRemoteHostFilter().checkURL(uri);
++}
++
+ void registerStorageURL(StorageFactory & factory)
+ {
+     factory.registerStorage("URL", [](const StorageFactory::Arguments & args)
+diff --git a/src/Storages/StorageURL.h b/src/Storages/StorageURL.h
+index 21b2e3e27a16..2b2384b1043b 100644
+--- a/src/Storages/StorageURL.h
++++ b/src/Storages/StorageURL.h
+@@ -45,7 +45,6 @@ class IStorageURLBase : public IStorage
+         const String & compression_method_);
+ 
+     Poco::URI uri;
+-    const Context & context_global;
+     String compression_method;
+     String format_name;
+     // For URL engine, we use format settings from server context + `SETTINGS`
+@@ -114,11 +113,7 @@ class StorageURL final : public ext::shared_ptr_helper<StorageURL>, public IStor
+             const ColumnsDescription & columns_,
+             const ConstraintsDescription & constraints_,
+             Context & context_,
+-            const String & compression_method_)
+-        : IStorageURLBase(uri_, context_, table_id_, format_name_,
+-            format_settings_, columns_, constraints_, compression_method_)
+-    {
+-    }
++            const String & compression_method_);
+ 
+     String getName() const override
+     {
+diff --git a/src/TableFunctions/ITableFunction.cpp b/src/TableFunctions/ITableFunction.cpp
+index 804a5b232ecb..b637838c6dae 100644
+--- a/src/TableFunctions/ITableFunction.cpp
++++ b/src/TableFunctions/ITableFunction.cpp
+@@ -20,12 +20,20 @@ StoragePtr ITableFunction::execute(const ASTPtr & ast_function, const Context &
+     ProfileEvents::increment(ProfileEvents::TableFunctionExecute);
+     context.checkAccess(AccessType::CREATE_TEMPORARY_TABLE | StorageFactory::instance().getSourceAccessType(getStorageTypeName()));
+ 
+-    if (cached_columns.empty() || (hasStaticStructure() && cached_columns == getActualTableStructure(context)))
++    if (cached_columns.empty())
+         return executeImpl(ast_function, context, table_name, std::move(cached_columns));
+ 
+-    auto get_storage = [=, tf = shared_from_this()]() -> StoragePtr
++    /// We have table structure, so it's CREATE AS table_function().
++    /// We should use global context here because there will be no query context on server startup
++    /// and because storage lifetime is bigger than query context lifetime.
++    const Context & global_context = context.getGlobalContext();
++    if (hasStaticStructure() && cached_columns == getActualTableStructure(context))
++        return executeImpl(ast_function, global_context, table_name, std::move(cached_columns));
++
++    auto this_table_function = shared_from_this();
++    auto get_storage = [=, &global_context]() -> StoragePtr
+     {
+-        return tf->executeImpl(ast_function, context, table_name, cached_columns);
++        return this_table_function->executeImpl(ast_function, global_context, table_name, cached_columns);
+     };
+ 
+     /// It will request actual table structure and create underlying storage lazily
+diff --git a/src/TableFunctions/ITableFunctionXDBC.cpp b/src/TableFunctions/ITableFunctionXDBC.cpp
+index e04a86b5abf9..21c78d199dbf 100644
+--- a/src/TableFunctions/ITableFunctionXDBC.cpp
++++ b/src/TableFunctions/ITableFunctionXDBC.cpp
+@@ -55,15 +55,21 @@ void ITableFunctionXDBC::parseArguments(const ASTPtr & ast_function, const Conte
+         connection_string = args[0]->as<ASTLiteral &>().value.safeGet<String>();
+         remote_table_name = args[1]->as<ASTLiteral &>().value.safeGet<String>();
+     }
++}
+ 
+-    /// Have to const_cast, because bridges store their commands inside context
+-    helper = createBridgeHelper(const_cast<Context &>(context), context.getSettingsRef().http_receive_timeout.value, connection_string);
+-    helper->startBridgeSync();
++void ITableFunctionXDBC::startBridgeIfNot(const Context & context) const
++{
++    if (!helper)
++    {
++        /// Have to const_cast, because bridges store their commands inside context
++        helper = createBridgeHelper(const_cast<Context &>(context), context.getSettingsRef().http_receive_timeout.value, connection_string);
++        helper->startBridgeSync();
++    }
+ }
+ 
+ ColumnsDescription ITableFunctionXDBC::getActualTableStructure(const Context & context) const
+ {
+-    assert(helper);
++    startBridgeIfNot(context);
+ 
+     /* Infer external table structure */
+     Poco::URI columns_info_uri = helper->getColumnsInfoURI();
+@@ -87,7 +93,7 @@ ColumnsDescription ITableFunctionXDBC::getActualTableStructure(const Context & c
+ 
+ StoragePtr ITableFunctionXDBC::executeImpl(const ASTPtr & /*ast_function*/, const Context & context, const std::string & table_name, ColumnsDescription /*cached_columns*/) const
+ {
+-    assert(helper);
++    startBridgeIfNot(context);
+     auto columns = getActualTableStructure(context);
+     auto result = std::make_shared<StorageXDBC>(StorageID(getDatabaseName(), table_name), schema_name, remote_table_name, columns, context, helper);
+     result->startup();
+diff --git a/src/TableFunctions/ITableFunctionXDBC.h b/src/TableFunctions/ITableFunctionXDBC.h
+index fb0a0fd1185a..f3ff64c2f2d3 100644
+--- a/src/TableFunctions/ITableFunctionXDBC.h
++++ b/src/TableFunctions/ITableFunctionXDBC.h
+@@ -29,10 +29,12 @@ class ITableFunctionXDBC : public ITableFunction
+ 
+     void parseArguments(const ASTPtr & ast_function, const Context & context) override;
+ 
++    void startBridgeIfNot(const Context & context) const;
++
+     String connection_string;
+     String schema_name;
+     String remote_table_name;
+-    BridgeHelperPtr helper;
++    mutable BridgeHelperPtr helper;
+ };
+ 
+ class TableFunctionJDBC : public ITableFunctionXDBC

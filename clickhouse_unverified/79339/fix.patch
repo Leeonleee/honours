@@ -1,0 +1,185 @@
+diff --git a/src/Core/FormatFactorySettings.h b/src/Core/FormatFactorySettings.h
+index cd7f12aa2479..6dccff175ce9 100644
+--- a/src/Core/FormatFactorySettings.h
++++ b/src/Core/FormatFactorySettings.h
+@@ -918,6 +918,11 @@ Output the pending block in pretty formats if more than the specified number of
+ )", 0) \
+     DECLARE(UInt64Auto, output_format_pretty_color, "auto", R"(
+ Use ANSI escape sequences in Pretty formats. 0 - disabled, 1 - enabled, 'auto' - enabled if a terminal.
++)", 0) \
++    DECLARE(UInt64Auto, output_format_pretty_glue_chunks, "auto", R"(
++If the data rendered in Pretty formats arrived in multiple chunks, even after a delay, but the next chunk has the same column widths as the previous, use ANSI escape sequences to move back to the previous line and overwrite the footer of the previous chunk to continue it with the data of the new chunk. This makes the result more visually pleasant.
++
++0 - disabled, 1 - enabled, 'auto' - enabled if a terminal.
+ )", 0) \
+     DECLARE(String, output_format_pretty_grid_charset, "UTF-8", R"(
+ Charset for printing grid borders. Available charsets: ASCII, UTF-8 (default one).
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index b84502a03a4d..e2d602f2fb46 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -73,6 +73,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+             {"implicit_table_at_top_level", "", "", "A new setting, used in clickhouse-local"},
+             {"use_skip_indexes_if_final_exact_mode", 0, 0, "This setting was introduced to help FINAL query return correct results with skip indexes"},
+             {"parallel_replicas_insert_select_local_pipeline", false, false, "Use local pipeline during distributed INSERT SELECT with parallel replicas. Currently disabled due to performance issues"},
++            {"output_format_pretty_glue_chunks", "0", "auto", "A new setting to make Pretty formats prettier."},
+         });
+         addSettingsChanges(settings_changes_history, "25.4",
+         {
+diff --git a/src/Formats/FormatFactory.cpp b/src/Formats/FormatFactory.cpp
+index 5229aab34c4e..af7f368baf62 100644
+--- a/src/Formats/FormatFactory.cpp
++++ b/src/Formats/FormatFactory.cpp
+@@ -216,6 +216,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
+     format_settings.parquet.enable_row_group_prefetch = settings[Setting::input_format_parquet_enable_row_group_prefetch];
+     format_settings.pretty.charset = settings[Setting::output_format_pretty_grid_charset].toString() == "ASCII" ? FormatSettings::Pretty::Charset::ASCII : FormatSettings::Pretty::Charset::UTF8;
+     format_settings.pretty.color = settings[Setting::output_format_pretty_color].valueOr(2);
++    format_settings.pretty.glue_chunks = settings[Setting::output_format_pretty_glue_chunks].valueOr(2);
+     format_settings.pretty.max_column_pad_width = settings[Setting::output_format_pretty_max_column_pad_width];
+     format_settings.pretty.max_rows = settings[Setting::output_format_pretty_max_rows];
+     format_settings.pretty.max_column_name_width_cut_to = settings[Setting::output_format_pretty_max_column_name_width_cut_to];
+diff --git a/src/Formats/FormatSettings.h b/src/Formats/FormatSettings.h
+index bc62df0513b5..cfe9f7f87254 100644
+--- a/src/Formats/FormatSettings.h
++++ b/src/Formats/FormatSettings.h
+@@ -325,6 +325,8 @@ struct FormatSettings
+ 
+         UInt64 squash_consecutive_ms = 50;
+         UInt64 squash_max_wait_ms = 1000;
++        /// Set to 2 for auto
++        UInt64 glue_chunks = 2;
+ 
+         bool fallback_to_vertical = true;
+         UInt64 fallback_to_vertical_max_rows_per_chunk = 100;
+diff --git a/src/Processors/Formats/Impl/PrettyBlockOutputFormat.cpp b/src/Processors/Formats/Impl/PrettyBlockOutputFormat.cpp
+index ec46d0ba92ab..b53c617ccf3c 100644
+--- a/src/Processors/Formats/Impl/PrettyBlockOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/PrettyBlockOutputFormat.cpp
+@@ -20,8 +20,8 @@ namespace DB
+ {
+ 
+ PrettyBlockOutputFormat::PrettyBlockOutputFormat(
+-    WriteBuffer & out_, const Block & header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_)
+-     : IOutputFormat(header_, out_), format_settings(format_settings_), serializations(header_.getSerializations()), style(style_), mono_block(mono_block_), color(color_)
++    WriteBuffer & out_, const Block & header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_, bool glue_chunks_)
++     : IOutputFormat(header_, out_), format_settings(format_settings_), serializations(header_.getSerializations()), style(style_), mono_block(mono_block_), color(color_), glue_chunks(glue_chunks_)
+ {
+     /// Decide whether we should print a tip near the single number value in the result.
+     if (header_.getColumns().size() == 1)
+@@ -51,6 +51,7 @@ void PrettyBlockOutputFormat::calculateWidths(
+     size_t num_displayed_rows = std::min<size_t>(num_rows, format_settings.pretty.max_rows);
+ 
+     /// len(num_rows + total_rows) + len(". ")
++    prev_row_number_width = row_number_width;
+     row_number_width = static_cast<size_t>(std::floor(std::log10(num_rows + total_rows))) + 3;
+ 
+     size_t num_columns = chunk.getNumColumns();
+@@ -457,9 +458,28 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
+         out << "
+";
+     };
+ 
+-    writeString(header_begin, out);
+-    write_names(true);
+-    writeString(header_end, out);
++    if (glue_chunks
++        && (!format_settings.pretty.row_numbers || row_number_width == prev_row_number_width)
++        && name_widths == prev_chunk_name_widths)
++    {
++        /// Move cursor up to overwrite the footer of the previous chunk:
++        if (!rows_end.empty())
++            writeCString("\033[1A\033[2K\033[G", out);
++        if (had_footer)
++        {
++            size_t times = !footer_begin.empty() + !footer_end.empty() + rows_end.empty();
++            for (size_t i = 0; i < times; ++i)
++                writeCString("\033[1A\033[2K\033[G", out);
++        }
++        if (!rows_separator.empty())
++            writeString(rows_separator, out);
++    }
++    else
++    {
++        writeString(header_begin, out);
++        write_names(true);
++        writeString(header_end, out);
++    }
+ 
+     bool vertical_filler_written = false;
+     size_t displayed_row = 0;
+@@ -561,13 +581,16 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
+         writeString(footer_begin, out);
+         write_names(false);
+         writeString(footer_end, out);
++        had_footer = true;
+     }
+     else
+     {
+         ///    └──────┘
+         writeString(rows_end, out);
++        had_footer = false;
+     }
+     total_rows += num_rows;
++    prev_chunk_name_widths = std::move(name_widths);
+ }
+ 
+ 
+@@ -778,7 +801,9 @@ void registerOutputFormatPretty(FormatFactory & factory)
+                 {
+                     bool color = !no_escapes
+                         && (format_settings.pretty.color == 1 || (format_settings.pretty.color == 2 && format_settings.is_writing_to_terminal));
+-                    return std::make_shared<PrettyBlockOutputFormat>(buf, sample, format_settings, style, mono_block, color);
++                    bool glue_chunks = !no_escapes
++                        && (format_settings.pretty.glue_chunks == 1 || (format_settings.pretty.glue_chunks == 2 && format_settings.is_writing_to_terminal));
++                    return std::make_shared<PrettyBlockOutputFormat>(buf, sample, format_settings, style, mono_block, color, glue_chunks);
+                 });
+             }
+         }
+diff --git a/src/Processors/Formats/Impl/PrettyBlockOutputFormat.h b/src/Processors/Formats/Impl/PrettyBlockOutputFormat.h
+index 0c132a04188b..ac53e2477c61 100644
+--- a/src/Processors/Formats/Impl/PrettyBlockOutputFormat.h
++++ b/src/Processors/Formats/Impl/PrettyBlockOutputFormat.h
+@@ -4,7 +4,8 @@
+ #include <Formats/FormatFactory.h>
+ #include <Formats/FormatSettings.h>
+ #include <Processors/Formats/IOutputFormat.h>
+-#include <Common/PODArray_fwd.h>
++#include <Common/PODArray.h>
++
+ 
+ namespace DB
+ {
+@@ -26,7 +27,7 @@ class PrettyBlockOutputFormat : public IOutputFormat
+     };
+ 
+     /// no_escapes - do not use ANSI escape sequences - to display in the browser, not in the console.
+-    PrettyBlockOutputFormat(WriteBuffer & out_, const Block & header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_);
++    PrettyBlockOutputFormat(WriteBuffer & out_, const Block & header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_, bool glue_chunks_);
+     ~PrettyBlockOutputFormat() override;
+ 
+     String getName() const override { return "PrettyBlockOutputFormat"; }
+@@ -38,6 +39,7 @@ class PrettyBlockOutputFormat : public IOutputFormat
+ 
+     size_t total_rows = 0;
+     size_t displayed_rows = 0;
++    size_t prev_row_number_width = 7;
+     size_t row_number_width = 7; // "10000. "
+ 
+     const FormatSettings format_settings;
+@@ -78,6 +80,7 @@ class PrettyBlockOutputFormat : public IOutputFormat
+     Style style;
+     bool mono_block;
+     bool color;
++    bool glue_chunks;
+ 
+     /// Fallback to Vertical format for wide but short tables.
+     std::unique_ptr<IRowOutputFormat> vertical_format_fallback;
+@@ -85,6 +88,8 @@ class PrettyBlockOutputFormat : public IOutputFormat
+ 
+     /// For mono_block == true only
+     Chunk mono_chunk;
++    Widths prev_chunk_name_widths;
++    bool had_footer = false;
+ 
+     /// Implements squashing of chunks by time
+     std::condition_variable mono_chunk_condvar;

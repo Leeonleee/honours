@@ -1,0 +1,287 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index c7a7ba71e83d..ffc0a1f93179 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -1027,6 +1027,11 @@ try
+     /// Initialize merge tree metadata cache
+     if (config().has("merge_tree_metadata_cache"))
+     {
++        global_context->addWarningMessage("The setting 'merge_tree_metadata_cache' is enabled."
++            " But the feature of 'metadata cache in RocksDB' is experimental and is not ready for production."
++            " The usage of this feature can lead to data corruption and loss. The setting should be disabled in production."
++            " See the corresponding report at https://github.com/ClickHouse/ClickHouse/issues/51182");
++
+         fs::create_directories(path / "rocksdb/");
+         size_t size = config().getUInt64("merge_tree_metadata_cache.lru_cache_size", 256 << 20);
+         bool continue_if_corrupted = config().getBool("merge_tree_metadata_cache.continue_if_corrupted", false);
+diff --git a/programs/server/config.xml b/programs/server/config.xml
+index 65d325ad6c40..7323818803ad 100644
+--- a/programs/server/config.xml
++++ b/programs/server/config.xml
+@@ -1410,12 +1410,6 @@
+         <max_entry_size_in_rows>30000000</max_entry_size_in_rows>
+     </query_cache>
+ 
+-    <!-- Uncomment if enable merge tree metadata cache -->
+-    <!--merge_tree_metadata_cache>
+-        <lru_cache_size>268435456</lru_cache_size>
+-        <continue_if_corrupted>true</continue_if_corrupted>
+-    </merge_tree_metadata_cache-->
+-
+     <!-- This allows to disable exposing addresses in stack traces for security reasons.
+          Please be aware that it does not improve security much, but makes debugging much harder.
+          The addresses that are small offsets from zero will be displayed nevertheless to show nullptr dereferences.
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 10a46fda24e8..e46a04b6f494 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -2838,16 +2838,6 @@ std::map<String, zkutil::ZooKeeperPtr> Context::getAuxiliaryZooKeepers() const
+ }
+ 
+ #if USE_ROCKSDB
+-MergeTreeMetadataCachePtr Context::getMergeTreeMetadataCache() const
+-{
+-    auto cache = tryGetMergeTreeMetadataCache();
+-    if (!cache)
+-        throw Exception(
+-            ErrorCodes::LOGICAL_ERROR,
+-            "Merge tree metadata cache is not initialized, please add config merge_tree_metadata_cache in config.xml and restart");
+-    return cache;
+-}
+-
+ MergeTreeMetadataCachePtr Context::tryGetMergeTreeMetadataCache() const
+ {
+     return shared->merge_tree_metadata_cache;
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index 6cbb0e589113..43526fc5eb2f 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -855,7 +855,6 @@ class Context: public std::enable_shared_from_this<Context>
+     void setClientProtocolVersion(UInt64 version);
+ 
+ #if USE_ROCKSDB
+-    MergeTreeMetadataCachePtr getMergeTreeMetadataCache() const;
+     MergeTreeMetadataCachePtr tryGetMergeTreeMetadataCache() const;
+ #endif
+ 
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.cpp b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+index 7050a98a4bc0..6d7b6b39a40d 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.cpp
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+@@ -1674,8 +1674,8 @@ std::pair<bool, NameSet> IMergeTreeDataPart::canRemovePart() const
+ void IMergeTreeDataPart::initializePartMetadataManager()
+ {
+ #if USE_ROCKSDB
+-    if (use_metadata_cache)
+-        metadata_manager = std::make_shared<PartMetadataManagerWithCache>(this, storage.getContext()->getMergeTreeMetadataCache());
++    if (auto metadata_cache = storage.getContext()->tryGetMergeTreeMetadataCache(); metadata_cache && use_metadata_cache)
++        metadata_manager = std::make_shared<PartMetadataManagerWithCache>(this, metadata_cache);
+     else
+         metadata_manager = std::make_shared<PartMetadataManagerOrdinary>(this);
+ #else
+diff --git a/src/Storages/System/StorageSystemMergeTreeMetadataCache.cpp b/src/Storages/System/StorageSystemMergeTreeMetadataCache.cpp
+deleted file mode 100644
+index 3bb92814a2f2..000000000000
+--- a/src/Storages/System/StorageSystemMergeTreeMetadataCache.cpp
++++ /dev/null
+@@ -1,145 +0,0 @@
+-#include <Storages/System/StorageSystemMergeTreeMetadataCache.h>
+-
+-#if USE_ROCKSDB
+-#include <DataTypes/DataTypeDateTime.h>
+-#include <DataTypes/DataTypeString.h>
+-#include <DataTypes/DataTypesNumber.h>
+-#include <Interpreters/Context.h>
+-#include <Parsers/ASTExpressionList.h>
+-#include <Parsers/ASTFunction.h>
+-#include <Parsers/ASTIdentifier.h>
+-#include <Parsers/ASTLiteral.h>
+-#include <Parsers/ASTSelectQuery.h>
+-#include <Storages/MergeTree/KeyCondition.h>
+-#include <Storages/MergeTree/MergeTreeMetadataCache.h>
+-#include <Common/typeid_cast.h>
+-
+-namespace DB
+-{
+-namespace ErrorCodes
+-{
+-    extern const int BAD_ARGUMENTS;
+-}
+-
+-NamesAndTypesList StorageSystemMergeTreeMetadataCache::getNamesAndTypes()
+-{
+-    return {
+-        {"key", std::make_shared<DataTypeString>()},
+-        {"value", std::make_shared<DataTypeString>()},
+-    };
+-}
+-
+-static bool extractKeyImpl(const IAST & elem, String & res, bool & precise)
+-{
+-    const auto * function = elem.as<ASTFunction>();
+-    if (!function)
+-        return false;
+-
+-    if (function->name == "and")
+-    {
+-        for (const auto & child : function->arguments->children)
+-        {
+-            bool tmp_precise = false;
+-            if (extractKeyImpl(*child, res, tmp_precise))
+-            {
+-                precise = tmp_precise;
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    if (function->name == "equals" || function->name == "like")
+-    {
+-        const auto & args = function->arguments->as<ASTExpressionList &>();
+-        const IAST * value;
+-
+-        if (args.children.size() != 2)
+-            return false;
+-
+-        const ASTIdentifier * ident;
+-        if ((ident = args.children.at(0)->as<ASTIdentifier>()))
+-            value = args.children.at(1).get();
+-        else if ((ident = args.children.at(1)->as<ASTIdentifier>()))
+-            value = args.children.at(0).get();
+-        else
+-            return false;
+-
+-        if (ident->name() != "key")
+-            return false;
+-
+-        const auto * literal = value->as<ASTLiteral>();
+-        if (!literal)
+-            return false;
+-
+-        if (literal->value.getType() != Field::Types::String)
+-            return false;
+-
+-        res = literal->value.safeGet<String>();
+-        precise = function->name == "equals";
+-        return true;
+-    }
+-    return false;
+-}
+-
+-
+-/// Retrieve from the query a condition of the form `key= 'key'`, from conjunctions in the WHERE clause.
+-static String extractKey(const ASTPtr & query, bool& precise)
+-{
+-    const auto & select = query->as<ASTSelectQuery &>();
+-    if (!select.where())
+-        return "";
+-
+-    String res;
+-    return extractKeyImpl(*select.where(), res, precise) ? res : "";
+-}
+-
+-
+-void StorageSystemMergeTreeMetadataCache::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo & query_info) const
+-{
+-    bool precise = false;
+-    String key = extractKey(query_info.query, precise);
+-    if (key.empty())
+-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                        "SELECT from system.merge_tree_metadata_cache table must contain condition like key = 'key' "
+-                        "or key LIKE 'prefix%' in WHERE clause.");
+-
+-    auto cache = context->getMergeTreeMetadataCache();
+-    if (precise)
+-    {
+-        String value;
+-        if (cache->get(key, value) != MergeTreeMetadataCache::Status::OK())
+-            return;
+-
+-        size_t col_num = 0;
+-        res_columns[col_num++]->insert(key);
+-        res_columns[col_num++]->insert(value);
+-    }
+-    else
+-    {
+-        String target = extractFixedPrefixFromLikePattern(key, /*requires_perfect_prefix*/ false);
+-        if (target.empty())
+-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                        "SELECT from system.merge_tree_metadata_cache table must contain condition like key = 'key' "
+-                        "or key LIKE 'prefix%' in WHERE clause.");
+-
+-        Strings keys;
+-        Strings values;
+-        keys.reserve(4096);
+-        values.reserve(4096);
+-        cache->getByPrefix(target, keys, values);
+-        if (keys.empty())
+-            return;
+-
+-        assert(keys.size() == values.size());
+-        for (size_t i = 0; i < keys.size(); ++i)
+-        {
+-            size_t col_num = 0;
+-            res_columns[col_num++]->insert(keys[i]);
+-            res_columns[col_num++]->insert(values[i]);
+-        }
+-    }
+-}
+-
+-}
+-#endif
+diff --git a/src/Storages/System/StorageSystemMergeTreeMetadataCache.h b/src/Storages/System/StorageSystemMergeTreeMetadataCache.h
+deleted file mode 100644
+index 4603583227ea..000000000000
+--- a/src/Storages/System/StorageSystemMergeTreeMetadataCache.h
++++ /dev/null
+@@ -1,29 +0,0 @@
+-#pragma once
+-
+-#include "config.h"
+-
+-#if USE_ROCKSDB
+-#include <Storages/System/IStorageSystemOneBlock.h>
+-
+-
+-namespace DB
+-{
+-class Context;
+-
+-
+-/// Implements `merge_tree_metadata_cache` system table, which allows you to view the metadata cache data in rocksdb for testing purposes.
+-class StorageSystemMergeTreeMetadataCache : public IStorageSystemOneBlock<StorageSystemMergeTreeMetadataCache>
+-{
+-public:
+-    std::string getName() const override { return "SystemMergeTreeMetadataCache"; }
+-
+-    static NamesAndTypesList getNamesAndTypes();
+-
+-protected:
+-    using IStorageSystemOneBlock::IStorageSystemOneBlock;
+-
+-    void fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo & query_info) const override;
+-};
+-
+-}
+-#endif
+diff --git a/src/Storages/System/attachSystemTables.cpp b/src/Storages/System/attachSystemTables.cpp
+index 84965b3196b9..f0c67e0f787a 100644
+--- a/src/Storages/System/attachSystemTables.cpp
++++ b/src/Storages/System/attachSystemTables.cpp
+@@ -90,7 +90,6 @@
+ 
+ #if USE_ROCKSDB
+ #include <Storages/RocksDB/StorageSystemRocksDB.h>
+-#include <Storages/System/StorageSystemMergeTreeMetadataCache.h>
+ #endif
+ 
+ 
+@@ -150,7 +149,6 @@ void attachSystemTablesLocal(ContextPtr context, IDatabase & system_database)
+ #endif
+ #if USE_ROCKSDB
+     attach<StorageSystemRocksDB>(context, system_database, "rocksdb");
+-    attach<StorageSystemMergeTreeMetadataCache>(context, system_database, "merge_tree_metadata_cache");
+ #endif
+ }
+ 

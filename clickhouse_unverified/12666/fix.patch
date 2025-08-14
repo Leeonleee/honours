@@ -1,0 +1,462 @@
+diff --git a/src/Storages/MergeTree/MergeTreeMutationStatus.cpp b/src/Storages/MergeTree/MergeTreeMutationStatus.cpp
+new file mode 100644
+index 000000000000..4819cf9b2a93
+--- /dev/null
++++ b/src/Storages/MergeTree/MergeTreeMutationStatus.cpp
+@@ -0,0 +1,34 @@
++#include <Storages/MergeTree/MergeTreeMutationStatus.h>
++
++#include <Common/Exception.h>
++#include <boost/algorithm/string/join.hpp>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int UNFINISHED;
++}
++
++void checkMutationStatus(std::optional<MergeTreeMutationStatus> & status, const Strings & mutation_ids)
++{
++    if (!status)
++    {
++        assert(mutation_ids.size() == 1);
++        throw Exception(ErrorCodes::UNFINISHED, "Mutation {} was killed", mutation_ids[0]);
++    }
++    else if (!status->is_done && !status->latest_fail_reason.empty())
++    {
++        throw Exception(
++            ErrorCodes::UNFINISHED,
++            "Exception happened during execution of mutation{} '{}' with part '{}' reason: '{}'. This error maybe retryable or not. "
++            "In case of unretryable error, mutation can be killed with KILL MUTATION query",
++            mutation_ids.size() > 1 ? "s" : "",
++            boost::algorithm::join(mutation_ids, ", "),
++            status->latest_failed_part,
++            status->latest_fail_reason);
++    }
++}
++
++}
+diff --git a/src/Storages/MergeTree/MergeTreeMutationStatus.h b/src/Storages/MergeTree/MergeTreeMutationStatus.h
+index 3a9ecf30eb1d..62d7c1bbbcd2 100644
+--- a/src/Storages/MergeTree/MergeTreeMutationStatus.h
++++ b/src/Storages/MergeTree/MergeTreeMutationStatus.h
+@@ -1,12 +1,16 @@
+ #pragma once
+ 
+ #include <Core/Types.h>
++#include <Core/Names.h>
++#include <optional>
+ #include <map>
++#include <ctime>
+ 
+ 
+ namespace DB
+ {
+ 
++
+ struct MergeTreeMutationStatus
+ {
+     String id;
+@@ -25,4 +29,10 @@ struct MergeTreeMutationStatus
+     String latest_fail_reason;
+ };
+ 
++/// Check mutation status and throw exception in case of error during mutation
++/// (latest_fail_reason not empty) or if mutation was killed (status empty
++/// optional). mutation_ids passed separately, because status may be empty and
++/// we can execute multiple mutations at once
++void checkMutationStatus(std::optional<MergeTreeMutationStatus> & status, const Strings & mutation_ids);
++
+ }
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 3deb61bf8db9..4ff63f9c2dec 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1538,6 +1538,43 @@ void ReplicatedMergeTreeQueue::getInsertTimes(time_t & out_min_unprocessed_inser
+ }
+ 
+ 
++std::optional<MergeTreeMutationStatus> ReplicatedMergeTreeQueue::getIncompleteMutationsStatus(const String & znode_name, Strings * mutation_ids) const
++{
++
++    std::lock_guard lock(state_mutex);
++    auto current_mutation_it = mutations_by_znode.find(znode_name);
++    /// killed
++    if (current_mutation_it == mutations_by_znode.end())
++        return {};
++
++    const MutationStatus & status = current_mutation_it->second;
++    MergeTreeMutationStatus result
++    {
++        .is_done = status.is_done,
++        .latest_failed_part = status.latest_failed_part,
++        .latest_fail_time = status.latest_fail_time,
++        .latest_fail_reason = status.latest_fail_reason,
++    };
++
++    if (mutation_ids && !status.latest_fail_reason.empty())
++    {
++        const auto & latest_failed_part_info = status.latest_failed_part_info;
++        auto in_partition = mutations_by_partition.find(latest_failed_part_info.partition_id);
++        if (in_partition != mutations_by_partition.end())
++        {
++            const auto & version_to_status = in_partition->second;
++            auto begin_it = version_to_status.upper_bound(latest_failed_part_info.getDataVersion());
++            for (auto it = begin_it; it != version_to_status.end(); ++it)
++            {
++                /// All mutations with the same failure
++                if (!it->second->is_done && it->second->latest_fail_reason == status.latest_fail_reason)
++                    mutation_ids->push_back(it->second->entry->znode_name);
++            }
++        }
++    }
++    return result;
++}
++
+ std::vector<MergeTreeMutationStatus> ReplicatedMergeTreeQueue::getMutationsStatus() const
+ {
+     std::lock_guard lock(state_mutex);
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+index cd155214cacb..c330631d9ddd 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+@@ -399,6 +399,13 @@ class ReplicatedMergeTreeQueue
+     /// Get information about the insertion times.
+     void getInsertTimes(time_t & out_min_unprocessed_insert_time, time_t & out_max_processed_insert_time) const;
+ 
++
++    /// Return empty optional if mutation was killed. Otherwise return partially
++    /// filled mutation status with information about error (latest_fail*) and
++    /// is_done. mutation_ids filled with all mutations with same errors, because
++    /// they may be executed simultaneously as one mutation.
++    std::optional<MergeTreeMutationStatus> getIncompleteMutationsStatus(const String & znode_name, Strings * mutation_ids = nullptr) const;
++
+     std::vector<MergeTreeMutationStatus> getMutationsStatus() const;
+ 
+     void removeCurrentPartsFromMutations();
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index eecde28b7bbe..8f58fd0ba4d7 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -134,7 +134,7 @@ void StorageMergeTree::shutdown()
+ 
+     /// Unlock all waiting mutations
+     {
+-        std::lock_guard<std::mutex> lock(mutation_wait_mutex);
++        std::lock_guard lock(mutation_wait_mutex);
+         mutation_wait_event.notify_all();
+     }
+ 
+@@ -284,9 +284,6 @@ struct CurrentlyMergingPartsTagger
+     FutureMergedMutatedPart future_part;
+     ReservationPtr reserved_space;
+ 
+-    bool is_successful = false;
+-    String exception_message;
+-
+     StorageMergeTree & storage;
+ 
+ public:
+@@ -339,40 +336,6 @@ struct CurrentlyMergingPartsTagger
+             storage.currently_merging_mutating_parts.erase(part);
+         }
+ 
+-        /// Update the information about failed parts in the system.mutations table.
+-
+-        Int64 sources_data_version = future_part.parts.at(0)->info.getDataVersion();
+-        Int64 result_data_version = future_part.part_info.getDataVersion();
+-        auto mutations_begin_it = storage.current_mutations_by_version.end();
+-        auto mutations_end_it = storage.current_mutations_by_version.end();
+-        if (sources_data_version != result_data_version)
+-        {
+-            mutations_begin_it = storage.current_mutations_by_version.upper_bound(sources_data_version);
+-            mutations_end_it = storage.current_mutations_by_version.upper_bound(result_data_version);
+-        }
+-
+-        for (auto it = mutations_begin_it; it != mutations_end_it; ++it)
+-        {
+-            MergeTreeMutationEntry & entry = it->second;
+-            if (is_successful)
+-            {
+-                if (!entry.latest_failed_part.empty() && future_part.part_info.contains(entry.latest_failed_part_info))
+-                {
+-                    entry.latest_failed_part.clear();
+-                    entry.latest_failed_part_info = MergeTreePartInfo();
+-                    entry.latest_fail_time = 0;
+-                    entry.latest_fail_reason.clear();
+-                }
+-            }
+-            else
+-            {
+-                entry.latest_failed_part = future_part.parts.at(0)->name;
+-                entry.latest_failed_part_info = future_part.parts.at(0)->info;
+-                entry.latest_fail_time = time(nullptr);
+-                entry.latest_fail_reason = exception_message;
+-            }
+-        }
+-
+         storage.currently_processing_in_background_condition.notify_all();
+     }
+ };
+@@ -398,12 +361,66 @@ Int64 StorageMergeTree::startMutation(const MutationCommands & commands, String
+     return version;
+ }
+ 
++
++void StorageMergeTree::updateMutationEntriesErrors(FutureMergedMutatedPart result_part, bool is_successful, const String & exception_message)
++{
++    /// Update the information about failed parts in the system.mutations table.
++
++    Int64 sources_data_version = result_part.parts.at(0)->info.getDataVersion();
++    Int64 result_data_version = result_part.part_info.getDataVersion();
++    if (sources_data_version != result_data_version)
++    {
++        std::lock_guard lock(currently_processing_in_background_mutex);
++        auto mutations_begin_it = current_mutations_by_version.upper_bound(sources_data_version);
++        auto mutations_end_it = current_mutations_by_version.upper_bound(result_data_version);
++
++        for (auto it = mutations_begin_it; it != mutations_end_it; ++it)
++        {
++            MergeTreeMutationEntry & entry = it->second;
++            if (is_successful)
++            {
++                if (!entry.latest_failed_part.empty() && result_part.part_info.contains(entry.latest_failed_part_info))
++                {
++                    entry.latest_failed_part.clear();
++                    entry.latest_failed_part_info = MergeTreePartInfo();
++                    entry.latest_fail_time = 0;
++                    entry.latest_fail_reason.clear();
++                }
++            }
++            else
++            {
++                entry.latest_failed_part = result_part.parts.at(0)->name;
++                entry.latest_failed_part_info = result_part.parts.at(0)->info;
++                entry.latest_fail_time = time(nullptr);
++                entry.latest_fail_reason = exception_message;
++            }
++        }
++    }
++
++    std::unique_lock lock(mutation_wait_mutex);
++    mutation_wait_event.notify_all();
++}
++
+ void StorageMergeTree::waitForMutation(Int64 version, const String & file_name)
+ {
+     LOG_INFO(log, "Waiting mutation: {}", file_name);
+-    auto check = [version, this]() { return shutdown_called || isMutationDone(version); };
+-    std::unique_lock lock(mutation_wait_mutex);
+-    mutation_wait_event.wait(lock, check);
++    {
++        auto check = [version, this]()
++        {
++            if (shutdown_called)
++                return true;
++            auto mutation_status = getIncompleteMutationsStatus(version);
++            return !mutation_status || mutation_status->is_done || !mutation_status->latest_fail_reason.empty();
++        };
++
++        std::unique_lock lock(mutation_wait_mutex);
++        mutation_wait_event.wait(lock, check);
++    }
++
++    Strings mutation_ids;
++    auto mutation_status = getIncompleteMutationsStatus(version, &mutation_ids);
++    checkMutationStatus(mutation_status, mutation_ids);
++
+     LOG_INFO(log, "Mutation {} done", file_name);
+ }
+ 
+@@ -432,20 +449,50 @@ bool comparator(const PartVersionWithName & f, const PartVersionWithName & s)
+ 
+ }
+ 
+-
+-bool StorageMergeTree::isMutationDone(Int64 mutation_version) const
++std::optional<MergeTreeMutationStatus> StorageMergeTree::getIncompleteMutationsStatus(Int64 mutation_version, Strings * mutation_ids) const
+ {
+     std::lock_guard lock(currently_processing_in_background_mutex);
+ 
++    auto current_mutation_it = current_mutations_by_version.find(mutation_version);
+     /// Killed
+-    if (!current_mutations_by_version.count(mutation_version))
+-        return true;
++    if (current_mutation_it == current_mutations_by_version.end())
++        return {};
++
++    MergeTreeMutationStatus result{.is_done = false};
++
++    const auto & mutation_entry = current_mutation_it->second;
+ 
+     auto data_parts = getDataPartsVector();
+     for (const auto & data_part : data_parts)
++    {
+         if (data_part->info.getDataVersion() < mutation_version)
+-            return false;
+-    return true;
++        {
++
++            if (!mutation_entry.latest_fail_reason.empty())
++            {
++                result.latest_failed_part = mutation_entry.latest_failed_part;
++                result.latest_fail_reason = mutation_entry.latest_fail_reason;
++                result.latest_fail_time = mutation_entry.latest_fail_time;
++
++                /// Fill all mutations which failed with the same error
++                /// (we can execute several mutations together)
++                if (mutation_ids)
++                {
++                    auto mutations_begin_it = current_mutations_by_version.upper_bound(data_part->info.getDataVersion());
++
++                    for (auto it = mutations_begin_it; it != current_mutations_by_version.end(); ++it)
++                        /// All mutations with the same failure
++                        if (it->second.latest_fail_reason == result.latest_fail_reason)
++                            mutation_ids->push_back(it->second.file_name);
++                }
++            }
++
++            return result;
++        }
++    }
++
++    result.is_done = true;
++    return result;
+ }
+ 
+ 
+@@ -474,7 +521,6 @@ std::vector<MergeTreeMutationStatus> StorageMergeTree::getMutationsStatus() cons
+     std::vector<MergeTreeMutationStatus> result;
+     for (const auto & kv : current_mutations_by_version)
+     {
+-
+         Int64 mutation_version = kv.first;
+         const MergeTreeMutationEntry & entry = kv.second;
+         const PartVersionWithName needle{mutation_version, ""};
+@@ -500,7 +546,7 @@ std::vector<MergeTreeMutationStatus> StorageMergeTree::getMutationsStatus() cons
+                 entry.create_time,
+                 block_numbers_map,
+                 parts_to_do_names,
+-                parts_to_do_names.empty(),
++                /* is_done = */parts_to_do_names.empty(),
+                 entry.latest_failed_part,
+                 entry.latest_fail_time,
+                 entry.latest_fail_reason,
+@@ -686,12 +732,10 @@ bool StorageMergeTree::merge(
+             merging_tagger->reserved_space, deduplicate, force_ttl);
+ 
+         merger_mutator.renameMergedTemporaryPart(new_part, future_part.parts, nullptr);
+-        merging_tagger->is_successful = true;
+         write_part_log({});
+     }
+     catch (...)
+     {
+-        merging_tagger->exception_message = getCurrentExceptionMessage(false);
+         write_part_log(ExecutionStatus::fromCurrentException());
+         throw;
+     }
+@@ -828,18 +872,12 @@ bool StorageMergeTree::tryMutatePart()
+ 
+         renameTempPartAndReplace(new_part);
+ 
+-        tagger->is_successful = true;
++        updateMutationEntriesErrors(future_part, true, "");
+         write_part_log({});
+-
+-        /// Notify all, who wait for this or previous mutations
+-        {
+-            std::lock_guard<std::mutex> lock(mutation_wait_mutex);
+-            mutation_wait_event.notify_all();
+-        }
+     }
+     catch (...)
+     {
+-        tagger->exception_message = getCurrentExceptionMessage(false);
++        updateMutationEntriesErrors(future_part, false, getCurrentExceptionMessage(false));
+         write_part_log(ExecutionStatus::fromCurrentException());
+         throw;
+     }
+diff --git a/src/Storages/StorageMergeTree.h b/src/Storages/StorageMergeTree.h
+index c80c9f443778..4bc7a1fbd987 100644
+--- a/src/Storages/StorageMergeTree.h
++++ b/src/Storages/StorageMergeTree.h
+@@ -153,9 +153,16 @@ class StorageMergeTree final : public ext::shared_ptr_helper<StorageMergeTree>,
+     void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & context);
+     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, const Context & context);
+     bool partIsAssignedToBackgroundOperation(const DataPartPtr & part) const override;
+-
+-    /// Just checks versions of each active data part
+-    bool isMutationDone(Int64 mutation_version) const;
++    /// Update mutation entries after part mutation execution. May reset old
++    /// errors if mutation was successful. Otherwise update last_failed* fields
++    /// in mutation entries.
++    void updateMutationEntriesErrors(FutureMergedMutatedPart result_part, bool is_successful, const String & exception_message);
++
++    /// Return empty optional if mutation was killed. Otherwise return partially
++    /// filled mutation status with information about error (latest_fail*) and
++    /// is_done. mutation_ids filled with mutations with the same errors, because we
++    /// can execute several mutations at once
++    std::optional<MergeTreeMutationStatus> getIncompleteMutationsStatus(Int64 mutation_version, Strings * mutation_ids = nullptr) const;
+ 
+     void startBackgroundMovesIfNeeded() override;
+ 
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index c6dc3e67b807..4a9acdb74c0a 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -348,7 +348,6 @@ void StorageReplicatedMergeTree::waitMutationToFinishOnReplicas(
+     std::set<String> inactive_replicas;
+     for (const String & replica : replicas)
+     {
+-
+         LOG_DEBUG(log, "Waiting for {} to apply mutation {}", replica, mutation_id);
+ 
+         while (!partial_shutdown_called)
+@@ -358,8 +357,7 @@ void StorageReplicatedMergeTree::waitMutationToFinishOnReplicas(
+             Coordination::Stat exists_stat;
+             if (!getZooKeeper()->exists(zookeeper_path + "/mutations/" + mutation_id, &exists_stat, wait_event))
+             {
+-                LOG_WARNING(log, "Mutation {} was killed or manually removed. Nothing to wait.", mutation_id);
+-                return;
++                throw Exception(ErrorCodes::UNFINISHED, "Mutation {} was killed, manually removed or table was dropped", mutation_id);
+             }
+ 
+             auto zookeeper = getZooKeeper();
+@@ -387,8 +385,23 @@ void StorageReplicatedMergeTree::waitMutationToFinishOnReplicas(
+             /// Replica can become inactive, so wait with timeout and recheck it
+             if (wait_event->tryWait(1000))
+                 break;
++
++            auto mutation_status = queue.getIncompleteMutationsStatus(mutation_id);
++            if (!mutation_status || !mutation_status->latest_fail_reason.empty())
++                break;
+         }
+ 
++        /// It maybe already removed from zk, but local in-memory mutations
++        /// state was not update.
++        if (!getZooKeeper()->exists(zookeeper_path + "/mutations/" + mutation_id))
++        {
++            throw Exception(ErrorCodes::UNFINISHED, "Mutation {} was killed, manually removed or table was dropped", mutation_id);
++        }
++
++        Strings mutation_ids;
++        auto mutation_status = queue.getIncompleteMutationsStatus(mutation_id, &mutation_ids);
++        checkMutationStatus(mutation_status, mutation_ids);
++
+         if (partial_shutdown_called)
+             throw Exception("Mutation is not finished because table shutdown was called. It will be done after table restart.",
+                 ErrorCodes::UNFINISHED);
+diff --git a/src/Storages/ya.make b/src/Storages/ya.make
+index 632434e1dfcb..5f5ec87ba915 100644
+--- a/src/Storages/ya.make
++++ b/src/Storages/ya.make
+@@ -87,6 +87,7 @@ SRCS(
+     MergeTree/MergeTreeDataPartWriterOnDisk.cpp
+     MergeTree/MergeTreeReaderInMemory.cpp
+     MergeTree/MergeTreeWriteAheadLog.cpp
++    MergeTree/MergeTreeMutationStatus.cpp
+     System/attachSystemTables.cpp
+     System/StorageSystemAggregateFunctionCombinators.cpp
+     System/StorageSystemAsynchronousMetrics.cpp

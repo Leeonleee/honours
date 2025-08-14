@@ -1,0 +1,215 @@
+diff --git a/dbms/src/Interpreters/InterpreterExplainQuery.cpp b/dbms/src/Interpreters/InterpreterExplainQuery.cpp
+index fd97841a55d2..d6272a08f71a 100644
+--- a/dbms/src/Interpreters/InterpreterExplainQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterExplainQuery.cpp
+@@ -3,19 +3,91 @@
+ #include <DataStreams/BlockIO.h>
+ #include <DataStreams/OneBlockInputStream.h>
+ #include <DataTypes/DataTypeString.h>
++#include <Interpreters/InDepthNodeVisitor.h>
++#include <Interpreters/IdentifierSemantic.h>
++#include <Interpreters/getTableExpressions.h>
+ #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+-#include <Parsers/ASTExplainQuery.h>
+ #include <Parsers/DumpASTNode.h>
++#include <Parsers/ASTSubquery.h>
+ #include <Parsers/queryToString.h>
+-#include <Common/typeid_cast.h>
+-#include <Core/Field.h>
++#include <Parsers/ASTIdentifier.h>
++#include <Parsers/ASTExplainQuery.h>
++#include <Parsers/ASTTablesInSelectQuery.h>
++#include <Parsers/ASTSelectWithUnionQuery.h>
+ 
++#include <Core/Field.h>
++#include <Common/typeid_cast.h>
++#include <Storages/StorageView.h>
+ #include <sstream>
+ 
+ 
+ namespace DB
+ {
+ 
++namespace
++{
++    struct ExplainAnalyzedSyntaxMatcher
++    {
++        struct Data
++        {
++            bool analyzed = false;
++            const Context & context;
++        };
++
++        static bool needChildVisit(ASTPtr &, ASTPtr &) { return true; }
++
++        static void visit(ASTPtr & ast, Data & data)
++        {
++            if (auto * select_query = ast->as<ASTSelectQuery>())
++                visit(*select_query, ast, data);
++            if (auto * union_select_query = ast->as<ASTSelectWithUnionQuery>())
++                visit(*union_select_query, ast, data);
++        }
++
++        static void visit(ASTSelectQuery & select_query, ASTPtr &, Data & data)
++        {
++            if (!select_query.tables())
++                return;
++
++            for (const auto & child : select_query.tables()->children)
++            {
++                auto * tables_element = child->as<ASTTablesInSelectQueryElement>();
++
++                if (tables_element && tables_element->table_expression)
++                    visit(*tables_element->table_expression->as<ASTTableExpression>(), select_query, data);
++            }
++        }
++
++        static void visit(ASTSelectWithUnionQuery &, ASTPtr & node, Data & data)
++        {
++            if (!data.analyzed)
++            {
++                data.analyzed = true;
++                InterpreterSelectWithUnionQuery interpreter(
++                    node, data.context, SelectQueryOptions(QueryProcessingStage::FetchColumns).analyze().modify());
++            }
++        }
++
++        static void visit(ASTTableExpression & expression, ASTSelectQuery & select_query, Data & data)
++        {
++            if (data.context.getSettingsRef().enable_optimize_predicate_expression && expression.database_and_table_name)
++            {
++                if (const auto * identifier = expression.database_and_table_name->as<ASTIdentifier>())
++                {
++                    const auto & [database, table] = IdentifierSemantic::extractDatabaseAndTable(*identifier);
++                    const auto & storage = data.context.getTable(database.empty() ? data.context.getCurrentDatabase() : database, table);
++
++                    if (auto * storage_view = dynamic_cast<StorageView *>(storage.get()))
++                        storage_view->getRuntimeViewQuery(&select_query, data.context, true);
++                }
++            }
++        }
++    };
++
++    using ExplainAnalyzedSyntaxVisitor = InDepthNodeVisitor<ExplainAnalyzedSyntaxMatcher, true>;
++
++}
++
+ BlockIO InterpreterExplainQuery::execute()
+ {
+     BlockIO res;
+@@ -52,10 +124,10 @@ BlockInputStreamPtr InterpreterExplainQuery::executeImpl()
+     }
+     else if (ast.getKind() == ASTExplainQuery::AnalyzedSyntax)
+     {
+-        InterpreterSelectWithUnionQuery interpreter(ast.children.at(0), context,
+-            SelectQueryOptions(QueryProcessingStage::FetchColumns).analyze().modify());
++        ExplainAnalyzedSyntaxVisitor::Data data{.context = context};
++        ExplainAnalyzedSyntaxVisitor(data).visit(query);
+ 
+-        interpreter.getQuery()->format(IAST::FormatSettings(ss, false));
++        ast.children.at(0)->format(IAST::FormatSettings(ss, false));
+     }
+ 
+     res_columns[0]->insert(ss.str());
+diff --git a/dbms/src/Storages/StorageView.cpp b/dbms/src/Storages/StorageView.cpp
+index 8ac8a696ec75..47f74c8aad6f 100644
+--- a/dbms/src/Storages/StorageView.cpp
++++ b/dbms/src/Storages/StorageView.cpp
+@@ -60,31 +60,7 @@ Pipes StorageView::read(
+     ASTPtr current_inner_query = inner_query;
+ 
+     if (context.getSettings().enable_optimize_predicate_expression)
+-    {
+-        auto new_inner_query = inner_query->clone();
+-        auto new_outer_query = query_info.query->clone();
+-        auto * new_outer_select = new_outer_query->as<ASTSelectQuery>();
+-
+-        replaceTableNameWithSubquery(new_outer_select, new_inner_query);
+-
+-        /// TODO: remove getTableExpressions and getTablesWithColumns
+-        {
+-            const auto & table_expressions = getTableExpressions(*new_outer_select);
+-            const auto & tables_with_columns = getDatabaseAndTablesWithColumnNames(table_expressions, context);
+-
+-            auto & settings = context.getSettingsRef();
+-            if (settings.joined_subquery_requires_alias && tables_with_columns.size() > 1)
+-            {
+-                for (auto & pr : tables_with_columns)
+-                    if (pr.table.table.empty() && pr.table.alias.empty())
+-                        throw Exception("Not unique subquery in FROM requires an alias (or joined_subquery_requires_alias=0 to disable restriction).",
+-                            ErrorCodes::ALIAS_REQUIRED);
+-            }
+-
+-            if (PredicateExpressionsOptimizer(context, tables_with_columns, context.getSettings()).optimize(*new_outer_select))
+-                current_inner_query = new_inner_query;
+-        }
+-    }
++        current_inner_query = getRuntimeViewQuery(*query_info.query->as<const ASTSelectQuery>(), context);
+ 
+     QueryPipeline pipeline;
+     InterpreterSelectWithUnionQuery interpreter(current_inner_query, context, {}, column_names);
+@@ -107,6 +83,41 @@ Pipes StorageView::read(
+     return pipes;
+ }
+ 
++ASTPtr StorageView::getRuntimeViewQuery(const ASTSelectQuery & outer_query, const Context & context)
++{
++    auto temp_outer_query = outer_query.clone();
++    auto * new_outer_select = temp_outer_query->as<ASTSelectQuery>();
++    return getRuntimeViewQuery(new_outer_select, context, false);
++}
++
++
++
++ASTPtr StorageView::getRuntimeViewQuery(ASTSelectQuery * outer_query, const Context & context, bool normalize)
++{
++    auto runtime_view_query = inner_query->clone();
++
++    /// TODO: remove getTableExpressions and getTablesWithColumns
++    {
++        const auto & table_expressions = getTableExpressions(*outer_query);
++        const auto & tables_with_columns = getDatabaseAndTablesWithColumnNames(table_expressions, context);
++
++        replaceTableNameWithSubquery(outer_query, runtime_view_query);
++        if (context.getSettingsRef().joined_subquery_requires_alias && tables_with_columns.size() > 1)
++        {
++            for (auto & pr : tables_with_columns)
++                if (pr.table.table.empty() && pr.table.alias.empty())
++                    throw Exception("Not unique subquery in FROM requires an alias (or joined_subquery_requires_alias=0 to disable restriction).",
++                                    ErrorCodes::ALIAS_REQUIRED);
++        }
++
++        if (PredicateExpressionsOptimizer(context, tables_with_columns, context.getSettings()).optimize(*outer_query) && normalize)
++            InterpreterSelectWithUnionQuery(
++                runtime_view_query, context, SelectQueryOptions(QueryProcessingStage::FetchColumns).analyze().modify(), {});
++    }
++
++    return runtime_view_query;
++}
++
+ void StorageView::replaceTableNameWithSubquery(ASTSelectQuery * select_query, ASTPtr & subquery)
+ {
+     auto * select_element = select_query->tables()->children[0]->as<ASTTablesInSelectQueryElement>();
+@@ -123,6 +134,7 @@ void StorageView::replaceTableNameWithSubquery(ASTSelectQuery * select_query, AS
+     table_expression->database_and_table_name = {};
+     table_expression->subquery = std::make_shared<ASTSubquery>();
+     table_expression->subquery->children.push_back(subquery);
++    table_expression->children.push_back(table_expression->subquery);
+     if (!alias.empty())
+         table_expression->subquery->setAlias(alias);
+ }
+diff --git a/dbms/src/Storages/StorageView.h b/dbms/src/Storages/StorageView.h
+index 6b4bfd48ccc4..0e1e90ff612b 100644
+--- a/dbms/src/Storages/StorageView.h
++++ b/dbms/src/Storages/StorageView.h
+@@ -29,6 +29,10 @@ class StorageView : public ext::shared_ptr_helper<StorageView>, public IStorage
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
++    ASTPtr getRuntimeViewQuery(const ASTSelectQuery & outer_query, const Context & context);
++
++    ASTPtr getRuntimeViewQuery(ASTSelectQuery * outer_query, const Context & context, bool normalize);
++
+ private:
+     ASTPtr inner_query;
+ 

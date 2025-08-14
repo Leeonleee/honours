@@ -1,0 +1,306 @@
+diff --git a/src/Databases/DatabaseReplicated.cpp b/src/Databases/DatabaseReplicated.cpp
+index 2c433c790339..ac6c525af68f 100644
+--- a/src/Databases/DatabaseReplicated.cpp
++++ b/src/Databases/DatabaseReplicated.cpp
+@@ -40,6 +40,7 @@ namespace ErrorCodes
+     extern const int NOT_IMPLEMENTED;
+     extern const int INCORRECT_QUERY;
+     extern const int ALL_CONNECTION_TRIES_FAILED;
++    extern const int NO_ACTIVE_REPLICAS;
+ }
+ 
+ static constexpr const char * DROPPED_MARK = "DROPPED";
+@@ -137,7 +138,9 @@ ClusterPtr DatabaseReplicated::getClusterImpl() const
+         Coordination::Stat stat;
+         hosts = zookeeper->getChildren(zookeeper_path + "/replicas", &stat);
+         if (hosts.empty())
+-            throw Exception(ErrorCodes::LOGICAL_ERROR, "No hosts found");
++            throw Exception(ErrorCodes::NO_ACTIVE_REPLICAS, "No replicas of database {} found. "
++                            "It's possible if the first replica is not fully created yet "
++                            "or if the last replica was just dropped or due to logical error", database_name);
+         Int32 cversion = stat.cversion;
+         std::sort(hosts.begin(), hosts.end());
+ 
+@@ -514,6 +517,19 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+         }
+     }
+ 
++    auto make_query_context = [this, current_zookeeper]()
++    {
++        auto query_context = Context::createCopy(getContext());
++        query_context->makeQueryContext();
++        query_context->getClientInfo().query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
++        query_context->getClientInfo().is_replicated_database_internal = true;
++        query_context->setCurrentDatabase(database_name);
++        query_context->setCurrentQueryId("");
++        auto txn = std::make_shared<ZooKeeperMetadataTransaction>(current_zookeeper, zookeeper_path, false);
++        query_context->initZooKeeperMetadataTransaction(txn);
++        return query_context;
++    };
++
+     String db_name = getDatabaseName();
+     String to_db_name = getDatabaseName() + BROKEN_TABLES_SUFFIX;
+     if (total_tables * db_settings.max_broken_tables_ratio < tables_to_detach.size())
+@@ -548,7 +564,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+             dropped_dictionaries += table->isDictionary();
+ 
+             table->flushAndShutdown();
+-            DatabaseAtomic::dropTable(getContext(), table_name, true);
++            DatabaseAtomic::dropTable(make_query_context(), table_name, true);
+         }
+         else
+         {
+@@ -558,7 +574,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+             assert(db_name < to_db_name);
+             DDLGuardPtr to_table_guard = DatabaseCatalog::instance().getDDLGuard(to_db_name, to_name);
+             auto to_db_ptr = DatabaseCatalog::instance().getDatabase(to_db_name);
+-            DatabaseAtomic::renameTable(getContext(), table_name, *to_db_ptr, to_name, false, false);
++            DatabaseAtomic::renameTable(make_query_context(), table_name, *to_db_ptr, to_name, false, false);
+             ++moved_tables;
+         }
+     }
+@@ -577,7 +593,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+         /// TODO Maybe we should do it in two steps: rename all tables to temporary names and then rename them to actual names?
+         DDLGuardPtr table_guard = DatabaseCatalog::instance().getDDLGuard(db_name, std::min(from, to));
+         DDLGuardPtr to_table_guard = DatabaseCatalog::instance().getDDLGuard(db_name, std::max(from, to));
+-        DatabaseAtomic::renameTable(getContext(), from, *this, to, false, false);
++        DatabaseAtomic::renameTable(make_query_context(), from, *this, to, false, false);
+     }
+ 
+     for (const auto & id : dropped_tables)
+@@ -592,15 +608,9 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+         }
+ 
+         auto query_ast = parseQueryFromMetadataInZooKeeper(name_and_meta.first, name_and_meta.second);
+-
+-        auto query_context = Context::createCopy(getContext());
+-        query_context->makeQueryContext();
+-        query_context->getClientInfo().query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
+-        query_context->setCurrentDatabase(database_name);
+-        query_context->setCurrentQueryId(""); // generate random query_id
+-
+         LOG_INFO(log, "Executing {}", serializeAST(*query_ast));
+-        InterpreterCreateQuery(query_ast, query_context).execute();
++        auto create_query_context = make_query_context();
++        InterpreterCreateQuery(query_ast, create_query_context).execute();
+     }
+ 
+     current_zookeeper->set(replica_path + "/log_ptr", toString(max_log_ptr));
+diff --git a/src/Databases/DatabaseReplicatedWorker.cpp b/src/Databases/DatabaseReplicatedWorker.cpp
+index eb7e65e1b709..365a5d028165 100644
+--- a/src/Databases/DatabaseReplicatedWorker.cpp
++++ b/src/Databases/DatabaseReplicatedWorker.cpp
+@@ -60,12 +60,13 @@ void DatabaseReplicatedDDLWorker::initializeReplication()
+     /// Check if we need to recover replica.
+     /// Invariant: replica is lost if it's log_ptr value is less then max_log_ptr - logs_to_keep.
+ 
+-    String log_ptr_str = current_zookeeper->get(database->replica_path + "/log_ptr");
++    auto zookeeper = getAndSetZooKeeper();
++    String log_ptr_str = zookeeper->get(database->replica_path + "/log_ptr");
+     UInt32 our_log_ptr = parse<UInt32>(log_ptr_str);
+-    UInt32 max_log_ptr = parse<UInt32>(current_zookeeper->get(database->zookeeper_path + "/max_log_ptr"));
+-    logs_to_keep = parse<UInt32>(current_zookeeper->get(database->zookeeper_path + "/logs_to_keep"));
++    UInt32 max_log_ptr = parse<UInt32>(zookeeper->get(database->zookeeper_path + "/max_log_ptr"));
++    logs_to_keep = parse<UInt32>(zookeeper->get(database->zookeeper_path + "/logs_to_keep"));
+     if (our_log_ptr == 0 || our_log_ptr + logs_to_keep < max_log_ptr)
+-        database->recoverLostReplica(current_zookeeper, our_log_ptr, max_log_ptr);
++        database->recoverLostReplica(zookeeper, our_log_ptr, max_log_ptr);
+     else
+         last_skipped_entry_name.emplace(DDLTaskBase::getLogEntryName(our_log_ptr));
+ }
+@@ -198,7 +199,7 @@ DDLTaskPtr DatabaseReplicatedDDLWorker::initAndCheckTask(const String & entry_na
+         }
+     }
+ 
+-    UInt32 our_log_ptr = parse<UInt32>(current_zookeeper->get(fs::path(database->replica_path) / "log_ptr"));
++    UInt32 our_log_ptr = parse<UInt32>(zookeeper->get(fs::path(database->replica_path) / "log_ptr"));
+     UInt32 entry_num = DatabaseReplicatedTask::getLogEntryNumber(entry_name);
+ 
+     if (entry_num <= our_log_ptr)
+diff --git a/src/Interpreters/ClientInfo.h b/src/Interpreters/ClientInfo.h
+index d6158a2d7d52..7c169e6ebb50 100644
+--- a/src/Interpreters/ClientInfo.h
++++ b/src/Interpreters/ClientInfo.h
+@@ -100,6 +100,8 @@ class ClientInfo
+ 
+     UInt64 distributed_depth = 0;
+ 
++    bool is_replicated_database_internal = false;
++
+     bool empty() const { return query_kind == QueryKind::NO_QUERY; }
+ 
+     /** Serialization and deserialization.
+diff --git a/src/Interpreters/DDLTask.cpp b/src/Interpreters/DDLTask.cpp
+index 4fb44738d8d9..8bebc2fb442b 100644
+--- a/src/Interpreters/DDLTask.cpp
++++ b/src/Interpreters/DDLTask.cpp
+@@ -359,6 +359,7 @@ ContextMutablePtr DatabaseReplicatedTask::makeQueryContext(ContextPtr from_conte
+ {
+     auto query_context = DDLTaskBase::makeQueryContext(from_context, zookeeper);
+     query_context->getClientInfo().query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
++    query_context->getClientInfo().is_replicated_database_internal = true;
+     query_context->setCurrentDatabase(database->getDatabaseName());
+ 
+     auto txn = std::make_shared<ZooKeeperMetadataTransaction>(zookeeper, database->zookeeper_path, is_initial_query);
+diff --git a/src/Interpreters/DDLTask.h b/src/Interpreters/DDLTask.h
+index 703d691a3586..41ab9ec80584 100644
+--- a/src/Interpreters/DDLTask.h
++++ b/src/Interpreters/DDLTask.h
+@@ -196,7 +196,7 @@ class ZooKeeperMetadataTransaction
+ 
+     void commit();
+ 
+-    ~ZooKeeperMetadataTransaction() { assert(isExecuted() || std::uncaught_exceptions()); }
++    ~ZooKeeperMetadataTransaction() { assert(isExecuted() || std::uncaught_exceptions() || ops.empty()); }
+ };
+ 
+ ClusterPtr tryGetReplicatedDatabaseCluster(const String & cluster_name);
+diff --git a/src/Interpreters/InterpreterAlterQuery.cpp b/src/Interpreters/InterpreterAlterQuery.cpp
+index 6f0af049d05c..76e7afb7009d 100644
+--- a/src/Interpreters/InterpreterAlterQuery.cpp
++++ b/src/Interpreters/InterpreterAlterQuery.cpp
+@@ -54,7 +54,7 @@ BlockIO InterpreterAlterQuery::execute()
+ 
+     DatabasePtr database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
+     if (typeid_cast<DatabaseReplicated *>(database.get())
+-        && getContext()->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
++        && !getContext()->getClientInfo().is_replicated_database_internal)
+     {
+         auto guard = DatabaseCatalog::instance().getDDLGuard(table_id.database_name, table_id.table_name);
+         guard->releaseTableLock();
+@@ -100,7 +100,8 @@ BlockIO InterpreterAlterQuery::execute()
+     if (typeid_cast<DatabaseReplicated *>(database.get()))
+     {
+         int command_types_count = !mutation_commands.empty() + !partition_commands.empty() + !live_view_commands.empty() + !alter_commands.empty();
+-        if (1 < command_types_count)
++        bool mixed_settings_amd_metadata_alter = alter_commands.hasSettingsAlterCommand() && !alter_commands.isSettingsAlter();
++        if (1 < command_types_count || mixed_settings_amd_metadata_alter)
+             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "For Replicated databases it's not allowed "
+                                                          "to execute ALTERs of different types in single query");
+     }
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index 1f7e239b5042..b3cbfdcd035c 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -856,7 +856,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+             auto guard = DatabaseCatalog::instance().getDDLGuard(database_name, create.table);
+ 
+             if (auto* ptr = typeid_cast<DatabaseReplicated *>(database.get());
+-                ptr && getContext()->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
++                ptr && !getContext()->getClientInfo().is_replicated_database_internal)
+             {
+                 create.database = database_name;
+                 guard->releaseTableLock();
+@@ -950,7 +950,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+         auto guard = DatabaseCatalog::instance().getDDLGuard(create.database, create.table);
+ 
+         if (auto * ptr = typeid_cast<DatabaseReplicated *>(database.get());
+-            ptr && getContext()->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
++            ptr && !getContext()->getClientInfo().is_replicated_database_internal)
+         {
+             assertOrSetUUID(create, database);
+             guard->releaseTableLock();
+diff --git a/src/Interpreters/InterpreterDropQuery.cpp b/src/Interpreters/InterpreterDropQuery.cpp
+index d5f6c3260c32..0e15c6be27cf 100644
+--- a/src/Interpreters/InterpreterDropQuery.cpp
++++ b/src/Interpreters/InterpreterDropQuery.cpp
+@@ -133,7 +133,7 @@ BlockIO InterpreterDropQuery::executeToTableImpl(ASTDropQuery & query, DatabaseP
+         /// Prevents recursive drop from drop database query. The original query must specify a table.
+         bool is_drop_or_detach_database = query_ptr->as<ASTDropQuery>()->table.empty();
+         bool is_replicated_ddl_query = typeid_cast<DatabaseReplicated *>(database.get()) &&
+-                                       getContext()->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY &&
++                                       !getContext()->getClientInfo().is_replicated_database_internal &&
+                                        !is_drop_or_detach_database;
+ 
+         AccessFlags drop_storage;
+@@ -426,6 +426,7 @@ void InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind kind, ContextPtr
+         if (auto txn = current_context->getZooKeeperMetadataTransaction())
+         {
+             /// For Replicated database
++            drop_context->getClientInfo().is_replicated_database_internal = true;
+             drop_context->setQueryContext(std::const_pointer_cast<Context>(current_context));
+             drop_context->initZooKeeperMetadataTransaction(txn, true);
+         }
+diff --git a/src/Interpreters/InterpreterRenameQuery.cpp b/src/Interpreters/InterpreterRenameQuery.cpp
+index 515559ad903c..373953e75308 100644
+--- a/src/Interpreters/InterpreterRenameQuery.cpp
++++ b/src/Interpreters/InterpreterRenameQuery.cpp
+@@ -81,7 +81,7 @@ BlockIO InterpreterRenameQuery::executeToTables(const ASTRenameQuery & rename, c
+ 
+         DatabasePtr database = database_catalog.getDatabase(elem.from_database_name);
+         if (typeid_cast<DatabaseReplicated *>(database.get())
+-            && getContext()->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
++            && !getContext()->getClientInfo().is_replicated_database_internal)
+         {
+             if (1 < descriptions.size())
+                 throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Database {} is Replicated, "
+diff --git a/src/Storages/AlterCommands.cpp b/src/Storages/AlterCommands.cpp
+index 9e9510b51a44..1bb8e6bb9b00 100644
+--- a/src/Storages/AlterCommands.cpp
++++ b/src/Storages/AlterCommands.cpp
+@@ -1276,6 +1276,11 @@ void AlterCommands::validate(const StorageInMemoryMetadata & metadata, ContextPt
+     validateColumnsDefaultsAndGetSampleBlock(default_expr_list, all_columns.getAll(), context);
+ }
+ 
++bool AlterCommands::hasSettingsAlterCommand() const
++{
++    return std::any_of(begin(), end(), [](const AlterCommand & c) { return c.isSettingsAlter(); });
++}
++
+ bool AlterCommands::isSettingsAlter() const
+ {
+     return std::all_of(begin(), end(), [](const AlterCommand & c) { return c.isSettingsAlter(); });
+diff --git a/src/Storages/AlterCommands.h b/src/Storages/AlterCommands.h
+index 6987de68f9c4..60f4ad7d552d 100644
+--- a/src/Storages/AlterCommands.h
++++ b/src/Storages/AlterCommands.h
+@@ -195,9 +195,12 @@ class AlterCommands : public std::vector<AlterCommand>
+     void apply(StorageInMemoryMetadata & metadata, ContextPtr context) const;
+ 
+     /// At least one command modify settings.
++    bool hasSettingsAlterCommand() const;
++
++    /// All commands modify settings only.
+     bool isSettingsAlter() const;
+ 
+-    /// At least one command modify comments.
++    /// All commands modify comments only.
+     bool isCommentAlter() const;
+ 
+     /// Return mutation commands which some storages may execute as part of
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 8b6267943bd3..0049f28e5681 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -4972,6 +4972,8 @@ void StorageReplicatedMergeTree::alter(
+ 
+         if (auto txn = query_context->getZooKeeperMetadataTransaction())
+         {
++            /// It would be better to clone ops instead of moving, so we could retry on ZBADVERSION,
++            /// but clone() is not implemented for Coordination::Request.
+             txn->moveOpsTo(ops);
+             /// NOTE: IDatabase::alterTable(...) is called when executing ALTER_METADATA queue entry without query context,
+             /// so we have to update metadata of DatabaseReplicated here.
+@@ -5015,6 +5017,11 @@ void StorageReplicatedMergeTree::alter(
+                 throw Exception("Metadata on replica is not up to date with common metadata in Zookeeper. Cannot alter",
+                     ErrorCodes::CANNOT_ASSIGN_ALTER);
+ 
++            /// Cannot retry automatically, because some zookeeper ops were lost on the first attempt. Will retry on DDLWorker-level.
++            if (query_context->getZooKeeperMetadataTransaction())
++                throw Exception("Cannot execute alter, because mutations version was suddenly changed due to concurrent alter",
++                                ErrorCodes::CANNOT_ASSIGN_ALTER);
++
+             continue;
+         }
+         else
+@@ -6007,6 +6014,10 @@ void StorageReplicatedMergeTree::mutate(const MutationCommands & commands, Conte
+         }
+         else if (rc == Coordination::Error::ZBADVERSION)
+         {
++            /// Cannot retry automatically, because some zookeeper ops were lost on the first attempt. Will retry on DDLWorker-level.
++            if (query_context->getZooKeeperMetadataTransaction())
++                throw Exception("Cannot execute alter, because mutations version was suddenly changed due to concurrent alter",
++                                ErrorCodes::CANNOT_ASSIGN_ALTER);
+             LOG_TRACE(log, "Version conflict when trying to create a mutation node, retrying...");
+             continue;
+         }

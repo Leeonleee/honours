@@ -1,0 +1,1094 @@
+diff --git a/programs/server/config.xml b/programs/server/config.xml
+index ca57987d9018..ba9b8b04b05d 100644
+--- a/programs/server/config.xml
++++ b/programs/server/config.xml
+@@ -284,6 +284,10 @@
+          In bytes. Cache is single for server. Memory is allocated only on demand.
+          Cache is used when 'use_uncompressed_cache' user setting turned on (off by default).
+          Uncompressed cache is advantageous only for very short queries and in rare cases.
++
++         Note: uncompressed cache can be pointless for lz4, because memory bandwidth
++         is slower than multi-core decompression on some server configurations.
++         Enabling it can sometimes paradoxically make queries slower.
+       -->
+     <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+ 
+diff --git a/programs/server/users.xml b/programs/server/users.xml
+index 3223d855651e..ef66891a6a03 100644
+--- a/programs/server/users.xml
++++ b/programs/server/users.xml
+@@ -7,9 +7,6 @@
+             <!-- Maximum memory usage for processing single query, in bytes. -->
+             <max_memory_usage>10000000000</max_memory_usage>
+ 
+-            <!-- Use cache of uncompressed blocks of data. Meaningful only for processing many of very short queries. -->
+-            <use_uncompressed_cache>0</use_uncompressed_cache>
+-
+             <!-- How to choose between replicas during distributed query processing.
+                  random - choose random replica from set of replicas with minimum number of errors
+                  nearest_hostname - from set of replicas with minimum number of errors, choose replica
+diff --git a/src/Columns/ColumnArray.cpp b/src/Columns/ColumnArray.cpp
+index 8c0e06424e71..e8a486724350 100644
+--- a/src/Columns/ColumnArray.cpp
++++ b/src/Columns/ColumnArray.cpp
+@@ -7,6 +7,7 @@
+ #include <Columns/ColumnNullable.h>
+ #include <Columns/ColumnConst.h>
+ #include <Columns/ColumnsCommon.h>
++#include <Columns/ColumnCompressed.h>
+ 
+ #include <common/unaligned.h>
+ #include <common/sort.h>
+@@ -369,8 +370,12 @@ void ColumnArray::compareColumn(const IColumn & rhs, size_t rhs_row_num,
+                                         compare_results, direction, nan_direction_hint);
+ }
+ 
++
++namespace
++{
++
+ template <bool positive>
+-struct ColumnArray::Cmp
++struct Cmp
+ {
+     const ColumnArray & parent;
+     int nan_direction_hint;
+@@ -390,6 +395,9 @@ struct ColumnArray::Cmp
+     }
+ };
+ 
++}
++
++
+ void ColumnArray::reserve(size_t n)
+ {
+     getOffsets().reserve(n);
+@@ -912,6 +920,21 @@ void ColumnArray::updatePermutationWithCollation(const Collator & collator, bool
+         updatePermutationImpl(limit, res, equal_range, Cmp<true>(*this, nan_direction_hint, &collator));
+ }
+ 
++ColumnPtr ColumnArray::compress() const
++{
++    ColumnPtr data_compressed = data->compress();
++    ColumnPtr offsets_compressed = offsets->compress();
++
++    size_t byte_size = data_compressed->byteSize() + offsets_compressed->byteSize();
++
++    return ColumnCompressed::create(size(), byte_size,
++        [data_compressed = std::move(data_compressed), offsets_compressed = std::move(offsets_compressed)]
++        {
++            return ColumnArray::create(data_compressed->decompress(), offsets_compressed->decompress());
++        });
++}
++
++
+ ColumnPtr ColumnArray::replicate(const Offsets & replicate_offsets) const
+ {
+     if (replicate_offsets.empty())
+diff --git a/src/Columns/ColumnArray.h b/src/Columns/ColumnArray.h
+index e81ecbc1ca02..1caaf672d498 100644
+--- a/src/Columns/ColumnArray.h
++++ b/src/Columns/ColumnArray.h
+@@ -123,6 +123,8 @@ class ColumnArray final : public COWHelper<IColumn, ColumnArray>
+ 
+     void gather(ColumnGathererStream & gatherer_stream) override;
+ 
++    ColumnPtr compress() const override;
++
+     void forEachSubcolumn(ColumnCallback callback) override
+     {
+         callback(offsets);
+@@ -183,9 +185,6 @@ class ColumnArray final : public COWHelper<IColumn, ColumnArray>
+ 
+     template <typename Comparator>
+     void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_range, Comparator cmp) const;
+-
+-    template <bool positive>
+-    struct Cmp;
+ };
+ 
+ 
+diff --git a/src/Columns/ColumnCompressed.cpp b/src/Columns/ColumnCompressed.cpp
+new file mode 100644
+index 000000000000..292c6968b866
+--- /dev/null
++++ b/src/Columns/ColumnCompressed.cpp
+@@ -0,0 +1,61 @@
++#include <Columns/ColumnCompressed.h>
++
++#pragma GCC diagnostic ignored "-Wold-style-cast"
++
++#include <lz4.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int CANNOT_COMPRESS;
++    extern const int CANNOT_DECOMPRESS;
++}
++
++
++std::shared_ptr<Memory<>> ColumnCompressed::compressBuffer(const void * data, size_t data_size, bool always_compress)
++{
++    size_t max_dest_size = LZ4_COMPRESSBOUND(data_size);
++
++    if (max_dest_size > std::numeric_limits<int>::max())
++        throw Exception(ErrorCodes::CANNOT_COMPRESS, "Cannot compress column of size {}", formatReadableSizeWithBinarySuffix(data_size));
++
++    Memory<> compressed(max_dest_size);
++
++    auto compressed_size = LZ4_compress_default(
++        reinterpret_cast<const char *>(data),
++        compressed.data(),
++        data_size,
++        max_dest_size);
++
++    if (compressed_size <= 0)
++        throw Exception(ErrorCodes::CANNOT_COMPRESS, "Cannot compress column");
++
++    /// If compression is inefficient.
++    if (!always_compress && static_cast<size_t>(compressed_size) * 2 > data_size)
++        return {};
++
++    /// Shrink to fit.
++    auto shrank = std::make_shared<Memory<>>(compressed_size);
++    memcpy(shrank->data(), compressed.data(), compressed_size);
++
++    return shrank;
++}
++
++
++void ColumnCompressed::decompressBuffer(
++    const void * compressed_data, void * decompressed_data, size_t compressed_size, size_t decompressed_size)
++{
++    auto processed_size = LZ4_decompress_safe(
++        reinterpret_cast<const char *>(compressed_data),
++        reinterpret_cast<char *>(decompressed_data),
++        compressed_size,
++        decompressed_size);
++
++    if (processed_size <= 0)
++        throw Exception(ErrorCodes::CANNOT_DECOMPRESS, "Cannot decompress column");
++}
++
++}
+diff --git a/src/Columns/ColumnCompressed.h b/src/Columns/ColumnCompressed.h
+new file mode 100644
+index 000000000000..f6b6bf22177f
+--- /dev/null
++++ b/src/Columns/ColumnCompressed.h
+@@ -0,0 +1,121 @@
++#pragma once
++
++#include <optional>
++#include <Core/Field.h>
++#include <Columns/IColumn.h>
++#include <IO/BufferWithOwnMemory.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++
++
++/** Wrapper for compressed column data.
++  * The only supported operations are:
++  * - decompress (reconstruct the source column)
++  * - get size in rows or bytes.
++  *
++  * It is needed to implement in-memory compression
++  * - to keep compressed data in Block or pass around.
++  *
++  * It's often beneficial to store compressed data in-memory and decompress on the fly
++  * because it allows to lower memory throughput. More specifically, if:
++  *
++  * decompression speed * num CPU cores >= memory read throughput
++  *
++  * Also in-memory compression allows to keep more data in RAM.
++  */
++class ColumnCompressed : public COWHelper<IColumn, ColumnCompressed>
++{
++public:
++    using Lazy = std::function<ColumnPtr()>;
++
++    ColumnCompressed(size_t rows_, size_t bytes_, Lazy lazy_)
++        : rows(rows_), bytes(bytes_), lazy(lazy_)
++    {
++    }
++
++    const char * getFamilyName() const override { return "Compressed"; }
++
++    size_t size() const override { return rows; }
++    size_t byteSize() const override { return bytes; }
++    size_t allocatedBytes() const override { return bytes; }
++
++    ColumnPtr decompress() const override
++    {
++        return lazy();
++    }
++
++    /** Wrap uncompressed column without compression.
++      * Method can be used when compression is not worth doing.
++      * But returning CompressedColumn is still needed to keep uniform block structure.
++      */
++    static ColumnPtr wrap(ColumnPtr column)
++    {
++        return ColumnCompressed::create(
++            column->size(),
++            column->allocatedBytes(),
++            [column = std::move(column)]{ return column; });
++    }
++
++    /// Helper methods for compression.
++
++    /// If data is not worth to be compressed and not 'always_compress' - returns nullptr.
++    /// Note: shared_ptr is to allow to be captured by std::function.
++    static std::shared_ptr<Memory<>> compressBuffer(const void * data, size_t data_size, bool always_compress);
++
++    static void decompressBuffer(
++        const void * compressed_data, void * decompressed_data, size_t compressed_size, size_t decompressed_size);
++
++    /// All other methods throw exception.
++
++    TypeIndex getDataType() const override { throwMustBeDecompressed(); }
++    Field operator[](size_t) const override { throwMustBeDecompressed(); }
++    void get(size_t, Field &) const override { throwMustBeDecompressed(); }
++    StringRef getDataAt(size_t) const override { throwMustBeDecompressed(); }
++    void insert(const Field &) override { throwMustBeDecompressed(); }
++    void insertRangeFrom(const IColumn &, size_t, size_t) override { throwMustBeDecompressed(); }
++    void insertData(const char *, size_t) override { throwMustBeDecompressed(); }
++    void insertDefault() override { throwMustBeDecompressed(); }
++    void popBack(size_t) override { throwMustBeDecompressed(); }
++    StringRef serializeValueIntoArena(size_t, Arena &, char const *&) const override { throwMustBeDecompressed(); }
++    const char * deserializeAndInsertFromArena(const char *) override { throwMustBeDecompressed(); }
++    void updateHashWithValue(size_t, SipHash &) const override { throwMustBeDecompressed(); }
++    void updateWeakHash32(WeakHash32 &) const override { throwMustBeDecompressed(); }
++    void updateHashFast(SipHash &) const override { throwMustBeDecompressed(); }
++    ColumnPtr filter(const Filter &, ssize_t) const override { throwMustBeDecompressed(); }
++    ColumnPtr permute(const Permutation &, size_t) const override { throwMustBeDecompressed(); }
++    ColumnPtr index(const IColumn &, size_t) const override { throwMustBeDecompressed(); }
++    int compareAt(size_t, size_t, const IColumn &, int) const override { throwMustBeDecompressed(); }
++    void compareColumn(const IColumn &, size_t, PaddedPODArray<UInt64> *, PaddedPODArray<Int8> &, int, int) const override
++    {
++        throwMustBeDecompressed();
++    }
++    void getPermutation(bool, size_t, int, Permutation &) const override { throwMustBeDecompressed(); }
++    void updatePermutation(bool, size_t, int, Permutation &, EqualRanges &) const override { throwMustBeDecompressed(); }
++    ColumnPtr replicate(const Offsets &) const override { throwMustBeDecompressed(); }
++    MutableColumns scatter(ColumnIndex, const Selector &) const override { throwMustBeDecompressed(); }
++    void gather(ColumnGathererStream &) override { throwMustBeDecompressed(); }
++    void getExtremes(Field &, Field &) const override { throwMustBeDecompressed(); }
++    size_t byteSizeAt(size_t) const override { throwMustBeDecompressed(); }
++
++protected:
++    size_t rows;
++    size_t bytes;
++
++    Lazy lazy;
++
++private:
++    [[noreturn]] void throwMustBeDecompressed() const
++    {
++        throw Exception("ColumnCompressed must be decompressed before use", ErrorCodes::LOGICAL_ERROR);
++    }
++};
++
++}
++
+diff --git a/src/Columns/ColumnDecimal.cpp b/src/Columns/ColumnDecimal.cpp
+index ddc971032b65..bad3a4c34022 100644
+--- a/src/Columns/ColumnDecimal.cpp
++++ b/src/Columns/ColumnDecimal.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <Columns/ColumnsCommon.h>
+ #include <Columns/ColumnDecimal.h>
++#include <Columns/ColumnCompressed.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ 
+ 
+@@ -346,6 +347,30 @@ void ColumnDecimal<T>::gather(ColumnGathererStream & gatherer)
+     gatherer.gather(*this);
+ }
+ 
++template <typename T>
++ColumnPtr ColumnDecimal<T>::compress() const
++{
++    size_t source_size = data.size() * sizeof(T);
++
++    /// Don't compress small blocks.
++    if (source_size < 4096) /// A wild guess.
++        return ColumnCompressed::wrap(this->getPtr());
++
++    auto compressed = ColumnCompressed::compressBuffer(data.data(), source_size, false);
++
++    if (!compressed)
++        return ColumnCompressed::wrap(this->getPtr());
++
++    return ColumnCompressed::create(data.size(), compressed->size(),
++        [compressed = std::move(compressed), column_size = data.size(), scale = this->scale]
++        {
++            auto res = ColumnDecimal<T>::create(column_size, scale);
++            ColumnCompressed::decompressBuffer(
++                compressed->data(), res->getData().data(), compressed->size(), column_size * sizeof(T));
++            return res;
++        });
++}
++
+ template <typename T>
+ void ColumnDecimal<T>::getExtremes(Field & min, Field & max) const
+ {
+diff --git a/src/Columns/ColumnDecimal.h b/src/Columns/ColumnDecimal.h
+index ef841292a7de..5016ddca791f 100644
+--- a/src/Columns/ColumnDecimal.h
++++ b/src/Columns/ColumnDecimal.h
+@@ -172,6 +172,8 @@ class ColumnDecimal final : public COWHelper<ColumnVectorHelper, ColumnDecimal<T
+         return false;
+     }
+ 
++    ColumnPtr compress() const override;
++
+ 
+     void insertValue(const T value) { data.push_back(value); }
+     Container & getData() { return data; }
+diff --git a/src/Columns/ColumnFixedString.cpp b/src/Columns/ColumnFixedString.cpp
+index 6cfec89a5dce..c4a7f923867d 100644
+--- a/src/Columns/ColumnFixedString.cpp
++++ b/src/Columns/ColumnFixedString.cpp
+@@ -1,6 +1,7 @@
+ #include <Columns/ColumnFixedString.h>
+-
+ #include <Columns/ColumnsCommon.h>
++#include <Columns/ColumnCompressed.h>
++
+ #include <DataStreams/ColumnGathererStream.h>
+ #include <IO/WriteHelpers.h>
+ #include <Common/Arena.h>
+@@ -446,6 +447,34 @@ void ColumnFixedString::getExtremes(Field & min, Field & max) const
+     get(max_idx, max);
+ }
+ 
++ColumnPtr ColumnFixedString::compress() const
++{
++    size_t source_size = chars.size();
++
++    /// Don't compress small blocks.
++    if (source_size < 4096) /// A wild guess.
++        return ColumnCompressed::wrap(this->getPtr());
++
++    auto compressed = ColumnCompressed::compressBuffer(chars.data(), source_size, false);
++
++    if (!compressed)
++        return ColumnCompressed::wrap(this->getPtr());
++
++    size_t column_size = size();
++
++    return ColumnCompressed::create(column_size, compressed->size(),
++        [compressed = std::move(compressed), column_size, n = n]
++        {
++            size_t chars_size = n * column_size;
++            auto res = ColumnFixedString::create(n);
++            res->getChars().resize(chars_size);
++            ColumnCompressed::decompressBuffer(
++                compressed->data(), res->getChars().data(), compressed->size(), chars_size);
++            return res;
++        });
++}
++
++
+ void ColumnFixedString::alignStringLength(ColumnFixedString::Chars & data, size_t n, size_t old_size)
+ {
+     size_t length = data.size() - old_size;
+diff --git a/src/Columns/ColumnFixedString.h b/src/Columns/ColumnFixedString.h
+index 24a99c27b132..d9f6619b2d1b 100644
+--- a/src/Columns/ColumnFixedString.h
++++ b/src/Columns/ColumnFixedString.h
+@@ -156,6 +156,8 @@ class ColumnFixedString final : public COWHelper<ColumnVectorHelper, ColumnFixed
+ 
+     void gather(ColumnGathererStream & gatherer_stream) override;
+ 
++    ColumnPtr compress() const override;
++
+     void reserve(size_t size) override
+     {
+         chars.reserve(n * size);
+diff --git a/src/Columns/ColumnMap.cpp b/src/Columns/ColumnMap.cpp
+index 1cfd7e6c4ef7..cc2640a9cf6e 100644
+--- a/src/Columns/ColumnMap.cpp
++++ b/src/Columns/ColumnMap.cpp
+@@ -1,4 +1,5 @@
+ #include <Columns/ColumnMap.h>
++#include <Columns/ColumnCompressed.h>
+ #include <Columns/IColumnImpl.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ #include <IO/WriteBufferFromString.h>
+@@ -243,4 +244,13 @@ bool ColumnMap::structureEquals(const IColumn & rhs) const
+     return false;
+ }
+ 
++ColumnPtr ColumnMap::compress() const
++{
++    auto compressed = nested->compress();
++    return ColumnCompressed::create(size(), compressed->byteSize(), [compressed = std::move(compressed)]
++    {
++        return ColumnMap::create(compressed->decompress());
++    });
++}
++
+ }
+diff --git a/src/Columns/ColumnMap.h b/src/Columns/ColumnMap.h
+index c1948491db59..acae1574f4c8 100644
+--- a/src/Columns/ColumnMap.h
++++ b/src/Columns/ColumnMap.h
+@@ -91,6 +91,8 @@ class ColumnMap final : public COWHelper<IColumn, ColumnMap>
+ 
+     const ColumnTuple & getNestedData() const { return assert_cast<const ColumnTuple &>(getNestedColumn().getData()); }
+     ColumnTuple & getNestedData() { return assert_cast<ColumnTuple &>(getNestedColumn().getData()); }
++
++    ColumnPtr compress() const override;
+ };
+ 
+ }
+diff --git a/src/Columns/ColumnNullable.cpp b/src/Columns/ColumnNullable.cpp
+index 35ce005073ab..4e5cc2b4cf7b 100644
+--- a/src/Columns/ColumnNullable.cpp
++++ b/src/Columns/ColumnNullable.cpp
+@@ -7,6 +7,7 @@
+ #include <Columns/ColumnNullable.h>
+ #include <Columns/ColumnConst.h>
+ #include <Columns/ColumnString.h>
++#include <Columns/ColumnCompressed.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ 
+ 
+@@ -511,6 +512,20 @@ void ColumnNullable::protect()
+     getNullMapColumn().protect();
+ }
+ 
++ColumnPtr ColumnNullable::compress() const
++{
++    ColumnPtr nested_compressed = nested_column->compress();
++    ColumnPtr null_map_compressed = null_map->compress();
++
++    size_t byte_size = nested_column->byteSize() + null_map->byteSize();
++
++    return ColumnCompressed::create(size(), byte_size,
++        [nested_column = std::move(nested_column), null_map = std::move(null_map)]
++        {
++            return ColumnNullable::create(nested_column->decompress(), null_map->decompress());
++        });
++}
++
+ 
+ namespace
+ {
+diff --git a/src/Columns/ColumnNullable.h b/src/Columns/ColumnNullable.h
+index ade2c1066275..8d267de86442 100644
+--- a/src/Columns/ColumnNullable.h
++++ b/src/Columns/ColumnNullable.h
+@@ -117,6 +117,8 @@ class ColumnNullable final : public COWHelper<IColumn, ColumnNullable>
+ 
+     void gather(ColumnGathererStream & gatherer_stream) override;
+ 
++    ColumnPtr compress() const override;
++
+     void forEachSubcolumn(ColumnCallback callback) override
+     {
+         callback(nested_column);
+diff --git a/src/Columns/ColumnString.cpp b/src/Columns/ColumnString.cpp
+index 00d6349408f8..8fd22e85e100 100644
+--- a/src/Columns/ColumnString.cpp
++++ b/src/Columns/ColumnString.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <Columns/Collator.h>
+ #include <Columns/ColumnsCommon.h>
++#include <Columns/ColumnCompressed.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ #include <Common/Arena.h>
+ #include <Common/HashTable/Hash.h>
+@@ -525,6 +526,47 @@ void ColumnString::getExtremes(Field & min, Field & max) const
+ }
+ 
+ 
++ColumnPtr ColumnString::compress() const
++{
++    size_t source_chars_size = chars.size();
++    size_t source_offsets_size = offsets.size() * sizeof(Offset);
++
++    /// Don't compress small blocks.
++    if (source_chars_size < 4096) /// A wild guess.
++        return ColumnCompressed::wrap(this->getPtr());
++
++    auto chars_compressed = ColumnCompressed::compressBuffer(chars.data(), source_chars_size, false);
++
++    /// Return original column if not compressible.
++    if (!chars_compressed)
++        return ColumnCompressed::wrap(this->getPtr());
++
++    auto offsets_compressed = ColumnCompressed::compressBuffer(offsets.data(), source_offsets_size, true);
++
++    return ColumnCompressed::create(offsets.size(), chars_compressed->size() + offsets_compressed->size(),
++        [
++            chars_compressed = std::move(chars_compressed),
++            offsets_compressed = std::move(offsets_compressed),
++            source_chars_size,
++            source_offsets_elements = offsets.size()
++        ]
++        {
++            auto res = ColumnString::create();
++
++            res->getChars().resize(source_chars_size);
++            res->getOffsets().resize(source_offsets_elements);
++
++            ColumnCompressed::decompressBuffer(
++                chars_compressed->data(), res->getChars().data(), chars_compressed->size(), source_chars_size);
++
++            ColumnCompressed::decompressBuffer(
++                offsets_compressed->data(), res->getOffsets().data(), offsets_compressed->size(), source_offsets_elements * sizeof(Offset));
++
++            return res;
++        });
++}
++
++
+ int ColumnString::compareAtWithCollation(size_t n, size_t m, const IColumn & rhs_, int, const Collator & collator) const
+ {
+     const ColumnString & rhs = assert_cast<const ColumnString &>(rhs_);
+diff --git a/src/Columns/ColumnString.h b/src/Columns/ColumnString.h
+index c1e76c5e28ee..843e445d1a01 100644
+--- a/src/Columns/ColumnString.h
++++ b/src/Columns/ColumnString.h
+@@ -261,6 +261,8 @@ class ColumnString final : public COWHelper<IColumn, ColumnString>
+ 
+     void gather(ColumnGathererStream & gatherer_stream) override;
+ 
++    ColumnPtr compress() const override;
++
+     void reserve(size_t n) override;
+ 
+     void getExtremes(Field & min, Field & max) const override;
+diff --git a/src/Columns/ColumnTuple.cpp b/src/Columns/ColumnTuple.cpp
+index fa5a15d0351e..c7c5f7b97c6f 100644
+--- a/src/Columns/ColumnTuple.cpp
++++ b/src/Columns/ColumnTuple.cpp
+@@ -1,6 +1,7 @@
+ #include <Columns/ColumnTuple.h>
+ 
+ #include <Columns/IColumnImpl.h>
++#include <Columns/ColumnCompressed.h>
+ #include <Core/Field.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ #include <IO/Operators.h>
+@@ -486,7 +487,7 @@ bool ColumnTuple::structureEquals(const IColumn & rhs) const
+ 
+ bool ColumnTuple::isCollationSupported() const
+ {
+-    for (const auto& column : columns)
++    for (const auto & column : columns)
+     {
+         if (column->isCollationSupported())
+             return true;
+@@ -495,4 +496,25 @@ bool ColumnTuple::isCollationSupported() const
+ }
+ 
+ 
++ColumnPtr ColumnTuple::compress() const
++{
++    size_t byte_size = 0;
++    Columns compressed;
++    compressed.reserve(columns.size());
++    for (const auto & column : columns)
++    {
++        auto compressed_column = column->compress();
++        byte_size += compressed_column->byteSize();
++        compressed.emplace_back(std::move(compressed_column));
++    }
++
++    return ColumnCompressed::create(size(), byte_size,
++        [compressed = std::move(compressed)]() mutable
++        {
++            for (auto & column : compressed)
++                column = column->decompress();
++            return ColumnTuple::create(compressed);
++        });
++}
++
+ }
+diff --git a/src/Columns/ColumnTuple.h b/src/Columns/ColumnTuple.h
+index f763ca3fcba9..818b29937bd3 100644
+--- a/src/Columns/ColumnTuple.h
++++ b/src/Columns/ColumnTuple.h
+@@ -89,6 +89,7 @@ class ColumnTuple final : public COWHelper<IColumn, ColumnTuple>
+     void forEachSubcolumn(ColumnCallback callback) override;
+     bool structureEquals(const IColumn & rhs) const override;
+     bool isCollationSupported() const override;
++    ColumnPtr compress() const override;
+ 
+     size_t tupleSize() const { return columns.size(); }
+ 
+diff --git a/src/Columns/ColumnUnique.h b/src/Columns/ColumnUnique.h
+index 5d58b2484e0d..fbd3c3641b55 100644
+--- a/src/Columns/ColumnUnique.h
++++ b/src/Columns/ColumnUnique.h
+@@ -28,13 +28,18 @@ namespace ErrorCodes
+     extern const int ILLEGAL_COLUMN;
+ }
+ 
++/** Stores another column with unique values
++  * and also an index that allows to find position by value.
++  *
++  * This column is not used on it's own but only as implementation detail of ColumnLowCardinality.
++  */
+ template <typename ColumnType>
+ class ColumnUnique final : public COWHelper<IColumnUnique, ColumnUnique<ColumnType>>
+ {
+     friend class COWHelper<IColumnUnique, ColumnUnique<ColumnType>>;
+ 
+ private:
+-    explicit ColumnUnique(MutableColumnPtr && holder, bool is_nullable);
++    ColumnUnique(MutableColumnPtr && holder, bool is_nullable);
+     explicit ColumnUnique(const IDataType & type);
+     ColumnUnique(const ColumnUnique & other);
+ 
+diff --git a/src/Columns/ColumnVector.cpp b/src/Columns/ColumnVector.cpp
+index ec26500d0574..19ba86c51201 100644
+--- a/src/Columns/ColumnVector.cpp
++++ b/src/Columns/ColumnVector.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <pdqsort.h>
+ #include <Columns/ColumnsCommon.h>
++#include <Columns/ColumnCompressed.h>
+ #include <DataStreams/ColumnGathererStream.h>
+ #include <IO/WriteHelpers.h>
+ #include <Common/Arena.h>
+@@ -520,6 +521,33 @@ void ColumnVector<T>::getExtremes(Field & min, Field & max) const
+     max = NearestFieldType<T>(cur_max);
+ }
+ 
++
++#pragma GCC diagnostic ignored "-Wold-style-cast"
++
++template <typename T>
++ColumnPtr ColumnVector<T>::compress() const
++{
++    size_t source_size = data.size() * sizeof(T);
++
++    /// Don't compress small blocks.
++    if (source_size < 4096) /// A wild guess.
++        return ColumnCompressed::wrap(this->getPtr());
++
++    auto compressed = ColumnCompressed::compressBuffer(data.data(), source_size, false);
++
++    if (!compressed)
++        return ColumnCompressed::wrap(this->getPtr());
++
++    return ColumnCompressed::create(data.size(), compressed->size(),
++        [compressed = std::move(compressed), column_size = data.size()]
++        {
++            auto res = ColumnVector<T>::create(column_size);
++            ColumnCompressed::decompressBuffer(
++                compressed->data(), res->getData().data(), compressed->size(), column_size * sizeof(T));
++            return res;
++        });
++}
++
+ /// Explicit template instantiations - to avoid code bloat in headers.
+ template class ColumnVector<UInt8>;
+ template class ColumnVector<UInt16>;
+diff --git a/src/Columns/ColumnVector.h b/src/Columns/ColumnVector.h
+index 586fced88a66..f0aa4a3bab5f 100644
+--- a/src/Columns/ColumnVector.h
++++ b/src/Columns/ColumnVector.h
+@@ -298,6 +298,8 @@ class ColumnVector final : public COWHelper<ColumnVectorHelper, ColumnVector<T>>
+         return typeid(rhs) == typeid(ColumnVector<T>);
+     }
+ 
++    ColumnPtr compress() const override;
++
+     /// Replace elements that match the filter with zeroes. If inverted replaces not matched elements.
+     void applyZeroMap(const IColumn::Filter & filt, bool inverted = false);
+ 
+diff --git a/src/Columns/IColumn.h b/src/Columns/IColumn.h
+index 824b5411744e..2b4b633f9a5f 100644
+--- a/src/Columns/IColumn.h
++++ b/src/Columns/IColumn.h
+@@ -357,6 +357,21 @@ class IColumn : public COW<IColumn>
+         throw Exception("Method structureEquals is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
++    /// Compress column in memory to some representation that allows to decompress it back.
++    /// Return itself if compression is not applicable for this column type.
++    virtual Ptr compress() const
++    {
++        /// No compression by default.
++        return getPtr();
++    }
++
++    /// If it's CompressedColumn, decompress it and return.
++    /// Otherwise return itself.
++    virtual Ptr decompress() const
++    {
++        return getPtr();
++    }
++
+ 
+     static MutablePtr mutate(Ptr ptr)
+     {
+@@ -460,7 +475,7 @@ using Columns = std::vector<ColumnPtr>;
+ using MutableColumns = std::vector<MutableColumnPtr>;
+ 
+ using ColumnRawPtrs = std::vector<const IColumn *>;
+-//using MutableColumnRawPtrs = std::vector<IColumn *>;
++
+ 
+ template <typename ... Args>
+ struct IsMutableColumns;
+diff --git a/src/Columns/ReverseIndex.h b/src/Columns/ReverseIndex.h
+index 154293acf99a..35b0029fc7b7 100644
+--- a/src/Columns/ReverseIndex.h
++++ b/src/Columns/ReverseIndex.h
+@@ -316,8 +316,8 @@ template <typename IndexType, typename ColumnType>
+ class ReverseIndex
+ {
+ public:
+-    explicit ReverseIndex(UInt64 num_prefix_rows_to_skip_, UInt64 base_index_)
+-            : num_prefix_rows_to_skip(num_prefix_rows_to_skip_), base_index(base_index_), saved_hash_ptr(nullptr) {}
++    ReverseIndex(UInt64 num_prefix_rows_to_skip_, UInt64 base_index_)
++        : num_prefix_rows_to_skip(num_prefix_rows_to_skip_), base_index(base_index_), saved_hash_ptr(nullptr) {}
+ 
+     void setColumn(ColumnType * column_);
+ 
+@@ -329,14 +329,16 @@ class ReverseIndex
+     /// Returns the found data's index in the dictionary. If index is not built, builds it.
+     UInt64 getInsertionPoint(StringRef data)
+     {
+-        if (!index) buildIndex();
++        if (!index)
++            buildIndex();
+         return getIndexImpl(data);
+     }
+ 
+     /// Returns the found data's index in the dictionary if the #index is built, otherwise, returns a std::nullopt.
+     std::optional<UInt64> getIndex(StringRef data) const
+     {
+-        if (!index) return {};
++        if (!index)
++            return {};
+         return getIndexImpl(data);
+     }
+ 
+diff --git a/src/Columns/ya.make b/src/Columns/ya.make
+index 2affaeb0fc66..54dd02609ff1 100644
+--- a/src/Columns/ya.make
++++ b/src/Columns/ya.make
+@@ -7,18 +7,21 @@ ADDINCL(
+     contrib/libs/icu/common
+     contrib/libs/icu/i18n
+     contrib/libs/pdqsort
++    contrib/libs/lz4
+ )
+ 
+ PEERDIR(
+     clickhouse/src/Common
+     contrib/libs/icu
+     contrib/libs/pdqsort
++    contrib/libs/lz4
+ )
+ 
+ SRCS(
+     Collator.cpp
+     ColumnAggregateFunction.cpp
+     ColumnArray.cpp
++    ColumnCompressed.cpp
+     ColumnConst.cpp
+     ColumnDecimal.cpp
+     ColumnFixedString.cpp
+diff --git a/src/Columns/ya.make.in b/src/Columns/ya.make.in
+index 677a5bcbd706..846e2c6c3bd5 100644
+--- a/src/Columns/ya.make.in
++++ b/src/Columns/ya.make.in
+@@ -6,12 +6,14 @@ ADDINCL(
+     contrib/libs/icu/common
+     contrib/libs/icu/i18n
+     contrib/libs/pdqsort
++    contrib/libs/lz4
+ )
+ 
+ PEERDIR(
+     clickhouse/src/Common
+     contrib/libs/icu
+     contrib/libs/pdqsort
++    contrib/libs/lz4
+ )
+ 
+ SRCS(
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 9bb9ad30f15e..72b89e5e8db2 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -69,7 +69,7 @@ class IColumn;
+     M(UInt64, s3_max_redirects, 10, "Max number of S3 redirects hops allowed.", 0) \
+     M(UInt64, s3_max_connections, 1024, "The maximum number of connections per server.", 0) \
+     M(Bool, extremes, false, "Calculate minimums and maximums of the result columns. They can be output in JSON-formats.", IMPORTANT) \
+-    M(Bool, use_uncompressed_cache, true, "Whether to use the cache of uncompressed blocks.", 0) \
++    M(Bool, use_uncompressed_cache, false, "Whether to use the cache of uncompressed blocks.", 0) \
+     M(Bool, replace_running_query, false, "Whether the running request should be canceled with the same id as the new one.", 0) \
+     M(UInt64, background_buffer_flush_schedule_pool_size, 16, "Number of threads performing background flush for tables with Buffer engine. Only has meaning at server startup.", 0) \
+     M(UInt64, background_pool_size, 16, "Number of threads performing background work for tables (for example, merging in merge tree). Only has meaning at server startup.", 0) \
+diff --git a/src/DataTypes/DataTypeLowCardinality.h b/src/DataTypes/DataTypeLowCardinality.h
+index 14beb423f1fa..f5b6b5711873 100644
+--- a/src/DataTypes/DataTypeLowCardinality.h
++++ b/src/DataTypes/DataTypeLowCardinality.h
+@@ -1,7 +1,9 @@
+ #pragma once
++
+ #include <DataTypes/IDataType.h>
+ #include <Columns/IColumnUnique.h>
+ 
++
+ namespace DB
+ {
+ 
+diff --git a/src/Storages/MemorySettings.cpp b/src/Storages/MemorySettings.cpp
+new file mode 100644
+index 000000000000..f5e182b3484e
+--- /dev/null
++++ b/src/Storages/MemorySettings.cpp
+@@ -0,0 +1,36 @@
++#include <Storages/MemorySettings.h>
++#include <Parsers/ASTCreateQuery.h>
++#include <Parsers/ASTSetQuery.h>
++#include <Parsers/ASTFunction.h>
++#include <Common/Exception.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int UNKNOWN_SETTING;
++}
++
++IMPLEMENT_SETTINGS_TRAITS(memorySettingsTraits, MEMORY_SETTINGS)
++
++void MemorySettings::loadFromQuery(ASTStorage & storage_def)
++{
++    if (storage_def.settings)
++    {
++        try
++        {
++            applyChanges(storage_def.settings->changes);
++        }
++        catch (Exception & e)
++        {
++            if (e.code() == ErrorCodes::UNKNOWN_SETTING)
++                e.addMessage("for storage " + storage_def.engine->name);
++            throw;
++        }
++    }
++}
++
++}
++
+diff --git a/src/Storages/MemorySettings.h b/src/Storages/MemorySettings.h
+new file mode 100644
+index 000000000000..5e3b5f81ba5a
+--- /dev/null
++++ b/src/Storages/MemorySettings.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <Core/BaseSettings.h>
++
++
++namespace DB
++{
++class ASTStorage;
++
++
++#define MEMORY_SETTINGS(M) \
++    M(Bool, compress, false, "Compress data in memory", 0) \
++
++DECLARE_SETTINGS_TRAITS(memorySettingsTraits, MEMORY_SETTINGS)
++
++
++/** Settings for the Memory engine.
++  * Could be loaded from a CREATE TABLE query (SETTINGS clause).
++  */
++struct MemorySettings : public BaseSettings<memorySettingsTraits>
++{
++    void loadFromQuery(ASTStorage & storage_def);
++};
++
++}
++
+diff --git a/src/Storages/StorageMemory.cpp b/src/Storages/StorageMemory.cpp
+index 4530d93c274a..d7b0ae055ab3 100644
+--- a/src/Storages/StorageMemory.cpp
++++ b/src/Storages/StorageMemory.cpp
+@@ -6,6 +6,7 @@
+ #include <Interpreters/MutationsInterpreter.h>
+ #include <Storages/StorageFactory.h>
+ #include <Storages/StorageMemory.h>
++#include <Storages/MemorySettings.h>
+ 
+ #include <IO/WriteHelpers.h>
+ #include <Processors/Sources/SourceWithProgress.h>
+@@ -71,6 +72,8 @@ class MemorySource : public SourceWithProgress
+         for (const auto & elem : column_names_and_types)
+         {
+             auto current_column = src.getByName(elem.getNameInStorage()).column;
++            current_column = current_column->decompress();
++
+             if (elem.isSubcolumn())
+                 columns.emplace_back(elem.getTypeInStorage()->getSubcolumn(elem.getSubcolumnName(), *current_column));
+             else
+@@ -117,7 +120,19 @@ class MemoryBlockOutputStream : public IBlockOutputStream
+     void write(const Block & block) override
+     {
+         metadata_snapshot->check(block, true);
+-        new_blocks.emplace_back(block);
++
++        if (storage.compress)
++        {
++            Block compressed_block;
++            for (const auto & elem : block)
++                compressed_block.insert({ elem.column->compress(), elem.type, elem.name });
++
++            new_blocks.emplace_back(compressed_block);
++        }
++        else
++        {
++            new_blocks.emplace_back(block);
++        }
+     }
+ 
+     void writeSuffix() override
+@@ -149,8 +164,12 @@ class MemoryBlockOutputStream : public IBlockOutputStream
+ };
+ 
+ 
+-StorageMemory::StorageMemory(const StorageID & table_id_, ColumnsDescription columns_description_, ConstraintsDescription constraints_)
+-    : IStorage(table_id_), data(std::make_unique<const Blocks>())
++StorageMemory::StorageMemory(
++    const StorageID & table_id_,
++    ColumnsDescription columns_description_,
++    ConstraintsDescription constraints_,
++    bool compress_)
++    : IStorage(table_id_), data(std::make_unique<const Blocks>()), compress(compress_)
+ {
+     StorageInMemoryMetadata storage_metadata;
+     storage_metadata.setColumns(std::move(columns_description_));
+@@ -245,9 +264,12 @@ void StorageMemory::mutate(const MutationCommands & commands, const Context & co
+ 
+     in->readPrefix();
+     Blocks out;
+-    Block block;
+-    while ((block = in->read()))
++    while (Block block = in->read())
+     {
++        if (compress)
++            for (auto & elem : block)
++                elem.column = elem.column->compress();
++
+         out.push_back(block);
+     }
+     in->readSuffix();
+@@ -317,13 +339,19 @@ void registerStorageMemory(StorageFactory & factory)
+     factory.registerStorage("Memory", [](const StorageFactory::Arguments & args)
+     {
+         if (!args.engine_args.empty())
+-            throw Exception(
+-                "Engine " + args.engine_name + " doesn't support any arguments (" + toString(args.engine_args.size()) + " given)",
+-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
++                "Engine {} doesn't support any arguments ({} given)",
++                args.engine_name, args.engine_args.size());
++
++        bool has_settings = args.storage_def->settings;
++        MemorySettings settings;
++        if (has_settings)
++            settings.loadFromQuery(*args.storage_def);
+ 
+-        return StorageMemory::create(args.table_id, args.columns, args.constraints);
++        return StorageMemory::create(args.table_id, args.columns, args.constraints, settings.compress);
+     },
+     {
++        .supports_settings = true,
+         .supports_parallel_insert = true,
+     });
+ }
+diff --git a/src/Storages/StorageMemory.h b/src/Storages/StorageMemory.h
+index 79ced856231e..db71c13ca991 100644
+--- a/src/Storages/StorageMemory.h
++++ b/src/Storages/StorageMemory.h
+@@ -97,6 +97,7 @@ friend struct ext::shared_ptr_helper<StorageMemory>;
+ 
+ private:
+     /// MultiVersion data storage, so that we can copy the list of blocks to readers.
++
+     MultiVersion<Blocks> data;
+ 
+     mutable std::mutex mutex;
+@@ -106,8 +107,14 @@ friend struct ext::shared_ptr_helper<StorageMemory>;
+     std::atomic<size_t> total_size_bytes = 0;
+     std::atomic<size_t> total_size_rows = 0;
+ 
++    bool compress;
++
+ protected:
+-    StorageMemory(const StorageID & table_id_, ColumnsDescription columns_description_, ConstraintsDescription constraints_);
++    StorageMemory(
++        const StorageID & table_id_,
++        ColumnsDescription columns_description_,
++        ConstraintsDescription constraints_,
++        bool compress_ = false);
+ };
+ 
+ }
+diff --git a/src/Storages/StorageSet.cpp b/src/Storages/StorageSet.cpp
+index e518c7da0e45..d64042f0c1e0 100644
+--- a/src/Storages/StorageSet.cpp
++++ b/src/Storages/StorageSet.cpp
+@@ -242,15 +242,12 @@ void registerStorageSet(StorageFactory & factory)
+                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+ 
+         bool has_settings = args.storage_def->settings;
+-
+-        auto set_settings = std::make_unique<SetSettings>();
++        SetSettings set_settings;
+         if (has_settings)
+-        {
+-            set_settings->loadFromQuery(*args.storage_def);
+-        }
++            set_settings.loadFromQuery(*args.storage_def);
+ 
+-        DiskPtr disk = args.context.getDisk(set_settings->disk);
+-        return StorageSet::create(disk, args.relative_data_path, args.table_id, args.columns, args.constraints, set_settings->persistent);
++        DiskPtr disk = args.context.getDisk(set_settings.disk);
++        return StorageSet::create(disk, args.relative_data_path, args.table_id, args.columns, args.constraints, set_settings.persistent);
+     }, StorageFactory::StorageFeatures{ .supports_settings = true, });
+ }
+ 
+diff --git a/src/Storages/ya.make b/src/Storages/ya.make
+index dbf37e58695c..e3e1807c5660 100644
+--- a/src/Storages/ya.make
++++ b/src/Storages/ya.make
+@@ -24,6 +24,7 @@ SRCS(
+     KeyDescription.cpp
+     LiveView/StorageLiveView.cpp
+     LiveView/TemporaryLiveViewCleaner.cpp
++    MemorySettings.cpp
+     MergeTree/ActiveDataPartSet.cpp
+     MergeTree/AllMergeSelector.cpp
+     MergeTree/BackgroundJobsExecutor.cpp

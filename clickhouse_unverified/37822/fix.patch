@@ -1,0 +1,627 @@
+diff --git a/src/Common/noexcept_scope.h b/src/Common/noexcept_scope.h
+new file mode 100644
+index 000000000000..56fb44ff0bf6
+--- /dev/null
++++ b/src/Common/noexcept_scope.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include <base/scope_guard.h>
++#include <Common/Exception.h>
++#include <Common/LockMemoryExceptionInThread.h>
++
++
++#define NOEXCEPT_SCOPE_IMPL_CONCAT(n, expected) \
++    LockMemoryExceptionInThread lock_memory_tracker##n(VariableContext::Global);   \
++    SCOPE_EXIT(                                                                    \
++        {                                                                          \
++            const auto uncaught = std::uncaught_exceptions();                      \
++            assert((expected) == uncaught || (expected) + 1 == uncaught);          \
++            if ((expected) < uncaught)                                             \
++            {                                                                      \
++                tryLogCurrentException("NOEXCEPT_SCOPE");                          \
++                abort();                                                           \
++            }                                                                      \
++        }                                                                          \
++    )
++
++#define NOEXCEPT_SCOPE_IMPL(n, expected) NOEXCEPT_SCOPE_IMPL_CONCAT(n, expected)
++
++#define NOEXCEPT_SCOPE_CONCAT(n)                                                   \
++    const auto num_curr_exceptions##n = std::uncaught_exceptions();                \
++    NOEXCEPT_SCOPE_IMPL(n, num_curr_exceptions##n)
++
++#define NOEXCEPT_SCOPE_FWD(n) NOEXCEPT_SCOPE_CONCAT(n)
++
++
++/// It can be used in critical places to exit on unexpected exceptions.
++/// SIGABRT is usually better that broken in-memory state with unpredictable consequences.
++/// It also temporarily disables exception from memory tracker in current thread.
++/// Strict version does not take into account nested exception (i.e. it aborts even when we're in catch block).
++
++#define NOEXCEPT_SCOPE_STRICT NOEXCEPT_SCOPE_IMPL(__LINE__, 0)
++#define NOEXCEPT_SCOPE NOEXCEPT_SCOPE_FWD(__LINE__)
+diff --git a/src/Daemon/BaseDaemon.cpp b/src/Daemon/BaseDaemon.cpp
+index 62fcebb10bbd..e731787a5c13 100644
+--- a/src/Daemon/BaseDaemon.cpp
++++ b/src/Daemon/BaseDaemon.cpp
+@@ -397,6 +397,7 @@ extern "C" void __sanitizer_set_death_callback(void (*)());
+ 
+ static void sanitizerDeathCallback()
+ {
++    DENY_ALLOCATIONS_IN_SCOPE;
+     /// Also need to send data via pipe. Otherwise it may lead to deadlocks or failures in printing diagnostic info.
+ 
+     char buf[signal_pipe_buf_size];
+diff --git a/src/Interpreters/InterpreterTransactionControlQuery.cpp b/src/Interpreters/InterpreterTransactionControlQuery.cpp
+index 1e4868788ba1..bdb523de8800 100644
+--- a/src/Interpreters/InterpreterTransactionControlQuery.cpp
++++ b/src/Interpreters/InterpreterTransactionControlQuery.cpp
+@@ -67,6 +67,7 @@ BlockIO InterpreterTransactionControlQuery::executeCommit(ContextMutablePtr sess
+         if (e.code() == ErrorCodes::UNKNOWN_STATUS_OF_TRANSACTION)
+         {
+             /// Detach transaction from current context if connection was lost and its status is unknown
++            /// (so it will be possible to start new one)
+             session_context->setCurrentTransaction(NO_TRANSACTION_PTR);
+         }
+         throw;
+@@ -80,6 +81,16 @@ BlockIO InterpreterTransactionControlQuery::executeCommit(ContextMutablePtr sess
+         /// It's useful for testing. It allows to enable fault injection (after commit) without breaking tests.
+         txn->waitStateChange(Tx::CommittingCSN);
+ 
++        CSN csn_changed_state = txn->getCSN();
++        if (csn_changed_state == Tx::UnknownCSN)
++        {
++            /// CommittingCSN -> UnknownCSN -> RolledBackCSN
++            /// It's possible if connection was lost before commit
++            /// (maybe we should get rid of intermediate UnknownCSN in this transition)
++            txn->waitStateChange(Tx::UnknownCSN);
++            chassert(txn->getCSN() == Tx::RolledBackCSN);
++        }
++
+         if (txn->getState() == MergeTreeTransaction::ROLLED_BACK)
+             throw Exception(ErrorCodes::INVALID_TRANSACTION, "Transaction {} was rolled back", txn->tid);
+         if (txn->getState() != MergeTreeTransaction::COMMITTED)
+diff --git a/src/Interpreters/MergeTreeTransaction.cpp b/src/Interpreters/MergeTreeTransaction.cpp
+index cab40f3c6db4..e6b4818b4d78 100644
+--- a/src/Interpreters/MergeTreeTransaction.cpp
++++ b/src/Interpreters/MergeTreeTransaction.cpp
+@@ -3,6 +3,7 @@
+ #include <Storages/MergeTree/MergeTreeData.h>
+ #include <Interpreters/TransactionLog.h>
+ #include <Interpreters/TransactionsInfoLog.h>
++#include <Common/noexcept_scope.h>
+ 
+ namespace DB
+ {
+@@ -146,8 +147,8 @@ void MergeTreeTransaction::removeOldPart(const StoragePtr & storage, const DataP
+         std::lock_guard lock{mutex};
+         checkIsNotCancelled();
+ 
+-        LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+         part_to_remove->version.lockRemovalTID(tid, context);
++        NOEXCEPT_SCOPE;
+         storages.insert(storage);
+         if (maybe_lock)
+             table_read_locks_for_ordinary_db.emplace_back(std::move(maybe_lock));
+diff --git a/src/Interpreters/ThreadStatusExt.cpp b/src/Interpreters/ThreadStatusExt.cpp
+index 2c83a3bfcdba..42db91f47c0f 100644
+--- a/src/Interpreters/ThreadStatusExt.cpp
++++ b/src/Interpreters/ThreadStatusExt.cpp
+@@ -16,7 +16,7 @@
+ #include <Common/SensitiveDataMasker.h>
+ #include <Common/ThreadProfileEvents.h>
+ #include <Common/setThreadName.h>
+-#include <Common/LockMemoryExceptionInThread.h>
++#include <Common/noexcept_scope.h>
+ #include <base/errnoToString.h>
+ 
+ #if defined(OS_LINUX)
+@@ -343,7 +343,7 @@ void ThreadStatus::finalizeQueryProfiler()
+ 
+ void ThreadStatus::detachQuery(bool exit_if_already_detached, bool thread_exits)
+ {
+-    LockMemoryExceptionInThread lock(VariableContext::Global);
++    NOEXCEPT_SCOPE;
+ 
+     if (exit_if_already_detached && thread_state == ThreadState::DetachedFromQuery)
+     {
+diff --git a/src/Interpreters/TransactionLog.cpp b/src/Interpreters/TransactionLog.cpp
+index 0ddc726ff7f6..e6bd47eed443 100644
+--- a/src/Interpreters/TransactionLog.cpp
++++ b/src/Interpreters/TransactionLog.cpp
+@@ -9,12 +9,9 @@
+ #include <Common/ZooKeeper/KeeperException.h>
+ #include <Core/ServerUUID.h>
+ #include <Common/logger_useful.h>
++#include <Common/noexcept_scope.h>
+ 
+ 
+-/// It's used in critical places to exit on unexpected exceptions.
+-/// SIGABRT is usually better that broken state in memory with unpredictable consequences.
+-#define NOEXCEPT_SCOPE SCOPE_EXIT({ if (std::uncaught_exceptions()) { tryLogCurrentException("NOEXCEPT_SCOPE"); abort(); } })
+-
+ namespace DB
+ {
+ 
+@@ -146,8 +143,7 @@ void TransactionLog::loadEntries(Strings::const_iterator beg, Strings::const_ite
+     }
+     futures.clear();
+ 
+-    NOEXCEPT_SCOPE;
+-    LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
++    NOEXCEPT_SCOPE_STRICT;
+     {
+         std::lock_guard lock{mutex};
+         for (const auto & entry : loaded)
+@@ -453,7 +449,7 @@ CSN TransactionLog::commitTransaction(const MergeTreeTransactionPtr & txn, bool
+ 
+         /// Do not allow exceptions between commit point and the and of transaction finalization
+         /// (otherwise it may stuck in COMMITTING state holding snapshot).
+-        NOEXCEPT_SCOPE;
++        NOEXCEPT_SCOPE_STRICT;
+         /// FIXME Transactions: Sequential node numbers in ZooKeeper are Int32, but 31 bit is not enough for production use
+         /// (overflow is possible in a several weeks/months of active usage)
+         allocated_csn = deserializeCSN(csn_path_created.substr(zookeeper_path_log.size() + 1));
+diff --git a/src/Interpreters/TransactionVersionMetadata.cpp b/src/Interpreters/TransactionVersionMetadata.cpp
+index 36a4fb9cc5be..5f46b86508c6 100644
+--- a/src/Interpreters/TransactionVersionMetadata.cpp
++++ b/src/Interpreters/TransactionVersionMetadata.cpp
+@@ -95,12 +95,8 @@ bool VersionMetadata::tryLockRemovalTID(const TransactionID & tid, const Transac
+     bool locked = removal_tid_lock.compare_exchange_strong(expected_removal_lock_value, removal_lock_value);
+     if (!locked)
+     {
+-        if (tid == Tx::PrehistoricTID && expected_removal_lock_value == Tx::PrehistoricTID.getHash())
+-        {
+-            /// Don't need to lock part for queries without transaction
+-            LOG_TEST(log, "Assuming removal_tid is locked by {}, table: {}, part: {}", tid, context.table.getNameForLogs(), context.part_name);
+-            return true;
+-        }
++        if (expected_removal_lock_value == removal_lock_value)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Tried to lock part {} for removal second time by {}", context.part_name, tid);
+ 
+         if (locked_by_id)
+             *locked_by_id = expected_removal_lock_value;
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index fb761ed1ae5b..dc94266bc956 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -65,6 +65,7 @@
+ #include <Common/escapeForFileName.h>
+ #include <Common/quoteString.h>
+ #include <Common/typeid_cast.h>
++#include <Common/noexcept_scope.h>
+ #include <Processors/QueryPlan/ReadFromMergeTree.h>
+ #include <Processors/Formats/IInputFormat.h>
+ #include <AggregateFunctions/AggregateFunctionCount.h>
+@@ -2907,16 +2908,18 @@ bool MergeTreeData::renameTempPartAndReplace(
+     part->renameTo(part_name, true);
+ 
+     auto part_it = data_parts_indexes.insert(part).first;
+-    /// FIXME Transactions: it's not the best place for checking and setting removal_tid,
+-    /// because it's too optimistic. We should lock removal_tid of covered parts at the beginning of operation.
+-    MergeTreeTransaction::addNewPartAndRemoveCovered(shared_from_this(), part, covered_parts, txn);
+ 
+     if (out_transaction)
+     {
++        chassert(out_transaction->txn == txn);
+         out_transaction->precommitted_parts.insert(part);
+     }
+     else
+     {
++        /// FIXME Transactions: it's not the best place for checking and setting removal_tid,
++        /// because it's too optimistic. We should lock removal_tid of covered parts at the beginning of operation.
++        MergeTreeTransaction::addNewPartAndRemoveCovered(shared_from_this(), part, covered_parts, txn);
++
+         size_t reduce_bytes = 0;
+         size_t reduce_rows = 0;
+         size_t reduce_parts = 0;
+@@ -3579,6 +3582,13 @@ MergeTreeData::DataPartsVector MergeTreeData::getVisibleDataPartsVectorInPartiti
+     return getVisibleDataPartsVectorInPartition(local_context->getCurrentTransaction().get(), partition_id);
+ }
+ 
++
++MergeTreeData::DataPartsVector MergeTreeData::getVisibleDataPartsVectorInPartition(
++    ContextPtr local_context, const String & partition_id, DataPartsLock & lock) const
++{
++    return getVisibleDataPartsVectorInPartition(local_context->getCurrentTransaction().get(), partition_id, &lock);
++}
++
+ MergeTreeData::DataPartsVector MergeTreeData::getVisibleDataPartsVectorInPartition(
+     MergeTreeTransaction * txn, const String & partition_id, DataPartsLock * acquired_lock) const
+ {
+@@ -4250,7 +4260,7 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
+ }
+ 
+ 
+-String MergeTreeData::getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr local_context) const
++String MergeTreeData::getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr local_context, DataPartsLock * acquired_lock) const
+ {
+     const auto & partition_ast = ast->as<ASTPartition &>();
+ 
+@@ -4334,7 +4344,7 @@ String MergeTreeData::getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr loc
+     String partition_id = partition.getID(*this);
+ 
+     {
+-        auto data_parts_lock = lockParts();
++        auto data_parts_lock = (acquired_lock) ? DataPartsLock() : lockParts();
+         DataPartPtr existing_part_in_partition = getAnyPartInPartition(partition_id, data_parts_lock);
+         if (existing_part_in_partition && existing_part_in_partition->partition.value != partition.value)
+         {
+@@ -4922,18 +4932,6 @@ void MergeTreeData::Transaction::rollback()
+         buf << ".";
+         LOG_DEBUG(data.log, "Undoing transaction.{}", buf.str());
+ 
+-        if (!txn)
+-        {
+-            auto lock = data.lockParts();
+-            for (const auto & part : precommitted_parts)
+-            {
+-                DataPartPtr covering_part;
+-                DataPartsVector covered_parts = data.getActivePartsToReplace(part->info, part->name, covering_part, lock);
+-                for (auto & covered : covered_parts)
+-                    covered->version.unlockRemovalTID(Tx::PrehistoricTID, TransactionInfoContext{data.getStorageID(), covered->name});
+-            }
+-        }
+-
+         data.removePartsFromWorkingSet(txn,
+             DataPartsVector(precommitted_parts.begin(), precommitted_parts.end()),
+             /* clear_without_timeout = */ true);
+@@ -4951,6 +4949,18 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(MergeTreeData:
+         auto parts_lock = acquired_parts_lock ? MergeTreeData::DataPartsLock() : data.lockParts();
+         auto * owing_parts_lock = acquired_parts_lock ? acquired_parts_lock : &parts_lock;
+ 
++        if (txn)
++        {
++            for (const DataPartPtr & part : precommitted_parts)
++            {
++                DataPartPtr covering_part;
++                DataPartsVector covered_parts = data.getActivePartsToReplace(part->info, part->name, covering_part, *owing_parts_lock);
++                MergeTreeTransaction::addNewPartAndRemoveCovered(data.shared_from_this(), part, covered_parts, txn);
++            }
++        }
++
++        NOEXCEPT_SCOPE;
++
+         auto current_time = time(nullptr);
+ 
+         size_t add_bytes = 0;
+@@ -4974,6 +4984,9 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(MergeTreeData:
+             }
+             else
+             {
++                if (!txn)
++                    MergeTreeTransaction::addNewPartAndRemoveCovered(data.shared_from_this(), part, covered_parts, NO_TRANSACTION_RAW);
++
+                 total_covered_parts.insert(total_covered_parts.end(), covered_parts.begin(), covered_parts.end());
+                 for (const auto & covered_part : covered_parts)
+                 {
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index d531fc9f3398..80921a4ef0c4 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -282,6 +282,7 @@ class MergeTreeData : public IStorage, public WithMutableContext
+         MergeTreeData & data;
+         MergeTreeTransaction * txn;
+         DataParts precommitted_parts;
++        DataParts locked_parts;
+ 
+         void clear() { precommitted_parts.clear(); }
+     };
+@@ -501,6 +502,7 @@ class MergeTreeData : public IStorage, public WithMutableContext
+ 
+     /// Returns all parts in specified partition
+     DataPartsVector getVisibleDataPartsVectorInPartition(MergeTreeTransaction * txn, const String & partition_id, DataPartsLock * acquired_lock = nullptr) const;
++    DataPartsVector getVisibleDataPartsVectorInPartition(ContextPtr local_context, const String & partition_id, DataPartsLock & lock) const;
+     DataPartsVector getVisibleDataPartsVectorInPartition(ContextPtr local_context, const String & partition_id) const;
+     DataPartsVector getVisibleDataPartsVectorInPartitions(ContextPtr local_context, const std::unordered_set<String> & partition_ids) const;
+ 
+@@ -767,7 +769,7 @@ class MergeTreeData : public IStorage, public WithMutableContext
+     }
+ 
+     /// For ATTACH/DETACH/DROP PARTITION.
+-    String getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr context) const;
++    String getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr context, DataPartsLock * acquired_lock = nullptr) const;
+     std::unordered_set<String> getPartitionIDsFromQuery(const ASTs & asts, ContextPtr context) const;
+     std::set<String> getPartitionIdsAffectedByCommands(const MutationCommands & commands, ContextPtr query_context) const;
+ 
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.cpp
+index 6e57fe558782..37d04541dfd3 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.cpp
+@@ -4,7 +4,7 @@
+ namespace DB
+ {
+ 
+-int ReplicatedMergeTreeAltersSequence::getHeadAlterVersion(std::lock_guard<std::mutex> & /*state_lock*/) const
++int ReplicatedMergeTreeAltersSequence::getHeadAlterVersion(std::unique_lock<std::mutex> & /*state_lock*/) const
+ {
+     /// If queue empty, than we don't have version
+     if (!queue_state.empty())
+@@ -66,7 +66,7 @@ void ReplicatedMergeTreeAltersSequence::finishDataAlter(int alter_version, std::
+     }
+ }
+ 
+-bool ReplicatedMergeTreeAltersSequence::canExecuteDataAlter(int alter_version, std::lock_guard<std::mutex> & /*state_lock*/) const
++bool ReplicatedMergeTreeAltersSequence::canExecuteDataAlter(int alter_version, std::unique_lock<std::mutex> & /*state_lock*/) const
+ {
+     /// Queue maybe empty when we start after server shutdown
+     /// and have some MUTATE_PART records in queue
+@@ -80,7 +80,7 @@ bool ReplicatedMergeTreeAltersSequence::canExecuteDataAlter(int alter_version, s
+     return queue_state.at(alter_version).metadata_finished;
+ }
+ 
+-bool ReplicatedMergeTreeAltersSequence::canExecuteMetaAlter(int alter_version, std::lock_guard<std::mutex> & /*state_lock*/) const
++bool ReplicatedMergeTreeAltersSequence::canExecuteMetaAlter(int alter_version, std::unique_lock<std::mutex> & /*state_lock*/) const
+ {
+     assert(!queue_state.empty());
+ 
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.h b/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.h
+index aa58e16a716e..c104109bd4cb 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.h
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeAltersSequence.h
+@@ -49,13 +49,13 @@ class ReplicatedMergeTreeAltersSequence
+     void finishDataAlter(int alter_version, std::lock_guard<std::mutex> & /*state_lock*/);
+ 
+     /// Check that we can execute this data alter. If it's metadata stage finished.
+-    bool canExecuteDataAlter(int alter_version, std::lock_guard<std::mutex> & /*state_lock*/) const;
++    bool canExecuteDataAlter(int alter_version, std::unique_lock<std::mutex> & /*state_lock*/) const;
+ 
+     /// Check that we can execute metadata alter with version.
+-    bool canExecuteMetaAlter(int alter_version, std::lock_guard<std::mutex> & /*state_lock*/) const;
++    bool canExecuteMetaAlter(int alter_version, std::unique_lock<std::mutex> & /*state_lock*/) const;
+ 
+     /// Just returns smallest alter version in sequence (first entry)
+-    int getHeadAlterVersion(std::lock_guard<std::mutex> & /*state_lock*/) const;
++    int getHeadAlterVersion(std::unique_lock<std::mutex> & /*state_lock*/) const;
+ };
+ 
+ }
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 9f679f121b88..add1ba875aa6 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1066,8 +1066,9 @@ void ReplicatedMergeTreeQueue::removePartProducingOpsInRange(
+ }
+ 
+ 
+-bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const LogEntry & entry, const String & new_part_name,
+-                                                             String & out_reason, std::lock_guard<std::mutex> & /* queue_lock */) const
++bool ReplicatedMergeTreeQueue::isCoveredByFuturePartsImpl(const LogEntry & entry, const String & new_part_name,
++                                                          String & out_reason, std::unique_lock<std::mutex> & /* queue_lock */,
++                                                          std::vector<LogEntryPtr> * covered_entries_to_wait) const
+ {
+     /// Let's check if the same part is now being created by another action.
+     auto entry_for_same_part_it = future_parts.find(new_part_name);
+@@ -1080,7 +1081,7 @@ bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const LogEntry & en
+             entry.znode_name, entry.type, entry.new_part_name,
+             another_entry.znode_name, another_entry.type, another_entry.new_part_name);
+         LOG_INFO(log, fmt::runtime(out_reason));
+-        return false;
++        return true;
+ 
+         /** When the corresponding action is completed, then `isNotCoveredByFuturePart` next time, will succeed,
+             *  and queue element will be processed.
+@@ -1098,24 +1099,50 @@ bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const LogEntry & en
+     {
+         auto future_part = MergeTreePartInfo::fromPartName(future_part_elem.first, format_version);
+ 
+-        if (future_part.contains(result_part))
++        if (future_part.isDisjoint(result_part))
++            continue;
++
++        /// Parts are not disjoint, so new_part_name either contains or covers future_part.
++        chassert(future_part.contains(result_part) || result_part.contains(future_part));
++        /// We cannot execute `entry` (or upgrade its actual_part_name to `new_part_name`)
++        /// while any covered or covering parts are processed.
++        /// But we also cannot simply return true and postpone entry processing, because it may lead to kind of livelock.
++        /// Since queue is processed in multiple threads, it's likely that there will be at least one thread
++        /// executing faulty entry for some small part, so bigger covering part will never be processed.
++        /// That's why it's better to wait for covered entry to be executed (does not matter successfully or not)
++        /// instead of exiting and postponing covering entry.
++
++        if (covered_entries_to_wait)
+         {
+-            out_reason = fmt::format(
+-                "Not executing log entry {} for part {} "
+-                "because it is covered by part {} that is currently executing.",
+-                entry.znode_name, new_part_name, future_part_elem.first);
+-            LOG_TRACE(log, fmt::runtime(out_reason));
+-            return false;
++            if (entry.znode_name < future_part_elem.second->znode_name)
++            {
++                out_reason = fmt::format(
++                    "Not executing log entry {} for part {} "
++                    "because it is not disjoint with part {} that is currently executing and another entry {} is newer.",
++                    entry.znode_name, new_part_name, future_part_elem.first, future_part_elem.second->znode_name);
++                LOG_TRACE(log, fmt::runtime(out_reason));
++                return true;
++            }
++
++            covered_entries_to_wait->push_back(future_part_elem.second);
++            continue;
+         }
++
++        out_reason = fmt::format(
++            "Not executing log entry {} for part {} "
++            "because it is not disjoint with part {} that is currently executing.",
++            entry.znode_name, new_part_name, future_part_elem.first);
++        LOG_TRACE(log, fmt::runtime(out_reason));
++        return true;
+     }
+ 
+-    return true;
++    return false;
+ }
+ 
+ bool ReplicatedMergeTreeQueue::addFuturePartIfNotCoveredByThem(const String & part_name, LogEntry & entry, String & reject_reason)
+ {
+     /// We have found `part_name` on some replica and are going to fetch it instead of covered `entry->new_part_name`.
+-    std::lock_guard lock(state_mutex);
++    std::unique_lock lock(state_mutex);
+ 
+     if (virtual_parts.getContainingPart(part_name).empty())
+     {
+@@ -1137,13 +1164,13 @@ bool ReplicatedMergeTreeQueue::addFuturePartIfNotCoveredByThem(const String & pa
+     if (drop_ranges.isAffectedByDropRange(part_name, reject_reason))
+         return false;
+ 
+-    if (isNotCoveredByFuturePartsImpl(entry, part_name, reject_reason, lock))
+-    {
+-        CurrentlyExecuting::setActualPartName(entry, part_name, *this, lock);
+-        return true;
+-    }
++    std::vector<LogEntryPtr> covered_entries_to_wait;
++    if (isCoveredByFuturePartsImpl(entry, part_name, reject_reason, lock, &covered_entries_to_wait))
++        return false;
++
++    CurrentlyExecuting::setActualPartName(entry, part_name, *this, lock, covered_entries_to_wait);
++    return true;
+ 
+-    return false;
+ }
+ 
+ 
+@@ -1152,13 +1179,15 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
+     String & out_postpone_reason,
+     MergeTreeDataMergerMutator & merger_mutator,
+     MergeTreeData & data,
+-    std::lock_guard<std::mutex> & state_lock) const
++    std::unique_lock<std::mutex> & state_lock) const
+ {
+     /// If our entry produce part which is already covered by
+     /// some other entry which is currently executing, then we can postpone this entry.
+     for (const String & new_part_name : entry.getVirtualPartNames(format_version))
+     {
+-        if (!isNotCoveredByFuturePartsImpl(entry, new_part_name, out_postpone_reason, state_lock))
++        /// Do not wait for any entries here, because we have only one thread that scheduling queue entries.
++        /// We can wait in worker threads, but not in scheduler.
++        if (isCoveredByFuturePartsImpl(entry, new_part_name, out_postpone_reason, state_lock, /* covered_entries_to_wait */ nullptr))
+             return false;
+     }
+ 
+@@ -1409,7 +1438,7 @@ Int64 ReplicatedMergeTreeQueue::getCurrentMutationVersion(const String & partiti
+ 
+ 
+ ReplicatedMergeTreeQueue::CurrentlyExecuting::CurrentlyExecuting(
+-    const ReplicatedMergeTreeQueue::LogEntryPtr & entry_, ReplicatedMergeTreeQueue & queue_, std::lock_guard<std::mutex> & /* state_lock */)
++    const ReplicatedMergeTreeQueue::LogEntryPtr & entry_, ReplicatedMergeTreeQueue & queue_, std::unique_lock<std::mutex> & /* state_lock */)
+     : entry(entry_), queue(queue_)
+ {
+     if (entry->type == ReplicatedMergeTreeLogEntry::DROP_RANGE || entry->type == ReplicatedMergeTreeLogEntry::REPLACE_RANGE)
+@@ -1435,7 +1464,8 @@ void ReplicatedMergeTreeQueue::CurrentlyExecuting::setActualPartName(
+     ReplicatedMergeTreeQueue::LogEntry & entry,
+     const String & actual_part_name,
+     ReplicatedMergeTreeQueue & queue,
+-    std::lock_guard<std::mutex> & /* state_lock */)
++    std::unique_lock<std::mutex> & state_lock,
++    std::vector<LogEntryPtr> & covered_entries_to_wait)
+ {
+     if (!entry.actual_new_part_name.empty())
+         throw Exception("Entry actual part isn't empty yet. This is a bug.", ErrorCodes::LOGICAL_ERROR);
+@@ -1450,6 +1480,15 @@ void ReplicatedMergeTreeQueue::CurrentlyExecuting::setActualPartName(
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "Attaching already existing future part {}. This is a bug. "
+                                                    "It happened on attempt to execute {}: {}",
+                                                    entry.actual_new_part_name, entry.znode_name, entry.toString());
++
++    for (LogEntryPtr & covered_entry : covered_entries_to_wait)
++    {
++        if (&entry == covered_entry.get())
++            continue;
++        LOG_TRACE(queue.log, "Waiting for {} producing {} to finish before executing {} producing not disjoint part {}",
++                  covered_entry->znode_name, covered_entry->new_part_name, entry.znode_name, entry.new_part_name);
++        covered_entry->execution_complete.wait(state_lock, [&covered_entry] { return !covered_entry->currently_executing; });
++    }
+ }
+ 
+ 
+@@ -1491,7 +1530,7 @@ ReplicatedMergeTreeQueue::SelectedEntryPtr ReplicatedMergeTreeQueue::selectEntry
+ {
+     LogEntryPtr entry;
+ 
+-    std::lock_guard lock(state_mutex);
++    std::unique_lock lock(state_mutex);
+ 
+     for (auto it = queue.begin(); it != queue.end(); ++it)
+     {
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+index dea4d0573db2..a88d9182bbf0 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+@@ -202,17 +202,18 @@ class ReplicatedMergeTreeQueue
+     bool shouldExecuteLogEntry(
+         const LogEntry & entry, String & out_postpone_reason,
+         MergeTreeDataMergerMutator & merger_mutator, MergeTreeData & data,
+-        std::lock_guard<std::mutex> & state_lock) const;
++        std::unique_lock<std::mutex> & state_lock) const;
+ 
+     Int64 getCurrentMutationVersionImpl(const String & partition_id, Int64 data_version, std::lock_guard<std::mutex> & /* state_lock */) const;
+ 
+     /** Check that part isn't in currently generating parts and isn't covered by them.
+       * Should be called under state_mutex.
+       */
+-    bool isNotCoveredByFuturePartsImpl(
++    bool isCoveredByFuturePartsImpl(
+         const LogEntry & entry,
+         const String & new_part_name, String & out_reason,
+-        std::lock_guard<std::mutex> & state_lock) const;
++        std::unique_lock<std::mutex> & state_lock,
++        std::vector<LogEntryPtr> * covered_entries_to_wait) const;
+ 
+     /// After removing the queue element, update the insertion times in the RAM. Running under state_mutex.
+     /// Returns information about what times have changed - this information can be passed to updateTimesInZooKeeper.
+@@ -254,14 +255,15 @@ class ReplicatedMergeTreeQueue
+         CurrentlyExecuting(
+             const ReplicatedMergeTreeQueue::LogEntryPtr & entry_,
+             ReplicatedMergeTreeQueue & queue_,
+-            std::lock_guard<std::mutex> & state_lock);
++            std::unique_lock<std::mutex> & state_lock);
+ 
+         /// In case of fetch, we determine actual part during the execution, so we need to update entry. It is called under state_mutex.
+         static void setActualPartName(
+             ReplicatedMergeTreeQueue::LogEntry & entry,
+             const String & actual_part_name,
+             ReplicatedMergeTreeQueue & queue,
+-            std::lock_guard<std::mutex> & state_lock);
++            std::unique_lock<std::mutex> & state_lock,
++            std::vector<LogEntryPtr> & covered_entries_to_wait);
+ 
+     public:
+         ~CurrentlyExecuting();
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index ab538ce8fd7d..070c55d3015e 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -278,8 +278,9 @@ void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, Cont
+         /// This protects against "revival" of data for a removed partition after completion of merge.
+         auto merge_blocker = stopMergesAndWait();
+ 
+-        auto parts_to_remove = getVisibleDataPartsVector(local_context);
+-        removePartsFromWorkingSet(local_context->getCurrentTransaction().get(), parts_to_remove, true);
++        auto data_parts_lock = lockParts();
++        auto parts_to_remove = getVisibleDataPartsVectorUnlocked(local_context, data_parts_lock);
++        removePartsFromWorkingSet(local_context->getCurrentTransaction().get(), parts_to_remove, true, data_parts_lock);
+ 
+         LOG_INFO(log, "Removed {} parts.", parts_to_remove.size());
+     }
+@@ -1469,16 +1470,17 @@ void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, Cont
+         /// Asks to complete merges and does not allow them to start.
+         /// This protects against "revival" of data for a removed partition after completion of merge.
+         auto merge_blocker = stopMergesAndWait();
++        auto data_parts_lock = lockParts();
+         const auto * partition_ast = partition->as<ASTPartition>();
+         if (partition_ast && partition_ast->all)
+-            parts_to_remove = getVisibleDataPartsVector(local_context);
++            parts_to_remove = getVisibleDataPartsVectorUnlocked(local_context, data_parts_lock);
+         else
+         {
+-            String partition_id = getPartitionIDFromQuery(partition, local_context);
+-            parts_to_remove = getVisibleDataPartsVectorInPartition(local_context, partition_id);
++            String partition_id = getPartitionIDFromQuery(partition, local_context, &data_parts_lock);
++            parts_to_remove = getVisibleDataPartsVectorInPartition(local_context, partition_id, data_parts_lock);
+         }
+         /// TODO should we throw an exception if parts_to_remove is empty?
+-        removePartsFromWorkingSet(local_context->getCurrentTransaction().get(), parts_to_remove, true);
++        removePartsFromWorkingSet(local_context->getCurrentTransaction().get(), parts_to_remove, true, data_parts_lock);
+     }
+ 
+     dropPartsImpl(std::move(parts_to_remove), detach);

@@ -1,0 +1,1083 @@
+diff --git a/dbms/src/Common/BitHelpers.h b/dbms/src/Common/BitHelpers.h
+index d776a399ac8e..ba6a4c60a494 100644
+--- a/dbms/src/Common/BitHelpers.h
++++ b/dbms/src/Common/BitHelpers.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <type_traits>
+ 
+ 
+ /** Returns log2 of number, rounded down.
+@@ -30,3 +31,64 @@ inline size_t roundUpToPowerOfTwoOrZero(size_t n)
+ 
+     return n;
+ }
++
++
++template <typename T>
++inline size_t getLeadingZeroBits(T x)
++{
++    if (!x)
++        return sizeof(x) * 8;
++
++    if constexpr (sizeof(T) <= sizeof(unsigned int))
++    {
++        return __builtin_clz(x);
++    }
++    else if constexpr (sizeof(T) <= sizeof(unsigned long int))
++    {
++        return __builtin_clzl(x);
++    }
++    else
++    {
++        return __builtin_clzll(x);
++    }
++}
++
++template <typename T>
++inline size_t getTrailingZeroBits(T x)
++{
++    if (!x)
++        return sizeof(x) * 8;
++
++    if constexpr (sizeof(T) <= sizeof(unsigned int))
++    {
++        return __builtin_ctz(x);
++    }
++    else if constexpr (sizeof(T) <= sizeof(unsigned long int))
++    {
++        return __builtin_ctzl(x);
++    }
++    else
++    {
++        return __builtin_ctzll(x);
++    }
++}
++
++/** Returns a mask that has '1' for `bits` LSB set:
++ * maskLowBits<UInt8>(3) => 00000111
++ */
++template <typename T>
++inline T maskLowBits(unsigned char bits)
++{
++    if (bits == 0)
++    {
++        return 0;
++    }
++
++    T result = static_cast<T>(~T{0});
++    if (bits < sizeof(T) * 8)
++    {
++        result = static_cast<T>(result >> (sizeof(T) * 8 - bits));
++    }
++
++    return result;
++}
+diff --git a/dbms/src/Compression/CompressionCodecDoubleDelta.cpp b/dbms/src/Compression/CompressionCodecDoubleDelta.cpp
+new file mode 100644
+index 000000000000..b40b2abccfac
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecDoubleDelta.cpp
+@@ -0,0 +1,325 @@
++#include <Compression/CompressionCodecDoubleDelta.h>
++#include <Compression/CompressionInfo.h>
++#include <Compression/CompressionFactory.h>
++#include <common/unaligned.h>
++#include <Parsers/IAST_fwd.h>
++
++#include <IO/ReadBufferFromMemory.h>
++#include <IO/BitHelpers.h>
++#include <IO/WriteHelpers.h>
++
++#include <string.h>
++#include <algorithm>
++#include <cstdlib>
++#include <type_traits>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++extern const int CANNOT_COMPRESS;
++extern const int CANNOT_DECOMPRESS;
++}
++
++namespace
++{
++UInt32 getDeltaTypeByteSize(UInt8 data_bytes_size)
++{
++    // both delta and double delta can be twice the size of data item, but not less than 32 bits and not more that 64.
++    return std::min(64/8, std::max(32/8, data_bytes_size * 2));
++}
++
++UInt32 getCompressedHeaderSize(UInt8 data_bytes_size)
++{
++    const UInt8 items_count_size = 4;
++
++    return items_count_size + data_bytes_size + getDeltaTypeByteSize(data_bytes_size);
++}
++
++UInt32 getCompressedDataSize(UInt8 data_bytes_size, UInt32 uncompressed_size)
++{
++    const UInt32 items_count = uncompressed_size / data_bytes_size;
++
++    // 11111 + max 64 bits of double delta.
++    const UInt32 max_item_size_bits = 5 + getDeltaTypeByteSize(data_bytes_size) * 8;
++
++    // + 8 is to round up to next byte.
++    return (items_count * max_item_size_bits + 8) / 8;
++}
++
++struct WriteSpec
++{
++    const UInt8 prefix_bits;
++    const UInt8 prefix;
++    const UInt8 data_bits;
++};
++
++template <typename T>
++WriteSpec getWriteSpec(const T & value)
++{
++    if (value > -63 && value < 64)
++    {
++        return WriteSpec{2, 0b10, 7};
++    }
++    else if (value > -255 && value < 256)
++    {
++        return WriteSpec{3, 0b110, 9};
++    }
++    else if (value > -2047 && value < 2048)
++    {
++        return WriteSpec{4, 0b1110, 12};
++    }
++    else if (value > std::numeric_limits<Int32>::min() && value < std::numeric_limits<Int32>::max())
++    {
++        return WriteSpec{5, 0b11110, 32};
++    }
++    else
++    {
++        return WriteSpec{5, 0b11111, 64};
++    }
++}
++
++template <typename T, typename DeltaType>
++UInt32 compressDataForType(const char * source, UInt32 source_size, char * dest)
++{
++    using UnsignedDeltaType = typename std::make_unsigned<DeltaType>::type;
++
++    if (source_size % sizeof(T) != 0)
++        throw Exception("Cannot compress, data size " + toString(source_size) + " is not aligned to " + toString(sizeof(T)), ErrorCodes::CANNOT_COMPRESS);
++    const char * source_end = source + source_size;
++
++    const UInt32 items_count = source_size / sizeof(T);
++    unalignedStore(dest, items_count);
++    dest += sizeof(items_count);
++
++    T prev_value{};
++    DeltaType prev_delta{};
++
++    if (source < source_end)
++    {
++        prev_value = unalignedLoad<T>(source);
++        unalignedStore(dest, prev_value);
++
++        source += sizeof(prev_value);
++        dest += sizeof(prev_value);
++    }
++
++    if (source < source_end)
++    {
++        const T curr_value = unalignedLoad<T>(source);
++        prev_delta = static_cast<DeltaType>(curr_value - prev_value);
++        unalignedStore(dest, prev_delta);
++
++        source += sizeof(curr_value);
++        dest += sizeof(prev_delta);
++        prev_value = curr_value;
++    }
++
++    WriteBuffer buffer(dest, getCompressedDataSize(sizeof(T), source_size - sizeof(T)*2));
++    BitWriter writer(buffer);
++
++    for (; source < source_end; source += sizeof(T))
++    {
++        const T curr_value = unalignedLoad<T>(source);
++
++        const auto delta = curr_value - prev_value;
++        const DeltaType double_delta = static_cast<DeltaType>(delta - static_cast<T>(prev_delta));
++
++        prev_delta = delta;
++        prev_value = curr_value;
++
++        if (double_delta == 0)
++        {
++            writer.writeBits(1, 0);
++        }
++        else
++        {
++            const auto sign = std::signbit(double_delta);
++            const auto abs_value = static_cast<UnsignedDeltaType>(std::abs(double_delta));
++            const auto write_spec = getWriteSpec(double_delta);
++
++            writer.writeBits(write_spec.prefix_bits, write_spec.prefix);
++            writer.writeBits(1, sign);
++            writer.writeBits(write_spec.data_bits - 1, abs_value);
++        }
++    }
++
++    writer.flush();
++
++    return sizeof(items_count) + sizeof(prev_value) + sizeof(prev_delta) + buffer.count();
++}
++
++template <typename T, typename DeltaType>
++void decompressDataForType(const char * source, UInt32 source_size, char * dest)
++{
++    const char * source_end = source + source_size;
++
++    const UInt32 items_count = unalignedLoad<UInt32>(source);
++    source += sizeof(items_count);
++
++    T prev_value{};
++    DeltaType prev_delta{};
++
++    if (source < source_end)
++    {
++        prev_value = unalignedLoad<T>(source);
++        unalignedStore(dest, prev_value);
++
++        source += sizeof(prev_value);
++        dest += sizeof(prev_value);
++    }
++
++    if (source < source_end)
++    {
++        prev_delta = unalignedLoad<DeltaType>(source);
++        prev_value = static_cast<T>(prev_value + prev_delta);
++        unalignedStore(dest, prev_value);
++
++        source += sizeof(prev_delta);
++        dest += sizeof(prev_value);
++    }
++
++    ReadBufferFromMemory buffer(source, source_size - sizeof(prev_value) - sizeof(prev_delta) - sizeof(items_count));
++    BitReader reader(buffer);
++
++    // since data is tightly packed, up to 1 bit per value, and last byte is padded with zeroes,
++    // we have to keep track of items to avoid reading more that there is.
++    for (UInt32 items_read = 2; items_read < items_count && !reader.eof(); ++items_read)
++    {
++        DeltaType double_delta = 0;
++        if (reader.readBit() == 1)
++        {
++            const UInt8 data_sizes[] = {6, 8, 11, 31, 63};
++            UInt8 i = 0;
++            for (; i < sizeof(data_sizes) - 1; ++i)
++            {
++                const auto next_bit = reader.readBit();
++                if (next_bit == 0)
++                    break;
++            }
++
++            const UInt8 sign = reader.readBit();
++            double_delta = static_cast<DeltaType>(reader.readBits(data_sizes[i]));
++            if (sign)
++            {
++                double_delta *= -1;
++            }
++        }
++        // else if first bit is zero, no need to read more data.
++
++        const T curr_value = static_cast<T>(prev_value + prev_delta + double_delta);
++        unalignedStore(dest, curr_value);
++        dest += sizeof(curr_value);
++
++        prev_delta = curr_value - prev_value;
++        prev_value = curr_value;
++    }
++}
++
++UInt8 getDataBytesSize(DataTypePtr column_type)
++{
++    UInt8 data_bytes_size = 1;
++    if (column_type && column_type->haveMaximumSizeOfValue())
++    {
++        size_t max_size = column_type->getSizeOfValueInMemory();
++        if (max_size == 1 || max_size == 2 || max_size == 4 || max_size == 8)
++            data_bytes_size = static_cast<UInt8>(max_size);
++    }
++    return data_bytes_size;
++}
++
++}
++
++
++CompressionCodecDoubleDelta::CompressionCodecDoubleDelta(UInt8 data_bytes_size_)
++    : data_bytes_size(data_bytes_size_)
++{
++}
++
++UInt8 CompressionCodecDoubleDelta::getMethodByte() const
++{
++    return static_cast<UInt8>(CompressionMethodByte::DoubleDelta);
++}
++
++String CompressionCodecDoubleDelta::getCodecDesc() const
++{
++    return "DoubleDelta";
++}
++
++UInt32 CompressionCodecDoubleDelta::getMaxCompressedDataSize(UInt32 uncompressed_size) const
++{
++    const auto result = 2 // common header
++            + data_bytes_size // max bytes skipped if source is not properly aligned.
++            + getCompressedHeaderSize(data_bytes_size) // data-specific header
++            + getCompressedDataSize(data_bytes_size, uncompressed_size);
++
++    return result;
++}
++
++UInt32 CompressionCodecDoubleDelta::doCompressData(const char * source, UInt32 source_size, char * dest) const
++{
++    UInt8 bytes_to_skip = source_size % data_bytes_size;
++    dest[0] = data_bytes_size;
++    dest[1] = bytes_to_skip;
++    memcpy(&dest[2], source, bytes_to_skip);
++    size_t start_pos = 2 + bytes_to_skip;
++    UInt32 compressed_size = 0;
++    switch (data_bytes_size)
++    {
++    case 1:
++        compressed_size = compressDataForType<UInt8, Int16>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 2:
++        compressed_size = compressDataForType<UInt16, Int32>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 4:
++        compressed_size = compressDataForType<UInt32, Int64>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 8:
++        compressed_size = compressDataForType<UInt64, Int64>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    }
++
++    return 1 + 1 + compressed_size;
++}
++
++void CompressionCodecDoubleDelta::doDecompressData(const char * source, UInt32 source_size, char * dest, UInt32 /* uncompressed_size */) const
++{
++    UInt8 bytes_size = source[0];
++    UInt8 bytes_to_skip = source[1];
++
++    memcpy(dest, &source[2], bytes_to_skip);
++    UInt32 source_size_no_header = source_size - bytes_to_skip - 2;
++    switch (bytes_size)
++    {
++    case 1:
++        decompressDataForType<UInt8, Int16>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 2:
++        decompressDataForType<UInt16, Int32>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 4:
++        decompressDataForType<UInt32, Int64>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 8:
++        decompressDataForType<UInt64, Int64>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    }
++}
++
++void CompressionCodecDoubleDelta::useInfoAboutType(DataTypePtr data_type)
++{
++    data_bytes_size = getDataBytesSize(data_type);
++}
++
++void registerCodecDoubleDelta(CompressionCodecFactory & factory)
++{
++    UInt8 method_code = UInt8(CompressionMethodByte::DoubleDelta);
++    factory.registerCompressionCodecWithType("DoubleDelta", method_code, [&](const ASTPtr &, DataTypePtr column_type) -> CompressionCodecPtr
++    {
++        UInt8 delta_bytes_size = getDataBytesSize(column_type);
++        return std::make_shared<CompressionCodecDoubleDelta>(delta_bytes_size);
++    });
++}
++}
+diff --git a/dbms/src/Compression/CompressionCodecDoubleDelta.h b/dbms/src/Compression/CompressionCodecDoubleDelta.h
+new file mode 100644
+index 000000000000..19c072141155
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecDoubleDelta.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Compression/ICompressionCodec.h>
++
++namespace DB
++{
++
++class CompressionCodecDoubleDelta : public ICompressionCodec
++{
++public:
++    CompressionCodecDoubleDelta(UInt8 data_bytes_size_);
++
++    UInt8 getMethodByte() const override;
++
++    String getCodecDesc() const override;
++
++    void useInfoAboutType(DataTypePtr data_type) override;
++
++protected:
++    UInt32 doCompressData(const char * source, UInt32 source_size, char * dest) const override;
++
++    void doDecompressData(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override;
++
++    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override;
++
++private:
++    UInt8 data_bytes_size;
++};
++
++}
+diff --git a/dbms/src/Compression/CompressionCodecGorilla.cpp b/dbms/src/Compression/CompressionCodecGorilla.cpp
+new file mode 100644
+index 000000000000..f9c6b52756c2
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecGorilla.cpp
+@@ -0,0 +1,326 @@
++#include <Compression/CompressionCodecGorilla.h>
++#include <Compression/CompressionInfo.h>
++#include <Compression/CompressionFactory.h>
++#include <common/unaligned.h>
++#include <Parsers/IAST_fwd.h>
++#include <IO/WriteHelpers.h>
++#include <IO/ReadBufferFromMemory.h>
++#include <IO/BitHelpers.h>
++
++#include <string.h>
++#include <algorithm>
++#include <cstdlib>
++#include <type_traits>
++
++#include <bitset>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++extern const int CANNOT_COMPRESS;
++extern const int CANNOT_DECOMPRESS;
++extern const int ILLEGAL_SYNTAX_FOR_CODEC_TYPE;
++extern const int ILLEGAL_CODEC_PARAMETER;
++}
++
++namespace
++{
++
++constexpr inline UInt8 getBitLengthOfLength(UInt8 data_bytes_size)
++{
++    // 1-byte value is 8 bits, and we need 4 bits to represent 8 : 1000,
++    // 2-byte         16 bits        =>    5
++    // 4-byte         32 bits        =>    6
++    // 8-byte         64 bits        =>    7
++    const UInt8 bit_lengths[] = {0, 4, 5, 0, 6, 0, 0, 0, 7};
++    assert(data_bytes_size >= 1 && data_bytes_size < sizeof(bit_lengths) && bit_lengths[data_bytes_size] != 0);
++
++    return bit_lengths[data_bytes_size];
++}
++
++
++UInt32 getCompressedHeaderSize(UInt8 data_bytes_size)
++{
++    const UInt8 items_count_size = 4;
++
++    return items_count_size + data_bytes_size;
++}
++
++UInt32 getCompressedDataSize(UInt8 data_bytes_size, UInt32 uncompressed_size)
++{
++    const UInt32 items_count = uncompressed_size / data_bytes_size;
++    static const auto DATA_BIT_LENGTH = getBitLengthOfLength(data_bytes_size);
++    // -1 since there must be at least 1 non-zero bit.
++    static const auto LEADING_ZEROES_BIT_LENGTH = DATA_BIT_LENGTH - 1;
++
++    // worst case (for 32-bit value):
++    // 11 + 5 bits of leading zeroes bit-size + 5 bits of data bit-size + non-zero data bits.
++    const UInt32 max_item_size_bits = 2 + LEADING_ZEROES_BIT_LENGTH + DATA_BIT_LENGTH + data_bytes_size * 8;
++
++    // + 8 is to round up to next byte.
++    return (items_count * max_item_size_bits + 8) / 8;
++}
++
++struct binary_value_info
++{
++    UInt8 leading_zero_bits;
++    UInt8 data_bits;
++    UInt8 trailing_zero_bits;
++};
++
++template <typename T>
++binary_value_info getLeadingAndTrailingBits(const T & value)
++{
++    constexpr UInt8 bit_size = sizeof(T) * 8;
++
++    const UInt8 lz = getLeadingZeroBits(value);
++    const UInt8 tz = getTrailingZeroBits(value);
++    const UInt8 data_size = value == 0 ? 0 : static_cast<UInt8>(bit_size - lz - tz);
++    return binary_value_info{lz, data_size, tz};
++}
++
++template <typename T>
++UInt32 compressDataForType(const char * source, UInt32 source_size, char * dest)
++{
++    static const auto DATA_BIT_LENGTH = getBitLengthOfLength(sizeof(T));
++    // -1 since there must be at least 1 non-zero bit.
++    static const auto LEADING_ZEROES_BIT_LENGTH = DATA_BIT_LENGTH - 1;
++
++    if (source_size % sizeof(T) != 0)
++        throw Exception("Cannot compress, data size " + toString(source_size) + " is not aligned to " + toString(sizeof(T)), ErrorCodes::CANNOT_COMPRESS);
++    const char * source_end = source + source_size;
++
++    const UInt32 items_count = source_size / sizeof(T);
++
++    unalignedStore(dest, items_count);
++    dest += sizeof(items_count);
++
++    T prev_value{};
++    // That would cause first XORed value to be written in-full.
++    binary_value_info prev_xored_info{0, 0, 0};
++
++    if (source < source_end)
++    {
++        prev_value = unalignedLoad<T>(source);
++        unalignedStore(dest, prev_value);
++
++        source += sizeof(prev_value);
++        dest += sizeof(prev_value);
++    }
++
++    WriteBuffer buffer(dest, getCompressedDataSize(sizeof(T), source_size - sizeof(items_count) - sizeof(prev_value)));
++    BitWriter writer(buffer);
++
++    while (source < source_end)
++    {
++        const T curr_value = unalignedLoad<T>(source);
++        source += sizeof(curr_value);
++
++        const auto xored_data = curr_value ^ prev_value;
++        const binary_value_info curr_xored_info = getLeadingAndTrailingBits(xored_data);
++
++        if (xored_data == 0)
++        {
++            writer.writeBits(1, 0);
++        }
++        else if (prev_xored_info.data_bits != 0
++                && prev_xored_info.leading_zero_bits <= curr_xored_info.leading_zero_bits
++                && prev_xored_info.trailing_zero_bits <= curr_xored_info.trailing_zero_bits)
++        {
++            writer.writeBits(2, 0b10);
++            writer.writeBits(prev_xored_info.data_bits, xored_data >> prev_xored_info.trailing_zero_bits);
++        }
++        else
++        {
++            writer.writeBits(2, 0b11);
++            writer.writeBits(LEADING_ZEROES_BIT_LENGTH, curr_xored_info.leading_zero_bits);
++            writer.writeBits(DATA_BIT_LENGTH, curr_xored_info.data_bits);
++            writer.writeBits(curr_xored_info.data_bits, xored_data >> curr_xored_info.trailing_zero_bits);
++            prev_xored_info = curr_xored_info;
++        }
++
++        prev_value = curr_value;
++    }
++
++    writer.flush();
++
++    return sizeof(items_count) + sizeof(prev_value) + buffer.count();
++}
++
++template <typename T>
++void decompressDataForType(const char * source, UInt32 source_size, char * dest)
++{
++    static const auto DATA_BIT_LENGTH = getBitLengthOfLength(sizeof(T));
++    // -1 since there must be at least 1 non-zero bit.
++    static const auto LEADING_ZEROES_BIT_LENGTH = DATA_BIT_LENGTH - 1;
++
++    const char * source_end = source + source_size;
++
++    const UInt32 items_count = unalignedLoad<UInt32>(source);
++    source += sizeof(items_count);
++
++    T prev_value{};
++
++    if (source < source_end)
++    {
++        prev_value = unalignedLoad<T>(source);
++        unalignedStore(dest, prev_value);
++
++        source += sizeof(prev_value);
++        dest += sizeof(prev_value);
++    }
++
++    ReadBufferFromMemory buffer(source, source_size - sizeof(items_count) - sizeof(prev_value));
++    BitReader reader(buffer);
++
++    binary_value_info prev_xored_info{0, 0, 0};
++
++    // since data is tightly packed, up to 1 bit per value, and last byte is padded with zeroes,
++    // we have to keep track of items to avoid reading more that there is.
++    for (UInt32 items_read = 1; items_read < items_count && !reader.eof(); ++items_read)
++    {
++        T curr_value = prev_value;
++        binary_value_info curr_xored_info = prev_xored_info;
++        T xored_data{};
++
++        if (reader.readBit() == 1)
++        {
++            if (reader.readBit() == 1)
++            {
++                // 0b11 prefix
++                curr_xored_info.leading_zero_bits = reader.readBits(LEADING_ZEROES_BIT_LENGTH);
++                curr_xored_info.data_bits = reader.readBits(DATA_BIT_LENGTH);
++                curr_xored_info.trailing_zero_bits = sizeof(T) * 8 - curr_xored_info.leading_zero_bits - curr_xored_info.data_bits;
++            }
++            // else: 0b10 prefix - use prev_xored_info
++
++            if (curr_xored_info.leading_zero_bits == 0
++                && curr_xored_info.data_bits == 0
++                && curr_xored_info.trailing_zero_bits == 0)
++            {
++                throw Exception("Cannot decompress gorilla-encoded data: corrupted input data.",
++                        ErrorCodes::CANNOT_DECOMPRESS);
++            }
++
++            xored_data = reader.readBits(curr_xored_info.data_bits);
++            xored_data <<= curr_xored_info.trailing_zero_bits;
++            curr_value = prev_value ^ xored_data;
++        }
++        // else: 0b0 prefix - use prev_value
++
++        unalignedStore(dest, curr_value);
++        dest += sizeof(curr_value);
++
++        prev_xored_info = curr_xored_info;
++        prev_value = curr_value;
++    }
++}
++
++UInt8 getDataBytesSize(DataTypePtr column_type)
++{
++    UInt8 delta_bytes_size = 1;
++    if (column_type && column_type->haveMaximumSizeOfValue())
++    {
++        size_t max_size = column_type->getSizeOfValueInMemory();
++        if (max_size == 1 || max_size == 2 || max_size == 4 || max_size == 8)
++            delta_bytes_size = static_cast<UInt8>(max_size);
++    }
++    return delta_bytes_size;
++}
++
++}
++
++
++CompressionCodecGorilla::CompressionCodecGorilla(UInt8 data_bytes_size_)
++    : data_bytes_size(data_bytes_size_)
++{
++}
++
++UInt8 CompressionCodecGorilla::getMethodByte() const
++{
++    return static_cast<UInt8>(CompressionMethodByte::Gorilla);
++}
++
++String CompressionCodecGorilla::getCodecDesc() const
++{
++    return "Gorilla";
++}
++
++UInt32 CompressionCodecGorilla::getMaxCompressedDataSize(UInt32 uncompressed_size) const
++{
++    const auto result = 2 // common header
++            + data_bytes_size // max bytes skipped if source is not properly aligned.
++            + getCompressedHeaderSize(data_bytes_size) // data-specific header
++            + getCompressedDataSize(data_bytes_size, uncompressed_size);
++
++    return result;
++}
++
++UInt32 CompressionCodecGorilla::doCompressData(const char * source, UInt32 source_size, char * dest) const
++{
++    UInt8 bytes_to_skip = source_size % data_bytes_size;
++    dest[0] = data_bytes_size;
++    dest[1] = bytes_to_skip;
++    memcpy(&dest[2], source, bytes_to_skip);
++    size_t start_pos = 2 + bytes_to_skip;
++    UInt32 compressed_size = 0;
++    switch (data_bytes_size)
++    {
++    case 1:
++        compressed_size = compressDataForType<UInt8>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 2:
++        compressed_size = compressDataForType<UInt16>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 4:
++        compressed_size = compressDataForType<UInt32>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    case 8:
++        compressed_size = compressDataForType<UInt64>(&source[bytes_to_skip], source_size - bytes_to_skip, &dest[start_pos]);
++        break;
++    }
++
++    return 1 + 1 + compressed_size;
++}
++
++void CompressionCodecGorilla::doDecompressData(const char * source, UInt32 source_size, char * dest, UInt32 /* uncompressed_size */) const
++{
++    UInt8 bytes_size = source[0];
++    UInt8 bytes_to_skip = source[1];
++
++    memcpy(dest, &source[2], bytes_to_skip);
++    UInt32 source_size_no_header = source_size - bytes_to_skip - 2;
++    switch (bytes_size)
++    {
++    case 1:
++        decompressDataForType<UInt8>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 2:
++        decompressDataForType<UInt16>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 4:
++        decompressDataForType<UInt32>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    case 8:
++        decompressDataForType<UInt64>(&source[2 + bytes_to_skip], source_size_no_header, &dest[bytes_to_skip]);
++        break;
++    }
++}
++
++void CompressionCodecGorilla::useInfoAboutType(DataTypePtr data_type)
++{
++    data_bytes_size = getDataBytesSize(data_type);
++}
++
++void registerCodecGorilla(CompressionCodecFactory & factory)
++{
++    UInt8 method_code = UInt8(CompressionMethodByte::Gorilla);
++    factory.registerCompressionCodecWithType("Gorilla", method_code, [&](const ASTPtr &, DataTypePtr column_type) -> CompressionCodecPtr
++    {
++        UInt8 delta_bytes_size = getDataBytesSize(column_type);
++        return std::make_shared<CompressionCodecGorilla>(delta_bytes_size);
++    });
++}
++}
+diff --git a/dbms/src/Compression/CompressionCodecGorilla.h b/dbms/src/Compression/CompressionCodecGorilla.h
+new file mode 100644
+index 000000000000..a3947434ad91
+--- /dev/null
++++ b/dbms/src/Compression/CompressionCodecGorilla.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Compression/ICompressionCodec.h>
++
++namespace DB
++{
++
++class CompressionCodecGorilla : public ICompressionCodec
++{
++public:
++    CompressionCodecGorilla(UInt8 data_bytes_size_);
++
++    UInt8 getMethodByte() const override;
++
++    String getCodecDesc() const override;
++
++    void useInfoAboutType(DataTypePtr data_type) override;
++
++protected:
++    UInt32 doCompressData(const char * source, UInt32 source_size, char * dest) const override;
++
++    void doDecompressData(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override;
++
++    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override;
++
++private:
++    UInt8 data_bytes_size;
++};
++
++}
+diff --git a/dbms/src/Compression/CompressionFactory.cpp b/dbms/src/Compression/CompressionFactory.cpp
+index 7f9a7a24f096..b67ac78b9702 100644
+--- a/dbms/src/Compression/CompressionFactory.cpp
++++ b/dbms/src/Compression/CompressionFactory.cpp
+@@ -138,6 +138,8 @@ void registerCodecMultiple(CompressionCodecFactory & factory);
+ void registerCodecLZ4HC(CompressionCodecFactory & factory);
+ void registerCodecDelta(CompressionCodecFactory & factory);
+ void registerCodecT64(CompressionCodecFactory & factory);
++void registerCodecDoubleDelta(CompressionCodecFactory & factory);
++void registerCodecGorilla(CompressionCodecFactory & factory);
+ 
+ CompressionCodecFactory::CompressionCodecFactory()
+ {
+@@ -149,6 +151,8 @@ CompressionCodecFactory::CompressionCodecFactory()
+     registerCodecLZ4HC(*this);
+     registerCodecDelta(*this);
+     registerCodecT64(*this);
++    registerCodecDoubleDelta(*this);
++    registerCodecGorilla(*this);
+ }
+ 
+ }
+diff --git a/dbms/src/Compression/CompressionInfo.h b/dbms/src/Compression/CompressionInfo.h
+index 430840686c9c..290ebaeb5042 100644
+--- a/dbms/src/Compression/CompressionInfo.h
++++ b/dbms/src/Compression/CompressionInfo.h
+@@ -41,6 +41,8 @@ enum class CompressionMethodByte : uint8_t
+     Multiple = 0x91,
+     Delta    = 0x92,
+     T64      = 0x93,
++    DoubleDelta = 0x94,
++    Gorilla     = 0x95,
+ };
+ 
+ }
+diff --git a/dbms/src/Compression/ICompressionCodec.cpp b/dbms/src/Compression/ICompressionCodec.cpp
+index f9707d7c9da3..ddedf8a4c9cf 100644
+--- a/dbms/src/Compression/ICompressionCodec.cpp
++++ b/dbms/src/Compression/ICompressionCodec.cpp
+@@ -29,7 +29,7 @@ namespace ErrorCodes
+ }
+ 
+ 
+-UInt32 ICompressionCodec::compress(char * source, UInt32 source_size, char * dest) const
++UInt32 ICompressionCodec::compress(const char * source, UInt32 source_size, char * dest) const
+ {
+     dest[0] = getMethodByte();
+     UInt8 header_size = getHeaderSize();
+@@ -41,7 +41,7 @@ UInt32 ICompressionCodec::compress(char * source, UInt32 source_size, char * des
+ }
+ 
+ 
+-UInt32 ICompressionCodec::decompress(char * source, UInt32 source_size, char * dest) const
++UInt32 ICompressionCodec::decompress(const char * source, UInt32 source_size, char * dest) const
+ {
+     UInt8 method = source[0];
+     if (method != getMethodByte())
+diff --git a/dbms/src/Compression/ICompressionCodec.h b/dbms/src/Compression/ICompressionCodec.h
+index 040cb84c5ebd..27630a79a0b5 100644
+--- a/dbms/src/Compression/ICompressionCodec.h
++++ b/dbms/src/Compression/ICompressionCodec.h
+@@ -35,10 +35,10 @@ class ICompressionCodec : private boost::noncopyable
+     virtual String getCodecDesc() const = 0;
+ 
+     /// Compressed bytes from uncompressed source to dest. Dest should preallocate memory
+-    virtual UInt32 compress(char * source, UInt32 source_size, char * dest) const;
++    virtual UInt32 compress(const char * source, UInt32 source_size, char * dest) const;
+ 
+     /// Decompress bytes from compressed source to dest. Dest should preallocate memory
+-    virtual UInt32 decompress(char * source, UInt32 source_size, char * dest) const;
++    virtual UInt32 decompress(const char * source, UInt32 source_size, char * dest) const;
+ 
+     /// Number of bytes, that will be used to compress uncompressed_size bytes with current codec
+     virtual UInt32 getCompressedReserveSize(UInt32 uncompressed_size) const { return getHeaderSize() + getMaxCompressedDataSize(uncompressed_size); }
+diff --git a/dbms/src/IO/BitHelpers.h b/dbms/src/IO/BitHelpers.h
+new file mode 100644
+index 000000000000..c29862997461
+--- /dev/null
++++ b/dbms/src/IO/BitHelpers.h
+@@ -0,0 +1,178 @@
++#pragma once
++
++#include <IO/ReadBuffer.h>
++#include <IO/WriteBuffer.h>
++#include <Core/Types.h>
++#include <Common/BitHelpers.h>
++
++namespace DB
++{
++
++/** Reads data from underlying ReadBuffer bit by bit, max 64 bits at once.
++ *
++ * reads MSB bits first, imagine that you have a data:
++ * 11110000 10101010 00100100 11111110
++ *
++ * Given that r is BitReader created with a ReadBuffer that reads from data above:
++ *  r.readBits(3)  => 0b111
++ *  r.readBit()    => 0b1
++ *  r.readBits(8)  => 0b1010 // 4 leading zero-bits are not shown
++ *  r.readBit()    => 0b1
++ *  r.readBit()    => 0b0
++ *  r.readBits(15) => 0b10001001001111111
++ *  r.readBit()    => 0b0
++**/
++
++class BitReader
++{
++    ReadBuffer & buf;
++
++    UInt64 bits_buffer;
++    UInt8 bits_count;
++    static constexpr UInt8 BIT_BUFFER_SIZE = sizeof(bits_buffer) * 8;
++
++public:
++    BitReader(ReadBuffer & buf_)
++        : buf(buf_),
++          bits_buffer(0),
++          bits_count(0)
++    {}
++
++    ~BitReader()
++    {}
++
++    inline UInt64 readBits(UInt8 bits)
++    {
++        UInt64 result = 0;
++        bits = std::min(static_cast<UInt8>(sizeof(result) * 8), bits);
++
++        while (bits != 0)
++        {
++            if (bits_count == 0)
++            {
++                fillBuffer();
++                if (bits_count == 0)
++                {
++                    // EOF.
++                    break;
++                }
++            }
++
++            const auto to_read = std::min(bits, bits_count);
++
++            const UInt64 v = bits_buffer >> (bits_count - to_read);
++            const UInt64 mask = maskLowBits<UInt64>(to_read);
++            const UInt64 value = v & mask;
++            result |= value;
++
++            // unset bits that were read
++            bits_buffer &= ~(mask << (bits_count - to_read));
++            bits_count -= to_read;
++            bits -= to_read;
++
++            result <<= std::min(bits, BIT_BUFFER_SIZE);
++        }
++
++        return result;
++    }
++
++    inline UInt64 peekBits(UInt8 /*bits*/)
++    {
++        return 0;
++    }
++
++    inline UInt8 readBit()
++    {
++        return static_cast<UInt8>(readBits(1));
++    }
++
++    inline bool eof() const
++    {
++        return bits_count == 0 && buf.eof();
++    }
++
++private:
++    void fillBuffer()
++    {
++        auto read = buf.read(reinterpret_cast<char *>(&bits_buffer), BIT_BUFFER_SIZE / 8);
++        bits_buffer = be64toh(bits_buffer);
++        bits_buffer >>= BIT_BUFFER_SIZE - read * 8;
++
++        bits_count = static_cast<UInt8>(read) * 8;
++    }
++};
++
++class BitWriter
++{
++    WriteBuffer & buf;
++
++    UInt64 bits_buffer;
++    UInt8 bits_count;
++
++    static constexpr UInt8 BIT_BUFFER_SIZE = sizeof(bits_buffer) * 8;
++
++public:
++    BitWriter(WriteBuffer & buf_)
++        : buf(buf_),
++          bits_buffer(0),
++          bits_count(0)
++    {}
++
++    ~BitWriter()
++    {
++        flush();
++    }
++
++    inline void writeBits(UInt8 bits, UInt64 value)
++    {
++        bits = std::min(static_cast<UInt8>(sizeof(value) * 8), bits);
++
++        while (bits > 0)
++        {
++            auto v = value;
++            auto to_write = bits;
++
++            const UInt8 capacity = BIT_BUFFER_SIZE - bits_count;
++            if (capacity < bits)
++            {
++                v >>= bits - capacity;
++                to_write = capacity;
++            }
++
++            const UInt64 mask = maskLowBits<UInt64>(to_write);
++            v &= mask;
++//            assert(v <= 255);
++
++            bits_buffer <<= to_write;
++            bits_buffer |= v;
++            bits_count += to_write;
++
++            if (bits_count < BIT_BUFFER_SIZE)
++                break;
++
++            doFlush();
++            bits -= to_write;
++        }
++    }
++
++    inline void flush()
++    {
++        if (bits_count != 0)
++        {
++            bits_buffer <<= (BIT_BUFFER_SIZE - bits_count);
++            doFlush();
++        }
++    }
++
++private:
++    void doFlush()
++    {
++        bits_buffer = htobe64(bits_buffer);
++        buf.write(reinterpret_cast<const char *>(&bits_buffer), (bits_count + 7) / 8);
++
++        bits_count = 0;
++        bits_buffer = 0;
++    }
++};
++
++}
+diff --git a/docs/en/query_language/create.md b/docs/en/query_language/create.md
+index 9ebd50839d38..926ba95173f1 100644
+--- a/docs/en/query_language/create.md
++++ b/docs/en/query_language/create.md
+@@ -101,6 +101,8 @@ Possible `level` range: \[3, 12\]. Default value: 9. Greater values stands for b
+ Greater values stands for better compression and higher CPU usage.
+ - `Delta(delta_bytes)` - compression approach when raw values are replace with difference of two neighbour values. Up to `delta_bytes` are used for storing delta value.
+ Possible `delta_bytes` values: 1, 2, 4, 8. Default value for delta bytes is `sizeof(type)`, if it is equals to 1, 2, 4, 8 and equals to 1 otherwise.
++- `DoubleDelta` - stores delta of deltas in compact binary form, compressing values down to 1 bit (in the best case). Best compression rates are achieved on monotonic sequences with constant stride, e.g. time samples. Can be used against any fixed-width type. Implementation is based on [Gorilla paper](http://www.vldb.org/pvldb/vol8/p1816-teller.pdf), and extended to support 64bit types. The drawback is 1 extra bit for 32-byte wide deltas: 5-bit prefix instead of 4-bit prefix.
++- `Gorilla` - stores (parts of) xored values in compact binary form, compressing values down to 1 bit (in the best case). Best compression rate is achieved when neighbouring values are binary equal. Basic use case - floating point data that do not change rapidly. Implementation is based on [Gorilla paper](http://www.vldb.org/pvldb/vol8/p1816-teller.pdf), and extended to support 64bit types.
+ 
+ Syntax example:
+ ```

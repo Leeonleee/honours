@@ -1,0 +1,452 @@
+diff --git a/src/Core/Block.cpp b/src/Core/Block.cpp
+index cd2855739e2f..0c9a470dc1d4 100644
+--- a/src/Core/Block.cpp
++++ b/src/Core/Block.cpp
+@@ -409,6 +409,15 @@ Block Block::cloneWithoutColumns() const
+     return res;
+ }
+ 
++Block Block::cloneWithCutColumns(size_t start, size_t length) const
++{
++    Block copy = *this;
++
++    for (auto & column_to_cut : copy.data)
++        column_to_cut.column = column_to_cut.column->cut(start, length);
++
++    return copy;
++}
+ 
+ Block Block::sortColumns() const
+ {
+diff --git a/src/Core/Block.h b/src/Core/Block.h
+index f588373aaed3..14f4f57caedc 100644
+--- a/src/Core/Block.h
++++ b/src/Core/Block.h
+@@ -129,6 +129,7 @@ class Block
+     void setColumns(const Columns & columns);
+     Block cloneWithColumns(const Columns & columns) const;
+     Block cloneWithoutColumns() const;
++    Block cloneWithCutColumns(size_t start, size_t length) const;
+ 
+     /** Get empty columns with the same types as in block. */
+     MutableColumns cloneEmptyColumns() const;
+diff --git a/src/Dictionaries/DictionarySourceHelpers.cpp b/src/Dictionaries/DictionarySourceHelpers.cpp
+index 309bc64e179e..2a872672aff0 100644
+--- a/src/Dictionaries/DictionarySourceHelpers.cpp
++++ b/src/Dictionaries/DictionarySourceHelpers.cpp
+@@ -1,6 +1,5 @@
+ #include "DictionarySourceHelpers.h"
+ #include <Columns/ColumnsNumber.h>
+-#include <Core/Block.h>
+ #include <Core/ColumnWithTypeAndName.h>
+ #include <DataStreams/IBlockOutputStream.h>
+ #include <DataTypes/DataTypesNumber.h>
+@@ -13,44 +12,54 @@
+ 
+ namespace DB
+ {
++
++void formatBlock(BlockOutputStreamPtr & out, const Block & block)
++{
++    out->writePrefix();
++    out->write(block);
++    out->writeSuffix();
++    out->flush();
++}
++
+ /// For simple key
+-void formatIDs(BlockOutputStreamPtr & out, const std::vector<UInt64> & ids)
++
++Block blockForIds(
++    const DictionaryStructure & dict_struct,
++    const std::vector<UInt64> & ids)
+ {
+     auto column = ColumnUInt64::create(ids.size());
+     memcpy(column->getData().data(), ids.data(), ids.size() * sizeof(ids.front()));
+ 
+-    Block block{{std::move(column), std::make_shared<DataTypeUInt64>(), "id"}};
++    Block block{{std::move(column), std::make_shared<DataTypeUInt64>(), (*dict_struct.id).name}};
+ 
+-    out->writePrefix();
+-    out->write(block);
+-    out->writeSuffix();
+-    out->flush();
++    return block;
+ }
+ 
+ /// For composite key
+-void formatKeys(
++
++Block blockForKeys(
+     const DictionaryStructure & dict_struct,
+-    BlockOutputStreamPtr & out,
+     const Columns & key_columns,
+     const std::vector<size_t> & requested_rows)
+ {
+     Block block;
++
+     for (size_t i = 0, size = key_columns.size(); i < size; ++i)
+     {
+         const ColumnPtr & source_column = key_columns[i];
+-        auto filtered_column = source_column->cloneEmpty();
+-        filtered_column->reserve(requested_rows.size());
++        size_t column_rows_size = source_column->size();
++
++        PaddedPODArray<UInt8> filter(column_rows_size, false);
+ 
+         for (size_t idx : requested_rows)
+-            filtered_column->insertFrom(*source_column, idx);
++            filter[idx] = true;
+ 
+-        block.insert({std::move(filtered_column), (*dict_struct.key)[i].type, toString(i)});
++        auto filtered_column = source_column->filter(filter, requested_rows.size());
++
++        block.insert({std::move(filtered_column), (*dict_struct.key)[i].type, (*dict_struct.key)[i].name});
+     }
+ 
+-    out->writePrefix();
+-    out->write(block);
+-    out->writeSuffix();
+-    out->flush();
++    return block;
+ }
+ 
+ Context copyContextAndApplySettings(
+diff --git a/src/Dictionaries/DictionarySourceHelpers.h b/src/Dictionaries/DictionarySourceHelpers.h
+index 3f42700d3362..cad5441c66e1 100644
+--- a/src/Dictionaries/DictionarySourceHelpers.h
++++ b/src/Dictionaries/DictionarySourceHelpers.h
+@@ -1,11 +1,15 @@
+ #pragma once
+ 
+ #include <vector>
+-#include <Columns/IColumn.h>
++
+ #include <common/types.h>
++
+ #include <Poco/File.h>
+ #include <Poco/Util/AbstractConfiguration.h>
+ 
++#include <Columns/IColumn.h>
++#include <Core/Block.h>
++
+ namespace DB
+ {
+ class IBlockOutputStream;
+@@ -16,13 +20,18 @@ class Context;
+ 
+ /// Write keys to block output stream.
+ 
++void formatBlock(BlockOutputStreamPtr & out, const Block & block);
++
+ /// For simple key
+-void formatIDs(BlockOutputStreamPtr & out, const std::vector<UInt64> & ids);
++
++Block blockForIds(
++    const DictionaryStructure & dict_struct,
++    const std::vector<UInt64> & ids);
+ 
+ /// For composite key
+-void formatKeys(
++
++Block blockForKeys(
+     const DictionaryStructure & dict_struct,
+-    BlockOutputStreamPtr & out,
+     const Columns & key_columns,
+     const std::vector<size_t> & requested_rows);
+ 
+@@ -36,4 +45,5 @@ void applySettingsToContext(
+     const std::string & config_prefix,
+     Context & context,
+     const Poco::Util::AbstractConfiguration & config);
++
+ }
+diff --git a/src/Dictionaries/DictionaryStructure.cpp b/src/Dictionaries/DictionaryStructure.cpp
+index 95c2e0a3e09e..25f5736221ea 100644
+--- a/src/Dictionaries/DictionaryStructure.cpp
++++ b/src/Dictionaries/DictionaryStructure.cpp
+@@ -281,6 +281,21 @@ size_t DictionaryStructure::getKeySize() const
+     });
+ }
+ 
++Strings DictionaryStructure::getKeysNames() const
++{
++    if (id)
++        return { id->name };
++
++    const auto & key_attributes = *key;
++
++    Strings keys_names;
++    keys_names.reserve(key_attributes.size());
++
++    for (const auto & key_attribute : key_attributes)
++        keys_names.emplace_back(key_attribute.name);
++
++    return keys_names;
++}
+ 
+ static void checkAttributeKeys(const Poco::Util::AbstractConfiguration::Keys & keys)
+ {
+diff --git a/src/Dictionaries/DictionaryStructure.h b/src/Dictionaries/DictionaryStructure.h
+index 945e1c55494f..c6c80498a4b7 100644
+--- a/src/Dictionaries/DictionaryStructure.h
++++ b/src/Dictionaries/DictionaryStructure.h
+@@ -158,6 +158,8 @@ struct DictionaryStructure final
+     std::string getKeyDescription() const;
+     bool isKeySizeFixed() const;
+     size_t getKeySize() const;
++    Strings getKeysNames() const;
++
+ private:
+     /// range_min and range_max have to be parsed before this function call
+     std::vector<DictionaryAttribute> getAttributes(
+diff --git a/src/Dictionaries/ExecutableDictionarySource.cpp b/src/Dictionaries/ExecutableDictionarySource.cpp
+index f2abe10f970c..42dac540f09e 100644
+--- a/src/Dictionaries/ExecutableDictionarySource.cpp
++++ b/src/Dictionaries/ExecutableDictionarySource.cpp
+@@ -26,6 +26,8 @@ namespace ErrorCodes
+ {
+     extern const int LOGICAL_ERROR;
+     extern const int DICTIONARY_ACCESS_DENIED;
++    extern const int UNSUPPORTED_METHOD;
++    extern const int SIZES_OF_COLUMNS_DOESNT_MATCH;
+ }
+ 
+ namespace
+@@ -65,18 +67,34 @@ ExecutableDictionarySource::ExecutableDictionarySource(
+     const Context & context_)
+     : log(&Poco::Logger::get("ExecutableDictionarySource"))
+     , dict_struct{dict_struct_}
++    , implicit_key{config.getBool(config_prefix + ".implicit_key", false)}
+     , command{config.getString(config_prefix + ".command")}
+     , update_field{config.getString(config_prefix + ".update_field", "")}
+     , format{config.getString(config_prefix + ".format")}
+     , sample_block{sample_block_}
+     , context(context_)
+ {
++    /// Remove keys from sample_block for implicit_key dictionary because
++    /// these columns will not be returned from source
++    /// Implicit key means that the source script will return only values,
++    /// and the correspondence to the requested keys is determined implicitly - by the order of rows in the result.
++    if (implicit_key)
++    {
++        auto keys_names = dict_struct.getKeysNames();
++
++        for (auto & key_name : keys_names)
++        {
++            size_t key_column_position_in_block = sample_block.getPositionByName(key_name);
++            sample_block.erase(key_column_position_in_block);
++        }
++    }
+ }
+ 
+ ExecutableDictionarySource::ExecutableDictionarySource(const ExecutableDictionarySource & other)
+     : log(&Poco::Logger::get("ExecutableDictionarySource"))
+     , update_time{other.update_time}
+     , dict_struct{other.dict_struct}
++    , implicit_key{other.implicit_key}
+     , command{other.command}
+     , update_field{other.update_field}
+     , format{other.format}
+@@ -87,6 +105,9 @@ ExecutableDictionarySource::ExecutableDictionarySource(const ExecutableDictionar
+ 
+ BlockInputStreamPtr ExecutableDictionarySource::loadAll()
+ {
++    if (implicit_key)
++        throw Exception("ExecutableDictionarySource with implicit_key does not support loadAll method", ErrorCodes::UNSUPPORTED_METHOD);
++
+     LOG_TRACE(log, "loadAll {}", toString());
+     auto process = ShellCommand::execute(command);
+     auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
+@@ -95,6 +116,9 @@ BlockInputStreamPtr ExecutableDictionarySource::loadAll()
+ 
+ BlockInputStreamPtr ExecutableDictionarySource::loadUpdatedAll()
+ {
++    if (implicit_key)
++        throw Exception("ExecutableDictionarySource with implicit_key does not support loadUpdatedAll method", ErrorCodes::UNSUPPORTED_METHOD);
++
+     time_t new_update_time = time(nullptr);
+     SCOPE_EXIT(update_time = new_update_time);
+ 
+@@ -173,6 +197,77 @@ namespace
+         std::function<void(WriteBufferFromFile &)> send_data;
+         ThreadFromGlobalPool thread;
+     };
++
++    /** A stream, adds additional columns to each block that it will read from inner stream.
++     *
++     *  block_to_add rows size must be equal to final sum rows size of all inner stream blocks.
++     */
++    class BlockInputStreamWithAdditionalColumns final: public IBlockInputStream
++    {
++    public:
++        BlockInputStreamWithAdditionalColumns(
++            Block block_to_add_,
++            std::unique_ptr<IBlockInputStream>&& stream_)
++            : block_to_add(std::move(block_to_add_))
++            , stream(std::move(stream_))
++        {
++        }
++
++        Block getHeader() const override
++        {
++            auto header = stream->getHeader();
++
++            if (header)
++            {
++                for (Int64 i = static_cast<Int64>(block_to_add.columns() - 1); i >= 0; --i)
++                    header.insert(0, block_to_add.getByPosition(i).cloneEmpty());
++            }
++
++            return header;
++        }
++
++        Block readImpl() override
++        {
++            auto block = stream->read();
++
++            if (block)
++            {
++                auto block_rows = block.rows();
++
++                auto cut_block = block_to_add.cloneWithCutColumns(current_range_index, block_rows);
++
++                if (cut_block.rows() != block_rows)
++                    throw Exception(
++                        "Number of rows in block to add after cut must equal to number of rows in block from inner stream",
++                        ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
++
++                for (Int64 i = static_cast<Int64>(cut_block.columns() - 1); i >= 0; --i)
++                    block.insert(0, cut_block.getByPosition(i));
++
++                current_range_index += block_rows;
++            }
++
++            return block;
++        }
++
++        void readPrefix() override
++        {
++            stream->readPrefix();
++        }
++
++        void readSuffix() override
++        {
++            stream->readSuffix();
++        }
++
++        String getName() const override { return "BlockInputStreamWithAdditionalColumns"; }
++
++    private:
++        Block block_to_add;
++        std::unique_ptr<IBlockInputStream> stream;
++        size_t current_range_index = 0;
++    };
++
+ }
+ 
+ 
+@@ -180,28 +275,44 @@ BlockInputStreamPtr ExecutableDictionarySource::loadIds(const std::vector<UInt64
+ {
+     LOG_TRACE(log, "loadIds {} size = {}", toString(), ids.size());
+ 
+-    return std::make_shared<BlockInputStreamWithBackgroundThread>(
++    auto block = blockForIds(dict_struct, ids);
++
++    auto stream = std::make_unique<BlockInputStreamWithBackgroundThread>(
+         context, format, sample_block, command, log,
+-        [&ids, this](WriteBufferFromFile & out) mutable
++        [block, this](WriteBufferFromFile & out) mutable
+         {
+-            auto output_stream = context.getOutputStream(format, out, sample_block);
+-            formatIDs(output_stream, ids);
++            auto output_stream = context.getOutputStream(format, out, block.cloneEmpty());
++            formatBlock(output_stream, block);
+             out.close();
+         });
++
++    if (implicit_key)
++    {
++        return std::make_shared<BlockInputStreamWithAdditionalColumns>(block, std::move(stream));
++    }
++    else
++        return std::shared_ptr<BlockInputStreamWithBackgroundThread>(stream.release());
+ }
+ 
+ BlockInputStreamPtr ExecutableDictionarySource::loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows)
+ {
+     LOG_TRACE(log, "loadKeys {} size = {}", toString(), requested_rows.size());
+ 
+-    return std::make_shared<BlockInputStreamWithBackgroundThread>(
++    auto block = blockForKeys(dict_struct, key_columns, requested_rows);
++
++    auto stream = std::make_unique<BlockInputStreamWithBackgroundThread>(
+         context, format, sample_block, command, log,
+-        [key_columns, &requested_rows, this](WriteBufferFromFile & out) mutable
++        [block, this](WriteBufferFromFile & out) mutable
+         {
+-            auto output_stream = context.getOutputStream(format, out, sample_block);
+-            formatKeys(dict_struct, output_stream, key_columns, requested_rows);
++            auto output_stream = context.getOutputStream(format, out, block.cloneEmpty());
++            formatBlock(output_stream, block);
+             out.close();
+         });
++
++    if (implicit_key)
++        return std::make_shared<BlockInputStreamWithAdditionalColumns>(block, std::move(stream));
++    else
++        return std::shared_ptr<BlockInputStreamWithBackgroundThread>(stream.release());
+ }
+ 
+ bool ExecutableDictionarySource::isModified() const
+diff --git a/src/Dictionaries/ExecutableDictionarySource.h b/src/Dictionaries/ExecutableDictionarySource.h
+index f28d71ca5e31..7aa203f267b2 100644
+--- a/src/Dictionaries/ExecutableDictionarySource.h
++++ b/src/Dictionaries/ExecutableDictionarySource.h
+@@ -49,9 +49,9 @@ class ExecutableDictionarySource final : public IDictionarySource
+ 
+ private:
+     Poco::Logger * log;
+-
+     time_t update_time = 0;
+     const DictionaryStructure dict_struct;
++    bool implicit_key;
+     const std::string command;
+     const std::string update_field;
+     const std::string format;
+diff --git a/src/Dictionaries/HTTPDictionarySource.cpp b/src/Dictionaries/HTTPDictionarySource.cpp
+index da5623bcdb05..ddcac117e586 100644
+--- a/src/Dictionaries/HTTPDictionarySource.cpp
++++ b/src/Dictionaries/HTTPDictionarySource.cpp
+@@ -131,11 +131,13 @@ BlockInputStreamPtr HTTPDictionarySource::loadIds(const std::vector<UInt64> & id
+ {
+     LOG_TRACE(log, "loadIds {} size = {}", toString(), ids.size());
+ 
+-    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = [&](std::ostream & ostr)
++    auto block = blockForIds(dict_struct, ids);
++
++    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = [block, this](std::ostream & ostr)
+     {
+         WriteBufferFromOStream out_buffer(ostr);
+         auto output_stream = context.getOutputStream(format, out_buffer, sample_block);
+-        formatIDs(output_stream, ids);
++        formatBlock(output_stream, block);
+     };
+ 
+     Poco::URI uri(url);
+@@ -150,11 +152,13 @@ BlockInputStreamPtr HTTPDictionarySource::loadKeys(const Columns & key_columns,
+ {
+     LOG_TRACE(log, "loadKeys {} size = {}", toString(), requested_rows.size());
+ 
+-    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = [&](std::ostream & ostr)
++    auto block = blockForKeys(dict_struct, key_columns, requested_rows);
++
++    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = [block, this](std::ostream & ostr)
+     {
+         WriteBufferFromOStream out_buffer(ostr);
+         auto output_stream = context.getOutputStream(format, out_buffer, sample_block);
+-        formatKeys(dict_struct, output_stream, key_columns, requested_rows);
++        formatBlock(output_stream, block);
+     };
+ 
+     Poco::URI uri(url);

@@ -1,0 +1,4374 @@
+diff --git a/base/common/DateLUT.cpp b/base/common/DateLUT.cpp
+index 6ff0884701cc..d14b63cd70a9 100644
+--- a/base/common/DateLUT.cpp
++++ b/base/common/DateLUT.cpp
+@@ -152,7 +152,7 @@ const DateLUTImpl & DateLUT::getImplementation(const std::string & time_zone) co
+ 
+     auto it = impls.emplace(time_zone, nullptr).first;
+     if (!it->second)
+-        it->second = std::make_unique<DateLUTImpl>(time_zone);
++        it->second = std::unique_ptr<DateLUTImpl>(new DateLUTImpl(time_zone));
+ 
+     return *it->second;
+ }
+diff --git a/base/common/DateLUT.h b/base/common/DateLUT.h
+index 93c6cb403e2f..378b4360f3b6 100644
+--- a/base/common/DateLUT.h
++++ b/base/common/DateLUT.h
+@@ -32,7 +32,6 @@ class DateLUT : private boost::noncopyable
+ 
+         return date_lut.getImplementation(time_zone);
+     }
+-
+     static void setDefaultTimezone(const std::string & time_zone)
+     {
+         auto & date_lut = getInstance();
+diff --git a/base/common/DateLUTImpl.cpp b/base/common/DateLUTImpl.cpp
+index 50620e21b8f0..e7faeb637609 100644
+--- a/base/common/DateLUTImpl.cpp
++++ b/base/common/DateLUTImpl.cpp
+@@ -46,24 +46,41 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
+     if (&inside_main)
+         assert(inside_main);
+ 
+-    size_t i = 0;
+-    time_t start_of_day = 0;
+-
+     cctz::time_zone cctz_time_zone;
+     if (!cctz::load_time_zone(time_zone, &cctz_time_zone))
+         throw Poco::Exception("Cannot load time zone " + time_zone_);
+ 
+-    cctz::time_zone::absolute_lookup start_of_epoch_lookup = cctz_time_zone.lookup(std::chrono::system_clock::from_time_t(start_of_day));
+-    offset_at_start_of_epoch = start_of_epoch_lookup.offset;
+-    offset_is_whole_number_of_hours_everytime = true;
++    constexpr cctz::civil_day epoch{1970, 1, 1};
++    constexpr cctz::civil_day lut_start{DATE_LUT_MIN_YEAR, 1, 1};
++    time_t start_of_day;
++
++    /// Note: it's validated against all timezones in the system.
++    static_assert((epoch - lut_start) == daynum_offset_epoch);
++
++    offset_at_start_of_epoch = cctz_time_zone.lookup(cctz_time_zone.lookup(epoch).pre).offset;
++    offset_at_start_of_lut = cctz_time_zone.lookup(cctz_time_zone.lookup(lut_start).pre).offset;
++    offset_is_whole_number_of_hours_during_epoch = true;
+ 
+-    cctz::civil_day date{1970, 1, 1};
++    cctz::civil_day date = lut_start;
+ 
++    UInt32 i = 0;
+     do
+     {
+         cctz::time_zone::civil_lookup lookup = cctz_time_zone.lookup(date);
+ 
+-        start_of_day = std::chrono::system_clock::to_time_t(lookup.pre);    /// Ambiguity is possible.
++        /// Ambiguity is possible if time was changed backwards at the midnight
++        /// or after midnight time has been changed back to midnight, for example one hour backwards at 01:00
++        /// or after midnight time has been changed to the previous day, for example two hours backwards at 01:00
++        /// Then midnight appears twice. Usually time change happens exactly at 00:00 or 01:00.
++
++        /// If transition did not involve previous day, we should use the first midnight as the start of the day,
++        /// otherwise it's better to use the second midnight.
++
++        std::chrono::time_point start_of_day_time_point = lookup.trans < lookup.post
++            ? lookup.post /* Second midnight appears after transition, so there was a piece of previous day after transition */
++            : lookup.pre;
++
++        start_of_day = std::chrono::system_clock::to_time_t(start_of_day_time_point);
+ 
+         Values & values = lut[i];
+         values.year = date.year();
+@@ -72,7 +89,7 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
+         values.day_of_week = getDayOfWeek(date);
+         values.date = start_of_day;
+ 
+-        assert(values.year >= DATE_LUT_MIN_YEAR && values.year <= DATE_LUT_MAX_YEAR);
++        assert(values.year >= DATE_LUT_MIN_YEAR && values.year <= DATE_LUT_MAX_YEAR + 1);
+         assert(values.month >= 1 && values.month <= 12);
+         assert(values.day_of_month >= 1 && values.day_of_month <= 31);
+         assert(values.day_of_week >= 1 && values.day_of_week <= 7);
+@@ -85,50 +102,42 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
+         else
+             values.days_in_month = i != 0 ? lut[i - 1].days_in_month : 31;
+ 
+-        values.time_at_offset_change = 0;
+-        values.amount_of_offset_change = 0;
++        values.time_at_offset_change_value = 0;
++        values.amount_of_offset_change_value = 0;
+ 
+-        if (start_of_day % 3600)
+-            offset_is_whole_number_of_hours_everytime = false;
++        if (offset_is_whole_number_of_hours_during_epoch && start_of_day > 0 && start_of_day % 3600)
++            offset_is_whole_number_of_hours_during_epoch = false;
+ 
+-        /// If UTC offset was changed in previous day.
+-        if (i != 0)
++        /// If UTC offset was changed this day.
++        /// Change in time zone without transition is possible, e.g. Moscow 1991 Sun, 31 Mar, 02:00 MSK to EEST
++        cctz::time_zone::civil_transition transition{};
++        if (cctz_time_zone.next_transition(start_of_day_time_point - std::chrono::seconds(1), &transition)
++            && (cctz::civil_day(transition.from) == date || cctz::civil_day(transition.to) == date)
++            && transition.from != transition.to)
+         {
+-            auto amount_of_offset_change_at_prev_day = 86400 - (lut[i].date - lut[i - 1].date);
+-            if (amount_of_offset_change_at_prev_day)
+-            {
+-                lut[i - 1].amount_of_offset_change = amount_of_offset_change_at_prev_day;
+-
+-                const auto utc_offset_at_beginning_of_day = cctz_time_zone.lookup(std::chrono::system_clock::from_time_t(lut[i - 1].date)).offset;
+-
+-                /// Find a time (timestamp offset from beginning of day),
+-                ///  when UTC offset was changed. Search is performed with 15-minute granularity, assuming it is enough.
+-
+-                time_t time_at_offset_change = 900;
+-                while (time_at_offset_change < 86400)
+-                {
+-                    auto utc_offset_at_current_time = cctz_time_zone.lookup(std::chrono::system_clock::from_time_t(
+-                        lut[i - 1].date + time_at_offset_change)).offset;
+-
+-                    if (utc_offset_at_current_time != utc_offset_at_beginning_of_day)
+-                        break;
+-
+-                    time_at_offset_change += 900;
+-                }
+-
+-                lut[i - 1].time_at_offset_change = time_at_offset_change;
+-
+-                /// We doesn't support cases when time change results in switching to previous day.
+-                if (static_cast<int>(lut[i - 1].time_at_offset_change) + static_cast<int>(lut[i - 1].amount_of_offset_change) < 0)
+-                    lut[i - 1].time_at_offset_change = -lut[i - 1].amount_of_offset_change;
+-            }
++            values.time_at_offset_change_value = (transition.from - cctz::civil_second(date)) / Values::OffsetChangeFactor;
++            values.amount_of_offset_change_value = (transition.to - transition.from) / Values::OffsetChangeFactor;
++
++//            std::cerr << time_zone << ", " << date << ": change from " << transition.from << " to " << transition.to << "
+";
++//            std::cerr << time_zone << ", " << date << ": change at " << values.time_at_offset_change() << " with " << values.amount_of_offset_change() << "
+";
++
++            /// We don't support too large changes.
++            if (values.amount_of_offset_change_value > 24 * 4)
++                values.amount_of_offset_change_value = 24 * 4;
++            else if (values.amount_of_offset_change_value < -24 * 4)
++                values.amount_of_offset_change_value = -24 * 4;
++
++            /// We don't support cases when time change results in switching to previous day.
++            /// Shift the point of time change later.
++            if (values.time_at_offset_change_value + values.amount_of_offset_change_value < 0)
++                values.time_at_offset_change_value = -values.amount_of_offset_change_value;
+         }
+ 
+         /// Going to next day.
+         ++date;
+         ++i;
+     }
+-    while (start_of_day <= DATE_LUT_MAX && i <= DATE_LUT_MAX_DAY_NUM);
++    while (i < DATE_LUT_SIZE && lut[i - 1].year <= DATE_LUT_MAX_YEAR);
+ 
+     /// Fill excessive part of lookup table. This is needed only to simplify handling of overflow cases.
+     while (i < DATE_LUT_SIZE)
+diff --git a/base/common/DateLUTImpl.h b/base/common/DateLUTImpl.h
+index 0c7465ec7a59..43fc1b8befd2 100644
+--- a/base/common/DateLUTImpl.h
++++ b/base/common/DateLUTImpl.h
+@@ -5,23 +5,32 @@
+ #include "types.h"
+ 
+ #include <ctime>
++#include <cassert>
+ #include <string>
++#include <type_traits>
+ 
+ 
+-#define DATE_LUT_MAX (0xFFFFFFFFU - 86400)
+-#define DATE_LUT_MAX_DAY_NUM (0xFFFFFFFFU / 86400)
+-/// Table size is bigger than DATE_LUT_MAX_DAY_NUM to fill all indices within UInt16 range: this allows to remove extra check.
+-#define DATE_LUT_SIZE 0x10000
+-#define DATE_LUT_MIN_YEAR 1970
+-#define DATE_LUT_MAX_YEAR 2106 /// Last supported year (incomplete)
++#define DATE_LUT_MIN_YEAR 1925 /// 1925 since wast majority of timezones changed to 15-minute aligned offsets somewhere in 1924 or earlier.
++#define DATE_LUT_MAX_YEAR 2283 /// Last supported year (complete)
+ #define DATE_LUT_YEARS (1 + DATE_LUT_MAX_YEAR - DATE_LUT_MIN_YEAR) /// Number of years in lookup table
+ 
++#define DATE_LUT_SIZE 0x20000
++
++#define DATE_LUT_MAX (0xFFFFFFFFU - 86400)
++#define DATE_LUT_MAX_DAY_NUM 0xFFFF
++
++/// A constant to add to time_t so every supported time point becomes non-negative and still has the same remainder of division by 3600.
++/// If we treat "remainder of division" operation in the sense of modular arithmetic (not like in C++).
++#define DATE_LUT_ADD ((1970 - DATE_LUT_MIN_YEAR) * 366 * 86400)
++
++
+ #if defined(__PPC__)
+ #if !__clang__
+ #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+ #endif
+ #endif
+ 
++
+ /// Flags for toYearWeek() function.
+ enum class WeekModeFlag : UInt8
+ {
+@@ -37,7 +46,8 @@ using YearWeek = std::pair<UInt16, UInt8>;
+   */
+ class DateLUTImpl
+ {
+-public:
++private:
++    friend class DateLUT;
+     explicit DateLUTImpl(const std::string & time_zone);
+ 
+     DateLUTImpl(const DateLUTImpl &) = delete;
+@@ -45,14 +55,75 @@ class DateLUTImpl
+     DateLUTImpl(const DateLUTImpl &&) = delete;
+     DateLUTImpl & operator=(const DateLUTImpl &&) = delete;
+ 
++    // Normalized and bound-checked index of element in lut,
++    // has to be a separate type to support overloading
++    // TODO: make sure that any arithmetic on LUTIndex actually results in valid LUTIndex.
++    STRONG_TYPEDEF(UInt32, LUTIndex)
++
++    template <typename T>
++    friend inline LUTIndex operator+(const LUTIndex & index, const T v)
++    {
++        return LUTIndex{(index.toUnderType() + UInt32(v)) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator+(const T v, const LUTIndex & index)
++    {
++        return LUTIndex{(v + index.toUnderType()) & date_lut_mask};
++    }
++
++    friend inline LUTIndex operator+(const LUTIndex & index, const LUTIndex & v)
++    {
++        return LUTIndex{(index.toUnderType() + v.toUnderType()) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator-(const LUTIndex & index, const T v)
++    {
++        return LUTIndex{(index.toUnderType() - UInt32(v)) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator-(const T v, const LUTIndex & index)
++    {
++        return LUTIndex{(v - index.toUnderType()) & date_lut_mask};
++    }
++
++    friend inline LUTIndex operator-(const LUTIndex & index, const LUTIndex & v)
++    {
++        return LUTIndex{(index.toUnderType() - v.toUnderType()) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator*(const LUTIndex & index, const T v)
++    {
++        return LUTIndex{(index.toUnderType() * UInt32(v)) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator*(const T v, const LUTIndex & index)
++    {
++        return LUTIndex{(v * index.toUnderType()) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator/(const LUTIndex & index, const T v)
++    {
++        return LUTIndex{(index.toUnderType() / UInt32(v)) & date_lut_mask};
++    }
++
++    template <typename T>
++    friend inline LUTIndex operator/(const T v, const LUTIndex & index)
++    {
++        return LUTIndex{(UInt32(v) / index.toUnderType()) & date_lut_mask};
++    }
++
+ public:
+     /// The order of fields matters for alignment and sizeof.
+     struct Values
+     {
+-        /// Least significat 32 bits from time_t at beginning of the day.
+-        /// If the unix timestamp of beginning of the day is negative (example: 1970-01-01 MSK, where time_t == -10800), then value will overflow.
+-        /// Change to time_t; change constants above; and recompile the sources if you need to support time after 2105 year.
+-        UInt32 date;
++        /// time_t at beginning of the day.
++        Int64 date;
+ 
+         /// Properties of the day.
+         UInt16 year;
+@@ -65,107 +136,189 @@ class DateLUTImpl
+         UInt8 days_in_month;
+ 
+         /// For days, when offset from UTC was changed due to daylight saving time or permanent change, following values could be non zero.
+-        Int16 amount_of_offset_change; /// Usually -3600 or 3600, but look at Lord Howe Island.
+-        UInt32 time_at_offset_change; /// In seconds from beginning of the day.
++        /// All in OffsetChangeFactor (15 minute) intervals.
++        Int8 amount_of_offset_change_value; /// Usually -4 or 4, but look at Lord Howe Island. Multiply by OffsetChangeFactor
++        UInt8 time_at_offset_change_value; /// In seconds from beginning of the day. Multiply by OffsetChangeFactor
++
++        inline Int32 amount_of_offset_change() const
++        {
++            return static_cast<Int32>(amount_of_offset_change_value) * OffsetChangeFactor;
++        }
++
++        inline UInt32 time_at_offset_change() const
++        {
++            return static_cast<UInt32>(time_at_offset_change_value) * OffsetChangeFactor;
++        }
++
++        /// Since most of the modern timezones have a DST change aligned to 15 minutes, to save as much space as possible inside Value,
++        /// we are dividing any offset change related value by this factor before setting it to Value,
++        /// hence it has to be explicitly multiplied back by this factor before being used.
++        static constexpr UInt16 OffsetChangeFactor = 900;
+     };
+ 
+     static_assert(sizeof(Values) == 16);
+ 
+ private:
+-    /// Lookup table is indexed by DayNum.
++
++    /// Mask is all-ones to allow efficient protection against overflow.
++    static constexpr UInt32 date_lut_mask = 0x1ffff;
++    static_assert(date_lut_mask == DATE_LUT_SIZE - 1);
++
++    /// Offset to epoch in days (ExtendedDayNum) of the first day in LUT.
++    /// "epoch" is the Unix Epoch (starts at unix timestamp zero)
++    static constexpr UInt32 daynum_offset_epoch = 16436;
++    static_assert(daynum_offset_epoch == (1970 - DATE_LUT_MIN_YEAR) * 365 + (1970 - DATE_LUT_MIN_YEAR / 4 * 4) / 4);
++
++    /// Lookup table is indexed by LUTIndex.
+     /// Day nums are the same in all time zones. 1970-01-01 is 0 and so on.
+     /// Table is relatively large, so better not to place the object on stack.
+     /// In comparison to std::vector, plain array is cheaper by one indirection.
+-    Values lut[DATE_LUT_SIZE];
++    Values lut[DATE_LUT_SIZE + 1];
+ 
+-    /// Year number after DATE_LUT_MIN_YEAR -> day num for start of year.
+-    DayNum years_lut[DATE_LUT_YEARS];
++    /// Year number after DATE_LUT_MIN_YEAR -> LUTIndex in lut for start of year.
++    LUTIndex years_lut[DATE_LUT_YEARS];
+ 
+     /// Year number after DATE_LUT_MIN_YEAR * month number starting at zero -> day num for first day of month
+-    DayNum years_months_lut[DATE_LUT_YEARS * 12];
++    LUTIndex years_months_lut[DATE_LUT_YEARS * 12];
+ 
+     /// UTC offset at beginning of the Unix epoch. The same as unix timestamp of 1970-01-01 00:00:00 local time.
+     time_t offset_at_start_of_epoch;
+-    bool offset_is_whole_number_of_hours_everytime;
++    /// UTC offset at the beginning of the first supported year.
++    time_t offset_at_start_of_lut;
++    bool offset_is_whole_number_of_hours_during_epoch;
+ 
+     /// Time zone name.
+     std::string time_zone;
+ 
+-
+-    /// We can correctly process only timestamps that less DATE_LUT_MAX (i.e. up to 2105 year inclusively)
+-    /// We don't care about overflow.
+-    inline DayNum findIndex(time_t t) const
++    inline LUTIndex findIndex(time_t t) const
+     {
+         /// First guess.
+-        DayNum guess(t / 86400);
++        Int64 guess = (t / 86400) + daynum_offset_epoch;
++
++        /// For negative time_t the integer division was rounded up, so the guess is offset by one.
++        if (unlikely(t < 0))
++            --guess;
++
++        if (guess < 0)
++            return LUTIndex(0);
++        if (guess >= DATE_LUT_SIZE)
++            return LUTIndex(DATE_LUT_SIZE - 1);
+ 
+         /// UTC offset is from -12 to +14 in all known time zones. This requires checking only three indices.
+ 
+-        if ((guess == 0 || t >= lut[guess].date) && t < lut[DayNum(guess + 1)].date)
+-            return guess;
++        if (t >= lut[guess].date)
++        {
++            if (guess + 1 >= DATE_LUT_SIZE || t < lut[guess + 1].date)
++                return LUTIndex(guess);
++
++            return LUTIndex(guess + 1);
++        }
++
++        return LUTIndex(guess ? guess - 1 : 0);
++    }
++
++    inline LUTIndex toLUTIndex(DayNum d) const
++    {
++        return LUTIndex{(d + daynum_offset_epoch) & date_lut_mask};
++    }
+ 
+-        /// Time zones that have offset 0 from UTC do daylight saving time change (if any) towards increasing UTC offset (example: British Standard Time).
+-        if (t >= lut[DayNum(guess + 1)].date)
+-            return DayNum(guess + 1);
++    inline LUTIndex toLUTIndex(ExtendedDayNum d) const
++    {
++        return LUTIndex{static_cast<UInt32>(d + daynum_offset_epoch) & date_lut_mask};
++    }
+ 
+-        return DayNum(guess - 1);
++    inline LUTIndex toLUTIndex(time_t t) const
++    {
++        return findIndex(t);
+     }
+ 
+-    inline const Values & find(time_t t) const
++    inline LUTIndex toLUTIndex(LUTIndex i) const
+     {
+-        return lut[findIndex(t)];
++        return i;
++    }
++
++    template <typename DateOrTime>
++    inline const Values & find(DateOrTime v) const
++    {
++        return lut[toLUTIndex(v)];
++    }
++
++    template <typename T, typename Divisor>
++    static inline T roundDown(T x, Divisor divisor)
++    {
++        static_assert(std::is_integral_v<T> && std::is_integral_v<Divisor>);
++        assert(divisor > 0);
++
++        if (likely(x >= 0))
++            return x / divisor * divisor;
++
++        /// Integer division for negative numbers rounds them towards zero (up).
++        /// We will shift the number so it will be rounded towards -inf (down).
++
++        return (x + 1 - divisor) / divisor * divisor;
+     }
+ 
+ public:
+     const std::string & getTimeZone() const { return time_zone; }
+ 
++    // Methods only for unit-testing, it makes very little sense to use it from user code.
++    auto getOffsetAtStartOfEpoch() const { return offset_at_start_of_epoch; }
++    auto getTimeOffsetAtStartOfLUT() const { return offset_at_start_of_lut; }
++
+     /// All functions below are thread-safe; arguments are not checked.
+ 
+-    inline time_t toDate(time_t t) const { return find(t).date; }
+-    inline unsigned toMonth(time_t t) const { return find(t).month; }
+-    inline unsigned toQuarter(time_t t) const { return (find(t).month - 1) / 3 + 1; }
+-    inline unsigned toYear(time_t t) const { return find(t).year; }
+-    inline unsigned toDayOfWeek(time_t t) const { return find(t).day_of_week; }
+-    inline unsigned toDayOfMonth(time_t t) const { return find(t).day_of_month; }
++    inline ExtendedDayNum toDayNum(ExtendedDayNum d) const
++    {
++        return d;
++    }
+ 
+-    /// Round down to start of monday.
+-    inline time_t toFirstDayOfWeek(time_t t) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toDayNum(DateOrTime v) const
+     {
+-        DayNum index = findIndex(t);
+-        return lut[DayNum(index - (lut[index].day_of_week - 1))].date;
++        return ExtendedDayNum{static_cast<ExtendedDayNum::UnderlyingType>(toLUTIndex(v).toUnderType() - daynum_offset_epoch)};
+     }
+ 
+-    inline DayNum toFirstDayNumOfWeek(DayNum d) const
++    /// Round down to start of monday.
++    template <typename DateOrTime>
++    inline time_t toFirstDayOfWeek(DateOrTime v) const
+     {
+-        return DayNum(d - (lut[d].day_of_week - 1));
++        const LUTIndex i = toLUTIndex(v);
++        return lut[i - (lut[i].day_of_week - 1)].date;
+     }
+ 
+-    inline DayNum toFirstDayNumOfWeek(time_t t) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfWeek(DateOrTime v) const
+     {
+-        return toFirstDayNumOfWeek(toDayNum(t));
++        const LUTIndex i = toLUTIndex(v);
++        return toDayNum(i - (lut[i].day_of_week - 1));
+     }
+ 
+     /// Round down to start of month.
+-    inline time_t toFirstDayOfMonth(time_t t) const
++    template <typename DateOrTime>
++    inline time_t toFirstDayOfMonth(DateOrTime v) const
+     {
+-        DayNum index = findIndex(t);
+-        return lut[index - (lut[index].day_of_month - 1)].date;
++        const LUTIndex i = toLUTIndex(v);
++        return lut[i - (lut[i].day_of_month - 1)].date;
+     }
+ 
+-    inline DayNum toFirstDayNumOfMonth(DayNum d) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfMonth(DateOrTime v) const
+     {
+-        return DayNum(d - (lut[d].day_of_month - 1));
++        const LUTIndex i = toLUTIndex(v);
++        return toDayNum(i - (lut[i].day_of_month - 1));
+     }
+ 
+-    inline DayNum toFirstDayNumOfMonth(time_t t) const
++    /// Round down to start of quarter.
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfQuarter(DateOrTime v) const
+     {
+-        return toFirstDayNumOfMonth(toDayNum(t));
++        return toDayNum(toFirstDayOfQuarterIndex(v));
+     }
+ 
+-    /// Round down to start of quarter.
+-    inline DayNum toFirstDayNumOfQuarter(DayNum d) const
++    template <typename DateOrTime>
++    inline LUTIndex toFirstDayOfQuarterIndex(DateOrTime v) const
+     {
+-        DayNum index = d;
++        LUTIndex index = toLUTIndex(v);
+         size_t month_inside_quarter = (lut[index].month - 1) % 3;
+ 
+         index -= lut[index].day_of_month;
+@@ -175,17 +328,13 @@ class DateLUTImpl
+             --month_inside_quarter;
+         }
+ 
+-        return DayNum(index + 1);
++        return index + 1;
+     }
+ 
+-    inline DayNum toFirstDayNumOfQuarter(time_t t) const
++    template <typename DateOrTime>
++    inline time_t toFirstDayOfQuarter(DateOrTime v) const
+     {
+-        return toFirstDayNumOfQuarter(toDayNum(t));
+-    }
+-
+-    inline time_t toFirstDayOfQuarter(time_t t) const
+-    {
+-        return fromDayNum(toFirstDayNumOfQuarter(t));
++        return toDate(toFirstDayOfQuarterIndex(v));
+     }
+ 
+     /// Round down to start of year.
+@@ -194,48 +343,47 @@ class DateLUTImpl
+         return lut[years_lut[lut[findIndex(t)].year - DATE_LUT_MIN_YEAR]].date;
+     }
+ 
+-    inline DayNum toFirstDayNumOfYear(DayNum d) const
++    template <typename DateOrTime>
++    inline LUTIndex toFirstDayNumOfYearIndex(DateOrTime v) const
+     {
+-        return years_lut[lut[d].year - DATE_LUT_MIN_YEAR];
++        return years_lut[lut[toLUTIndex(v)].year - DATE_LUT_MIN_YEAR];
+     }
+ 
+-    inline DayNum toFirstDayNumOfYear(time_t t) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfYear(DateOrTime v) const
+     {
+-        return toFirstDayNumOfYear(toDayNum(t));
++        return toDayNum(toFirstDayNumOfYearIndex(v));
+     }
+ 
+     inline time_t toFirstDayOfNextMonth(time_t t) const
+     {
+-        DayNum index = findIndex(t);
++        LUTIndex index = findIndex(t);
+         index += 32 - lut[index].day_of_month;
+         return lut[index - (lut[index].day_of_month - 1)].date;
+     }
+ 
+     inline time_t toFirstDayOfPrevMonth(time_t t) const
+     {
+-        DayNum index = findIndex(t);
++        LUTIndex index = findIndex(t);
+         index -= lut[index].day_of_month;
+         return lut[index - (lut[index].day_of_month - 1)].date;
+     }
+ 
+-    inline UInt8 daysInMonth(DayNum d) const
++    template <typename DateOrTime>
++    inline UInt8 daysInMonth(DateOrTime value) const
+     {
+-        return lut[d].days_in_month;
++        const LUTIndex i = toLUTIndex(value);
++        return lut[i].days_in_month;
+     }
+ 
+-    inline UInt8 daysInMonth(time_t t) const
+-    {
+-        return find(t).days_in_month;
+-    }
+-
+-    inline UInt8 daysInMonth(UInt16 year, UInt8 month) const
++    inline UInt8 daysInMonth(Int16 year, UInt8 month) const
+     {
+         UInt16 idx = year - DATE_LUT_MIN_YEAR;
+         if (unlikely(idx >= DATE_LUT_YEARS))
+             return 31;  /// Implementation specific behaviour on overflow.
+ 
+         /// 32 makes arithmetic more simple.
+-        DayNum any_day_of_month = DayNum(years_lut[idx] + 32 * (month - 1));
++        const auto any_day_of_month = years_lut[year - DATE_LUT_MIN_YEAR] + 32 * (month - 1);
+         return lut[any_day_of_month].days_in_month;
+     }
+ 
+@@ -243,107 +391,111 @@ class DateLUTImpl
+       */
+     inline time_t toDateAndShift(time_t t, Int32 days) const
+     {
+-        return lut[DayNum(findIndex(t) + days)].date;
++        return lut[findIndex(t) + days].date;
+     }
+ 
+     inline time_t toTime(time_t t) const
+     {
+-        DayNum index = findIndex(t);
+-
+-        if (unlikely(index == 0 || index > DATE_LUT_MAX_DAY_NUM))
+-            return t + offset_at_start_of_epoch;
++        const LUTIndex index = findIndex(t);
+ 
+         time_t res = t - lut[index].date;
+ 
+-        if (res >= lut[index].time_at_offset_change)
+-            res += lut[index].amount_of_offset_change;
++        if (res >= lut[index].time_at_offset_change())
++            res += lut[index].amount_of_offset_change();
+ 
+         return res - offset_at_start_of_epoch; /// Starting at 1970-01-01 00:00:00 local time.
+     }
+ 
+     inline unsigned toHour(time_t t) const
+     {
+-        DayNum index = findIndex(t);
+-
+-        /// If it is overflow case,
+-        ///  then limit number of hours to avoid insane results like 1970-01-01 89:28:15
+-        if (unlikely(index == 0 || index > DATE_LUT_MAX_DAY_NUM))
+-            return static_cast<unsigned>((t + offset_at_start_of_epoch) / 3600) % 24;
++        const LUTIndex index = findIndex(t);
+ 
+         time_t time = t - lut[index].date;
+ 
+-        if (time >= lut[index].time_at_offset_change)
+-            time += lut[index].amount_of_offset_change;
++        if (time >= lut[index].time_at_offset_change())
++            time += lut[index].amount_of_offset_change();
+ 
+         unsigned res = time / 3600;
+-        return res <= 23 ? res : 0;
++
++        /// In case time was changed backwards at the start of next day, we will repeat the hour 23.
++        return res <= 23 ? res : 23;
+     }
+ 
+     /** Calculating offset from UTC in seconds.
+-     * which means Using the same literal time of "t" to get the corresponding timestamp in UTC,
+-     * then subtract the former from the latter to get the offset result.
+-     * The boundaries when meets DST(daylight saving time) change should be handled very carefully.
+-     */
++      * which means Using the same literal time of "t" to get the corresponding timestamp in UTC,
++      * then subtract the former from the latter to get the offset result.
++      * The boundaries when meets DST(daylight saving time) change should be handled very carefully.
++      */
+     inline time_t timezoneOffset(time_t t) const
+     {
+-        DayNum index = findIndex(t);
++        const LUTIndex index = findIndex(t);
+ 
+         /// Calculate daylight saving offset first.
+         /// Because the "amount_of_offset_change" in LUT entry only exists in the change day, it's costly to scan it from the very begin.
+         /// but we can figure out all the accumulated offsets from 1970-01-01 to that day just by get the whole difference between lut[].date,
+         /// and then, we can directly subtract multiple 86400s to get the real DST offsets for the leap seconds is not considered now.
+-        time_t res = (lut[index].date - lut[0].date) % 86400;
++        time_t res = (lut[index].date - lut[daynum_offset_epoch].date) % 86400;
++
+         /// As so far to know, the maximal DST offset couldn't be more than 2 hours, so after the modulo operation the remainder
+         /// will sits between [-offset --> 0 --> offset] which respectively corresponds to moving clock forward or backward.
+         res = res > 43200 ? (86400 - res) : (0 - res);
+ 
+         /// Check if has a offset change during this day. Add the change when cross the line
+-        if (lut[index].amount_of_offset_change != 0 && t >= lut[index].date + lut[index].time_at_offset_change)
+-            res += lut[index].amount_of_offset_change;
++        if (lut[index].amount_of_offset_change() != 0 && t >= lut[index].date + lut[index].time_at_offset_change())
++            res += lut[index].amount_of_offset_change();
+ 
+         return res + offset_at_start_of_epoch;
+     }
+ 
+-    /** Only for time zones with/when offset from UTC is multiple of five minutes.
+-      * This is true for all time zones: right now, all time zones have an offset that is multiple of 15 minutes.
+-      *
+-      * "By 1929, most major countries had adopted hourly time zones. Nepal was the last
+-      *  country to adopt a standard offset, shifting slightly to UTC+5:45 in 1986."
+-      * - https://en.wikipedia.org/wiki/Time_zone#Offsets_from_UTC
+-      *
+-      * Also please note, that unix timestamp doesn't count "leap seconds":
+-      *  each minute, with added or subtracted leap second, spans exactly 60 unix timestamps.
+-      */
+ 
+-    inline unsigned toSecond(time_t t) const { return UInt32(t) % 60; }
++    inline unsigned toSecond(time_t t) const
++    {
++        auto res = t % 60;
++        if (likely(res >= 0))
++            return res;
++        return res + 60;
++    }
+ 
+     inline unsigned toMinute(time_t t) const
+     {
+-        if (offset_is_whole_number_of_hours_everytime)
+-            return (UInt32(t) / 60) % 60;
++        if (t >= 0 && offset_is_whole_number_of_hours_during_epoch)
++            return (t / 60) % 60;
+ 
+-        /// To consider the DST changing situation within this day.
+-        /// also make the special timezones with no whole hour offset such as 'Australia/Lord_Howe' been taken into account
+-        DayNum index = findIndex(t);
+-        UInt32 res = t - lut[index].date;
+-        if (lut[index].amount_of_offset_change != 0 && t >= lut[index].date + lut[index].time_at_offset_change)
+-            res += lut[index].amount_of_offset_change;
++        /// To consider the DST changing situation within this day
++        /// also make the special timezones with no whole hour offset such as 'Australia/Lord_Howe' been taken into account.
+ 
+-        return res / 60 % 60;
++        LUTIndex index = findIndex(t);
++        UInt32 time = t - lut[index].date;
++
++        if (time >= lut[index].time_at_offset_change())
++            time += lut[index].amount_of_offset_change();
++
++        return time / 60 % 60;
+     }
+ 
+-    inline time_t toStartOfMinute(time_t t) const { return t / 60 * 60; }
+-    inline time_t toStartOfFiveMinute(time_t t) const { return t / 300 * 300; }
+-    inline time_t toStartOfFifteenMinutes(time_t t) const { return t / 900 * 900; }
+-    inline time_t toStartOfTenMinutes(time_t t) const { return t / 600 * 600; }
++    /// NOTE: Assuming timezone offset is a multiple of 15 minutes.
++    inline time_t toStartOfMinute(time_t t) const { return roundDown(t, 60); }
++    inline time_t toStartOfFiveMinute(time_t t) const { return roundDown(t, 300); }
++    inline time_t toStartOfFifteenMinutes(time_t t) const { return roundDown(t, 900); }
++
++    inline time_t toStartOfTenMinutes(time_t t) const
++    {
++        if (t >= 0 && offset_is_whole_number_of_hours_during_epoch)
++            return t / 600 * 600;
++
++        /// More complex logic is for Nepal - it has offset 05:45. Australia/Eucla is also unfortunate.
++        Int64 date = find(t).date;
++        return date + (t - date) / 600 * 600;
++    }
+ 
++    /// NOTE: Assuming timezone transitions are multiple of hours. Lord Howe Island in Australia is a notable exception.
+     inline time_t toStartOfHour(time_t t) const
+     {
+-        if (offset_is_whole_number_of_hours_everytime)
++        if (t >= 0 && offset_is_whole_number_of_hours_during_epoch)
+             return t / 3600 * 3600;
+ 
+-        UInt32 date = find(t).date;
+-        return date + (UInt32(t) - date) / 3600 * 3600;
++        Int64 date = find(t).date;
++        return date + (t - date) / 3600 * 3600;
+     }
+ 
+     /** Number of calendar day since the beginning of UNIX epoch (1970-01-01 is zero)
+@@ -354,80 +506,89 @@ class DateLUTImpl
+       *  because the same calendar day starts/ends at different timestamps in different time zones)
+       */
+ 
+-    inline DayNum toDayNum(time_t t) const { return findIndex(t); }
+-    inline time_t fromDayNum(DayNum d) const { return lut[d].date; }
++    inline time_t fromDayNum(DayNum d) const { return lut[toLUTIndex(d)].date; }
++    inline time_t fromDayNum(ExtendedDayNum d) const { return lut[toLUTIndex(d)].date; }
++
++    template <typename DateOrTime>
++    inline time_t toDate(DateOrTime v) const { return lut[toLUTIndex(v)].date; }
++
++    template <typename DateOrTime>
++    inline unsigned toMonth(DateOrTime v) const { return lut[toLUTIndex(v)].month; }
++
++    template <typename DateOrTime>
++    inline unsigned toQuarter(DateOrTime v) const { return (lut[toLUTIndex(v)].month - 1) / 3 + 1; }
++
++    template <typename DateOrTime>
++    inline Int16 toYear(DateOrTime v) const { return lut[toLUTIndex(v)].year; }
+ 
+-    inline time_t toDate(DayNum d) const { return lut[d].date; }
+-    inline unsigned toMonth(DayNum d) const { return lut[d].month; }
+-    inline unsigned toQuarter(DayNum d) const { return (lut[d].month - 1) / 3 + 1; }
+-    inline unsigned toYear(DayNum d) const { return lut[d].year; }
+-    inline unsigned toDayOfWeek(DayNum d) const { return lut[d].day_of_week; }
+-    inline unsigned toDayOfMonth(DayNum d) const { return lut[d].day_of_month; }
+-    inline unsigned toDayOfYear(DayNum d) const { return d + 1 - toFirstDayNumOfYear(d); }
++    template <typename DateOrTime>
++    inline unsigned toDayOfWeek(DateOrTime v) const { return lut[toLUTIndex(v)].day_of_week; }
+ 
+-    inline unsigned toDayOfYear(time_t t) const { return toDayOfYear(toDayNum(t)); }
++    template <typename DateOrTime>
++    inline unsigned toDayOfMonth(DateOrTime v) const { return lut[toLUTIndex(v)].day_of_month; }
++
++    template <typename DateOrTime>
++    inline unsigned toDayOfYear(DateOrTime v) const
++    {
++        // TODO: different overload for ExtendedDayNum
++        const LUTIndex i = toLUTIndex(v);
++        return i + 1 - toFirstDayNumOfYearIndex(i);
++    }
+ 
+     /// Number of week from some fixed moment in the past. Week begins at monday.
+     /// (round down to monday and divide DayNum by 7; we made an assumption,
+     ///  that in domain of the function there was no weeks with any other number of days than 7)
+-    inline unsigned toRelativeWeekNum(DayNum d) const
++    template <typename DateOrTime>
++    inline unsigned toRelativeWeekNum(DateOrTime v) const
+     {
++        const LUTIndex i = toLUTIndex(v);
+         /// We add 8 to avoid underflow at beginning of unix epoch.
+-        return (d + 8 - toDayOfWeek(d)) / 7;
+-    }
+-
+-    inline unsigned toRelativeWeekNum(time_t t) const
+-    {
+-        return toRelativeWeekNum(toDayNum(t));
++        return toDayNum(i + 8 - toDayOfWeek(i)) / 7;
+     }
+ 
+     /// Get year that contains most of the current week. Week begins at monday.
+-    inline unsigned toISOYear(DayNum d) const
++    template <typename DateOrTime>
++    inline unsigned toISOYear(DateOrTime v) const
+     {
++        const LUTIndex i = toLUTIndex(v);
+         /// That's effectively the year of thursday of current week.
+-        return toYear(DayNum(d + 4 - toDayOfWeek(d)));
+-    }
+-
+-    inline unsigned toISOYear(time_t t) const
+-    {
+-        return toISOYear(toDayNum(t));
++        return toYear(toLUTIndex(i + 4 - toDayOfWeek(i)));
+     }
+ 
+     /// ISO year begins with a monday of the week that is contained more than by half in the corresponding calendar year.
+     /// Example: ISO year 2019 begins at 2018-12-31. And ISO year 2017 begins at 2017-01-02.
+     /// https://en.wikipedia.org/wiki/ISO_week_date
+-    inline DayNum toFirstDayNumOfISOYear(DayNum d) const
++    template <typename DateOrTime>
++    inline LUTIndex toFirstDayNumOfISOYearIndex(DateOrTime v) const
+     {
+-        auto iso_year = toISOYear(d);
++        const LUTIndex i = toLUTIndex(v);
++        auto iso_year = toISOYear(i);
+ 
+-        DayNum first_day_of_year = years_lut[iso_year - DATE_LUT_MIN_YEAR];
++        const auto first_day_of_year = years_lut[iso_year - DATE_LUT_MIN_YEAR];
+         auto first_day_of_week_of_year = lut[first_day_of_year].day_of_week;
+ 
+-        return DayNum(first_day_of_week_of_year <= 4
++        return LUTIndex{first_day_of_week_of_year <= 4
+             ? first_day_of_year + 1 - first_day_of_week_of_year
+-            : first_day_of_year + 8 - first_day_of_week_of_year);
++            : first_day_of_year + 8 - first_day_of_week_of_year};
+     }
+ 
+-    inline DayNum toFirstDayNumOfISOYear(time_t t) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfISOYear(DateOrTime v) const
+     {
+-        return toFirstDayNumOfISOYear(toDayNum(t));
++        return toDayNum(toFirstDayNumOfISOYearIndex(v));
+     }
+ 
+     inline time_t toFirstDayOfISOYear(time_t t) const
+     {
+-        return fromDayNum(toFirstDayNumOfISOYear(t));
++        return lut[toFirstDayNumOfISOYearIndex(t)].date;
+     }
+ 
+     /// ISO 8601 week number. Week begins at monday.
+     /// The week number 1 is the first week in year that contains 4 or more days (that's more than half).
+-    inline unsigned toISOWeek(DayNum d) const
+-    {
+-        return 1 + DayNum(toFirstDayNumOfWeek(d) - toFirstDayNumOfISOYear(d)) / 7;
+-    }
+-
+-    inline unsigned toISOWeek(time_t t) const
++    template <typename DateOrTime>
++    inline unsigned toISOWeek(DateOrTime v) const
+     {
+-        return toISOWeek(toDayNum(t));
++        return 1 + (toFirstDayNumOfWeek(v) - toFirstDayNumOfISOYear(v)) / 7;
+     }
+ 
+     /*
+@@ -463,30 +624,33 @@ class DateLUTImpl
+         Otherwise it is the last week of the previous year, and the
+         next week is week 1.
+     */
+-    inline YearWeek toYearWeek(DayNum d, UInt8 week_mode) const
++    template <typename DateOrTime>
++    inline YearWeek toYearWeek(DateOrTime v, UInt8 week_mode) const
+     {
+-        bool newyear_day_mode = week_mode & static_cast<UInt8>(WeekModeFlag::NEWYEAR_DAY);
++        const bool newyear_day_mode = week_mode & static_cast<UInt8>(WeekModeFlag::NEWYEAR_DAY);
+         week_mode = check_week_mode(week_mode);
+-        bool monday_first_mode = week_mode & static_cast<UInt8>(WeekModeFlag::MONDAY_FIRST);
++        const bool monday_first_mode = week_mode & static_cast<UInt8>(WeekModeFlag::MONDAY_FIRST);
+         bool week_year_mode = week_mode & static_cast<UInt8>(WeekModeFlag::YEAR);
+-        bool first_weekday_mode = week_mode & static_cast<UInt8>(WeekModeFlag::FIRST_WEEKDAY);
++        const bool first_weekday_mode = week_mode & static_cast<UInt8>(WeekModeFlag::FIRST_WEEKDAY);
++
++        const LUTIndex i = toLUTIndex(v);
+ 
+         // Calculate week number of WeekModeFlag::NEWYEAR_DAY mode
+         if (newyear_day_mode)
+         {
+-            return toYearWeekOfNewyearMode(d, monday_first_mode);
++            return toYearWeekOfNewyearMode(i, monday_first_mode);
+         }
+ 
+-        YearWeek yw(toYear(d), 0);
++        YearWeek yw(toYear(i), 0);
+         UInt16 days = 0;
+-        UInt16 daynr = makeDayNum(yw.first, toMonth(d), toDayOfMonth(d));
+-        UInt16 first_daynr = makeDayNum(yw.first, 1, 1);
++        const auto daynr = makeDayNum(yw.first, toMonth(i), toDayOfMonth(i));
++        auto first_daynr = makeDayNum(yw.first, 1, 1);
+ 
+         // 0 for monday, 1 for tuesday ...
+         // get weekday from first day in year.
+-        UInt16 weekday = calc_weekday(DayNum(first_daynr), !monday_first_mode);
++        UInt16 weekday = calc_weekday(first_daynr, !monday_first_mode);
+ 
+-        if (toMonth(d) == 1 && toDayOfMonth(d) <= static_cast<UInt32>(7 - weekday))
++        if (toMonth(i) == 1 && toDayOfMonth(i) <= static_cast<UInt32>(7 - weekday))
+         {
+             if (!week_year_mode && ((first_weekday_mode && weekday != 0) || (!first_weekday_mode && weekday >= 4)))
+                 return yw;
+@@ -517,48 +681,51 @@ class DateLUTImpl
+ 
+     /// Calculate week number of WeekModeFlag::NEWYEAR_DAY mode
+     /// The week number 1 is the first week in year that contains January 1,
+-    inline YearWeek toYearWeekOfNewyearMode(DayNum d, bool monday_first_mode) const
++    template <typename DateOrTime>
++    inline YearWeek toYearWeekOfNewyearMode(DateOrTime v, bool monday_first_mode) const
+     {
+         YearWeek yw(0, 0);
+         UInt16 offset_day = monday_first_mode ? 0U : 1U;
+ 
++        const LUTIndex i = LUTIndex(v);
++
+         // Checking the week across the year
+-        yw.first = toYear(DayNum(d + 7 - toDayOfWeek(DayNum(d + offset_day))));
++        yw.first = toYear(i + 7 - toDayOfWeek(i + offset_day));
+ 
+-        DayNum first_day = makeDayNum(yw.first, 1, 1);
+-        DayNum this_day = d;
++        auto first_day = makeLUTIndex(yw.first, 1, 1);
++        auto this_day = i;
+ 
++        // TODO: do not perform calculations in terms of DayNum, since that would under/overflow for extended range.
+         if (monday_first_mode)
+         {
+             // Rounds down a date to the nearest Monday.
+             first_day = toFirstDayNumOfWeek(first_day);
+-            this_day = toFirstDayNumOfWeek(d);
++            this_day = toFirstDayNumOfWeek(i);
+         }
+         else
+         {
+             // Rounds down a date to the nearest Sunday.
+             if (toDayOfWeek(first_day) != 7)
+-                first_day = DayNum(first_day - toDayOfWeek(first_day));
+-            if (toDayOfWeek(d) != 7)
+-                this_day = DayNum(d - toDayOfWeek(d));
++                first_day = ExtendedDayNum(first_day - toDayOfWeek(first_day));
++            if (toDayOfWeek(i) != 7)
++                this_day = ExtendedDayNum(i - toDayOfWeek(i));
+         }
+         yw.second = (this_day - first_day) / 7 + 1;
+         return yw;
+     }
+ 
+-    /**
+-     * get first day of week with week_mode, return Sunday or Monday
+-     */
+-    inline DayNum toFirstDayNumOfWeek(DayNum d, UInt8 week_mode) const
++    /// Get first day of week with week_mode, return Sunday or Monday
++    template <typename DateOrTime>
++    inline ExtendedDayNum toFirstDayNumOfWeek(DateOrTime v, UInt8 week_mode) const
+     {
+         bool monday_first_mode = week_mode & static_cast<UInt8>(WeekModeFlag::MONDAY_FIRST);
+         if (monday_first_mode)
+         {
+-            return toFirstDayNumOfWeek(d);
++            return toFirstDayNumOfWeek(v);
+         }
+         else
+         {
+-            return (toDayOfWeek(d) != 7) ? DayNum(d - toDayOfWeek(d)) : d;
++            return (toDayOfWeek(v) != 7) ? ExtendedDayNum(v - toDayOfWeek(v)) : toDayNum(v);
+         }
+     }
+ 
+@@ -574,104 +741,112 @@ class DateLUTImpl
+     /** Calculate weekday from d.
+       * Returns 0 for monday, 1 for tuesday...
+       */
+-    inline unsigned calc_weekday(DayNum d, bool sunday_first_day_of_week) const
++    template <typename DateOrTime>
++    inline unsigned calc_weekday(DateOrTime v, bool sunday_first_day_of_week) const
+     {
++        const LUTIndex i = toLUTIndex(v);
+         if (!sunday_first_day_of_week)
+-            return toDayOfWeek(d) - 1;
++            return toDayOfWeek(i) - 1;
+         else
+-            return toDayOfWeek(DayNum(d + 1)) - 1;
++            return toDayOfWeek(i + 1) - 1;
+     }
+ 
+     /// Calculate days in one year.
+-    inline unsigned calc_days_in_year(UInt16 year) const
++    inline unsigned calc_days_in_year(Int32 year) const
+     {
+         return ((year & 3) == 0 && (year % 100 || (year % 400 == 0 && year)) ? 366 : 365);
+     }
+ 
+     /// Number of month from some fixed moment in the past (year * 12 + month)
+-    inline unsigned toRelativeMonthNum(DayNum d) const
+-    {
+-        return lut[d].year * 12 + lut[d].month;
+-    }
+-
+-    inline unsigned toRelativeMonthNum(time_t t) const
+-    {
+-        return toRelativeMonthNum(toDayNum(t));
+-    }
+-
+-    inline unsigned toRelativeQuarterNum(DayNum d) const
++    template <typename DateOrTime>
++    inline unsigned toRelativeMonthNum(DateOrTime v) const
+     {
+-        return lut[d].year * 4 + (lut[d].month - 1) / 3;
++        const LUTIndex i = toLUTIndex(v);
++        return lut[i].year * 12 + lut[i].month;
+     }
+ 
+-    inline unsigned toRelativeQuarterNum(time_t t) const
++    template <typename DateOrTime>
++    inline unsigned toRelativeQuarterNum(DateOrTime v) const
+     {
+-        return toRelativeQuarterNum(toDayNum(t));
++        const LUTIndex i = toLUTIndex(v);
++        return lut[i].year * 4 + (lut[i].month - 1) / 3;
+     }
+ 
+     /// We count all hour-length intervals, unrelated to offset changes.
+     inline time_t toRelativeHourNum(time_t t) const
+     {
+-        if (offset_is_whole_number_of_hours_everytime)
++        if (t >= 0 && offset_is_whole_number_of_hours_during_epoch)
+             return t / 3600;
+ 
+         /// Assume that if offset was fractional, then the fraction is the same as at the beginning of epoch.
+         /// NOTE This assumption is false for "Pacific/Pitcairn" and "Pacific/Kiritimati" time zones.
+-        return (t + 86400 - offset_at_start_of_epoch) / 3600;
++        return (t + DATE_LUT_ADD + 86400 - offset_at_start_of_epoch) / 3600 - (DATE_LUT_ADD / 3600);
+     }
+ 
+-    inline time_t toRelativeHourNum(DayNum d) const
++    template <typename DateOrTime>
++    inline time_t toRelativeHourNum(DateOrTime v) const
+     {
+-        return toRelativeHourNum(lut[d].date);
++        return toRelativeHourNum(lut[toLUTIndex(v)].date);
+     }
+ 
+     inline time_t toRelativeMinuteNum(time_t t) const
+     {
+-        return t / 60;
++        return (t + DATE_LUT_ADD) / 60 - (DATE_LUT_ADD / 60);
+     }
+ 
+-    inline time_t toRelativeMinuteNum(DayNum d) const
++    template <typename DateOrTime>
++    inline time_t toRelativeMinuteNum(DateOrTime v) const
+     {
+-        return toRelativeMinuteNum(lut[d].date);
++        return toRelativeMinuteNum(lut[toLUTIndex(v)].date);
+     }
+ 
+-    inline DayNum toStartOfYearInterval(DayNum d, UInt64 years) const
++    template <typename DateOrTime>
++    inline ExtendedDayNum toStartOfYearInterval(DateOrTime v, UInt64 years) const
+     {
+         if (years == 1)
+-            return toFirstDayNumOfYear(d);
+-        return years_lut[(lut[d].year - DATE_LUT_MIN_YEAR) / years * years];
++            return toFirstDayNumOfYear(v);
++
++        const LUTIndex i = toLUTIndex(v);
++
++        UInt16 year = lut[i].year / years * years;
++
++        /// For example, rounding down 1925 to 100 years will be 1900, but it's less than min supported year.
++        if (unlikely(year < DATE_LUT_MIN_YEAR))
++            year = DATE_LUT_MIN_YEAR;
++
++        return toDayNum(years_lut[year - DATE_LUT_MIN_YEAR]);
+     }
+ 
+-    inline DayNum toStartOfQuarterInterval(DayNum d, UInt64 quarters) const
++    inline ExtendedDayNum toStartOfQuarterInterval(ExtendedDayNum d, UInt64 quarters) const
+     {
+         if (quarters == 1)
+             return toFirstDayNumOfQuarter(d);
+         return toStartOfMonthInterval(d, quarters * 3);
+     }
+ 
+-    inline DayNum toStartOfMonthInterval(DayNum d, UInt64 months) const
++    inline ExtendedDayNum toStartOfMonthInterval(ExtendedDayNum d, UInt64 months) const
+     {
+         if (months == 1)
+             return toFirstDayNumOfMonth(d);
+-        const auto & date = lut[d];
+-        UInt32 month_total_index = (date.year - DATE_LUT_MIN_YEAR) * 12 + date.month - 1;
+-        return years_months_lut[month_total_index / months * months];
++        const Values & values = lut[toLUTIndex(d)];
++        UInt32 month_total_index = (values.year - DATE_LUT_MIN_YEAR) * 12 + values.month - 1;
++        return toDayNum(years_months_lut[month_total_index / months * months]);
+     }
+ 
+-    inline DayNum toStartOfWeekInterval(DayNum d, UInt64 weeks) const
++    inline ExtendedDayNum toStartOfWeekInterval(ExtendedDayNum d, UInt64 weeks) const
+     {
+         if (weeks == 1)
+             return toFirstDayNumOfWeek(d);
+         UInt64 days = weeks * 7;
+         // January 1st 1970 was Thursday so we need this 4-days offset to make weeks start on Monday.
+-        return DayNum(4 + (d - 4) / days * days);
++        return ExtendedDayNum(4 + (d - 4) / days * days);
+     }
+ 
+-    inline time_t toStartOfDayInterval(DayNum d, UInt64 days) const
++    inline time_t toStartOfDayInterval(ExtendedDayNum d, UInt64 days) const
+     {
+         if (days == 1)
+             return toDate(d);
+-        return lut[d / days * days].date;
++        return lut[toLUTIndex(ExtendedDayNum(d / days * days))].date;
+     }
+ 
+     inline time_t toStartOfHourInterval(time_t t, UInt64 hours) const
+@@ -679,9 +854,13 @@ class DateLUTImpl
+         if (hours == 1)
+             return toStartOfHour(t);
+         UInt64 seconds = hours * 3600;
+-        t = t / seconds * seconds;
+-        if (offset_is_whole_number_of_hours_everytime)
++
++        t = roundDown(t, seconds);
++
++        if (t >= 0 && offset_is_whole_number_of_hours_during_epoch)
+             return t;
++
++        /// TODO check if it's correct.
+         return toStartOfHour(t);
+     }
+ 
+@@ -689,101 +868,155 @@ class DateLUTImpl
+     {
+         if (minutes == 1)
+             return toStartOfMinute(t);
++
+         UInt64 seconds = 60 * minutes;
+-        return t / seconds * seconds;
++        return roundDown(t, seconds);
+     }
+ 
+     inline time_t toStartOfSecondInterval(time_t t, UInt64 seconds) const
+     {
+         if (seconds == 1)
+             return t;
+-        return t / seconds * seconds;
++
++        return roundDown(t, seconds);
+     }
+ 
+-    /// Create DayNum from year, month, day of month.
+-    inline DayNum makeDayNum(UInt16 year, UInt8 month, UInt8 day_of_month) const
++    inline LUTIndex makeLUTIndex(Int16 year, UInt8 month, UInt8 day_of_month) const
+     {
+         if (unlikely(year < DATE_LUT_MIN_YEAR || year > DATE_LUT_MAX_YEAR || month < 1 || month > 12 || day_of_month < 1 || day_of_month > 31))
+-            return DayNum(0); // TODO (nemkov, DateTime64 phase 2): implement creating real date for year outside of LUT range.
++            return LUTIndex(0);
+ 
+-        // The day after 2106-02-07 will not stored fully as struct Values, so just overflow it as 0
+-        if (unlikely(year == DATE_LUT_MAX_YEAR && (month > 2 || (month == 2 && day_of_month > 7))))
+-            return DayNum(0);
++        return LUTIndex{years_months_lut[(year - DATE_LUT_MIN_YEAR) * 12 + month - 1] + day_of_month - 1};
++    }
+ 
+-        return DayNum(years_months_lut[(year - DATE_LUT_MIN_YEAR) * 12 + month - 1] + day_of_month - 1);
++    /// Create DayNum from year, month, day of month.
++    inline ExtendedDayNum makeDayNum(Int16 year, UInt8 month, UInt8 day_of_month) const
++    {
++        if (unlikely(year < DATE_LUT_MIN_YEAR || year > DATE_LUT_MAX_YEAR || month < 1 || month > 12 || day_of_month < 1 || day_of_month > 31))
++            return ExtendedDayNum(0);
++
++        return toDayNum(makeLUTIndex(year, month, day_of_month));
+     }
+ 
+-    inline time_t makeDate(UInt16 year, UInt8 month, UInt8 day_of_month) const
++    inline time_t makeDate(Int16 year, UInt8 month, UInt8 day_of_month) const
+     {
+-        return lut[makeDayNum(year, month, day_of_month)].date;
++        return lut[makeLUTIndex(year, month, day_of_month)].date;
+     }
+ 
+     /** Does not accept daylight saving time as argument: in case of ambiguity, it choose greater timestamp.
+       */
+-    inline time_t makeDateTime(UInt16 year, UInt8 month, UInt8 day_of_month, UInt8 hour, UInt8 minute, UInt8 second) const
++    inline time_t makeDateTime(Int16 year, UInt8 month, UInt8 day_of_month, UInt8 hour, UInt8 minute, UInt8 second) const
+     {
+-        size_t index = makeDayNum(year, month, day_of_month);
++        size_t index = makeLUTIndex(year, month, day_of_month);
+         UInt32 time_offset = hour * 3600 + minute * 60 + second;
+ 
+-        if (time_offset >= lut[index].time_at_offset_change)
+-            time_offset -= lut[index].amount_of_offset_change;
+-
+-        UInt32 res = lut[index].date + time_offset;
++        if (time_offset >= lut[index].time_at_offset_change())
++            time_offset -= lut[index].amount_of_offset_change();
+ 
+-        if (unlikely(res > DATE_LUT_MAX))
+-            return 0;
+-
+-        return res;
++        return lut[index].date + time_offset;
+     }
+ 
+-    inline const Values & getValues(DayNum d) const { return lut[d]; }
+-    inline const Values & getValues(time_t t) const { return lut[findIndex(t)]; }
++    template <typename DateOrTime>
++    inline const Values & getValues(DateOrTime v) const { return lut[toLUTIndex(v)]; }
+ 
+-    inline UInt32 toNumYYYYMM(time_t t) const
++    template <typename DateOrTime>
++    inline UInt32 toNumYYYYMM(DateOrTime v) const
+     {
+-        const Values & values = find(t);
++        const Values & values = getValues(v);
+         return values.year * 100 + values.month;
+     }
+ 
+-    inline UInt32 toNumYYYYMM(DayNum d) const
++    template <typename DateOrTime>
++    inline UInt32 toNumYYYYMMDD(DateOrTime v) const
+     {
+-        const Values & values = lut[d];
+-        return values.year * 100 + values.month;
++        const Values & values = getValues(v);
++        return values.year * 10000 + values.month * 100 + values.day_of_month;
+     }
+ 
+-    inline UInt32 toNumYYYYMMDD(time_t t) const
++    inline time_t YYYYMMDDToDate(UInt32 num) const
+     {
+-        const Values & values = find(t);
+-        return values.year * 10000 + values.month * 100 + values.day_of_month;
++        return makeDate(num / 10000, num / 100 % 100, num % 100);
+     }
+ 
+-    inline UInt32 toNumYYYYMMDD(DayNum d) const
++    inline ExtendedDayNum YYYYMMDDToDayNum(UInt32 num) const
+     {
+-        const Values & values = lut[d];
+-        return values.year * 10000 + values.month * 100 + values.day_of_month;
++        return makeDayNum(num / 10000, num / 100 % 100, num % 100);
+     }
+ 
+-    inline time_t YYYYMMDDToDate(UInt32 num) const
++
++    struct DateComponents
+     {
+-        return makeDate(num / 10000, num / 100 % 100, num % 100);
++        uint16_t year;
++        uint8_t month;
++        uint8_t day;
++    };
++
++    struct TimeComponents
++    {
++        uint8_t hour;
++        uint8_t minute;
++        uint8_t second;
++    };
++
++    struct DateTimeComponents
++    {
++        DateComponents date;
++        TimeComponents time;
++    };
++
++    inline DateComponents toDateComponents(time_t t) const
++    {
++        const Values & values = getValues(t);
++        return { values.year, values.month, values.day_of_month };
+     }
+ 
+-    inline DayNum YYYYMMDDToDayNum(UInt32 num) const
++    inline DateTimeComponents toDateTimeComponents(time_t t) const
+     {
+-        return makeDayNum(num / 10000, num / 100 % 100, num % 100);
++        const LUTIndex index = findIndex(t);
++        const Values & values = lut[index];
++
++        DateTimeComponents res;
++
++        res.date.year = values.year;
++        res.date.month = values.month;
++        res.date.day = values.day_of_month;
++
++        time_t time = t - values.date;
++        if (time >= values.time_at_offset_change())
++            time += values.amount_of_offset_change();
++
++        if (unlikely(time < 0))
++        {
++            res.time.second = 0;
++            res.time.minute = 0;
++            res.time.hour = 0;
++        }
++        else
++        {
++            res.time.second = time % 60;
++            res.time.minute = time / 60 % 60;
++            res.time.hour = time / 3600;
++        }
++
++        /// In case time was changed backwards at the start of next day, we will repeat the hour 23.
++        if (unlikely(res.time.hour > 23))
++            res.time.hour = 23;
++
++        return res;
+     }
+ 
+ 
+     inline UInt64 toNumYYYYMMDDhhmmss(time_t t) const
+     {
+-        const Values & values = find(t);
++        DateTimeComponents components = toDateTimeComponents(t);
++
+         return
+-              toSecond(t)
+-            + toMinute(t) * 100
+-            + toHour(t) * 10000
+-            + UInt64(values.day_of_month) * 1000000
+-            + UInt64(values.month) * 100000000
+-            + UInt64(values.year) * 10000000000;
++              components.time.second
++            + components.time.minute * 100
++            + components.time.hour * 10000
++            + UInt64(components.date.day) * 1000000
++            + UInt64(components.date.month) * 100000000
++            + UInt64(components.date.year) * 10000000000;
+     }
+ 
+     inline time_t YYYYMMDDhhmmssToTime(UInt64 num) const
+@@ -802,15 +1035,19 @@ class DateLUTImpl
+ 
+     inline NO_SANITIZE_UNDEFINED time_t addDays(time_t t, Int64 delta) const
+     {
+-        DayNum index = findIndex(t);
+-        time_t time_offset = toHour(t) * 3600 + toMinute(t) * 60 + toSecond(t);
++        const LUTIndex index = findIndex(t);
++        const Values & values = lut[index];
+ 
+-        index += delta;
++        time_t time = t - values.date;
++        if (time >= values.time_at_offset_change())
++            time += values.amount_of_offset_change();
+ 
+-        if (time_offset >= lut[index].time_at_offset_change)
+-            time_offset -= lut[index].amount_of_offset_change;
++        const LUTIndex new_index = index + delta;
+ 
+-        return lut[index].date + time_offset;
++        if (time >= lut[new_index].time_at_offset_change())
++            time -= lut[new_index].amount_of_offset_change();
++
++        return lut[new_index].date + time;
+     }
+ 
+     inline NO_SANITIZE_UNDEFINED time_t addWeeks(time_t t, Int64 delta) const
+@@ -818,7 +1055,7 @@ class DateLUTImpl
+         return addDays(t, delta * 7);
+     }
+ 
+-    inline UInt8 saturateDayOfMonth(UInt16 year, UInt8 month, UInt8 day_of_month) const
++    inline UInt8 saturateDayOfMonth(Int16 year, UInt8 month, UInt8 day_of_month) const
+     {
+         if (likely(day_of_month <= 28))
+             return day_of_month;
+@@ -831,23 +1068,10 @@ class DateLUTImpl
+         return day_of_month;
+     }
+ 
+-    /// If resulting month has less deys than source month, then saturation can happen.
+-    /// Example: 31 Aug + 1 month = 30 Sep.
+-    inline time_t addMonths(time_t t, Int64 delta) const
+-    {
+-        DayNum result_day = addMonths(toDayNum(t), delta);
+-
+-        time_t time_offset = toHour(t) * 3600 + toMinute(t) * 60 + toSecond(t);
+-
+-        if (time_offset >= lut[result_day].time_at_offset_change)
+-            time_offset -= lut[result_day].amount_of_offset_change;
+-
+-        return lut[result_day].date + time_offset;
+-    }
+-
+-    inline NO_SANITIZE_UNDEFINED DayNum addMonths(DayNum d, Int64 delta) const
++    template <typename DateOrTime>
++    inline LUTIndex addMonthsIndex(DateOrTime v, Int64 delta) const
+     {
+-        const Values & values = lut[d];
++        const Values & values = lut[toLUTIndex(v)];
+ 
+         Int64 month = static_cast<Int64>(values.month) + delta;
+ 
+@@ -857,7 +1081,7 @@ class DateLUTImpl
+             month = ((month - 1) % 12) + 1;
+             auto day_of_month = saturateDayOfMonth(year, month, values.day_of_month);
+ 
+-            return makeDayNum(year, month, day_of_month);
++            return makeLUTIndex(year, month, day_of_month);
+         }
+         else
+         {
+@@ -865,36 +1089,48 @@ class DateLUTImpl
+             month = 12 - (-month % 12);
+             auto day_of_month = saturateDayOfMonth(year, month, values.day_of_month);
+ 
+-            return makeDayNum(year, month, day_of_month);
++            return makeLUTIndex(year, month, day_of_month);
+         }
+     }
+ 
+-    inline NO_SANITIZE_UNDEFINED time_t addQuarters(time_t t, Int64 delta) const
++    /// If resulting month has less deys than source month, then saturation can happen.
++    /// Example: 31 Aug + 1 month = 30 Sep.
++    inline time_t NO_SANITIZE_UNDEFINED addMonths(time_t t, Int64 delta) const
+     {
+-        return addMonths(t, delta * 3);
++        const auto result_day = addMonthsIndex(t, delta);
++
++        const LUTIndex index = findIndex(t);
++        const Values & values = lut[index];
++
++        time_t time = t - values.date;
++        if (time >= values.time_at_offset_change())
++            time += values.amount_of_offset_change();
++
++        if (time >= lut[result_day].time_at_offset_change())
++            time -= lut[result_day].amount_of_offset_change();
++
++        return lut[result_day].date + time;
+     }
+ 
+-    inline NO_SANITIZE_UNDEFINED DayNum addQuarters(DayNum d, Int64 delta) const
++    inline ExtendedDayNum NO_SANITIZE_UNDEFINED addMonths(ExtendedDayNum d, Int64 delta) const
+     {
+-        return addMonths(d, delta * 3);
++        return toDayNum(addMonthsIndex(d, delta));
+     }
+ 
+-    /// Saturation can occur if 29 Feb is mapped to non-leap year.
+-    inline NO_SANITIZE_UNDEFINED time_t addYears(time_t t, Int64 delta) const
++    inline time_t NO_SANITIZE_UNDEFINED addQuarters(time_t t, Int64 delta) const
+     {
+-        DayNum result_day = addYears(toDayNum(t), delta);
+-
+-        time_t time_offset = toHour(t) * 3600 + toMinute(t) * 60 + toSecond(t);
+-
+-        if (time_offset >= lut[result_day].time_at_offset_change)
+-            time_offset -= lut[result_day].amount_of_offset_change;
++        return addMonths(t, delta * 3);
++    }
+ 
+-        return lut[result_day].date + time_offset;
++    inline ExtendedDayNum addQuarters(ExtendedDayNum d, Int64 delta) const
++    {
++        return addMonths(d, delta * 3);
+     }
+ 
+-    inline NO_SANITIZE_UNDEFINED DayNum addYears(DayNum d, Int64 delta) const
++    template <typename DateOrTime>
++    inline LUTIndex NO_SANITIZE_UNDEFINED addYearsIndex(DateOrTime v, Int64 delta) const
+     {
+-        const Values & values = lut[d];
++        const Values & values = lut[toLUTIndex(v)];
+ 
+         auto year = values.year + delta;
+         auto month = values.month;
+@@ -904,42 +1140,61 @@ class DateLUTImpl
+         if (unlikely(day_of_month == 29 && month == 2))
+             day_of_month = saturateDayOfMonth(year, month, day_of_month);
+ 
+-        return makeDayNum(year, month, day_of_month);
++        return makeLUTIndex(year, month, day_of_month);
+     }
+ 
++    /// Saturation can occur if 29 Feb is mapped to non-leap year.
++    inline time_t addYears(time_t t, Int64 delta) const
++    {
++        auto result_day = addYearsIndex(t, delta);
+ 
+-    inline std::string timeToString(time_t t) const
++        const LUTIndex index = findIndex(t);
++        const Values & values = lut[index];
++
++        time_t time = t - values.date;
++        if (time >= values.time_at_offset_change())
++            time += values.amount_of_offset_change();
++
++        if (time >= lut[result_day].time_at_offset_change())
++            time -= lut[result_day].amount_of_offset_change();
++
++        return lut[result_day].date + time;
++    }
++
++    inline ExtendedDayNum addYears(ExtendedDayNum d, Int64 delta) const
+     {
+-        const Values & values = find(t);
++        return toDayNum(addYearsIndex(d, delta));
++    }
+ 
+-        std::string s {"0000-00-00 00:00:00"};
+ 
+-        s[0] += values.year / 1000;
+-        s[1] += (values.year / 100) % 10;
+-        s[2] += (values.year / 10) % 10;
+-        s[3] += values.year % 10;
+-        s[5] += values.month / 10;
+-        s[6] += values.month % 10;
+-        s[8] += values.day_of_month / 10;
+-        s[9] += values.day_of_month % 10;
++    inline std::string timeToString(time_t t) const
++    {
++        DateTimeComponents components = toDateTimeComponents(t);
+ 
+-        auto hour = toHour(t);
+-        auto minute = toMinute(t);
+-        auto second = toSecond(t);
++        std::string s {"0000-00-00 00:00:00"};
+ 
+-        s[11] += hour / 10;
+-        s[12] += hour % 10;
+-        s[14] += minute / 10;
+-        s[15] += minute % 10;
+-        s[17] += second / 10;
+-        s[18] += second % 10;
++        s[0] += components.date.year / 1000;
++        s[1] += (components.date.year / 100) % 10;
++        s[2] += (components.date.year / 10) % 10;
++        s[3] += components.date.year % 10;
++        s[5] += components.date.month / 10;
++        s[6] += components.date.month % 10;
++        s[8] += components.date.day / 10;
++        s[9] += components.date.day % 10;
++
++        s[11] += components.time.hour / 10;
++        s[12] += components.time.hour % 10;
++        s[14] += components.time.minute / 10;
++        s[15] += components.time.minute % 10;
++        s[17] += components.time.second / 10;
++        s[18] += components.time.second % 10;
+ 
+         return s;
+     }
+ 
+     inline std::string dateToString(time_t t) const
+     {
+-        const Values & values = find(t);
++        const Values & values = getValues(t);
+ 
+         std::string s {"0000-00-00"};
+ 
+@@ -955,9 +1210,9 @@ class DateLUTImpl
+         return s;
+     }
+ 
+-    inline std::string dateToString(DayNum d) const
++    inline std::string dateToString(ExtendedDayNum d) const
+     {
+-        const Values & values = lut[d];
++        const Values & values = getValues(d);
+ 
+         std::string s {"0000-00-00"};
+ 
+diff --git a/base/common/DayNum.h b/base/common/DayNum.h
+index a4ef0c43b69a..5cf4d4635c82 100644
+--- a/base/common/DayNum.h
++++ b/base/common/DayNum.h
+@@ -7,3 +7,8 @@
+   * See DateLUTImpl for usage examples.
+   */
+ STRONG_TYPEDEF(UInt16, DayNum)
++
++/** Represent number of days since 1970-01-01 but in extended range,
++ * for dates before 1970-01-01 and after 2105
++ */
++STRONG_TYPEDEF(Int32, ExtendedDayNum)
+diff --git a/base/common/LocalDate.h b/base/common/LocalDate.h
+index e5ebe877bc5a..b1e6eeb907c1 100644
+--- a/base/common/LocalDate.h
++++ b/base/common/LocalDate.h
+@@ -92,20 +92,10 @@ class LocalDate
+     LocalDate(const LocalDate &) noexcept = default;
+     LocalDate & operator= (const LocalDate &) noexcept = default;
+ 
+-    LocalDate & operator= (time_t time)
+-    {
+-        init(time);
+-        return *this;
+-    }
+-
+-    operator time_t() const
+-    {
+-        return DateLUT::instance().makeDate(m_year, m_month, m_day);
+-    }
+-
+     DayNum getDayNum() const
+     {
+-        return DateLUT::instance().makeDayNum(m_year, m_month, m_day);
++        const auto & lut = DateLUT::instance();
++        return DayNum(lut.makeDayNum(m_year, m_month, m_day).toUnderType());
+     }
+ 
+     operator DayNum() const
+@@ -166,12 +156,3 @@ class LocalDate
+ };
+ 
+ static_assert(sizeof(LocalDate) == 4);
+-
+-
+-namespace std
+-{
+-inline string to_string(const LocalDate & date)
+-{
+-    return date.toString();
+-}
+-}
+diff --git a/base/common/LocalDateTime.h b/base/common/LocalDateTime.h
+index 0e237789bd13..dde283e5ebbf 100644
+--- a/base/common/LocalDateTime.h
++++ b/base/common/LocalDateTime.h
+@@ -29,29 +29,16 @@ class LocalDateTime
+     /// NOTE We may use attribute packed instead, but it is less portable.
+     unsigned char pad = 0;
+ 
+-    void init(time_t time)
++    void init(time_t time, const DateLUTImpl & time_zone)
+     {
+-        if (unlikely(time > DATE_LUT_MAX || time == 0))
+-        {
+-            m_year = 0;
+-            m_month = 0;
+-            m_day = 0;
+-            m_hour = 0;
+-            m_minute = 0;
+-            m_second = 0;
+-
+-            return;
+-        }
+-
+-        const auto & date_lut = DateLUT::instance();
+-        const auto & values = date_lut.getValues(time);
+-
+-        m_year = values.year;
+-        m_month = values.month;
+-        m_day = values.day_of_month;
+-        m_hour = date_lut.toHour(time);
+-        m_minute = date_lut.toMinute(time);
+-        m_second = date_lut.toSecond(time);
++        DateLUTImpl::DateTimeComponents components = time_zone.toDateTimeComponents(time);
++
++        m_year = components.date.year;
++        m_month = components.date.month;
++        m_day = components.date.day;
++        m_hour = components.time.hour;
++        m_minute = components.time.minute;
++        m_second = components.time.second;
+ 
+         (void)pad;  /// Suppress unused private field warning.
+     }
+@@ -73,9 +60,9 @@ class LocalDateTime
+     }
+ 
+ public:
+-    explicit LocalDateTime(time_t time)
++    explicit LocalDateTime(time_t time, const DateLUTImpl & time_zone = DateLUT::instance())
+     {
+-        init(time);
++        init(time, time_zone);
+     }
+ 
+     LocalDateTime(unsigned short year_, unsigned char month_, unsigned char day_,
+@@ -104,19 +91,6 @@ class LocalDateTime
+     LocalDateTime(const LocalDateTime &) noexcept = default;
+     LocalDateTime & operator= (const LocalDateTime &) noexcept = default;
+ 
+-    LocalDateTime & operator= (time_t time)
+-    {
+-        init(time);
+-        return *this;
+-    }
+-
+-    operator time_t() const
+-    {
+-        return m_year == 0
+-            ? 0
+-            : DateLUT::instance().makeDateTime(m_year, m_month, m_day, m_hour, m_minute, m_second);
+-    }
+-
+     unsigned short year() const { return m_year; }
+     unsigned char month() const { return m_month; }
+     unsigned char day() const { return m_day; }
+@@ -132,8 +106,30 @@ class LocalDateTime
+     void second(unsigned char x) { m_second = x; }
+ 
+     LocalDate toDate() const { return LocalDate(m_year, m_month, m_day); }
++    LocalDateTime toStartOfDate() const { return LocalDateTime(m_year, m_month, m_day, 0, 0, 0); }
+ 
+-    LocalDateTime toStartOfDate() { return LocalDateTime(m_year, m_month, m_day, 0, 0, 0); }
++    std::string toString() const
++    {
++        std::string s{"0000-00-00 00:00:00"};
++
++        s[0] += m_year / 1000;
++        s[1] += (m_year / 100) % 10;
++        s[2] += (m_year / 10) % 10;
++        s[3] += m_year % 10;
++        s[5] += m_month / 10;
++        s[6] += m_month % 10;
++        s[8] += m_day / 10;
++        s[9] += m_day % 10;
++
++        s[11] += m_hour / 10;
++        s[12] += m_hour % 10;
++        s[14] += m_minute / 10;
++        s[15] += m_minute % 10;
++        s[17] += m_second / 10;
++        s[18] += m_second % 10;
++
++        return s;
++    }
+ 
+     bool operator< (const LocalDateTime & other) const
+     {
+@@ -167,14 +163,3 @@ class LocalDateTime
+ };
+ 
+ static_assert(sizeof(LocalDateTime) == 8);
+-
+-
+-namespace std
+-{
+-inline string to_string(const LocalDateTime & datetime)
+-{
+-    stringstream str;
+-    str << datetime;
+-    return str.str();
+-}
+-}
+diff --git a/base/common/strong_typedef.h b/base/common/strong_typedef.h
+index d9850a25c370..77b83bfa6e5f 100644
+--- a/base/common/strong_typedef.h
++++ b/base/common/strong_typedef.h
+@@ -12,6 +12,7 @@ struct StrongTypedef
+     T t;
+ 
+ public:
++    using UnderlyingType = T;
+     template <class Enable = typename std::is_copy_constructible<T>::type>
+     explicit StrongTypedef(const T & t_) : t(t_) {}
+     template <class Enable = typename std::is_move_constructible<T>::type>
+diff --git a/programs/CMakeLists.txt b/programs/CMakeLists.txt
+index 9adca58b55a3..6b322df5ffd2 100644
+--- a/programs/CMakeLists.txt
++++ b/programs/CMakeLists.txt
+@@ -325,7 +325,7 @@ else ()
+ endif ()
+ 
+ if (ENABLE_TESTS AND USE_GTEST)
+-    set (CLICKHOUSE_UNIT_TESTS_TARGETS unit_tests_libcommon unit_tests_dbms)
++    set (CLICKHOUSE_UNIT_TESTS_TARGETS unit_tests_dbms)
+     add_custom_target (clickhouse-tests ALL DEPENDS ${CLICKHOUSE_UNIT_TESTS_TARGETS})
+     add_dependencies(clickhouse-bundle clickhouse-tests)
+ endif()
+diff --git a/programs/client/Client.cpp b/programs/client/Client.cpp
+index da7c729a737d..a594a06f000e 100644
+--- a/programs/client/Client.cpp
++++ b/programs/client/Client.cpp
+@@ -390,7 +390,7 @@ class Client : public Poco::Util::Application
+         for (auto d : chineseNewYearIndicators)
+         {
+             /// Let's celebrate until Lantern Festival
+-            if (d <= days && d + 25u >= days)
++            if (d <= days && d + 25 >= days)
+                 return true;
+             else if (d > days)
+                 return false;
+diff --git a/programs/git-import/git-import.cpp b/programs/git-import/git-import.cpp
+index ae8b55e2aff7..b07435dcf781 100644
+--- a/programs/git-import/git-import.cpp
++++ b/programs/git-import/git-import.cpp
+@@ -1064,7 +1064,7 @@ void processCommit(
+ 
+     time_t commit_time;
+     readText(commit_time, in);
+-    commit.time = commit_time;
++    commit.time = LocalDateTime(commit_time);
+     assertChar('\0', in);
+     readNullTerminated(commit.author, in);
+     std::string parent_hash;
+diff --git a/programs/odbc-bridge/ODBCBlockInputStream.cpp b/programs/odbc-bridge/ODBCBlockInputStream.cpp
+index 3e2a2d0c7d42..b8a4209ac947 100644
+--- a/programs/odbc-bridge/ODBCBlockInputStream.cpp
++++ b/programs/odbc-bridge/ODBCBlockInputStream.cpp
+@@ -87,8 +87,8 @@ namespace
+             case ValueType::vtDateTime:
+             {
+                 Poco::DateTime datetime = value.convert<Poco::DateTime>();
+-                assert_cast<ColumnUInt32 &>(column).insertValue(time_t{LocalDateTime(
+-                    datetime.year(), datetime.month(), datetime.day(), datetime.hour(), datetime.minute(), datetime.second())});
++                assert_cast<ColumnUInt32 &>(column).insertValue(DateLUT::instance().makeDateTime(
++                    datetime.year(), datetime.month(), datetime.day(), datetime.hour(), datetime.minute(), datetime.second()));
+                 break;
+             }
+             case ValueType::vtUUID:
+diff --git a/programs/odbc-bridge/ODBCBlockOutputStream.cpp b/programs/odbc-bridge/ODBCBlockOutputStream.cpp
+index 4d8b9fa6bdfb..db3c94414192 100644
+--- a/programs/odbc-bridge/ODBCBlockOutputStream.cpp
++++ b/programs/odbc-bridge/ODBCBlockOutputStream.cpp
+@@ -81,7 +81,7 @@ namespace
+             case ValueType::vtDate:
+                 return Poco::Dynamic::Var(LocalDate(DayNum(field.get<UInt64>())).toString()).convert<String>();
+             case ValueType::vtDateTime:
+-                return Poco::Dynamic::Var(std::to_string(LocalDateTime(time_t(field.get<UInt64>())))).convert<String>();
++                return Poco::Dynamic::Var(DateLUT::instance().timeToString(time_t(field.get<UInt64>()))).convert<String>();
+             case ValueType::vtUUID:
+                 return Poco::Dynamic::Var(UUID(field.get<UInt128>()).toUnderType().toHexString()).convert<std::string>();
+              default:
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 412da2fc00fb..b34a64b2d19d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -459,6 +459,8 @@ endif()
+ 
+ dbms_target_link_libraries(PRIVATE _boost_context)
+ 
++include (${ClickHouse_SOURCE_DIR}/cmake/add_check.cmake)
++
+ if (ENABLE_TESTS AND USE_GTEST)
+     macro (grep_gtest_sources BASE_DIR DST_VAR)
+         # Cold match files that are not in tests/ directories
+@@ -479,6 +481,15 @@ if (ENABLE_TESTS AND USE_GTEST)
+         -Wno-gnu-zero-variadic-macro-arguments
+     )
+ 
+-    target_link_libraries(unit_tests_dbms PRIVATE ${GTEST_BOTH_LIBRARIES} clickhouse_functions clickhouse_aggregate_functions clickhouse_parsers dbms clickhouse_common_zookeeper string_utils)
++    target_link_libraries(unit_tests_dbms PRIVATE
++        ${GTEST_BOTH_LIBRARIES}
++        clickhouse_functions
++        clickhouse_aggregate_functions
++        clickhouse_parsers
++        clickhouse_storages_system
++        dbms
++        clickhouse_common_zookeeper
++        string_utils)
++
+     add_check(unit_tests_dbms)
+ endif ()
+diff --git a/src/Core/DecimalFunctions.h b/src/Core/DecimalFunctions.h
+index 355cf1d378af..2cd50ab8d08d 100644
+--- a/src/Core/DecimalFunctions.h
++++ b/src/Core/DecimalFunctions.h
+@@ -50,9 +50,10 @@ inline auto scaleMultiplier(UInt32 scale)
+  * whole - represents whole part of decimal, can be negative or positive.
+  * fractional - for fractional part of decimal, always positive.
+  */
+-template <typename T>
++template <typename DecimalType>
+ struct DecimalComponents
+ {
++    using T = typename DecimalType::NativeType;
+     T whole;
+     T fractional;
+ };
+@@ -106,6 +107,15 @@ inline DecimalType decimalFromComponentsWithMultiplier(
+     return DecimalType(value);
+ }
+ 
++template <typename DecimalType>
++inline DecimalType decimalFromComponentsWithMultiplier(
++        const DecimalComponents<DecimalType> & components,
++        typename DecimalType::NativeType scale_multiplier)
++{
++    return decimalFromComponentsWithMultiplier<DecimalType>(components.whole, components.fractional, scale_multiplier);
++}
++
++
+ /** Make a decimal value from whole and fractional components with given scale.
+  *
+  * @see `decimalFromComponentsWithMultiplier` for details.
+@@ -126,7 +136,7 @@ inline DecimalType decimalFromComponents(
+  */
+ template <typename DecimalType>
+ inline DecimalType decimalFromComponents(
+-        const DecimalComponents<typename DecimalType::NativeType> & components,
++        const DecimalComponents<DecimalType> & components,
+         UInt32 scale)
+ {
+     return decimalFromComponents<DecimalType>(components.whole, components.fractional, scale);
+@@ -136,7 +146,7 @@ inline DecimalType decimalFromComponents(
+  * This is an optimization to reduce number of calls to scaleMultiplier on known scale.
+  */
+ template <typename DecimalType>
+-inline DecimalComponents<typename DecimalType::NativeType> splitWithScaleMultiplier(
++inline DecimalComponents<DecimalType> splitWithScaleMultiplier(
+         const DecimalType & decimal,
+         typename DecimalType::NativeType scale_multiplier)
+ {
+@@ -151,7 +161,7 @@ inline DecimalComponents<typename DecimalType::NativeType> splitWithScaleMultipl
+ 
+ /// Split decimal into components: whole and fractional part, @see `DecimalComponents` for details.
+ template <typename DecimalType>
+-inline DecimalComponents<typename DecimalType::NativeType> split(const DecimalType & decimal, UInt32 scale)
++inline DecimalComponents<DecimalType> split(const DecimalType & decimal, UInt32 scale)
+ {
+     if (scale == 0)
+     {
+diff --git a/src/Core/MySQL/MySQLReplication.cpp b/src/Core/MySQL/MySQLReplication.cpp
+index 16e31a46aa2e..7e3f68983be1 100644
+--- a/src/Core/MySQL/MySQLReplication.cpp
++++ b/src/Core/MySQL/MySQLReplication.cpp
+@@ -421,8 +421,8 @@ namespace MySQLReplication
+                         UInt32 i24 = 0;
+                         payload.readStrict(reinterpret_cast<char *>(&i24), 3);
+ 
+-                        DayNum date_day_number = DateLUT::instance().makeDayNum(
+-                            static_cast<int>((i24 >> 9) & 0x7fff), static_cast<int>((i24 >> 5) & 0xf), static_cast<int>(i24 & 0x1f));
++                        const DayNum date_day_number(DateLUT::instance().makeDayNum(
++                            static_cast<int>((i24 >> 9) & 0x7fff), static_cast<int>((i24 >> 5) & 0xf), static_cast<int>(i24 & 0x1f)).toUnderType());
+ 
+                         row.push_back(Field(date_day_number.toUnderType()));
+                         break;
+@@ -444,7 +444,7 @@ namespace MySQLReplication
+                             row.push_back(Field{UInt32(date_time)});
+                         else
+                         {
+-                            DB::DecimalUtils::DecimalComponents<DateTime64::NativeType> components{
++                            DB::DecimalUtils::DecimalComponents<DateTime64> components{
+                                 static_cast<DateTime64::NativeType>(date_time), 0};
+ 
+                             components.fractional = fsp;
+@@ -463,7 +463,7 @@ namespace MySQLReplication
+                             row.push_back(Field{sec});
+                         else
+                         {
+-                            DB::DecimalUtils::DecimalComponents<DateTime64::NativeType> components{
++                            DB::DecimalUtils::DecimalComponents<DateTime64> components{
+                                 static_cast<DateTime64::NativeType>(sec), 0};
+ 
+                             components.fractional = fsp;
+diff --git a/src/DataStreams/MongoDBBlockInputStream.cpp b/src/DataStreams/MongoDBBlockInputStream.cpp
+index 5463d95151bd..e4ddcd09ede4 100644
+--- a/src/DataStreams/MongoDBBlockInputStream.cpp
++++ b/src/DataStreams/MongoDBBlockInputStream.cpp
+@@ -270,8 +270,8 @@ namespace
+                     throw Exception{"Type mismatch, expected Timestamp, got type id = " + toString(value.type()) + " for column " + name,
+                                     ErrorCodes::TYPE_MISMATCH};
+ 
+-                assert_cast<ColumnUInt16 &>(column).getData().push_back(UInt16{DateLUT::instance().toDayNum(
+-                    static_cast<const Poco::MongoDB::ConcreteElement<Poco::Timestamp> &>(value).value().epochTime())});
++                assert_cast<ColumnUInt16 &>(column).getData().push_back(static_cast<UInt16>(DateLUT::instance().toDayNum(
++                    static_cast<const Poco::MongoDB::ConcreteElement<Poco::Timestamp> &>(value).value().epochTime())));
+                 break;
+             }
+ 
+diff --git a/src/DataStreams/PostgreSQLBlockInputStream.cpp b/src/DataStreams/PostgreSQLBlockInputStream.cpp
+index da6a83fb9300..8350dc86849a 100644
+--- a/src/DataStreams/PostgreSQLBlockInputStream.cpp
++++ b/src/DataStreams/PostgreSQLBlockInputStream.cpp
+@@ -160,8 +160,15 @@ void PostgreSQLBlockInputStream::insertValue(IColumn & column, std::string_view
+             assert_cast<ColumnUInt16 &>(column).insertValue(UInt16{LocalDate{std::string(value)}.getDayNum()});
+             break;
+         case ValueType::vtDateTime:
+-            assert_cast<ColumnUInt32 &>(column).insertValue(time_t{LocalDateTime{std::string(value)}});
++        {
++            ReadBufferFromString in(value);
++            time_t time = 0;
++            readDateTimeText(time, in);
++            if (time < 0)
++                time = 0;
++            assert_cast<ColumnUInt32 &>(column).insertValue(time);
+             break;
++        }
+         case ValueType::vtDateTime64:[[fallthrough]];
+         case ValueType::vtDecimal32: [[fallthrough]];
+         case ValueType::vtDecimal64: [[fallthrough]];
+@@ -257,7 +264,13 @@ void PostgreSQLBlockInputStream::prepareArrayInfo(size_t column_idx, const DataT
+     else if (which.isDate())
+         parser = [](std::string & field) -> Field { return UInt16{LocalDate{field}.getDayNum()}; };
+     else if (which.isDateTime())
+-        parser = [](std::string & field) -> Field { return time_t{LocalDateTime{field}}; };
++        parser = [](std::string & field) -> Field
++        {
++            ReadBufferFromString in(field);
++            time_t time = 0;
++            readDateTimeText(time, in);
++            return time;
++        };
+     else if (which.isDecimal32())
+         parser = [nested](std::string & field) -> Field
+         {
+diff --git a/src/DataTypes/DataTypeDateTime.cpp b/src/DataTypes/DataTypeDateTime.cpp
+index d2bbb4a1efa1..510747f6ef97 100644
+--- a/src/DataTypes/DataTypeDateTime.cpp
++++ b/src/DataTypes/DataTypeDateTime.cpp
+@@ -12,10 +12,14 @@
+ #include <IO/parseDateTimeBestEffort.h>
+ #include <Parsers/ASTLiteral.h>
+ 
++namespace DB
++{
++
+ namespace
+ {
+-using namespace DB;
+-inline void readText(time_t & x, ReadBuffer & istr, const FormatSettings & settings, const DateLUTImpl & time_zone, const DateLUTImpl & utc_time_zone)
++
++inline void readTextHelper(
++    time_t & x, ReadBuffer & istr, const FormatSettings & settings, const DateLUTImpl & time_zone, const DateLUTImpl & utc_time_zone)
+ {
+     switch (settings.date_time_input_format)
+     {
+@@ -27,16 +31,16 @@ inline void readText(time_t & x, ReadBuffer & istr, const FormatSettings & setti
+             return;
+     }
+ }
++
+ }
+ 
+-namespace DB
+-{
+ 
+ TimezoneMixin::TimezoneMixin(const String & time_zone_name)
+     : has_explicit_time_zone(!time_zone_name.empty()),
+     time_zone(DateLUT::instance(time_zone_name)),
+     utc_time_zone(DateLUT::instance("UTC"))
+-{}
++{
++}
+ 
+ DataTypeDateTime::DataTypeDateTime(const String & time_zone_name)
+     : TimezoneMixin(time_zone_name)
+@@ -45,7 +49,8 @@ DataTypeDateTime::DataTypeDateTime(const String & time_zone_name)
+ 
+ DataTypeDateTime::DataTypeDateTime(const TimezoneMixin & time_zone_)
+     : TimezoneMixin(time_zone_)
+-{}
++{
++}
+ 
+ String DataTypeDateTime::doGetName() const
+ {
+@@ -86,8 +91,10 @@ void DataTypeDateTime::deserializeWholeText(IColumn & column, ReadBuffer & istr,
+ 
+ void DataTypeDateTime::deserializeTextEscaped(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
+ {
+-    time_t x;
+-    ::readText(x, istr, settings, time_zone, utc_time_zone);
++    time_t x = 0;
++    readTextHelper(x, istr, settings, time_zone, utc_time_zone);
++    if (x < 0)
++        x = 0;
+     assert_cast<ColumnType &>(column).getData().push_back(x);
+ }
+ 
+@@ -100,16 +107,19 @@ void DataTypeDateTime::serializeTextQuoted(const IColumn & column, size_t row_nu
+ 
+ void DataTypeDateTime::deserializeTextQuoted(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
+ {
+-    time_t x;
++    time_t x = 0;
++
+     if (checkChar('\'', istr)) /// Cases: '2017-08-31 18:36:48' or '1504193808'
+     {
+-        ::readText(x, istr, settings, time_zone, utc_time_zone);
++        readTextHelper(x, istr, settings, time_zone, utc_time_zone);
+         assertChar('\'', istr);
+     }
+     else /// Just 1504193808 or 01504193808
+     {
+         readIntText(x, istr);
+     }
++    if (x < 0)
++        x = 0;
+     assert_cast<ColumnType &>(column).getData().push_back(x);    /// It's important to do this at the end - for exception safety.
+ }
+ 
+@@ -122,16 +132,21 @@ void DataTypeDateTime::serializeTextJSON(const IColumn & column, size_t row_num,
+ 
+ void DataTypeDateTime::deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
+ {
+-    time_t x;
++    time_t x = 0;
++
+     if (checkChar('"', istr))
+     {
+-        ::readText(x, istr, settings, time_zone, utc_time_zone);
++        readTextHelper(x, istr, settings, time_zone, utc_time_zone);
+         assertChar('"', istr);
+     }
+     else
+     {
+         readIntText(x, istr);
+     }
++
++    if (x < 0)
++        x = 0;
++
+     assert_cast<ColumnType &>(column).getData().push_back(x);
+ }
+ 
+@@ -144,7 +159,7 @@ void DataTypeDateTime::serializeTextCSV(const IColumn & column, size_t row_num,
+ 
+ void DataTypeDateTime::deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
+ {
+-    time_t x;
++    time_t x = 0;
+ 
+     if (istr.eof())
+         throwReadAfterEOF();
+@@ -154,11 +169,14 @@ void DataTypeDateTime::deserializeTextCSV(IColumn & column, ReadBuffer & istr, c
+     if (maybe_quote == '\'' || maybe_quote == '\"')
+         ++istr.position();
+ 
+-    ::readText(x, istr, settings, time_zone, utc_time_zone);
++    readTextHelper(x, istr, settings, time_zone, utc_time_zone);
+ 
+     if (maybe_quote == '\'' || maybe_quote == '\"')
+         assertChar(maybe_quote, istr);
+ 
++    if (x < 0)
++        x = 0;
++
+     assert_cast<ColumnType &>(column).getData().push_back(x);
+ }
+ 
+diff --git a/src/DataTypes/DataTypeDateTime64.h b/src/DataTypes/DataTypeDateTime64.h
+index 198c3739f588..ec3f2fde8898 100644
+--- a/src/DataTypes/DataTypeDateTime64.h
++++ b/src/DataTypes/DataTypeDateTime64.h
+@@ -48,66 +48,5 @@ class DataTypeDateTime64 final : public DataTypeDecimalBase<DateTime64>, public
+     bool canBePromoted() const override { return false; }
+ };
+ 
+-/** Tansform-type wrapper for DateTime64, applies given Transform to DateTime64 value or only to a whole part of it.
+- *
+- * Depending on what overloads of Transform::execute() are available, when called with DateTime64 value,
+- * invokes Transform::execute() with:
+- * * whole part of DateTime64 value, discarding fractional part.
+- * * DateTime64 value and scale factor.
+- *
+- * Suitable Transfotm-types are commonly used in Date/DateTime manipulation functions,
+- * and should implement static (or const) function with following signatures:
+- *      R execute(UInt32 whole_value, ... , const TimeZoneImpl &)
+- * OR
+- *      R execute(DateTime64 value, Int64 scale_factor, ... , const TimeZoneImpl &)
+- *
+- * Where R and T could be arbitrary types.
+-*/
+-template <typename Transform>
+-class TransformDateTime64 : public Transform
+-{
+-private:
+-    // Detect if Transform::execute is const or static method
+-    // with signature defined by template args (ignoring result type).
+-    template<typename = void, typename... Args>
+-    struct TransformHasExecuteOverload : std::false_type {};
+-
+-    template<typename... Args>
+-    struct TransformHasExecuteOverload<std::void_t<decltype(std::declval<Transform>().execute(std::declval<Args>()...))>, Args...>
+-        : std::true_type {};
+-
+-    template<typename... Args>
+-    static constexpr bool TransformHasExecuteOverload_v = TransformHasExecuteOverload<void, Args...>::value;
+-
+-public:
+-    static constexpr auto name = Transform::name;
+-
+-    using Transform::execute;
+-
+-    // non-explicit constructor to allow creating from scale value (or with no scale at all), indispensable in some contexts.
+-    TransformDateTime64(UInt32 scale_ = 0)
+-        : scale_multiplier(DecimalUtils::scaleMultiplier<DateTime64::NativeType>(scale_))
+-    {}
+-
+-    template <typename ... Args>
+-    inline auto execute(const DateTime64 & t, Args && ... args) const
+-    {
+-        const auto transform = static_cast<const Transform *>(this);
+-
+-        if constexpr (TransformHasExecuteOverload_v<DateTime64, decltype(scale_multiplier), Args...>)
+-        {
+-            return transform->execute(t, scale_multiplier, std::forward<Args>(args)...);
+-        }
+-        else
+-        {
+-            const auto components = DecimalUtils::splitWithScaleMultiplier(t, scale_multiplier);
+-            return transform->execute(static_cast<UInt32>(components.whole), std::forward<Args>(args)...);
+-        }
+-    }
+-
+-private:
+-    DateTime64::NativeType scale_multiplier = 1;
+-};
+-
+ }
+ 
+diff --git a/src/Dictionaries/ClickHouseDictionarySource.cpp b/src/Dictionaries/ClickHouseDictionarySource.cpp
+index f4c17884afa4..5e69df2c8a02 100644
+--- a/src/Dictionaries/ClickHouseDictionarySource.cpp
++++ b/src/Dictionaries/ClickHouseDictionarySource.cpp
+@@ -118,10 +118,9 @@ std::string ClickHouseDictionarySource::getUpdateFieldAndDate()
+ {
+     if (update_time != std::chrono::system_clock::from_time_t(0))
+     {
+-        auto tmp_time = update_time;
++        time_t hr_time = std::chrono::system_clock::to_time_t(update_time) - 1;
++        std::string str_time = DateLUT::instance().timeToString(hr_time);
+         update_time = std::chrono::system_clock::now();
+-        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
+-        std::string str_time = std::to_string(LocalDateTime(hr_time));
+         return query_builder.composeUpdateQuery(update_field, str_time);
+     }
+     else
+diff --git a/src/Dictionaries/MySQLDictionarySource.cpp b/src/Dictionaries/MySQLDictionarySource.cpp
+index 572080aee1ef..a1d0cbe7ffcf 100644
+--- a/src/Dictionaries/MySQLDictionarySource.cpp
++++ b/src/Dictionaries/MySQLDictionarySource.cpp
+@@ -107,10 +107,9 @@ std::string MySQLDictionarySource::getUpdateFieldAndDate()
+ {
+     if (update_time != std::chrono::system_clock::from_time_t(0))
+     {
+-        auto tmp_time = update_time;
++        time_t hr_time = std::chrono::system_clock::to_time_t(update_time) - 1;
++        std::string str_time = DateLUT::instance().timeToString(hr_time);
+         update_time = std::chrono::system_clock::now();
+-        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
+-        std::string str_time = std::to_string(LocalDateTime(hr_time));
+         return query_builder.composeUpdateQuery(update_field, str_time);
+     }
+     else
+@@ -262,7 +261,7 @@ LocalDateTime MySQLDictionarySource::getLastModification(mysqlxx::Pool::Entry &
+             if (!update_time_value.isNull())
+             {
+                 modification_time = update_time_value.getDateTime();
+-                LOG_TRACE(log, "Got modification time: {}", modification_time);
++                LOG_TRACE(log, "Got modification time: {}", update_time_value.getString());
+             }
+ 
+             /// fetch remaining rows to avoid "commands out of sync" error
+diff --git a/src/Dictionaries/PostgreSQLDictionarySource.cpp b/src/Dictionaries/PostgreSQLDictionarySource.cpp
+index aa852404750d..93a573833804 100644
+--- a/src/Dictionaries/PostgreSQLDictionarySource.cpp
++++ b/src/Dictionaries/PostgreSQLDictionarySource.cpp
+@@ -127,10 +127,9 @@ std::string PostgreSQLDictionarySource::getUpdateFieldAndDate()
+ {
+     if (update_time != std::chrono::system_clock::from_time_t(0))
+     {
+-        auto tmp_time = update_time;
++        time_t hr_time = std::chrono::system_clock::to_time_t(update_time) - 1;
++        std::string str_time = DateLUT::instance().timeToString(hr_time);
+         update_time = std::chrono::system_clock::now();
+-        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
+-        std::string str_time = std::to_string(LocalDateTime(hr_time));
+         return query_builder.composeUpdateQuery(update_field, str_time);
+     }
+     else
+diff --git a/src/Dictionaries/RangeHashedDictionary.cpp b/src/Dictionaries/RangeHashedDictionary.cpp
+index 52b6f219baca..81c5191ffabb 100644
+--- a/src/Dictionaries/RangeHashedDictionary.cpp
++++ b/src/Dictionaries/RangeHashedDictionary.cpp
+@@ -556,8 +556,9 @@ void RangeHashedDictionary::getIdsAndDates(
+             start_dates.push_back(value.range.left);
+             end_dates.push_back(value.range.right);
+ 
+-            if (is_date && static_cast<UInt64>(end_dates.back()) > DATE_LUT_MAX_DAY_NUM)
+-                end_dates.back() = 0;
++            if constexpr (std::numeric_limits<RangeType>::max() > DATE_LUT_MAX_DAY_NUM) /// Avoid warning about tautological comparison in next line.
++                if (is_date && static_cast<UInt64>(end_dates.back()) > DATE_LUT_MAX_DAY_NUM)
++                    end_dates.back() = 0;
+         }
+     }
+ }
+diff --git a/src/Dictionaries/RedisBlockInputStream.cpp b/src/Dictionaries/RedisBlockInputStream.cpp
+index a5514d141558..39cc2d610df7 100644
+--- a/src/Dictionaries/RedisBlockInputStream.cpp
++++ b/src/Dictionaries/RedisBlockInputStream.cpp
+@@ -99,8 +99,15 @@ namespace DB
+                     assert_cast<ColumnUInt16 &>(column).insertValue(parse<LocalDate>(string_value).getDayNum());
+                     break;
+                 case ValueType::vtDateTime:
+-                    assert_cast<ColumnUInt32 &>(column).insertValue(static_cast<UInt32>(parse<LocalDateTime>(string_value)));
++                {
++                    ReadBufferFromString in(string_value);
++                    time_t time = 0;
++                    readDateTimeText(time, in);
++                    if (time < 0)
++                        time = 0;
++                    assert_cast<ColumnUInt32 &>(column).insertValue(time);
+                     break;
++                }
+                 case ValueType::vtUUID:
+                     assert_cast<ColumnUInt128 &>(column).insertValue(parse<UUID>(string_value));
+                     break;
+diff --git a/src/Dictionaries/XDBCDictionarySource.cpp b/src/Dictionaries/XDBCDictionarySource.cpp
+index 3615f72605f3..37d54f3549c7 100644
+--- a/src/Dictionaries/XDBCDictionarySource.cpp
++++ b/src/Dictionaries/XDBCDictionarySource.cpp
+@@ -156,10 +156,9 @@ std::string XDBCDictionarySource::getUpdateFieldAndDate()
+ {
+     if (update_time != std::chrono::system_clock::from_time_t(0))
+     {
+-        auto tmp_time = update_time;
++        time_t hr_time = std::chrono::system_clock::to_time_t(update_time) - 1;
++        std::string str_time = DateLUT::instance().timeToString(hr_time);
+         update_time = std::chrono::system_clock::now();
+-        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
+-        std::string str_time = std::to_string(LocalDateTime(hr_time));
+         return query_builder.composeUpdateQuery(update_field, str_time);
+     }
+     else
+diff --git a/src/Formats/MySQLBlockInputStream.cpp b/src/Formats/MySQLBlockInputStream.cpp
+index 87df0c1f4b1d..29cf749de3bd 100644
+--- a/src/Formats/MySQLBlockInputStream.cpp
++++ b/src/Formats/MySQLBlockInputStream.cpp
+@@ -11,6 +11,7 @@
+ #    include <Columns/ColumnFixedString.h>
+ #    include <DataTypes/IDataType.h>
+ #    include <DataTypes/DataTypeNullable.h>
++#    include <IO/ReadBufferFromString.h>
+ #    include <IO/ReadHelpers.h>
+ #    include <IO/WriteHelpers.h>
+ #    include <IO/Operators.h>
+@@ -97,8 +98,15 @@ namespace
+                 assert_cast<ColumnUInt16 &>(column).insertValue(UInt16(value.getDate().getDayNum()));
+                 break;
+             case ValueType::vtDateTime:
+-                assert_cast<ColumnUInt32 &>(column).insertValue(UInt32(value.getDateTime()));
++            {
++                ReadBufferFromString in(value);
++                time_t time = 0;
++                readDateTimeText(time, in);
++                if (time < 0)
++                    time = 0;
++                assert_cast<ColumnUInt32 &>(column).insertValue(time);
+                 break;
++            }
+             case ValueType::vtUUID:
+                 assert_cast<ColumnUInt128 &>(column).insert(parse<UUID>(value.data(), value.size()));
+                 break;
+diff --git a/src/Formats/ProtobufSerializer.cpp b/src/Formats/ProtobufSerializer.cpp
+index 2ab8e11a8543..f99888975bc5 100644
+--- a/src/Formats/ProtobufSerializer.cpp
++++ b/src/Formats/ProtobufSerializer.cpp
+@@ -1486,6 +1486,8 @@ namespace
+             ReadBufferFromString buf{str};
+             time_t tm = 0;
+             readDateTimeText(tm, buf);
++            if (tm < 0)
++                tm = 0;
+             return tm;
+         }
+ 
+diff --git a/src/Functions/CustomWeekTransforms.h b/src/Functions/CustomWeekTransforms.h
+index afcbadc835c5..28da546eb93a 100644
+--- a/src/Functions/CustomWeekTransforms.h
++++ b/src/Functions/CustomWeekTransforms.h
+@@ -33,14 +33,21 @@ static inline UInt32 dateIsNotSupported(const char * name)
+ /// This factor transformation will say that the function is monotone everywhere.
+ struct ZeroTransform
+ {
+-    static inline UInt16 execute(UInt32, UInt8, const DateLUTImpl &) { return 0; }
+     static inline UInt16 execute(UInt16, UInt8, const DateLUTImpl &) { return 0; }
++    static inline UInt16 execute(UInt32, UInt8, const DateLUTImpl &) { return 0; }
++    static inline UInt16 execute(Int64, UInt8, const DateLUTImpl &) { return 0; }
+ };
+ 
+ struct ToWeekImpl
+ {
+     static constexpr auto name = "toWeek";
+ 
++    static inline UInt8 execute(Int64 t, UInt8 week_mode, const DateLUTImpl & time_zone)
++    {
++        // TODO: ditch conversion to DayNum, since it doesn't support extended range.
++        YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode);
++        return yw.second;
++    }
+     static inline UInt8 execute(UInt32 t, UInt8 week_mode, const DateLUTImpl & time_zone)
+     {
+         YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode);
+@@ -59,6 +66,13 @@ struct ToYearWeekImpl
+ {
+     static constexpr auto name = "toYearWeek";
+ 
++    static inline UInt32 execute(Int64 t, UInt8 week_mode, const DateLUTImpl & time_zone)
++    {
++        // TODO: ditch toDayNum()
++        YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode | static_cast<UInt32>(WeekModeFlag::YEAR));
++        return yw.first * 100 + yw.second;
++    }
++
+     static inline UInt32 execute(UInt32 t, UInt8 week_mode, const DateLUTImpl & time_zone)
+     {
+         YearWeek yw = time_zone.toYearWeek(time_zone.toDayNum(t), week_mode | static_cast<UInt32>(WeekModeFlag::YEAR));
+@@ -77,13 +91,19 @@ struct ToStartOfWeekImpl
+ {
+     static constexpr auto name = "toStartOfWeek";
+ 
++    static inline UInt16 execute(Int64 t, UInt8 week_mode, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toFirstDayNumOfWeek(time_zone.toDayNum(t), week_mode);
++//        return time_zone.toFirstDayNumOfWeek(t, week_mode);
++    }
+     static inline UInt16 execute(UInt32 t, UInt8 week_mode, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toFirstDayNumOfWeek(time_zone.toDayNum(t), week_mode);
++//        return time_zone.toFirstDayNumOfWeek(t, week_mode);
+     }
+     static inline UInt16 execute(UInt16 d, UInt8 week_mode, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfWeek(DayNum(d), week_mode);
++        return time_zone.toFirstDayNumOfWeek(ExtendedDayNum(d), week_mode);
+     }
+ 
+     using FactorTransform = ZeroTransform;
+diff --git a/src/Functions/DateTimeTransforms.h b/src/Functions/DateTimeTransforms.h
+index 333b397312d7..c299b9c4169c 100644
+--- a/src/Functions/DateTimeTransforms.h
++++ b/src/Functions/DateTimeTransforms.h
+@@ -3,6 +3,7 @@
+ #include <Core/DecimalFunctions.h>
+ #include <Common/Exception.h>
+ #include <common/DateLUTImpl.h>
++//#include <common/TimeZone.h>
+ #include <Columns/ColumnVector.h>
+ #include <Columns/ColumnDecimal.h>
+ #include <Functions/FunctionHelpers.h>
+@@ -33,14 +34,15 @@ namespace ErrorCodes
+   *  factor-transformation F is "round to the nearest month" (2015-02-03 -> 2015-02-01).
+   */
+ 
+-static inline UInt32 dateIsNotSupported(const char * name)
+-{
+-    throw Exception("Illegal type Date of argument for function " + std::string(name), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+-}
++    static inline UInt32 dateIsNotSupported(const char * name)
++    {
++        throw Exception("Illegal type Date of argument for function " + std::string(name), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
++    }
+ 
+ /// This factor transformation will say that the function is monotone everywhere.
+ struct ZeroTransform
+ {
++    static inline UInt16 execute(Int64, const DateLUTImpl &) { return 0; }
+     static inline UInt16 execute(UInt32, const DateLUTImpl &) { return 0; }
+     static inline UInt16 execute(UInt16, const DateLUTImpl &) { return 0; }
+ };
+@@ -49,6 +51,10 @@ struct ToDateImpl
+ {
+     static constexpr auto name = "toDate";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return UInt16(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return UInt16(time_zone.toDayNum(t));
+@@ -65,13 +71,18 @@ struct ToStartOfDayImpl
+ {
+     static constexpr auto name = "toStartOfDay";
+ 
++    //TODO: right now it is hardcoded to produce DateTime only, needs fixing later. See date_and_time_type_details::ResultDataTypeMap for deduction of result type example.
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toDate(static_cast<time_t>(t.whole));
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toDate(t);
+     }
+     static inline UInt32 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toDate(DayNum(d));
++        return time_zone.toDate(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -81,13 +92,19 @@ struct ToMondayImpl
+ {
+     static constexpr auto name = "toMonday";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        //return time_zone.toFirstDayNumOfWeek(time_zone.toDayNum(t));
++        return time_zone.toFirstDayNumOfWeek(t);
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfWeek(time_zone.toDayNum(t));
++        //return time_zone.toFirstDayNumOfWeek(time_zone.toDayNum(t));
++        return time_zone.toFirstDayNumOfWeek(t);
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfWeek(DayNum(d));
++        return time_zone.toFirstDayNumOfWeek(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -97,13 +114,17 @@ struct ToStartOfMonthImpl
+ {
+     static constexpr auto name = "toStartOfMonth";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toFirstDayNumOfMonth(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toFirstDayNumOfMonth(time_zone.toDayNum(t));
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfMonth(DayNum(d));
++        return time_zone.toFirstDayNumOfMonth(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -113,13 +134,17 @@ struct ToStartOfQuarterImpl
+ {
+     static constexpr auto name = "toStartOfQuarter";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toFirstDayNumOfQuarter(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toFirstDayNumOfQuarter(time_zone.toDayNum(t));
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfQuarter(DayNum(d));
++        return time_zone.toFirstDayNumOfQuarter(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -129,13 +154,17 @@ struct ToStartOfYearImpl
+ {
+     static constexpr auto name = "toStartOfYear";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toFirstDayNumOfYear(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toFirstDayNumOfYear(time_zone.toDayNum(t));
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfYear(DayNum(d));
++        return time_zone.toFirstDayNumOfYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -144,9 +173,13 @@ struct ToStartOfYearImpl
+ 
+ struct ToTimeImpl
+ {
++    /// When transforming to time, the date will be equated to 1970-01-01.
+     static constexpr auto name = "toTime";
+ 
+-    /// When transforming to time, the date will be equated to 1970-01-02.
++    static UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toTime(t.whole) + 86400;
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toTime(t) + 86400;
+@@ -164,6 +197,10 @@ struct ToStartOfMinuteImpl
+ {
+     static constexpr auto name = "toStartOfMinute";
+ 
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toStartOfMinute(t.whole);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toStartOfMinute(t);
+@@ -215,6 +252,10 @@ struct ToStartOfFiveMinuteImpl
+ {
+     static constexpr auto name = "toStartOfFiveMinute";
+ 
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toStartOfFiveMinute(t.whole);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toStartOfFiveMinute(t);
+@@ -231,6 +272,10 @@ struct ToStartOfTenMinutesImpl
+ {
+     static constexpr auto name = "toStartOfTenMinutes";
+ 
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toStartOfTenMinutes(t.whole);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toStartOfTenMinutes(t);
+@@ -247,6 +292,10 @@ struct ToStartOfFifteenMinutesImpl
+ {
+     static constexpr auto name = "toStartOfFifteenMinutes";
+ 
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toStartOfFifteenMinutes(t.whole);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toStartOfFifteenMinutes(t);
+@@ -264,6 +313,12 @@ struct TimeSlotImpl
+ {
+     static constexpr auto name = "timeSlot";
+ 
++    //static inline DecimalUtils::DecimalComponents<DateTime64> execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl &)
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl &)
++    {
++        return t.whole / 1800 * 1800;
++    }
++
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl &)
+     {
+         return t / 1800 * 1800;
+@@ -281,6 +336,11 @@ struct ToStartOfHourImpl
+ {
+     static constexpr auto name = "toStartOfHour";
+ 
++    static inline UInt32 execute(const DecimalUtils::DecimalComponents<DateTime64> & t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toStartOfHour(t.whole);
++    }
++
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toStartOfHour(t);
+@@ -298,13 +358,17 @@ struct ToYearImpl
+ {
+     static constexpr auto name = "toYear";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toYear(t);
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toYear(t);
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toYear(DayNum(d));
++        return time_zone.toYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -314,13 +378,17 @@ struct ToQuarterImpl
+ {
+     static constexpr auto name = "toQuarter";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toQuarter(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toQuarter(t);
+     }
+     static inline UInt8 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toQuarter(DayNum(d));
++        return time_zone.toQuarter(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToStartOfYearImpl;
+@@ -330,13 +398,17 @@ struct ToMonthImpl
+ {
+     static constexpr auto name = "toMonth";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toMonth(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toMonth(t);
+     }
+     static inline UInt8 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toMonth(DayNum(d));
++        return time_zone.toMonth(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToStartOfYearImpl;
+@@ -346,13 +418,17 @@ struct ToDayOfMonthImpl
+ {
+     static constexpr auto name = "toDayOfMonth";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toDayOfMonth(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toDayOfMonth(t);
+     }
+     static inline UInt8 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toDayOfMonth(DayNum(d));
++        return time_zone.toDayOfMonth(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToStartOfMonthImpl;
+@@ -362,13 +438,17 @@ struct ToDayOfWeekImpl
+ {
+     static constexpr auto name = "toDayOfWeek";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toDayOfWeek(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toDayOfWeek(t);
+     }
+     static inline UInt8 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toDayOfWeek(DayNum(d));
++        return time_zone.toDayOfWeek(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToMondayImpl;
+@@ -378,13 +458,17 @@ struct ToDayOfYearImpl
+ {
+     static constexpr auto name = "toDayOfYear";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toDayOfYear(t);
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toDayOfYear(t);
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toDayOfYear(DayNum(d));
++        return time_zone.toDayOfYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToStartOfYearImpl;
+@@ -394,6 +478,10 @@ struct ToHourImpl
+ {
+     static constexpr auto name = "toHour";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toHour(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toHour(t);
+@@ -411,6 +499,11 @@ struct TimezoneOffsetImpl
+ {
+     static constexpr auto name = "timezoneOffset";
+ 
++    static inline time_t execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.timezoneOffset(t);
++    }
++
+     static inline time_t execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.timezoneOffset(t);
+@@ -428,6 +521,10 @@ struct ToMinuteImpl
+ {
+     static constexpr auto name = "toMinute";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toMinute(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toMinute(t);
+@@ -444,6 +541,10 @@ struct ToSecondImpl
+ {
+     static constexpr auto name = "toSecond";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toSecond(t);
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toSecond(t);
+@@ -460,13 +561,17 @@ struct ToISOYearImpl
+ {
+     static constexpr auto name = "toISOYear";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toISOYear(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toISOYear(time_zone.toDayNum(t));
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toISOYear(DayNum(d));
++        return time_zone.toISOYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -476,13 +581,17 @@ struct ToStartOfISOYearImpl
+ {
+     static constexpr auto name = "toStartOfISOYear";
+ 
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toFirstDayNumOfISOYear(time_zone.toDayNum(t));
++    }
+     static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toFirstDayNumOfISOYear(time_zone.toDayNum(t));
+     }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toFirstDayNumOfISOYear(DayNum(d));
++        return time_zone.toFirstDayNumOfISOYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -492,13 +601,17 @@ struct ToISOWeekImpl
+ {
+     static constexpr auto name = "toISOWeek";
+ 
++    static inline UInt8 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toISOWeek(time_zone.toDayNum(t));
++    }
+     static inline UInt8 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toISOWeek(time_zone.toDayNum(t));
+     }
+     static inline UInt8 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toISOWeek(DayNum(d));
++        return time_zone.toISOWeek(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ToISOYearImpl;
+@@ -508,13 +621,17 @@ struct ToRelativeYearNumImpl
+ {
+     static constexpr auto name = "toRelativeYearNum";
+ 
+-    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toYear(t);
+     }
++    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toYear(static_cast<time_t>(t));
++    }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toYear(DayNum(d));
++        return time_zone.toYear(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -524,13 +641,17 @@ struct ToRelativeQuarterNumImpl
+ {
+     static constexpr auto name = "toRelativeQuarterNum";
+ 
+-    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toRelativeQuarterNum(t);
+     }
++    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toRelativeQuarterNum(static_cast<time_t>(t));
++    }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toRelativeQuarterNum(DayNum(d));
++        return time_zone.toRelativeQuarterNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -540,13 +661,17 @@ struct ToRelativeMonthNumImpl
+ {
+     static constexpr auto name = "toRelativeMonthNum";
+ 
+-    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toRelativeMonthNum(t);
+     }
++    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toRelativeMonthNum(static_cast<time_t>(t));
++    }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toRelativeMonthNum(DayNum(d));
++        return time_zone.toRelativeMonthNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -556,13 +681,17 @@ struct ToRelativeWeekNumImpl
+ {
+     static constexpr auto name = "toRelativeWeekNum";
+ 
+-    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toRelativeWeekNum(t);
+     }
++    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toRelativeWeekNum(static_cast<time_t>(t));
++    }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toRelativeWeekNum(DayNum(d));
++        return time_zone.toRelativeWeekNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -572,10 +701,14 @@ struct ToRelativeDayNumImpl
+ {
+     static constexpr auto name = "toRelativeDayNum";
+ 
+-    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt16 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toDayNum(t);
+     }
++    static inline UInt16 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toDayNum(static_cast<time_t>(t));
++    }
+     static inline UInt16 execute(UInt16 d, const DateLUTImpl &)
+     {
+         return static_cast<DayNum>(d);
+@@ -589,13 +722,17 @@ struct ToRelativeHourNumImpl
+ {
+     static constexpr auto name = "toRelativeHourNum";
+ 
+-    static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt32 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toRelativeHourNum(t);
+     }
++    static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toRelativeHourNum(static_cast<time_t>(t));
++    }
+     static inline UInt32 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toRelativeHourNum(DayNum(d));
++        return time_zone.toRelativeHourNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -605,13 +742,17 @@ struct ToRelativeMinuteNumImpl
+ {
+     static constexpr auto name = "toRelativeMinuteNum";
+ 
+-    static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
++    static inline UInt32 execute(Int64 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toRelativeMinuteNum(t);
+     }
++    static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toRelativeMinuteNum(static_cast<time_t>(t));
++    }
+     static inline UInt32 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.toRelativeMinuteNum(DayNum(d));
++        return time_zone.toRelativeMinuteNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -621,13 +762,17 @@ struct ToRelativeSecondNumImpl
+ {
+     static constexpr auto name = "toRelativeSecondNum";
+ 
++    static inline Int64 execute(Int64 t, const DateLUTImpl &)
++    {
++        return t;
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl &)
+     {
+         return t;
+     }
+     static inline UInt32 execute(UInt16 d, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.fromDayNum(DayNum(d));
++        return time_zone.fromDayNum(ExtendedDayNum(d));
+     }
+ 
+     using FactorTransform = ZeroTransform;
+@@ -637,6 +782,10 @@ struct ToYYYYMMImpl
+ {
+     static constexpr auto name = "toYYYYMM";
+ 
++    static inline UInt32 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toNumYYYYMM(t);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toNumYYYYMM(t);
+@@ -653,6 +802,10 @@ struct ToYYYYMMDDImpl
+ {
+     static constexpr auto name = "toYYYYMMDD";
+ 
++    static inline UInt32 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toNumYYYYMMDD(t);
++    }
+     static inline UInt32 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toNumYYYYMMDD(t);
+@@ -669,6 +822,10 @@ struct ToYYYYMMDDhhmmssImpl
+ {
+     static constexpr auto name = "toYYYYMMDDhhmmss";
+ 
++    static inline UInt64 execute(Int64 t, const DateLUTImpl & time_zone)
++    {
++        return time_zone.toNumYYYYMMDDhhmmss(t);
++    }
+     static inline UInt64 execute(UInt32 t, const DateLUTImpl & time_zone)
+     {
+         return time_zone.toNumYYYYMMDDhhmmss(t);
+diff --git a/src/Functions/FunctionCustomWeekToSomething.h b/src/Functions/FunctionCustomWeekToSomething.h
+index 8a343cffb950..5634ea115846 100644
+--- a/src/Functions/FunctionCustomWeekToSomething.h
++++ b/src/Functions/FunctionCustomWeekToSomething.h
+@@ -4,6 +4,7 @@
+ #include <DataTypes/DataTypeDateTime64.h>
+ #include <Functions/CustomWeekTransforms.h>
+ #include <Functions/IFunctionImpl.h>
++#include <Functions/TransformDateTime64.h>
+ #include <Functions/extractTimeZoneFromFunctionArguments.h>
+ #include <IO/WriteHelpers.h>
+ 
+diff --git a/src/Functions/FunctionDateOrDateTimeAddInterval.h b/src/Functions/FunctionDateOrDateTimeAddInterval.h
+index 5f964b899b48..2b0082f43343 100644
+--- a/src/Functions/FunctionDateOrDateTimeAddInterval.h
++++ b/src/Functions/FunctionDateOrDateTimeAddInterval.h
+@@ -11,6 +11,7 @@
+ #include <Functions/FunctionHelpers.h>
+ #include <Functions/castTypeToEither.h>
+ #include <Functions/extractTimeZoneFromFunctionArguments.h>
++#include <Functions/TransformDateTime64.h>
+ 
+ #include <IO/WriteHelpers.h>
+ 
+@@ -25,31 +26,6 @@ namespace ErrorCodes
+     extern const int ILLEGAL_COLUMN;
+ }
+ 
+-/// AddOnDateTime64DefaultImpl provides default implementation of add-X functionality for DateTime64.
+-///
+-/// Default implementation is not to change fractional part, but only modify whole part as if it was DateTime.
+-/// That means large whole values (for scale less than 9) might not fit into UInt32-range,
+-/// and hence default implementation will produce incorrect results.
+-template <typename T>
+-struct AddOnDateTime64DefaultImpl
+-{
+-    AddOnDateTime64DefaultImpl(UInt32 scale_ = 0)
+-        : scale_multiplier(DecimalUtils::scaleMultiplier<DateTime64::NativeType>(scale_))
+-    {}
+-
+-    // Default implementation for add/sub on DateTime64: do math on whole part (the same way as for DateTime), leave fractional as it is.
+-    inline DateTime64 execute(const DateTime64 & t, Int64 delta, const DateLUTImpl & time_zone) const
+-    {
+-        const auto components = DecimalUtils::splitWithScaleMultiplier(t, scale_multiplier);
+-
+-        const auto whole = static_cast<const T *>(this)->execute(static_cast<UInt32>(components.whole), delta, time_zone);
+-        return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(static_cast<DateTime64::NativeType>(whole), components.fractional, scale_multiplier);
+-    }
+-
+-    UInt32 scale_multiplier = 1;
+-};
+-
+-
+ /// Type of first argument of 'execute' function overload defines what INPUT DataType it is used for.
+ /// Return type defines what is the OUTPUT (return) type of the CH function.
+ /// Corresponding types:
+@@ -60,14 +36,15 @@ struct AddOnDateTime64DefaultImpl
+ ///  - 'AddSecondsImpl::execute(UInt32, ...) -> UInt32' is available to the ClickHouse users as 'addSeconds(DateTime, ...) -> DateTime'
+ ///  - 'AddSecondsImpl::execute(UInt16, ...) -> UInt32' is available to the ClickHouse users as 'addSeconds(Date, ...) -> DateTime'
+ 
+-struct AddSecondsImpl : public AddOnDateTime64DefaultImpl<AddSecondsImpl>
++struct AddSecondsImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddSecondsImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addSeconds";
+ 
++    static inline NO_SANITIZE_UNDEFINED DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl &)
++    {
++        return {t.whole + delta, t.fractional};
++    }
++
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl &)
+     {
+         return t + delta;
+@@ -75,18 +52,19 @@ struct AddSecondsImpl : public AddOnDateTime64DefaultImpl<AddSecondsImpl>
+ 
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.fromDayNum(DayNum(d)) + delta;
++        return time_zone.fromDayNum(ExtendedDayNum(d)) + delta;
+     }
+ };
+ 
+-struct AddMinutesImpl : public AddOnDateTime64DefaultImpl<AddMinutesImpl>
++struct AddMinutesImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddMinutesImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addMinutes";
+ 
++    static inline NO_SANITIZE_UNDEFINED DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl &)
++    {
++        return {t.whole + delta * 60, t.fractional};
++    }
++
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl &)
+     {
+         return t + delta * 60;
+@@ -94,18 +72,18 @@ struct AddMinutesImpl : public AddOnDateTime64DefaultImpl<AddMinutesImpl>
+ 
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.fromDayNum(DayNum(d)) + delta * 60;
++        return time_zone.fromDayNum(ExtendedDayNum(d)) + delta * 60;
+     }
+ };
+ 
+-struct AddHoursImpl : public AddOnDateTime64DefaultImpl<AddHoursImpl>
++struct AddHoursImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddHoursImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addHours";
+ 
++    static inline NO_SANITIZE_UNDEFINED DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl &)
++    {
++        return {t.whole + delta * 3600, t.fractional};
++    }
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl &)
+     {
+         return t + delta * 3600;
+@@ -113,19 +91,20 @@ struct AddHoursImpl : public AddOnDateTime64DefaultImpl<AddHoursImpl>
+ 
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.fromDayNum(DayNum(d)) + delta * 3600;
++        return time_zone.fromDayNum(ExtendedDayNum(d)) + delta * 3600;
+     }
+ };
+ 
+-struct AddDaysImpl : public AddOnDateTime64DefaultImpl<AddDaysImpl>
++struct AddDaysImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddDaysImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addDays";
+ 
+-    static inline UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
++    static inline NO_SANITIZE_UNDEFINED DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl & time_zone)
++    {
++        return {time_zone.addDays(t.whole, delta), t.fractional};
++    }
++
++    static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
+     {
+         return time_zone.addDays(t, delta);
+     }
+@@ -136,14 +115,15 @@ struct AddDaysImpl : public AddOnDateTime64DefaultImpl<AddDaysImpl>
+     }
+ };
+ 
+-struct AddWeeksImpl : public AddOnDateTime64DefaultImpl<AddWeeksImpl>
++struct AddWeeksImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddWeeksImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addWeeks";
+ 
++    static inline NO_SANITIZE_UNDEFINED DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl & time_zone)
++    {
++        return {time_zone.addWeeks(t.whole, delta), t.fractional};
++    }
++
+     static inline NO_SANITIZE_UNDEFINED UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
+     {
+         return time_zone.addWeeks(t, delta);
+@@ -155,14 +135,15 @@ struct AddWeeksImpl : public AddOnDateTime64DefaultImpl<AddWeeksImpl>
+     }
+ };
+ 
+-struct AddMonthsImpl : public AddOnDateTime64DefaultImpl<AddMonthsImpl>
++struct AddMonthsImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddMonthsImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addMonths";
+ 
++    static inline DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl & time_zone)
++    {
++        return {time_zone.addMonths(t.whole, delta), t.fractional};
++    }
++
+     static inline UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
+     {
+         return time_zone.addMonths(t, delta);
+@@ -170,18 +151,19 @@ struct AddMonthsImpl : public AddOnDateTime64DefaultImpl<AddMonthsImpl>
+ 
+     static inline UInt16 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.addMonths(DayNum(d), delta);
++        return time_zone.addMonths(ExtendedDayNum(d), delta);
+     }
+ };
+ 
+-struct AddQuartersImpl : public AddOnDateTime64DefaultImpl<AddQuartersImpl>
++struct AddQuartersImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddQuartersImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addQuarters";
+ 
++    static inline DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl & time_zone)
++    {
++        return {time_zone.addQuarters(t.whole, delta), t.fractional};
++    }
++
+     static inline UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
+     {
+         return time_zone.addQuarters(t, delta);
+@@ -189,18 +171,19 @@ struct AddQuartersImpl : public AddOnDateTime64DefaultImpl<AddQuartersImpl>
+ 
+     static inline UInt16 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.addQuarters(DayNum(d), delta);
++        return time_zone.addQuarters(ExtendedDayNum(d), delta);
+     }
+ };
+ 
+-struct AddYearsImpl : public AddOnDateTime64DefaultImpl<AddYearsImpl>
++struct AddYearsImpl
+ {
+-    using Base = AddOnDateTime64DefaultImpl<AddYearsImpl>;
+-    using Base::Base;
+-    using Base::execute;
+-
+     static constexpr auto name = "addYears";
+ 
++    static inline DecimalUtils::DecimalComponents<DateTime64> execute(DecimalUtils::DecimalComponents<DateTime64> t, Int64 delta, const DateLUTImpl & time_zone)
++    {
++        return {time_zone.addYears(t.whole, delta), t.fractional};
++    }
++
+     static inline UInt32 execute(UInt32 t, Int64 delta, const DateLUTImpl & time_zone)
+     {
+         return time_zone.addYears(t, delta);
+@@ -208,7 +191,7 @@ struct AddYearsImpl : public AddOnDateTime64DefaultImpl<AddYearsImpl>
+ 
+     static inline UInt16 execute(UInt16 d, Int64 delta, const DateLUTImpl & time_zone)
+     {
+-        return time_zone.addYears(DayNum(d), delta);
++        return time_zone.addYears(ExtendedDayNum(d), delta);
+     }
+ };
+ 
+@@ -351,6 +334,7 @@ template <> struct ResultDataTypeMap<Int16>      { using ResultDataType = DataTy
+ template <> struct ResultDataTypeMap<UInt32>     { using ResultDataType = DataTypeDateTime; };
+ template <> struct ResultDataTypeMap<Int32>      { using ResultDataType = DataTypeDateTime; };
+ template <> struct ResultDataTypeMap<DateTime64> { using ResultDataType = DataTypeDateTime64; };
++template <> struct ResultDataTypeMap<Int64>      { using ResultDataType = DataTypeDateTime64; };
+ }
+ 
+ template <typename Transform>
+@@ -417,10 +401,18 @@ class FunctionDateOrDateTimeAddInterval : public IFunction
+         }
+     }
+ 
++    // TransformDateTime64 helps choosing correct overload of exec and does some transformations
++    // on input and output parameters to simplify support of DateTime64 in concrete Transform.
++    template <typename FieldType>
++    using TransformType = std::conditional_t<
++        std::is_same_v<FieldType, DateTime64>,
++        TransformDateTime64<Transform>,
++        Transform>;
++
+     /// Helper templates to deduce return type based on argument type, since some overloads may promote or denote types,
+     /// e.g. addSeconds(Date, 1) => DateTime
+     template <typename FieldType>
+-    using TransformExecuteReturnType = decltype(std::declval<Transform>().execute(FieldType(), 0, std::declval<DateLUTImpl>()));
++    using TransformExecuteReturnType = decltype(std::declval<TransformType<FieldType>>().execute(FieldType(), 0, std::declval<DateLUTImpl>()));
+ 
+     // Deduces RETURN DataType from INPUT DataType, based on return type of Transform{}.execute(INPUT_TYPE, UInt64, DateLUTImpl).
+     // e.g. for Transform-type that has execute()-overload with 'UInt16' input and 'UInt32' return,
+@@ -475,8 +467,9 @@ class FunctionDateOrDateTimeAddInterval : public IFunction
+         }
+         else if (const auto * datetime64_type = assert_cast<const DataTypeDateTime64 *>(from_type))
+         {
+-            return DateTimeAddIntervalImpl<DataTypeDateTime64, TransformResultDataType<DataTypeDateTime64>, Transform>::execute(
+-                Transform{datetime64_type->getScale()}, arguments, result_type);
++            using WrappedTransformType = TransformType<typename DataTypeDateTime64::FieldType>;
++            return DateTimeAddIntervalImpl<DataTypeDateTime64, TransformResultDataType<DataTypeDateTime64>, WrappedTransformType>::execute(
++                    WrappedTransformType{datetime64_type->getScale()}, arguments, result_type);
+         }
+         else
+             throw Exception("Illegal type " + arguments[0].type->getName() + " of first argument of function " + getName(),
+diff --git a/src/Functions/FunctionDateOrDateTimeToSomething.h b/src/Functions/FunctionDateOrDateTimeToSomething.h
+index e0676f3dc0f9..abe859e2f29c 100644
+--- a/src/Functions/FunctionDateOrDateTimeToSomething.h
++++ b/src/Functions/FunctionDateOrDateTimeToSomething.h
+@@ -5,6 +5,7 @@
+ #include <DataTypes/DataTypeDateTime64.h>
+ #include <Functions/extractTimeZoneFromFunctionArguments.h>
+ #include <Functions/DateTimeTransforms.h>
++#include <Functions/TransformDateTime64.h>
+ #include <IO/WriteHelpers.h>
+ 
+ 
+@@ -107,6 +108,7 @@ class FunctionDateOrDateTimeToSomething : public IFunction
+         else if (which.isDateTime64())
+         {
+             const auto scale = static_cast<const DataTypeDateTime64 *>(from_type)->getScale();
++
+             const TransformDateTime64<Transform> transformer(scale);
+             return DateTimeTransformImpl<DataTypeDateTime64, ToDataType, decltype(transformer)>::execute(arguments, result_type, input_rows_count, transformer);
+         }
+@@ -133,7 +135,6 @@ class FunctionDateOrDateTimeToSomething : public IFunction
+ 
+         /// This method is called only if the function has one argument. Therefore, we do not care about the non-local time zone.
+         const DateLUTImpl & date_lut = DateLUT::instance();
+-
+         if (left.isNull() || right.isNull())
+             return is_not_monotonic;
+ 
+diff --git a/src/Functions/FunctionsConversion.h b/src/Functions/FunctionsConversion.h
+index 4889132eeb23..ef74f7778b19 100644
+--- a/src/Functions/FunctionsConversion.h
++++ b/src/Functions/FunctionsConversion.h
+@@ -44,6 +44,7 @@
+ #include <Functions/FunctionHelpers.h>
+ #include <Functions/DateTimeTransforms.h>
+ #include <Functions/toFixedString.h>
++#include <Functions/TransformDateTime64.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
+ #include <Columns/ColumnLowCardinality.h>
+ #include <Interpreters/Context.h>
+@@ -310,10 +311,15 @@ struct ToDateTimeImpl
+         return time_zone.fromDayNum(DayNum(d));
+     }
+ 
+-    // no-op conversion from DateTime to DateTime, used in DateTime64 to DateTime conversion.
+-    static inline UInt32 execute(UInt32 d, const DateLUTImpl & /*time_zone*/)
++    static inline UInt32 execute(UInt32 dt, const DateLUTImpl & /*time_zone*/)
+     {
+-        return d;
++        return dt;
++    }
++
++    // TODO: return UInt32 ???
++    static inline Int64 execute(Int64 dt64, const DateLUTImpl & /*time_zone*/)
++    {
++        return dt64;
+     }
+ };
+ 
+@@ -329,6 +335,7 @@ struct ToDateTransform32Or64
+ 
+     static inline NO_SANITIZE_UNDEFINED ToType execute(const FromType & from, const DateLUTImpl & time_zone)
+     {
++        // since converting to Date, no need in values outside of default LUT range.
+         return (from < 0xFFFF)
+             ? from
+             : time_zone.toDayNum(std::min(time_t(from), time_t(0xFFFFFFFF)));
+@@ -342,6 +349,7 @@ struct ToDateTransform32Or64Signed
+ 
+     static inline NO_SANITIZE_UNDEFINED ToType execute(const FromType & from, const DateLUTImpl & time_zone)
+     {
++        // TODO: decide narrow or extended range based on FromType
+         /// The function should be monotonic (better for query optimizations), so we saturate instead of overflow.
+         if (from < 0)
+             return 0;
+@@ -447,35 +455,8 @@ template <typename Name> struct ConvertImpl<DataTypeFloat32, DataTypeDateTime, N
+ template <typename Name> struct ConvertImpl<DataTypeFloat64, DataTypeDateTime, Name>
+     : DateTimeTransformImpl<DataTypeFloat64, DataTypeDateTime, ToDateTimeTransform64Signed<Float64, UInt32>> {};
+ 
+-
+-/** Conversion of Date or DateTime to DateTime64: add zero sub-second part.
+-  */
+-struct ToDateTime64Transform
+-{
+-    static constexpr auto name = "toDateTime64";
+-
+-    const DateTime64::NativeType scale_multiplier = 1;
+-
+-    ToDateTime64Transform(UInt32 scale = 0)
+-        : scale_multiplier(DecimalUtils::scaleMultiplier<DateTime64::NativeType>(scale))
+-    {}
+-
+-    inline DateTime64::NativeType execute(UInt16 d, const DateLUTImpl & time_zone) const
+-    {
+-        const auto dt = ToDateTimeImpl::execute(d, time_zone);
+-        return execute(dt, time_zone);
+-    }
+-
+-    inline DateTime64::NativeType execute(UInt32 dt, const DateLUTImpl & /*time_zone*/) const
+-    {
+-        return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(dt, 0, scale_multiplier);
+-    }
+-};
+-
+-template <typename Name> struct ConvertImpl<DataTypeDate, DataTypeDateTime64, Name, ConvertDefaultBehaviorTag>
+-    : DateTimeTransformImpl<DataTypeDate, DataTypeDateTime64, ToDateTime64Transform> {};
+-template <typename Name> struct ConvertImpl<DataTypeDateTime, DataTypeDateTime64, Name, ConvertDefaultBehaviorTag>
+-    : DateTimeTransformImpl<DataTypeDateTime, DataTypeDateTime64, ToDateTime64Transform> {};
++const time_t LUT_MIN_TIME = -1420070400l;       // 1925-01-01 UTC
++const time_t LUT_MAX_TIME = 9877248000l;        // 2282-12-31 UTC
+ 
+ /** Conversion of numeric to DateTime64
+   */
+@@ -493,7 +474,7 @@ struct ToDateTime64TransformUnsigned
+ 
+     inline NO_SANITIZE_UNDEFINED DateTime64::NativeType execute(FromType from, const DateLUTImpl &) const
+     {
+-        from = std::min(time_t(from), time_t(0xFFFFFFFF));
++        from = std::min<time_t>(from, LUT_MAX_TIME);
+         return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(from, 0, scale_multiplier);
+     }
+ };
+@@ -510,9 +491,8 @@ struct ToDateTime64TransformSigned
+ 
+     inline NO_SANITIZE_UNDEFINED DateTime64::NativeType execute(FromType from, const DateLUTImpl &) const
+     {
+-        if (from < 0)
+-            return 0;
+-        from = std::min(time_t(from), time_t(0xFFFFFFFF));
++        from = std::max<time_t>(from, LUT_MIN_TIME);
++        from = std::min<time_t>(from, LUT_MAX_TIME);
+         return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(from, 0, scale_multiplier);
+     }
+ };
+@@ -551,6 +531,7 @@ template <typename Name> struct ConvertImpl<DataTypeFloat32, DataTypeDateTime64,
+ template <typename Name> struct ConvertImpl<DataTypeFloat64, DataTypeDateTime64, Name>
+     : DateTimeTransformImpl<DataTypeFloat64, DataTypeDateTime64, ToDateTime64TransformFloat<DataTypeFloat64, Float64>> {};
+ 
++
+ /** Conversion of DateTime64 to Date or DateTime: discards fractional part.
+  */
+ template <typename Transform>
+@@ -571,10 +552,41 @@ struct FromDateTime64Transform
+     }
+ };
+ 
++/** Conversion of DateTime64 to Date or DateTime: discards fractional part.
++ */
+ template <typename Name> struct ConvertImpl<DataTypeDateTime64, DataTypeDate, Name, ConvertDefaultBehaviorTag>
+-    : DateTimeTransformImpl<DataTypeDateTime64, DataTypeDate, FromDateTime64Transform<ToDateImpl>> {};
++    : DateTimeTransformImpl<DataTypeDateTime64, DataTypeDate, TransformDateTime64<ToDateImpl>> {};
+ template <typename Name> struct ConvertImpl<DataTypeDateTime64, DataTypeDateTime, Name, ConvertDefaultBehaviorTag>
+-    : DateTimeTransformImpl<DataTypeDateTime64, DataTypeDateTime, FromDateTime64Transform<ToDateTimeImpl>> {};
++    : DateTimeTransformImpl<DataTypeDateTime64, DataTypeDateTime, TransformDateTime64<ToDateTimeImpl>> {};
++
++struct ToDateTime64Transform
++{
++    static constexpr auto name = "toDateTime64";
++
++    const DateTime64::NativeType scale_multiplier = 1;
++
++    ToDateTime64Transform(UInt32 scale = 0)
++        : scale_multiplier(DecimalUtils::scaleMultiplier<DateTime64::NativeType>(scale))
++    {}
++
++    inline DateTime64::NativeType execute(UInt16 d, const DateLUTImpl & time_zone) const
++    {
++        const auto dt = ToDateTimeImpl::execute(d, time_zone);
++        return execute(dt, time_zone);
++    }
++
++    inline DateTime64::NativeType execute(UInt32 dt, const DateLUTImpl & /*time_zone*/) const
++    {
++        return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(dt, 0, scale_multiplier);
++    }
++};
++
++/** Conversion of Date or DateTime to DateTime64: add zero sub-second part.
++  */
++template <typename Name> struct ConvertImpl<DataTypeDate, DataTypeDateTime64, Name, ConvertDefaultBehaviorTag>
++    : DateTimeTransformImpl<DataTypeDate, DataTypeDateTime64, ToDateTime64Transform> {};
++template <typename Name> struct ConvertImpl<DataTypeDateTime, DataTypeDateTime64, Name, ConvertDefaultBehaviorTag>
++    : DateTimeTransformImpl<DataTypeDateTime, DataTypeDateTime64, ToDateTime64Transform> {};
+ 
+ 
+ /** Transformation of numbers, dates, datetimes to strings: through formatting.
+@@ -658,7 +670,6 @@ struct ConvertImpl<FromDataType, std::enable_if_t<!std::is_same_v<FromDataType,
+         const auto & type = static_cast<const FromDataType &>(*col_with_type_and_name.type);
+ 
+         const DateLUTImpl * time_zone = nullptr;
+-
+         /// For argument of DateTime type, second argument with time zone could be specified.
+         if constexpr (std::is_same_v<FromDataType, DataTypeDateTime> || std::is_same_v<FromDataType, DataTypeDateTime64>)
+             time_zone = &extractTimeZoneFromFunctionArguments(arguments, 1, 0);
+@@ -754,14 +765,18 @@ inline void parseImpl<DataTypeDate>(DataTypeDate::FieldType & x, ReadBuffer & rb
+     x = tmp;
+ }
+ 
++// NOTE: no need of extra overload of DateTime64, since readDateTimeText64 has different signature and that case is explicitly handled in the calling code.
+ template <>
+ inline void parseImpl<DataTypeDateTime>(DataTypeDateTime::FieldType & x, ReadBuffer & rb, const DateLUTImpl * time_zone)
+ {
+-    time_t tmp = 0;
+-    readDateTimeText(tmp, rb, *time_zone);
+-    x = tmp;
++    time_t time = 0;
++    readDateTimeText(time, rb, *time_zone);
++    if (time < 0)
++        time = 0;
++    x = time;
+ }
+ 
++
+ template <>
+ inline void parseImpl<DataTypeUUID>(DataTypeUUID::FieldType & x, ReadBuffer & rb, const DateLUTImpl *)
+ {
+@@ -989,9 +1004,18 @@ struct ConvertThroughParsing
+                 }
+                 else if constexpr (parsing_mode == ConvertFromStringParsingMode::BestEffortUS)
+                 {
+-                    time_t res;
+-                    parseDateTimeBestEffortUS(res, read_buffer, *local_time_zone, *utc_time_zone);
+-                    vec_to[i] = res;
++                    if constexpr (to_datetime64)
++                    {
++                        DateTime64 res = 0;
++                        parseDateTime64BestEffortUS(res, vec_to.getScale(), read_buffer, *local_time_zone, *utc_time_zone);
++                        vec_to[i] = res;
++                    }
++                    else
++                    {
++                        time_t res;
++                        parseDateTimeBestEffortUS(res, read_buffer, *local_time_zone, *utc_time_zone);
++                        vec_to[i] = res;
++                    }
+                 }
+                 else
+                 {
+diff --git a/src/Functions/TransformDateTime64.h b/src/Functions/TransformDateTime64.h
+new file mode 100644
+index 000000000000..e42c3155327f
+--- /dev/null
++++ b/src/Functions/TransformDateTime64.h
+@@ -0,0 +1,92 @@
++#pragma once
++
++#include <Core/Types.h>
++#include <Core/DecimalFunctions.h>
++
++namespace DB
++{
++/** Tansform-type wrapper for DateTime64, simplifies DateTime64 support for given Transform.
++ *
++ * Depending on what overloads of Transform::execute() are available, when called with DateTime64 value,
++ * invokes Transform::execute() with either:
++ * * whole part of DateTime64 value, discarding fractional part (1)
++ * * DateTime64 value and scale factor (2)
++ * * DateTime64 broken down to components, result of execute is then re-assembled back into DateTime64 value (3)
++ *
++ * Suitable Transfotm-types are commonly used in Date/DateTime manipulation functions,
++ * and should implement static (or const) function with following signatures:
++ * 1:
++ *     R execute(Int64 whole_value, ... )
++ * 2:
++ *     R execute(DateTime64 value, Int64 scale_multiplier, ... )
++ * 3:
++ *     R execute(DecimalUtils::DecimalComponents<DateTime64> components, ... )
++ *
++ * Where R could be of arbitrary type, in case of (3) if R is DecimalUtils::DecimalComponents<DateTime64>, result is re-assembed back into DateTime64.
++*/
++template <typename Transform>
++class TransformDateTime64
++{
++private:
++    // Detect if Transform::execute is const or static method
++    // with signature defined by template args (ignoring result type).
++    template<typename = void, typename... Args>
++    struct TransformHasExecuteOverload : std::false_type {};
++
++    template<typename... Args>
++    struct TransformHasExecuteOverload<std::void_t<decltype(std::declval<Transform>().execute(std::declval<Args>()...))>, Args...>
++        : std::true_type {};
++
++    template<typename... Args>
++    static constexpr bool TransformHasExecuteOverload_v = TransformHasExecuteOverload<void, Args...>::value;
++
++public:
++    static constexpr auto name = Transform::name;
++
++    // non-explicit constructor to allow creating from scale value (or with no scale at all), indispensable in some contexts.
++    TransformDateTime64(UInt32 scale_ = 0)
++        : scale_multiplier(DecimalUtils::scaleMultiplier<DateTime64::NativeType>(scale_))
++    {}
++
++    template <typename ... Args>
++    inline auto execute(const DateTime64 & t, Args && ... args) const
++    {
++        if constexpr (TransformHasExecuteOverload_v<DateTime64, decltype(scale_multiplier), Args...>)
++        {
++            return wrapped_transform.execute(t, scale_multiplier, std::forward<Args>(args)...);
++        }
++        else if constexpr (TransformHasExecuteOverload_v<DecimalUtils::DecimalComponents<DateTime64>, Args...>)
++        {
++            auto components = DecimalUtils::splitWithScaleMultiplier(t, scale_multiplier);
++
++            const auto result = wrapped_transform.execute(components, std::forward<Args>(args)...);
++            using ResultType = std::decay_t<decltype(result)>;
++
++            if constexpr (std::is_same_v<DecimalUtils::DecimalComponents<DateTime64>, ResultType>)
++            {
++                return DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(result, scale_multiplier);
++            }
++            else
++            {
++                return result;
++            }
++        }
++        else
++        {
++            const auto components = DecimalUtils::splitWithScaleMultiplier(t, scale_multiplier);
++            return wrapped_transform.execute(static_cast<Int64>(components.whole), std::forward<Args>(args)...);
++        }
++    }
++
++    template <typename T, typename ... Args, typename = std::enable_if_t<!std::is_same_v<T, DateTime64>>>
++    inline auto execute(const T & t, Args && ... args) const
++    {
++        return wrapped_transform.execute(t, std::forward<Args>(args)...);
++    }
++
++private:
++    DateTime64::NativeType scale_multiplier = 1;
++    Transform wrapped_transform = {};
++};
++
++}
+diff --git a/src/Functions/dateDiff.cpp b/src/Functions/dateDiff.cpp
+index 54833eb359fb..f660b92efc5b 100644
+--- a/src/Functions/dateDiff.cpp
++++ b/src/Functions/dateDiff.cpp
+@@ -97,8 +97,8 @@ class FunctionDateDiff : public IFunction
+         size_t rows = input_rows_count;
+         auto res = ColumnInt64::create(rows);
+ 
+-        const DateLUTImpl & timezone_x = extractTimeZoneFromFunctionArguments(arguments, 3, 1);
+-        const DateLUTImpl & timezone_y = extractTimeZoneFromFunctionArguments(arguments, 3, 2);
++        const auto & timezone_x = extractTimeZoneFromFunctionArguments(arguments, 3, 1);
++        const auto & timezone_y = extractTimeZoneFromFunctionArguments(arguments, 3, 2);
+ 
+         if (unit == "year" || unit == "yy" || unit == "yyyy")
+             dispatchForColumns<ToRelativeYearNumImpl>(x, y, timezone_x, timezone_y, res->getData());
+diff --git a/src/Functions/extractTimeZoneFromFunctionArguments.cpp b/src/Functions/extractTimeZoneFromFunctionArguments.cpp
+index 9d6e54a599e1..0ba08b3c6121 100644
+--- a/src/Functions/extractTimeZoneFromFunctionArguments.cpp
++++ b/src/Functions/extractTimeZoneFromFunctionArguments.cpp
+@@ -66,10 +66,11 @@ const DateLUTImpl & extractTimeZoneFromFunctionArguments(const ColumnsWithTypeAn
+         if (arguments.empty())
+             return DateLUT::instance();
+ 
++        const auto & dt_arg = arguments[datetime_arg_num].type.get();
+         /// If time zone is attached to an argument of type DateTime.
+-        if (const auto * type = checkAndGetDataType<DataTypeDateTime>(arguments[datetime_arg_num].type.get()))
++        if (const auto * type = checkAndGetDataType<DataTypeDateTime>(dt_arg))
+             return type->getTimeZone();
+-        if (const auto * type = checkAndGetDataType<DataTypeDateTime64>(arguments[datetime_arg_num].type.get()))
++        if (const auto * type = checkAndGetDataType<DataTypeDateTime64>(dt_arg))
+             return type->getTimeZone();
+ 
+         return DateLUT::instance();
+diff --git a/src/Functions/formatDateTime.cpp b/src/Functions/formatDateTime.cpp
+index fd909ed6fce9..5128f077c5a5 100644
+--- a/src/Functions/formatDateTime.cpp
++++ b/src/Functions/formatDateTime.cpp
+@@ -46,9 +46,8 @@ template <> struct ActionValueTypeMap<DataTypeInt64>      { using ActionValueTyp
+ template <> struct ActionValueTypeMap<DataTypeUInt64>     { using ActionValueType = UInt32; };
+ template <> struct ActionValueTypeMap<DataTypeDate>       { using ActionValueType = UInt16; };
+ template <> struct ActionValueTypeMap<DataTypeDateTime>   { using ActionValueType = UInt32; };
+-// TODO(vnemkov): once there is support for Int64 in LUT, make that Int64.
+ // TODO(vnemkov): to add sub-second format instruction, make that DateTime64 and do some math in Action<T>.
+-template <> struct ActionValueTypeMap<DataTypeDateTime64> { using ActionValueType = UInt32; };
++template <> struct ActionValueTypeMap<DataTypeDateTime64> { using ActionValueType = Int64; };
+ 
+ 
+ /** formatDateTime(time, 'pattern')
+@@ -434,7 +433,6 @@ class FunctionFormatDateTimeImpl : public IFunction
+             time_zone_tmp = &DateLUT::instance();
+ 
+         const DateLUTImpl & time_zone = *time_zone_tmp;
+-
+         const auto & vec = times->getData();
+ 
+         UInt32 scale [[maybe_unused]] = 0;
+@@ -519,6 +517,8 @@ class FunctionFormatDateTimeImpl : public IFunction
+         {
+             if constexpr (std::is_same_v<T, UInt32>)
+                 instructions.emplace_back(func, shift);
++            else if constexpr (std::is_same_v<T, Int64>)
++                instructions.emplace_back(func, shift);
+             else
+                 add_shift(shift);
+         };
+diff --git a/src/Functions/now64.cpp b/src/Functions/now64.cpp
+index feb821fde82e..32c7a95de17e 100644
+--- a/src/Functions/now64.cpp
++++ b/src/Functions/now64.cpp
+@@ -30,7 +30,7 @@ Field nowSubsecond(UInt32 scale)
+     if (clock_gettime(CLOCK_REALTIME, &spec))
+         throwFromErrno("Cannot clock_gettime.", ErrorCodes::CANNOT_CLOCK_GETTIME);
+ 
+-    DecimalUtils::DecimalComponents<DateTime64::NativeType> components{spec.tv_sec, spec.tv_nsec};
++    DecimalUtils::DecimalComponents<DateTime64> components{spec.tv_sec, spec.tv_nsec};
+ 
+     // clock_gettime produces subsecond part in nanoseconds, but decimalFromComponents fractional is scale-dependent.
+     // Andjust fractional to scale, e.g. for 123456789 nanoseconds:
+diff --git a/src/Functions/toStartOfInterval.cpp b/src/Functions/toStartOfInterval.cpp
+index 6f5a52ca1823..f194da166aa2 100644
+--- a/src/Functions/toStartOfInterval.cpp
++++ b/src/Functions/toStartOfInterval.cpp
+@@ -7,6 +7,7 @@
+ #include <Functions/DateTimeTransforms.h>
+ #include <Functions/FunctionFactory.h>
+ #include <Functions/IFunctionImpl.h>
++#include <Functions/TransformDateTime64.h>
+ #include <IO/WriteHelpers.h>
+ 
+ 
+@@ -35,13 +36,18 @@ namespace
+ 
+         static UInt16 execute(UInt16 d, UInt64 years, const DateLUTImpl & time_zone)
+         {
+-            return time_zone.toStartOfYearInterval(DayNum(d), years);
++            return time_zone.toStartOfYearInterval(ExtendedDayNum(d), years);
+         }
+ 
+         static UInt16 execute(UInt32 t, UInt64 years, const DateLUTImpl & time_zone)
+         {
+             return time_zone.toStartOfYearInterval(time_zone.toDayNum(t), years);
+         }
++
++        static UInt16 execute(Int64 t, UInt64 years, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfYearInterval(time_zone.toDayNum(t), years);
++        }
+     };
+ 
+     template <>
+@@ -51,13 +57,18 @@ namespace
+ 
+         static UInt16 execute(UInt16 d, UInt64 quarters, const DateLUTImpl & time_zone)
+         {
+-            return time_zone.toStartOfQuarterInterval(DayNum(d), quarters);
++            return time_zone.toStartOfQuarterInterval(ExtendedDayNum(d), quarters);
+         }
+ 
+         static UInt16 execute(UInt32 t, UInt64 quarters, const DateLUTImpl & time_zone)
+         {
+             return time_zone.toStartOfQuarterInterval(time_zone.toDayNum(t), quarters);
+         }
++
++        static UInt16 execute(Int64 t, UInt64 quarters, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfQuarterInterval(time_zone.toDayNum(t), quarters);
++        }
+     };
+ 
+     template <>
+@@ -67,13 +78,18 @@ namespace
+ 
+         static UInt16 execute(UInt16 d, UInt64 months, const DateLUTImpl & time_zone)
+         {
+-            return time_zone.toStartOfMonthInterval(DayNum(d), months);
++            return time_zone.toStartOfMonthInterval(ExtendedDayNum(d), months);
+         }
+ 
+         static UInt16 execute(UInt32 t, UInt64 months, const DateLUTImpl & time_zone)
+         {
+             return time_zone.toStartOfMonthInterval(time_zone.toDayNum(t), months);
+         }
++
++        static UInt16 execute(Int64 t, UInt64 months, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfMonthInterval(time_zone.toDayNum(t), months);
++        }
+     };
+ 
+     template <>
+@@ -83,13 +99,18 @@ namespace
+ 
+         static UInt16 execute(UInt16 d, UInt64 weeks, const DateLUTImpl & time_zone)
+         {
+-            return time_zone.toStartOfWeekInterval(DayNum(d), weeks);
++            return time_zone.toStartOfWeekInterval(ExtendedDayNum(d), weeks);
+         }
+ 
+         static UInt16 execute(UInt32 t, UInt64 weeks, const DateLUTImpl & time_zone)
+         {
+             return time_zone.toStartOfWeekInterval(time_zone.toDayNum(t), weeks);
+         }
++
++        static UInt16 execute(Int64 t, UInt64 weeks, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfWeekInterval(time_zone.toDayNum(t), weeks);
++        }
+     };
+ 
+     template <>
+@@ -99,13 +120,18 @@ namespace
+ 
+         static UInt32 execute(UInt16 d, UInt64 days, const DateLUTImpl & time_zone)
+         {
+-            return time_zone.toStartOfDayInterval(DayNum(d), days);
++            return time_zone.toStartOfDayInterval(ExtendedDayNum(d), days);
+         }
+ 
+         static UInt32 execute(UInt32 t, UInt64 days, const DateLUTImpl & time_zone)
+         {
+             return time_zone.toStartOfDayInterval(time_zone.toDayNum(t), days);
+         }
++
++        static UInt32 execute(Int64 t, UInt64 days, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfDayInterval(time_zone.toDayNum(t), days);
++        }
+     };
+ 
+     template <>
+@@ -114,8 +140,8 @@ namespace
+         static constexpr auto name = function_name;
+ 
+         static UInt32 execute(UInt16, UInt64, const DateLUTImpl &) { return dateIsNotSupported(function_name); }
+-
+         static UInt32 execute(UInt32 t, UInt64 hours, const DateLUTImpl & time_zone) { return time_zone.toStartOfHourInterval(t, hours); }
++        static UInt32 execute(Int64 t, UInt64 hours, const DateLUTImpl & time_zone) { return time_zone.toStartOfHourInterval(t, hours); }
+     };
+ 
+     template <>
+@@ -129,6 +155,11 @@ namespace
+         {
+             return time_zone.toStartOfMinuteInterval(t, minutes);
+         }
++
++        static UInt32 execute(Int64 t, UInt64 minutes, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfMinuteInterval(t, minutes);
++        }
+     };
+ 
+     template <>
+@@ -142,6 +173,11 @@ namespace
+         {
+             return time_zone.toStartOfSecondInterval(t, seconds);
+         }
++
++        static Int64 execute(Int64 t, UInt64 seconds, const DateLUTImpl & time_zone)
++        {
++            return time_zone.toStartOfSecondInterval(t, seconds);
++        }
+     };
+ 
+ 
+@@ -230,7 +266,7 @@ class FunctionToStartOfInterval : public IFunction
+     {
+         const auto & time_column = arguments[0];
+         const auto & interval_column = arguments[1];
+-        const DateLUTImpl & time_zone = extractTimeZoneFromFunctionArguments(arguments, 2, 0);
++        const auto & time_zone = extractTimeZoneFromFunctionArguments(arguments, 2, 0);
+         auto result_column = dispatchForColumns(time_column, interval_column, time_zone);
+         return result_column;
+     }
+diff --git a/src/Functions/today.cpp b/src/Functions/today.cpp
+index 653730585404..511af881d73a 100644
+--- a/src/Functions/today.cpp
++++ b/src/Functions/today.cpp
+@@ -77,7 +77,7 @@ class TodayOverloadResolver : public IFunctionOverloadResolverImpl
+ 
+     FunctionBaseImplPtr build(const ColumnsWithTypeAndName &, const DataTypePtr &) const override
+     {
+-        return std::make_unique<FunctionBaseToday>(DateLUT::instance().toDayNum(time(nullptr)));
++        return std::make_unique<FunctionBaseToday>(DayNum(DateLUT::instance().toDayNum(time(nullptr)).toUnderType()));
+     }
+ };
+ 
+diff --git a/src/IO/ReadHelpers.h b/src/IO/ReadHelpers.h
+index e33de04f3221..369237f329d5 100644
+--- a/src/IO/ReadHelpers.h
++++ b/src/IO/ReadHelpers.h
+@@ -747,7 +747,7 @@ inline ReturnType readDateTimeTextImpl(DateTime64 & datetime64, UInt32 scale, Re
+         return ReturnType(false);
+     }
+ 
+-    DB::DecimalUtils::DecimalComponents<DateTime64::NativeType> components{static_cast<DateTime64::NativeType>(whole), 0};
++    DB::DecimalUtils::DecimalComponents<DateTime64> components{static_cast<DateTime64::NativeType>(whole), 0};
+ 
+     if (!buf.eof() && *buf.position() == '.')
+     {
+@@ -791,9 +791,9 @@ inline ReturnType readDateTimeTextImpl(DateTime64 & datetime64, UInt32 scale, Re
+     return ReturnType(true);
+ }
+ 
+-inline void readDateTimeText(time_t & datetime, ReadBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
++inline void readDateTimeText(time_t & datetime, ReadBuffer & buf, const DateLUTImpl & time_zone = DateLUT::instance())
+ {
+-    readDateTimeTextImpl<void>(datetime, buf, date_lut);
++    readDateTimeTextImpl<void>(datetime, buf, time_zone);
+ }
+ 
+ inline void readDateTime64Text(DateTime64 & datetime64, UInt32 scale, ReadBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
+@@ -801,9 +801,9 @@ inline void readDateTime64Text(DateTime64 & datetime64, UInt32 scale, ReadBuffer
+     readDateTimeTextImpl<void>(datetime64, scale, buf, date_lut);
+ }
+ 
+-inline bool tryReadDateTimeText(time_t & datetime, ReadBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
++inline bool tryReadDateTimeText(time_t & datetime, ReadBuffer & buf, const DateLUTImpl & time_zone = DateLUT::instance())
+ {
+-    return readDateTimeTextImpl<bool>(datetime, buf, date_lut);
++    return readDateTimeTextImpl<bool>(datetime, buf, time_zone);
+ }
+ 
+ inline bool tryReadDateTime64Text(DateTime64 & datetime64, UInt32 scale, ReadBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
+diff --git a/src/IO/WriteHelpers.h b/src/IO/WriteHelpers.h
+index a382ae13cdda..b9497b6f87e7 100644
+--- a/src/IO/WriteHelpers.h
++++ b/src/IO/WriteHelpers.h
+@@ -819,26 +819,20 @@ inline void writeDateTimeText(const LocalDateTime & datetime, WriteBuffer & buf)
+ 
+ /// In the format YYYY-MM-DD HH:MM:SS, according to the specified time zone.
+ template <char date_delimeter = '-', char time_delimeter = ':', char between_date_time_delimiter = ' '>
+-inline void writeDateTimeText(time_t datetime, WriteBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
++inline void writeDateTimeText(time_t datetime, WriteBuffer & buf, const DateLUTImpl & time_zone = DateLUT::instance())
+ {
+-    const auto & values = date_lut.getValues(datetime);
+-    writeDateTimeText<date_delimeter, time_delimeter, between_date_time_delimiter>(
+-        LocalDateTime(values.year, values.month, values.day_of_month,
+-            date_lut.toHour(datetime), date_lut.toMinute(datetime), date_lut.toSecond(datetime)), buf);
++    writeDateTimeText<date_delimeter, time_delimeter, between_date_time_delimiter>(LocalDateTime(datetime, time_zone), buf);
+ }
+ 
+ /// In the format YYYY-MM-DD HH:MM:SS.NNNNNNNNN, according to the specified time zone.
+ template <char date_delimeter = '-', char time_delimeter = ':', char between_date_time_delimiter = ' ', char fractional_time_delimiter = '.'>
+-inline void writeDateTimeText(DateTime64 datetime64, UInt32 scale, WriteBuffer & buf, const DateLUTImpl & date_lut = DateLUT::instance())
++inline void writeDateTimeText(DateTime64 datetime64, UInt32 scale, WriteBuffer & buf, const DateLUTImpl & time_zone = DateLUT::instance())
+ {
+     static constexpr UInt32 MaxScale = DecimalUtils::max_precision<DateTime64>;
+     scale = scale > MaxScale ? MaxScale : scale;
+ 
+     auto components = DecimalUtils::split(datetime64, scale);
+-    const auto & values = date_lut.getValues(components.whole);
+-    writeDateTimeText<date_delimeter, time_delimeter, between_date_time_delimiter>(
+-        LocalDateTime(values.year, values.month, values.day_of_month,
+-            date_lut.toHour(components.whole), date_lut.toMinute(components.whole), date_lut.toSecond(components.whole)), buf);
++    writeDateTimeText<date_delimeter, time_delimeter, between_date_time_delimiter>(LocalDateTime(components.whole, time_zone), buf);
+ 
+     if (scale > 0)
+     {
+@@ -849,9 +843,9 @@ inline void writeDateTimeText(DateTime64 datetime64, UInt32 scale, WriteBuffer &
+ 
+ /// In the RFC 1123 format: "Tue, 03 Dec 2019 00:11:50 GMT". You must provide GMT DateLUT.
+ /// This is needed for HTTP requests.
+-inline void writeDateTimeTextRFC1123(time_t datetime, WriteBuffer & buf, const DateLUTImpl & date_lut)
++inline void writeDateTimeTextRFC1123(time_t datetime, WriteBuffer & buf, const DateLUTImpl & time_zone = DateLUT::instance())
+ {
+-    const auto & values = date_lut.getValues(datetime);
++    const auto & values = time_zone.getValues(datetime);
+ 
+     static const char week_days[3 * 8 + 1] = "XXX" "Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun";
+     static const char months[3 * 13 + 1] = "XXX" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec";
+@@ -865,11 +859,11 @@ inline void writeDateTimeTextRFC1123(time_t datetime, WriteBuffer & buf, const D
+     buf.write(&digits100[values.year / 100 * 2], 2);
+     buf.write(&digits100[values.year % 100 * 2], 2);
+     buf.write(' ');
+-    buf.write(&digits100[date_lut.toHour(datetime) * 2], 2);
++    buf.write(&digits100[time_zone.toHour(datetime) * 2], 2);
+     buf.write(':');
+-    buf.write(&digits100[date_lut.toMinute(datetime) * 2], 2);
++    buf.write(&digits100[time_zone.toMinute(datetime) * 2], 2);
+     buf.write(':');
+-    buf.write(&digits100[date_lut.toSecond(datetime) * 2], 2);
++    buf.write(&digits100[time_zone.toSecond(datetime) * 2], 2);
+     buf.write(" GMT", 4);
+ }
+ 
+diff --git a/src/IO/parseDateTimeBestEffort.cpp b/src/IO/parseDateTimeBestEffort.cpp
+index 47a298ede294..26745a8f1387 100644
+--- a/src/IO/parseDateTimeBestEffort.cpp
++++ b/src/IO/parseDateTimeBestEffort.cpp
+@@ -600,7 +600,7 @@ ReturnType parseDateTimeBestEffortImpl(
+     return ReturnType(true);
+ }
+ 
+-template <typename ReturnType>
++template <typename ReturnType, bool is_us_style>
+ ReturnType parseDateTime64BestEffortImpl(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone)
+ {
+     time_t whole;
+@@ -608,12 +608,12 @@ ReturnType parseDateTime64BestEffortImpl(DateTime64 & res, UInt32 scale, ReadBuf
+ 
+     if constexpr (std::is_same_v<ReturnType, bool>)
+     {
+-        if (!parseDateTimeBestEffortImpl<bool, false>(whole, in, local_time_zone, utc_time_zone, &subsecond))
++        if (!parseDateTimeBestEffortImpl<bool, is_us_style>(whole, in, local_time_zone, utc_time_zone, &subsecond))
+             return false;
+     }
+     else
+     {
+-        parseDateTimeBestEffortImpl<ReturnType, false>(whole, in, local_time_zone, utc_time_zone, &subsecond);
++        parseDateTimeBestEffortImpl<ReturnType, is_us_style>(whole, in, local_time_zone, utc_time_zone, &subsecond);
+     }
+ 
+ 
+@@ -661,12 +661,17 @@ bool tryParseDateTimeBestEffortUS(time_t & res, ReadBuffer & in, const DateLUTIm
+ 
+ void parseDateTime64BestEffort(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone)
+ {
+-    return parseDateTime64BestEffortImpl<void>(res, scale, in, local_time_zone, utc_time_zone);
++    return parseDateTime64BestEffortImpl<void, false>(res, scale, in, local_time_zone, utc_time_zone);
++}
++
++void parseDateTime64BestEffortUS(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone)
++{
++    return parseDateTime64BestEffortImpl<void, true>(res, scale, in, local_time_zone, utc_time_zone);
+ }
+ 
+ bool tryParseDateTime64BestEffort(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone)
+ {
+-    return parseDateTime64BestEffortImpl<bool>(res, scale, in, local_time_zone, utc_time_zone);
++    return parseDateTime64BestEffortImpl<bool, false>(res, scale, in, local_time_zone, utc_time_zone);
+ }
+ 
+ }
+diff --git a/src/IO/parseDateTimeBestEffort.h b/src/IO/parseDateTimeBestEffort.h
+index 65e92cbee428..fe3da24a7974 100644
+--- a/src/IO/parseDateTimeBestEffort.h
++++ b/src/IO/parseDateTimeBestEffort.h
+@@ -61,6 +61,7 @@ bool tryParseDateTimeBestEffort(time_t & res, ReadBuffer & in, const DateLUTImpl
+ void parseDateTimeBestEffortUS(time_t & res, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone);
+ bool tryParseDateTimeBestEffortUS(time_t & res, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone);
+ void parseDateTime64BestEffort(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone);
++void parseDateTime64BestEffortUS(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone);
+ bool tryParseDateTime64BestEffort(DateTime64 & res, UInt32 scale, ReadBuffer & in, const DateLUTImpl & local_time_zone, const DateLUTImpl & utc_time_zone);
+ 
+ }
+diff --git a/src/Interpreters/CrashLog.cpp b/src/Interpreters/CrashLog.cpp
+index bf81a2e8abad..5067acd4a5c4 100644
+--- a/src/Interpreters/CrashLog.cpp
++++ b/src/Interpreters/CrashLog.cpp
+@@ -40,7 +40,7 @@ void CrashLogElement::appendToBlock(MutableColumns & columns) const
+ {
+     size_t i = 0;
+ 
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(timestamp_ns);
+     columns[i++]->insert(signal);
+diff --git a/src/Interpreters/MetricLog.cpp b/src/Interpreters/MetricLog.cpp
+index ce5d5793b87c..fd1c120f18c3 100644
+--- a/src/Interpreters/MetricLog.cpp
++++ b/src/Interpreters/MetricLog.cpp
+@@ -41,7 +41,7 @@ void MetricLogElement::appendToBlock(MutableColumns & columns) const
+ {
+     size_t column_idx = 0;
+ 
+-    columns[column_idx++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[column_idx++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[column_idx++]->insert(event_time);
+     columns[column_idx++]->insert(event_time_microseconds);
+     columns[column_idx++]->insert(milliseconds);
+diff --git a/src/Interpreters/OpenTelemetrySpanLog.cpp b/src/Interpreters/OpenTelemetrySpanLog.cpp
+index e1df145cf511..f9ae6518af0b 100644
+--- a/src/Interpreters/OpenTelemetrySpanLog.cpp
++++ b/src/Interpreters/OpenTelemetrySpanLog.cpp
+@@ -49,7 +49,7 @@ void OpenTelemetrySpanLogElement::appendToBlock(MutableColumns & columns) const
+     columns[i++]->insert(operation_name);
+     columns[i++]->insert(start_time_us);
+     columns[i++]->insert(finish_time_us);
+-    columns[i++]->insert(DateLUT::instance().toDayNum(finish_time_us / 1000000));
++    columns[i++]->insert(DateLUT::instance().toDayNum(finish_time_us / 1000000).toUnderType());
+     columns[i++]->insert(attribute_names);
+     // The user might add some ints values, and we will have Int Field, and the
+     // insert will fail because the column requires Strings. Convert the fields
+diff --git a/src/Interpreters/PartLog.cpp b/src/Interpreters/PartLog.cpp
+index 860666a00354..c180a4dd2548 100644
+--- a/src/Interpreters/PartLog.cpp
++++ b/src/Interpreters/PartLog.cpp
+@@ -71,7 +71,7 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
+ 
+     columns[i++]->insert(query_id);
+     columns[i++]->insert(event_type);
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(event_time_microseconds);
+     columns[i++]->insert(duration_ms);
+diff --git a/src/Interpreters/QueryLog.cpp b/src/Interpreters/QueryLog.cpp
+index 82b957f895b6..b6902468242f 100644
+--- a/src/Interpreters/QueryLog.cpp
++++ b/src/Interpreters/QueryLog.cpp
+@@ -119,7 +119,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
+     size_t i = 0;
+ 
+     columns[i++]->insert(type);
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(event_time_microseconds);
+     columns[i++]->insert(query_start_time);
+diff --git a/src/Interpreters/QueryThreadLog.cpp b/src/Interpreters/QueryThreadLog.cpp
+index f1cce1a3da97..31f1fddc87f5 100644
+--- a/src/Interpreters/QueryThreadLog.cpp
++++ b/src/Interpreters/QueryThreadLog.cpp
+@@ -76,7 +76,7 @@ void QueryThreadLogElement::appendToBlock(MutableColumns & columns) const
+ {
+     size_t i = 0;
+ 
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(event_time_microseconds);
+     columns[i++]->insert(query_start_time);
+diff --git a/src/Interpreters/TextLog.cpp b/src/Interpreters/TextLog.cpp
+index f60b6acae6f5..489bb302ad03 100644
+--- a/src/Interpreters/TextLog.cpp
++++ b/src/Interpreters/TextLog.cpp
+@@ -55,7 +55,7 @@ void TextLogElement::appendToBlock(MutableColumns & columns) const
+ {
+     size_t i = 0;
+ 
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(event_time_microseconds);
+     columns[i++]->insert(microseconds);
+diff --git a/src/Interpreters/TraceLog.cpp b/src/Interpreters/TraceLog.cpp
+index 40bcc0db4450..fe7512f2f009 100644
+--- a/src/Interpreters/TraceLog.cpp
++++ b/src/Interpreters/TraceLog.cpp
+@@ -42,7 +42,7 @@ void TraceLogElement::appendToBlock(MutableColumns & columns) const
+ {
+     size_t i = 0;
+ 
+-    columns[i++]->insert(DateLUT::instance().toDayNum(event_time));
++    columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+     columns[i++]->insert(event_time);
+     columns[i++]->insert(event_time_microseconds);
+     columns[i++]->insert(timestamp_ns);
+diff --git a/src/Interpreters/convertFieldToType.cpp b/src/Interpreters/convertFieldToType.cpp
+index 1d93ef56deac..d47f64cb1dc4 100644
+--- a/src/Interpreters/convertFieldToType.cpp
++++ b/src/Interpreters/convertFieldToType.cpp
+@@ -141,7 +141,7 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
+     /// Conversion between Date and DateTime and vice versa.
+     if (which_type.isDate() && which_from_type.isDateTime())
+     {
+-        return static_cast<const DataTypeDateTime &>(*from_type_hint).getTimeZone().toDayNum(src.get<UInt64>());
++        return static_cast<UInt16>(static_cast<const DataTypeDateTime &>(*from_type_hint).getTimeZone().toDayNum(src.get<UInt64>()).toUnderType());
+     }
+     else if (which_type.isDateTime() && which_from_type.isDate())
+     {
+diff --git a/src/Storages/MergeTree/MergeTreeMutationEntry.cpp b/src/Storages/MergeTree/MergeTreeMutationEntry.cpp
+index 44c4b3c4d109..49c4e93eb1dc 100644
+--- a/src/Storages/MergeTree/MergeTreeMutationEntry.cpp
++++ b/src/Storages/MergeTree/MergeTreeMutationEntry.cpp
+@@ -75,7 +75,9 @@ MergeTreeMutationEntry::MergeTreeMutationEntry(DiskPtr disk_, const String & pat
+ 
+     LocalDateTime create_time_dt;
+     *buf >> "create time: " >> create_time_dt >> "
+";
+-    create_time = create_time_dt;
++    create_time = DateLUT::instance().makeDateTime(
++        create_time_dt.year(), create_time_dt.month(), create_time_dt.day(),
++        create_time_dt.hour(), create_time_dt.minute(), create_time_dt.second());
+ 
+     *buf >> "commands: ";
+     commands.readText(*buf);
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeLogEntry.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeLogEntry.cpp
+index 9a9f25fd470e..07c64d9c95ce 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeLogEntry.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeLogEntry.cpp
+@@ -162,7 +162,9 @@ void ReplicatedMergeTreeLogEntryData::readText(ReadBuffer & in)
+     {
+         LocalDateTime create_time_dt;
+         in >> "create_time: " >> create_time_dt >> "
+";
+-        create_time = create_time_dt;
++        create_time = DateLUT::instance().makeDateTime(
++            create_time_dt.year(), create_time_dt.month(), create_time_dt.day(),
++            create_time_dt.hour(), create_time_dt.minute(), create_time_dt.second());
+     }
+ 
+     in >> "source replica: " >> source_replica >> "
+";
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeMutationEntry.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeMutationEntry.cpp
+index b2299b2cbbdc..c617befe9c4b 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeMutationEntry.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeMutationEntry.cpp
+@@ -37,7 +37,9 @@ void ReplicatedMergeTreeMutationEntry::readText(ReadBuffer & in)
+ 
+     LocalDateTime create_time_dt;
+     in >> "create time: " >> create_time_dt >> "
+";
+-    create_time = create_time_dt;
++    create_time = DateLUT::instance().makeDateTime(
++        create_time_dt.year(), create_time_dt.month(), create_time_dt.day(),
++        create_time_dt.hour(), create_time_dt.minute(), create_time_dt.second());
+ 
+     in >> "source replica: " >> source_replica >> "
+";
+ 
+diff --git a/src/Storages/StorageGenerateRandom.cpp b/src/Storages/StorageGenerateRandom.cpp
+index fd10691ecc49..f06daa3a2bd5 100644
+--- a/src/Storages/StorageGenerateRandom.cpp
++++ b/src/Storages/StorageGenerateRandom.cpp
+@@ -215,7 +215,7 @@ ColumnPtr fillColumnWithRandomData(
+             column->getData().resize(limit);
+ 
+             for (size_t i = 0; i < limit; ++i)
+-                column->getData()[i] = rng() % (DATE_LUT_MAX_DAY_NUM + 1);   /// Slow
++                column->getData()[i] = rng() % (DATE_LUT_MAX_DAY_NUM + 1);
+ 
+             return column;
+         }
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 2a2805083641..a8de89a8bb09 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -1450,7 +1450,7 @@ bool StorageReplicatedMergeTree::tryExecuteMerge(const LogEntry & entry)
+     {
+         LOG_INFO(log, "Will try to fetch part {} until '{}' because this part assigned to recompression merge. "
+             "Source replica {} will try to merge this part first", entry.new_part_name,
+-            LocalDateTime(entry.create_time + storage_settings_ptr->try_fetch_recompressed_part_timeout.totalSeconds()), entry.source_replica);
++            DateLUT::instance().timeToString(entry.create_time + storage_settings_ptr->try_fetch_recompressed_part_timeout.totalSeconds()), entry.source_replica);
+         return false;
+     }
+ 
+@@ -4616,7 +4616,7 @@ static String getPartNamePossiblyFake(MergeTreeDataFormatVersion format_version,
+         /// The date range is all month long.
+         const auto & lut = DateLUT::instance();
+         time_t start_time = lut.YYYYMMDDToDate(parse<UInt32>(part_info.partition_id + "01"));
+-        DayNum left_date = lut.toDayNum(start_time);
++        DayNum left_date = DayNum(lut.toDayNum(start_time).toUnderType());
+         DayNum right_date = DayNum(static_cast<size_t>(left_date) + lut.daysInMonth(start_time) - 1);
+         return part_info.getPartNameV0(left_date, right_date);
+     }
+diff --git a/utils/convert-month-partitioned-parts/main.cpp b/utils/convert-month-partitioned-parts/main.cpp
+index 0a697937eb65..a6829d79726c 100644
+--- a/utils/convert-month-partitioned-parts/main.cpp
++++ b/utils/convert-month-partitioned-parts/main.cpp
+@@ -47,8 +47,9 @@ void run(String part_path, String date_column, String dest_path)
+     DayNum max_date;
+     MergeTreePartInfo::parseMinMaxDatesFromPartName(old_part_name, min_date, max_date);
+ 
+-    UInt32 yyyymm = DateLUT::instance().toNumYYYYMM(min_date);
+-    if (yyyymm != DateLUT::instance().toNumYYYYMM(max_date))
++    const auto & time_zone = DateLUT::instance();
++    UInt32 yyyymm = time_zone.toNumYYYYMM(min_date);
++    if (yyyymm != time_zone.toNumYYYYMM(max_date))
+         throw Exception("Part " + old_part_name + " spans different months",
+             ErrorCodes::BAD_DATA_PART_NAME);
+ 
+diff --git a/utils/wikistat-loader/main.cpp b/utils/wikistat-loader/main.cpp
+index f2adcc43a3a2..31ade014c744 100644
+--- a/utils/wikistat-loader/main.cpp
++++ b/utils/wikistat-loader/main.cpp
+@@ -151,7 +151,7 @@ try
+ 
+     std::string time_str = options.at("time").as<std::string>();
+     LocalDateTime time(time_str);
+-    LocalDate date(time);
++    LocalDate date(time_str);
+ 
+     DB::ReadBufferFromFileDescriptor in(STDIN_FILENO);
+     DB::WriteBufferFromFileDescriptor out(STDOUT_FILENO);

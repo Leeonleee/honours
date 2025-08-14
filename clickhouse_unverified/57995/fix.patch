@@ -1,0 +1,597 @@
+diff --git a/docs/en/sql-reference/statements/select/join.md b/docs/en/sql-reference/statements/select/join.md
+index 281a1d0436c1..97090a7a699e 100644
+--- a/docs/en/sql-reference/statements/select/join.md
++++ b/docs/en/sql-reference/statements/select/join.md
+@@ -43,6 +43,7 @@ Additional join types available in ClickHouse:
+ - `LEFT ANTI JOIN` and `RIGHT ANTI JOIN`, a blacklist on “join keys”, without producing a cartesian product.
+ - `LEFT ANY JOIN`, `RIGHT ANY JOIN` and `INNER ANY JOIN`, partially (for opposite side of `LEFT` and `RIGHT`) or completely (for `INNER` and `FULL`) disables the cartesian product for standard `JOIN` types.
+ - `ASOF JOIN` and `LEFT ASOF JOIN`, joining sequences with a non-exact match. `ASOF JOIN` usage is described below.
++- `PASTE JOIN`, performs a horizontal concatenation of two tables.
+ 
+ :::note
+ When [join_algorithm](../../../operations/settings/settings.md#settings-join_algorithm) is set to `partial_merge`, `RIGHT JOIN` and `FULL JOIN` are supported only with `ALL` strictness (`SEMI`, `ANTI`, `ANY`, and `ASOF` are not supported).
+@@ -269,6 +270,33 @@ For example, consider the following tables:
+ `ASOF` join is **not** supported in the [Join](../../../engines/table-engines/special/join.md) table engine.
+ :::
+ 
++## PASTE JOIN Usage
++
++The result of `PASTE JOIN` is a table that contains all columns from left subquery followed by all columns from the right subquery.
++The rows are matched based on their positions in the original tables (the order of rows should be defined). 
++If the subqueries return a different number of rows, extra rows will be cut.
++
++Example:
++```SQL
++SELECT *
++FROM
++(
++    SELECT number AS a
++    FROM numbers(2)
++) AS t1
++PASTE JOIN
++(
++    SELECT number AS a
++    FROM numbers(2)
++    ORDER BY a DESC
++) AS t2
++
++┌─a─┬─t2.a─┐
++│ 0 │    1 │
++│ 1 │    0 │
++└───┴──────┘
++```
++
+ ## Distributed JOIN
+ 
+ There are two ways to execute join involving distributed tables:
+diff --git a/src/Client/Suggest.cpp b/src/Client/Suggest.cpp
+index c7ebcac12644..eb98c3a57402 100644
+--- a/src/Client/Suggest.cpp
++++ b/src/Client/Suggest.cpp
+@@ -48,7 +48,7 @@ Suggest::Suggest()
+               "GRANT",        "REVOKE",        "OPTION",       "ADMIN",      "EXCEPT",   "REPLACE",     "IDENTIFIED", "HOST",
+               "NAME",         "READONLY",      "WRITABLE",     "PERMISSIVE", "FOR",      "RESTRICTIVE", "RANDOMIZED", "INTERVAL",
+               "LIMITS",       "ONLY",          "TRACKING",     "IP",         "REGEXP",   "ILIKE",       "CLEANUP",    "APPEND",
+-              "IGNORE NULLS", "RESPECT NULLS", "OVER"});
++              "IGNORE NULLS", "RESPECT NULLS", "OVER",         "PASTE"});
+ }
+ 
+ static String getLoadSuggestionQuery(Int32 suggestion_limit, bool basic_suggestion)
+diff --git a/src/Core/Joins.cpp b/src/Core/Joins.cpp
+index 9c8ece822248..77568223d718 100644
+--- a/src/Core/Joins.cpp
++++ b/src/Core/Joins.cpp
+@@ -13,6 +13,7 @@ const char * toString(JoinKind kind)
+         case JoinKind::Full: return "FULL";
+         case JoinKind::Cross: return "CROSS";
+         case JoinKind::Comma: return "COMMA";
++        case JoinKind::Paste: return "PASTE";
+     }
+ };
+ 
+diff --git a/src/Core/Joins.h b/src/Core/Joins.h
+index 6884e8dfd9a7..cc69f07263d8 100644
+--- a/src/Core/Joins.h
++++ b/src/Core/Joins.h
+@@ -13,7 +13,8 @@ enum class JoinKind
+     Right,
+     Full,
+     Cross, /// Direct product. Strictness and condition doesn't matter.
+-    Comma /// Same as direct product. Intended to be converted to INNER JOIN with conditions from WHERE.
++    Comma, /// Same as direct product. Intended to be converted to INNER JOIN with conditions from WHERE.
++    Paste, /// Used to join parts without `ON` clause.
+ };
+ 
+ const char * toString(JoinKind kind);
+@@ -27,6 +28,7 @@ inline constexpr bool isRightOrFull(JoinKind kind)  { return kind == JoinKind::R
+ inline constexpr bool isLeftOrFull(JoinKind kind)   { return kind == JoinKind::Left  || kind == JoinKind::Full; }
+ inline constexpr bool isInnerOrRight(JoinKind kind) { return kind == JoinKind::Inner || kind == JoinKind::Right; }
+ inline constexpr bool isInnerOrLeft(JoinKind kind)  { return kind == JoinKind::Inner || kind == JoinKind::Left; }
++inline constexpr bool isPaste(JoinKind kind)        { return kind == JoinKind::Paste; }
+ 
+ /// Allows more optimal JOIN for typical cases.
+ enum class JoinStrictness
+diff --git a/src/Interpreters/ExpressionAnalyzer.cpp b/src/Interpreters/ExpressionAnalyzer.cpp
+index 3b389dcf61e4..6dbdcb50cfdd 100644
+--- a/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -56,6 +56,7 @@
+ #include <Core/Names.h>
+ #include <Core/NamesAndTypes.h>
+ #include <Common/logger_useful.h>
++#include <Interpreters/PasteJoin.h>
+ #include <QueryPipeline/SizeLimits.h>
+ 
+ 
+@@ -954,6 +955,9 @@ static std::shared_ptr<IJoin> tryCreateJoin(
+     std::unique_ptr<QueryPlan> & joined_plan,
+     ContextPtr context)
+ {
++    if (analyzed_join->kind() == JoinKind::Paste)
++        return std::make_shared<PasteJoin>(analyzed_join, right_sample_block);
++
+     if (algorithm == JoinAlgorithm::DIRECT || algorithm == JoinAlgorithm::DEFAULT)
+     {
+         JoinPtr direct_join = tryKeyValueJoin(analyzed_join, right_sample_block);
+diff --git a/src/Interpreters/InterpreterSelectQuery.cpp b/src/Interpreters/InterpreterSelectQuery.cpp
+index 672454381568..e9b0bdbd925c 100644
+--- a/src/Interpreters/InterpreterSelectQuery.cpp
++++ b/src/Interpreters/InterpreterSelectQuery.cpp
+@@ -1698,7 +1698,7 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, std::optional<P
+                         return step_raw_ptr;
+                     };
+ 
+-                    if (expressions.join->pipelineType() == JoinPipelineType::YShaped)
++                    if (expressions.join->pipelineType() == JoinPipelineType::YShaped && expressions.join->getTableJoin().kind() != JoinKind::Paste)
+                     {
+                         const auto & table_join = expressions.join->getTableJoin();
+                         const auto & join_clause = table_join.getOnlyClause();
+diff --git a/src/Interpreters/PasteJoin.h b/src/Interpreters/PasteJoin.h
+new file mode 100644
+index 000000000000..df7bb2f280c1
+--- /dev/null
++++ b/src/Interpreters/PasteJoin.h
+@@ -0,0 +1,96 @@
++#pragma once
++
++#include <Interpreters/IJoin.h>
++#include <Interpreters/TableJoin.h>
++#include <DataTypes/DataTypeNullable.h>
++#include <DataTypes/DataTypeLowCardinality.h>
++#include <Common/logger_useful.h>
++#include <Poco/Logger.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int NOT_IMPLEMENTED;
++}
++
++/// Dummy class, actual joining is done by MergeTransform
++class PasteJoin : public IJoin
++{
++public:
++    explicit PasteJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block_)
++        : table_join(table_join_)
++        , right_sample_block(right_sample_block_)
++    {
++        LOG_TRACE(&Poco::Logger::get("PasteJoin"), "Will use paste join");
++    }
++
++    std::string getName() const override { return "PasteJoin"; }
++    const TableJoin & getTableJoin() const override { return *table_join; }
++
++    bool addBlockToJoin(const Block & /* block */, bool /* check_limits */) override
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "PasteJoin::addBlockToJoin should not be called");
++    }
++
++    static bool isSupported(const std::shared_ptr<TableJoin> & table_join)
++    {
++        bool support_storage = !table_join->isSpecialStorage();
++
++        /// Key column can change nullability and it's not handled on type conversion stage, so algorithm should be aware of it
++        bool support_using = !table_join->hasUsing();
++
++        bool check_strictness = table_join->strictness() == JoinStrictness::All;
++
++        bool if_has_keys = table_join->getClauses().empty();
++
++        return support_using && support_storage && check_strictness && if_has_keys;
++    }
++
++    void checkTypesOfKeys(const Block & /*left_block*/) const override
++    {
++        if (!isSupported(table_join))
++            throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "PasteJoin doesn't support specified query");
++    }
++
++    /// Used just to get result header
++    void joinBlock(Block & block, std::shared_ptr<ExtraBlock> & /* not_processed */) override
++    {
++        for (const auto & col : right_sample_block)
++            block.insert(col);
++        block = materializeBlock(block).cloneEmpty();
++    }
++
++    void setTotals(const Block & block) override { totals = block; }
++    const Block & getTotals() const override { return totals; }
++
++    size_t getTotalRowCount() const override
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "PasteJoin::getTotalRowCount should not be called");
++    }
++
++    size_t getTotalByteCount() const override
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "PasteJoin::getTotalByteCount should not be called");
++    }
++
++    bool alwaysReturnsEmptySet() const override { return false; }
++
++    IBlocksStreamPtr
++    getNonJoinedBlocks(const Block & /* left_sample_block */, const Block & /* result_sample_block */, UInt64 /* max_block_size */) const override
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "PasteJoin::getNonJoinedBlocks should not be called");
++    }
++
++    /// Left and right streams have the same priority and are processed simultaneously
++    JoinPipelineType pipelineType() const override { return JoinPipelineType::YShaped; }
++
++private:
++    std::shared_ptr<TableJoin> table_join;
++    Block right_sample_block;
++    Block totals;
++};
++
++}
+diff --git a/src/Parsers/ASTTablesInSelectQuery.cpp b/src/Parsers/ASTTablesInSelectQuery.cpp
+index e4e8c00879ee..8ca2ee0efae0 100644
+--- a/src/Parsers/ASTTablesInSelectQuery.cpp
++++ b/src/Parsers/ASTTablesInSelectQuery.cpp
+@@ -211,6 +211,9 @@ void ASTTableJoin::formatImplBeforeTable(const FormatSettings & settings, Format
+         case JoinKind::Comma:
+             settings.ostr << ",";
+             break;
++        case JoinKind::Paste:
++            settings.ostr << "PASTE JOIN";
++            break;
+     }
+ 
+     settings.ostr << (settings.hilite ? hilite_none : "");
+diff --git a/src/Parsers/ParserTablesInSelectQuery.cpp b/src/Parsers/ParserTablesInSelectQuery.cpp
+index b3ae6ca0bb91..ca209739dada 100644
+--- a/src/Parsers/ParserTablesInSelectQuery.cpp
++++ b/src/Parsers/ParserTablesInSelectQuery.cpp
+@@ -6,6 +6,7 @@
+ #include <Parsers/ParserSelectQuery.h>
+ #include <Parsers/ParserSampleRatio.h>
+ #include <Parsers/ParserTablesInSelectQuery.h>
++#include <Core/Joins.h>
+ 
+ 
+ namespace DB
+@@ -166,6 +167,8 @@ bool ParserTablesInSelectQueryElement::parseImpl(Pos & pos, ASTPtr & node, Expec
+                 table_join->kind = JoinKind::Full;
+             else if (ParserKeyword("CROSS").ignore(pos))
+                 table_join->kind = JoinKind::Cross;
++            else if (ParserKeyword("PASTE").ignore(pos))
++                table_join->kind = JoinKind::Paste;
+             else
+                 no_kind = true;
+ 
+@@ -191,8 +194,8 @@ bool ParserTablesInSelectQueryElement::parseImpl(Pos & pos, ASTPtr & node, Expec
+             }
+ 
+             if (table_join->strictness != JoinStrictness::Unspecified
+-                && table_join->kind == JoinKind::Cross)
+-                throw Exception(ErrorCodes::SYNTAX_ERROR, "You must not specify ANY or ALL for CROSS JOIN.");
++                && (table_join->kind == JoinKind::Cross || table_join->kind == JoinKind::Paste))
++                throw Exception(ErrorCodes::SYNTAX_ERROR, "You must not specify ANY or ALL for {} JOIN.", toString(table_join->kind));
+ 
+             if ((table_join->strictness == JoinStrictness::Semi || table_join->strictness == JoinStrictness::Anti) &&
+                 (table_join->kind != JoinKind::Left && table_join->kind != JoinKind::Right))
+@@ -206,7 +209,7 @@ bool ParserTablesInSelectQueryElement::parseImpl(Pos & pos, ASTPtr & node, Expec
+             return false;
+ 
+         if (table_join->kind != JoinKind::Comma
+-            && table_join->kind != JoinKind::Cross)
++            && table_join->kind != JoinKind::Cross && table_join->kind != JoinKind::Paste)
+         {
+             if (ParserKeyword("USING").ignore(pos, expected))
+             {
+diff --git a/src/Planner/PlannerJoinTree.cpp b/src/Planner/PlannerJoinTree.cpp
+index abcf971b8320..25a23052153c 100644
+--- a/src/Planner/PlannerJoinTree.cpp
++++ b/src/Planner/PlannerJoinTree.cpp
+@@ -1312,7 +1312,7 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(const QueryTreeNodePtr & join_table_
+             return step_raw_ptr;
+         };
+ 
+-        if (join_algorithm->pipelineType() == JoinPipelineType::YShaped)
++        if (join_algorithm->pipelineType() == JoinPipelineType::YShaped && join_kind != JoinKind::Paste)
+         {
+             const auto & join_clause = table_join->getOnlyClause();
+ 
+diff --git a/src/Planner/PlannerJoins.cpp b/src/Planner/PlannerJoins.cpp
+index 5fda2a8617d1..5e9de4dedcf6 100644
+--- a/src/Planner/PlannerJoins.cpp
++++ b/src/Planner/PlannerJoins.cpp
+@@ -35,6 +35,7 @@
+ #include <Interpreters/JoinSwitcher.h>
+ #include <Interpreters/ArrayJoinAction.h>
+ #include <Interpreters/GraceHashJoin.h>
++#include <Interpreters/PasteJoin.h>
+ 
+ #include <Planner/PlannerActionsVisitor.h>
+ #include <Planner/PlannerContext.h>
+@@ -653,6 +654,8 @@ static std::shared_ptr<IJoin> tryCreateJoin(JoinAlgorithm algorithm,
+     const Block & right_table_expression_header,
+     const PlannerContextPtr & planner_context)
+ {
++    if (table_join->kind() == JoinKind::Paste)
++        return std::make_shared<PasteJoin>(table_join, right_table_expression_header);
+     /// Direct JOIN with special storages that support key value access. For example JOIN with Dictionary
+     if (algorithm == JoinAlgorithm::DIRECT || algorithm == JoinAlgorithm::DEFAULT)
+     {
+diff --git a/src/Processors/Transforms/PasteJoinTransform.cpp b/src/Processors/Transforms/PasteJoinTransform.cpp
+new file mode 100644
+index 000000000000..ff3e2fb85e55
+--- /dev/null
++++ b/src/Processors/Transforms/PasteJoinTransform.cpp
+@@ -0,0 +1,127 @@
++#include <cassert>
++#include <cstddef>
++#include <limits>
++#include <memory>
++#include <type_traits>
++
++#include <base/defines.h>
++#include <base/types.h>
++
++#include <Common/logger_useful.h>
++#include <Columns/ColumnNullable.h>
++#include <Columns/ColumnsNumber.h>
++#include <Columns/IColumn.h>
++#include <IO/WriteHelpers.h>
++#include <Interpreters/TableJoin.h>
++#include <Parsers/ASTTablesInSelectQuery.h>
++#include <Processors/Transforms/PasteJoinTransform.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int NOT_IMPLEMENTED;
++}
++
++
++PasteJoinAlgorithm::PasteJoinAlgorithm(
++    JoinPtr table_join_,
++    const Blocks & input_headers,
++    size_t max_block_size_)
++    : table_join(table_join_)
++    , max_block_size(max_block_size_)
++    , log(&Poco::Logger::get("PasteJoinAlgorithm"))
++{
++    if (input_headers.size() != 2)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "PasteJoinAlgorithm requires exactly two inputs");
++
++    auto strictness = table_join->getTableJoin().strictness();
++    if (strictness != JoinStrictness::Any && strictness != JoinStrictness::All)
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "PasteJoinAlgorithm is not implemented for strictness {}", strictness);
++
++    auto kind = table_join->getTableJoin().kind();
++    if (!isPaste(kind))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "PasteJoinAlgorithm is not implemented for kind {}", kind);
++}
++
++static void prepareChunk(Chunk & chunk)
++{
++    if (!chunk)
++        return;
++
++    auto num_rows = chunk.getNumRows();
++    auto columns = chunk.detachColumns();
++
++    chunk.setColumns(std::move(columns), num_rows);
++}
++
++void PasteJoinAlgorithm::initialize(Inputs inputs)
++{
++    if (inputs.size() != 2)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Two inputs are required, got {}", inputs.size());
++
++    for (size_t i = 0; i < inputs.size(); ++i)
++    {
++        consume(inputs[i], i);
++    }
++}
++
++void PasteJoinAlgorithm::consume(Input & input, size_t source_num)
++{
++    if (input.skip_last_row)
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "skip_last_row is not supported");
++
++    if (input.permutation)
++        throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "permutation is not supported");
++
++    last_used_row[source_num] = 0;
++
++    prepareChunk(input.chunk);
++    chunks[source_num] = std::move(input.chunk);
++}
++
++IMergingAlgorithm::Status PasteJoinAlgorithm::merge()
++{
++    if (chunks[0].empty() || chunks[1].empty())
++        return Status({}, true);
++    if (last_used_row[0] >= chunks[0].getNumRows())
++        return Status(0);
++    if (last_used_row[1] >= chunks[1].getNumRows())
++        return Status(1);
++    /// We have unused rows from both inputs
++    size_t result_num_rows = std::min(chunks[0].getNumRows() - last_used_row[0], chunks[1].getNumRows() - last_used_row[1]);
++
++    Chunk result;
++    for (size_t source_num = 0; source_num < 2; ++source_num)
++        for (const auto & col : chunks[source_num].getColumns())
++            result.addColumn(col->cut(last_used_row[source_num], result_num_rows));
++    last_used_row[0] += result_num_rows;
++    last_used_row[1] += result_num_rows;
++    return Status(std::move(result));
++}
++
++PasteJoinTransform::PasteJoinTransform(
++        JoinPtr table_join,
++        const Blocks & input_headers,
++        const Block & output_header,
++        size_t max_block_size,
++        UInt64 limit_hint_)
++    : IMergingTransform<PasteJoinAlgorithm>(
++        input_headers,
++        output_header,
++        /* have_all_inputs_= */ true,
++        limit_hint_,
++        /* always_read_till_end_= */ false,
++        /* empty_chunk_on_finish_= */ true,
++        table_join, input_headers, max_block_size)
++    , log(&Poco::Logger::get("PasteJoinTransform"))
++{
++    LOG_TRACE(log, "Use PasteJoinTransform");
++}
++
++void PasteJoinTransform::onFinish() {};
++
++}
+diff --git a/src/Processors/Transforms/PasteJoinTransform.h b/src/Processors/Transforms/PasteJoinTransform.h
+new file mode 100644
+index 000000000000..7ecf70e18dc2
+--- /dev/null
++++ b/src/Processors/Transforms/PasteJoinTransform.h
+@@ -0,0 +1,88 @@
++#pragma once
++#include <cassert>
++#include <cstddef>
++#include <memory>
++#include <mutex>
++#include <utility>
++
++#include <boost/core/noncopyable.hpp>
++
++#include <Common/PODArray.h>
++#include <IO/ReadBuffer.h>
++#include <Parsers/ASTTablesInSelectQuery.h>
++#include <Processors/Chunk.h>
++#include <Processors/Merges/Algorithms/IMergingAlgorithm.h>
++#include <Processors/Merges/IMergingTransform.h>
++
++namespace Poco { class Logger; }
++
++namespace DB
++{
++
++class IJoin;
++using JoinPtr = std::shared_ptr<IJoin>;
++
++/*
++ * This class is used to join chunks from two sorted streams.
++ * It is used in MergeJoinTransform.
++ */
++class PasteJoinAlgorithm final : public IMergingAlgorithm
++{
++public:
++    explicit PasteJoinAlgorithm(JoinPtr table_join, const Blocks & input_headers, size_t max_block_size_);
++
++    const char * getName() const override { return "PasteJoinAlgorithm"; }
++    virtual void initialize(Inputs inputs) override;
++    virtual void consume(Input & input, size_t source_num) override;
++    virtual Status merge() override;
++
++    void logElapsed(double seconds);
++
++private:
++    Chunk createBlockWithDefaults(size_t source_num);
++    Chunk createBlockWithDefaults(size_t source_num, size_t start, size_t num_rows) const;
++
++    /// For `USING` join key columns should have values from right side instead of defaults
++    std::unordered_map<size_t, size_t> left_to_right_key_remap;
++
++    std::array<Chunk, 2> chunks;
++
++    JoinPtr table_join;
++
++    size_t max_block_size;
++
++    struct Statistic
++    {
++        size_t num_blocks[2] = {0, 0};
++        size_t num_rows[2] = {0, 0};
++
++        size_t max_blocks_loaded = 0;
++    };
++
++    Statistic stat;
++
++    Poco::Logger * log;
++    UInt64 last_used_row[2] = {0, 0};
++};
++
++class PasteJoinTransform final : public IMergingTransform<PasteJoinAlgorithm>
++{
++    using Base = IMergingTransform<PasteJoinAlgorithm>;
++
++public:
++    PasteJoinTransform(
++        JoinPtr table_join,
++        const Blocks & input_headers,
++        const Block & output_header,
++        size_t max_block_size,
++        UInt64 limit_hint = 0);
++
++    String getName() const override { return "PasteJoinTransform"; }
++
++protected:
++    void onFinish() override;
++
++    Poco::Logger * log;
++};
++
++}
+diff --git a/src/QueryPipeline/QueryPipelineBuilder.cpp b/src/QueryPipeline/QueryPipelineBuilder.cpp
+index 21eb07a5acd1..a0fabe3273c3 100644
+--- a/src/QueryPipeline/QueryPipelineBuilder.cpp
++++ b/src/QueryPipeline/QueryPipelineBuilder.cpp
+@@ -25,6 +25,7 @@
+ #include <Processors/Transforms/ExtremesTransform.h>
+ #include <Processors/Transforms/JoiningTransform.h>
+ #include <Processors/Transforms/MergeJoinTransform.h>
++#include <Processors/Transforms/PasteJoinTransform.h>
+ #include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
+ #include <Processors/Transforms/PartialSortingTransform.h>
+ #include <Processors/Transforms/TotalsHavingTransform.h>
+@@ -36,6 +37,7 @@ namespace ErrorCodes
+ {
+     extern const int LOGICAL_ERROR;
+     extern const int NOT_IMPLEMENTED;
++    extern const int BAD_ARGUMENTS;
+ }
+ 
+ void QueryPipelineBuilder::checkInitialized()
+@@ -354,7 +356,9 @@ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesYShaped
+ 
+     left->pipe.dropExtremes();
+     right->pipe.dropExtremes();
+-    if (left->getNumStreams() != 1 || right->getNumStreams() != 1)
++    if ((left->getNumStreams() != 1 || right->getNumStreams() != 1) && join->getTableJoin().kind() == JoinKind::Paste)
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Paste JOIN requires sorted tables only");
++    else if (left->getNumStreams() != 1 || right->getNumStreams() != 1)
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "Join is supported only for pipelines with one output port");
+ 
+     if (left->hasTotals() || right->hasTotals())
+@@ -362,9 +366,16 @@ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesYShaped
+ 
+     Blocks inputs = {left->getHeader(), right->getHeader()};
+ 
+-    auto joining = std::make_shared<MergeJoinTransform>(join, inputs, out_header, max_block_size);
+-
+-    return mergePipelines(std::move(left), std::move(right), std::move(joining), collected_processors);
++    if (join->getTableJoin().kind() == JoinKind::Paste)
++    {
++        auto joining = std::make_shared<PasteJoinTransform>(join, inputs, out_header, max_block_size);
++        return mergePipelines(std::move(left), std::move(right), std::move(joining), collected_processors);
++    }
++    else
++    {
++        auto joining = std::make_shared<MergeJoinTransform>(join, inputs, out_header, max_block_size);
++        return mergePipelines(std::move(left), std::move(right), std::move(joining), collected_processors);
++    }
+ }
+ 
+ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesRightLeft(

@@ -1,0 +1,150 @@
+diff --git a/dbms/CMakeLists.txt b/dbms/CMakeLists.txt
+index d0ca68543f0f..a14495dfc19a 100644
+--- a/dbms/CMakeLists.txt
++++ b/dbms/CMakeLists.txt
+@@ -367,6 +367,6 @@ if (ENABLE_TESTS AND USE_GTEST)
+     # attach all dbms gtest sources
+     grep_gtest_sources(${ClickHouse_SOURCE_DIR}/dbms dbms_gtest_sources)
+     add_executable(unit_tests_dbms ${dbms_gtest_sources})
+-    target_link_libraries(unit_tests_dbms PRIVATE ${GTEST_BOTH_LIBRARIES} dbms clickhouse_common_zookeeper)
++    target_link_libraries(unit_tests_dbms PRIVATE ${GTEST_BOTH_LIBRARIES} clickhouse_functions clickhouse_parsers dbms clickhouse_common_zookeeper)
+     add_check(unit_tests_dbms)
+ endif ()
+diff --git a/dbms/src/Parsers/ASTFunction.cpp b/dbms/src/Parsers/ASTFunction.cpp
+index b45bded96646..5c5dbc9ba904 100644
+--- a/dbms/src/Parsers/ASTFunction.cpp
++++ b/dbms/src/Parsers/ASTFunction.cpp
+@@ -2,6 +2,7 @@
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTWithAlias.h>
++#include <Parsers/ASTSubquery.h>
+ #include <IO/WriteHelpers.h>
+ #include <IO/WriteBufferFromString.h>
+ 
+@@ -141,7 +142,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
+             }
+         }
+ 
+-        /** need_parens - do I need parentheses around the expression with the operator.
++        /** need_parens - do we need parentheses around the expression with the operator.
+           * They are needed only if this expression is included in another expression with the operator.
+           */
+ 
+@@ -182,7 +183,22 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
+                         && (name == "like" || name == "notLike")
+                         && highlightStringLiteralWithMetacharacters(arguments->children[1], settings, "%_");
+ 
+-                    if (!special_hilite)
++                    /// Format x IN 1 as x IN (1): put parens around rhs even if there is a single element in set.
++                    const auto * second_arg_func = arguments->children[1]->as<ASTFunction>();
++                    const auto * second_arg_literal = arguments->children[1]->as<ASTLiteral>();
++                    bool extra_parents_around_in_rhs = (name == "in" || name == "notIn" || name == "globalIn" || name == "globalNotIn")
++                        && !(second_arg_func && second_arg_func->name == "tuple")
++                        && !(second_arg_literal && second_arg_literal->value.getType() == Field::Types::Tuple)
++                        && !arguments->children[1]->as<ASTSubquery>();
++
++                    if (extra_parents_around_in_rhs)
++                    {
++                        settings.ostr << '(';
++                        arguments->children[1]->formatImpl(settings, state, nested_dont_need_parens);
++                        settings.ostr << ')';
++                    }
++
++                    if (!special_hilite && !extra_parents_around_in_rhs)
+                         arguments->children[1]->formatImpl(settings, state, nested_need_parens);
+ 
+                     if (frame.need_parens)
+diff --git a/dbms/src/Parsers/ParserQuery.h b/dbms/src/Parsers/ParserQuery.h
+index 4bde22b2f6b8..cf8837cb7beb 100644
+--- a/dbms/src/Parsers/ParserQuery.h
++++ b/dbms/src/Parsers/ParserQuery.h
+@@ -10,7 +10,7 @@ class ParserQuery : public IParserBase
+ {
+ private:
+     const char * end;
+-    bool enable_explain;
++    bool enable_explain;    /// Allow queries prefixed with AST and ANALYZE for development purposes.
+ 
+     const char * getName() const override { return "Query"; }
+     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+diff --git a/dbms/src/Storages/transformQueryForExternalDatabase.cpp b/dbms/src/Storages/transformQueryForExternalDatabase.cpp
+index 1a1d1b00dcc1..c0fcbabba42a 100644
+--- a/dbms/src/Storages/transformQueryForExternalDatabase.cpp
++++ b/dbms/src/Storages/transformQueryForExternalDatabase.cpp
+@@ -16,6 +16,11 @@
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++
+ static void replaceConstFunction(IAST & node, const Context & context, const NamesAndTypesList & all_columns)
+ {
+     for (size_t i = 0; i < node.children.size(); ++i)
+@@ -44,19 +49,33 @@ static bool isCompatible(const IAST & node)
+ {
+     if (const auto * function = node.as<ASTFunction>())
+     {
++        if (function->parameters)   /// Parametric aggregate functions
++            return false;
++
++        if (!function->arguments)
++            throw Exception("Logical error: function->arguments is not set", ErrorCodes::LOGICAL_ERROR);
++
+         String name = function->name;
++
+         if (!(name == "and"
+             || name == "or"
+             || name == "not"
+             || name == "equals"
+             || name == "notEquals"
++            || name == "less"
++            || name == "greater"
++            || name == "lessOrEquals"
++            || name == "greaterOrEquals"
+             || name == "like"
+             || name == "notLike"
+             || name == "in"
+-            || name == "greater"
+-            || name == "less"
+-            || name == "lessOrEquals"
+-            || name == "greaterOrEquals"))
++            || name == "notIn"
++            || name == "tuple"))
++            return false;
++
++        /// A tuple with zero or one elements is represented by a function tuple(x) and is not compatible,
++        /// but a normal tuple with more than one element is represented as a parenthesed expression (x, y) and is perfectly compatible.
++        if (name == "tuple" && function->arguments->children.size() <= 1)
+             return false;
+ 
+         for (const auto & expr : function->arguments->children)
+@@ -68,9 +87,8 @@ static bool isCompatible(const IAST & node)
+ 
+     if (const auto * literal = node.as<ASTLiteral>())
+     {
+-        /// Foreign databases often have no support for Array and Tuple literals.
+-        if (literal->value.getType() == Field::Types::Array
+-            || literal->value.getType() == Field::Types::Tuple)
++        /// Foreign databases often have no support for Array. But Tuple literals are passed to support IN clause.
++        if (literal->value.getType() == Field::Types::Array)
+             return false;
+ 
+         return true;
+diff --git a/dbms/src/Storages/transformQueryForExternalDatabase.h b/dbms/src/Storages/transformQueryForExternalDatabase.h
+index 77cc7f3a194d..9b838da51271 100644
+--- a/dbms/src/Storages/transformQueryForExternalDatabase.h
++++ b/dbms/src/Storages/transformQueryForExternalDatabase.h
+@@ -21,9 +21,6 @@ class Context;
+   * that contain only compatible expressions.
+   *
+   * Compatible expressions are comparisons of identifiers, constants, and logical operations on them.
+-  *
+-  * NOTE There are concerns with proper quoting of identifiers for remote database.
+-  * Some databases use `quotes` and other use "quotes".
+   */
+ String transformQueryForExternalDatabase(
+     const IAST & query,

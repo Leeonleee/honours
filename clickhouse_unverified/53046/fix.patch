@@ -1,0 +1,114 @@
+diff --git a/src/Interpreters/ExpressionAnalyzer.cpp b/src/Interpreters/ExpressionAnalyzer.cpp
+index 9aee61eb8f07..acedede579b4 100644
+--- a/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -1130,9 +1130,17 @@ JoinPtr SelectQueryExpressionAnalyzer::makeJoin(
+ 
+     if (auto storage = analyzed_join->getStorageJoin())
+     {
++        auto joined_block_actions = analyzed_join->createJoinedBlockActions(getContext());
++        NamesWithAliases required_columns_with_aliases = analyzed_join->getRequiredColumns(
++            Block(joined_block_actions->getResultColumns()), joined_block_actions->getRequiredColumns().getNames());
++
++        Names original_right_column_names;
++        for (auto & pr : required_columns_with_aliases)
++            original_right_column_names.push_back(pr.first);
++
+         auto right_columns = storage->getRightSampleBlock().getColumnsWithTypeAndName();
+         std::tie(left_convert_actions, right_convert_actions) = analyzed_join->createConvertingActions(left_columns, right_columns);
+-        return storage->getJoinLocked(analyzed_join, getContext());
++        return storage->getJoinLocked(analyzed_join, getContext(), original_right_column_names);
+     }
+ 
+     joined_plan = buildJoinedPlan(getContext(), join_element, *analyzed_join, query_options);
+diff --git a/src/Interpreters/TableJoin.h b/src/Interpreters/TableJoin.h
+index 5d14a57759f6..16e641b27180 100644
+--- a/src/Interpreters/TableJoin.h
++++ b/src/Interpreters/TableJoin.h
+@@ -189,7 +189,6 @@ class TableJoin
+     template <typename LeftNamesAndTypes, typename RightNamesAndTypes>
+     void inferJoinKeyCommonType(const LeftNamesAndTypes & left, const RightNamesAndTypes & right, bool allow_right, bool strict);
+ 
+-    NamesAndTypesList correctedColumnsAddedByJoin() const;
+ 
+     void deduplicateAndQualifyColumnNames(const NameSet & left_table_columns, const String & right_table_prefix);
+ 
+@@ -371,6 +370,8 @@ class TableJoin
+     bool isSpecialStorage() const { return !right_storage_name.empty() || right_storage_join || right_kv_storage; }
+ 
+     std::shared_ptr<const IKeyValueEntity> getStorageKeyValue() { return right_kv_storage; }
++
++    NamesAndTypesList correctedColumnsAddedByJoin() const;
+ };
+ 
+ }
+diff --git a/src/Planner/PlannerJoins.cpp b/src/Planner/PlannerJoins.cpp
+index e495b0967e99..e87930a4d6bc 100644
+--- a/src/Planner/PlannerJoins.cpp
++++ b/src/Planner/PlannerJoins.cpp
+@@ -635,6 +635,7 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_jo
+     /// JOIN with JOIN engine.
+     if (auto storage = table_join->getStorageJoin())
+     {
++        Names required_column_names;
+         for (const auto & result_column : right_table_expression_header)
+         {
+             const auto * source_column_name = right_table_expression_data.getColumnNameOrNull(result_column.name);
+@@ -644,8 +645,9 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_jo
+                     fmt::join(storage->getKeyNames(), ", "), result_column.name);
+ 
+             table_join->setRename(*source_column_name, result_column.name);
++            required_column_names.push_back(*source_column_name);
+         }
+-        return storage->getJoinLocked(table_join, planner_context->getQueryContext());
++        return storage->getJoinLocked(table_join, planner_context->getQueryContext(), required_column_names);
+     }
+ 
+     /** JOIN with constant.
+diff --git a/src/Storages/StorageJoin.cpp b/src/Storages/StorageJoin.cpp
+index 640706aae171..121d859a3f23 100644
+--- a/src/Storages/StorageJoin.cpp
++++ b/src/Storages/StorageJoin.cpp
+@@ -14,6 +14,7 @@
+ #include <Interpreters/castColumn.h>
+ #include <Common/quoteString.h>
+ #include <Common/Exception.h>
++#include <Core/ColumnsWithTypeAndName.h>
+ #include <Interpreters/JoinUtils.h>
+ 
+ #include <Compression/CompressedWriteBuffer.h>
+@@ -177,7 +178,7 @@ void StorageJoin::mutate(const MutationCommands & commands, ContextPtr context)
+     }
+ }
+ 
+-HashJoinPtr StorageJoin::getJoinLocked(std::shared_ptr<TableJoin> analyzed_join, ContextPtr context) const
++HashJoinPtr StorageJoin::getJoinLocked(std::shared_ptr<TableJoin> analyzed_join, ContextPtr context, const Names & required_columns_names) const
+ {
+     auto metadata_snapshot = getInMemoryMetadataPtr();
+     if (!analyzed_join->sameStrictnessAndKind(strictness, kind))
+@@ -237,8 +238,10 @@ HashJoinPtr StorageJoin::getJoinLocked(std::shared_ptr<TableJoin> analyzed_join,
+     /// Qualifies will be added by join implementation (TableJoin contains a rename mapping).
+     analyzed_join->setRightKeys(key_names);
+     analyzed_join->setLeftKeys(left_key_names_resorted);
+-
+-    HashJoinPtr join_clone = std::make_shared<HashJoin>(analyzed_join, getRightSampleBlock());
++    Block right_sample_block;
++    for (const auto & name : required_columns_names)
++        right_sample_block.insert(getRightSampleBlock().getByName(name));
++    HashJoinPtr join_clone = std::make_shared<HashJoin>(analyzed_join, right_sample_block);
+ 
+     RWLockImpl::LockHolder holder = tryLockTimedWithContext(rwlock, RWLockImpl::Read, context);
+     join_clone->setLock(holder);
+diff --git a/src/Storages/StorageJoin.h b/src/Storages/StorageJoin.h
+index 5559b5d1ec89..4626d744a380 100644
+--- a/src/Storages/StorageJoin.h
++++ b/src/Storages/StorageJoin.h
+@@ -49,7 +49,7 @@ class StorageJoin final : public StorageSetOrJoinBase
+ 
+     /// Return instance of HashJoin holding lock that protects from insertions to StorageJoin.
+     /// HashJoin relies on structure of hash table that's why we need to return it with locked mutex.
+-    HashJoinPtr getJoinLocked(std::shared_ptr<TableJoin> analyzed_join, ContextPtr context) const;
++    HashJoinPtr getJoinLocked(std::shared_ptr<TableJoin> analyzed_join, ContextPtr context, const Names & required_columns_names) const;
+ 
+     /// Get result type for function "joinGet(OrNull)"
+     DataTypePtr joinGetCheckAndGetReturnType(const DataTypes & data_types, const String & column_name, bool or_null) const;

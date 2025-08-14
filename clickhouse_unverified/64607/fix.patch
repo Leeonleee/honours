@@ -1,0 +1,314 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 9dfb51340001..07427c6c85ac 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -530,6 +530,7 @@ class IColumn;
+     M(Bool, optimize_read_in_order, true, "Enable ORDER BY optimization for reading data in corresponding order in MergeTree tables.", 0) \
+     M(Bool, optimize_read_in_window_order, true, "Enable ORDER BY optimization in window clause for reading data in corresponding order in MergeTree tables.", 0) \
+     M(Bool, optimize_aggregation_in_order, false, "Enable GROUP BY optimization for aggregating data in corresponding order in MergeTree tables.", 0) \
++    M(Bool, read_in_order_use_buffering, true, "Use buffering before merging while reading in order of primary key. It increases the parallelism of query execution", 0) \
+     M(UInt64, aggregation_in_order_max_block_bytes, 50000000, "Maximal size of block in bytes accumulated during aggregation in order of primary key. Lower block size allows to parallelize more final merge stage of aggregation.", 0) \
+     M(UInt64, read_in_order_two_level_merge_threshold, 100, "Minimal number of parts to read to run preliminary merge step during multithread reading in order of primary key.", 0) \
+     M(Bool, low_cardinality_allow_in_native_format, true, "Use LowCardinality type in Native format. Otherwise, convert LowCardinality columns to ordinary for select query, and convert ordinary columns to required LowCardinality for insert query.", 0) \
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index 886ca0fa2463..d59183975e15 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -58,6 +58,7 @@ String ClickHouseVersion::toString() const
+ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory::SettingsChanges>> settings_changes_history_initializer =
+ {
+     {"24.7", {{"output_format_parquet_write_page_index", false, true, "Add a possibility to write page index into parquet files."},
++              {"read_in_order_use_buffering", false, true, "Use buffering before merging while reading in order of primary key"},
+               {"optimize_functions_to_subcolumns", false, true, "Enable optimization by default"},
+               {"input_format_json_ignore_key_case", false, false, "Ignore json key case while read json field from string."},
+               {"optimize_trivial_insert_select", true, false, "The optimization does not make sense in many cases."},
+diff --git a/src/Processors/QueryPlan/BufferChunksTransform.cpp b/src/Processors/QueryPlan/BufferChunksTransform.cpp
+new file mode 100644
+index 000000000000..3601a68d36e6
+--- /dev/null
++++ b/src/Processors/QueryPlan/BufferChunksTransform.cpp
+@@ -0,0 +1,85 @@
++#include <Processors/QueryPlan/BufferChunksTransform.h>
++
++namespace DB
++{
++
++BufferChunksTransform::BufferChunksTransform(
++    const Block & header_,
++    size_t max_rows_to_buffer_,
++    size_t max_bytes_to_buffer_,
++    size_t limit_)
++    : IProcessor({header_}, {header_})
++    , input(inputs.front())
++    , output(outputs.front())
++    , max_rows_to_buffer(max_rows_to_buffer_)
++    , max_bytes_to_buffer(max_bytes_to_buffer_)
++    , limit(limit_)
++{
++}
++
++IProcessor::Status BufferChunksTransform::prepare()
++{
++    if (output.isFinished())
++    {
++        chunks = {};
++        input.close();
++        return Status::Finished;
++    }
++
++    if (input.isFinished() && chunks.empty())
++    {
++        output.finish();
++        return Status::Finished;
++    }
++
++    if (output.canPush())
++    {
++        input.setNeeded();
++
++        if (!chunks.empty())
++        {
++            auto chunk = std::move(chunks.front());
++            chunks.pop();
++
++            num_buffered_rows -= chunk.getNumRows();
++            num_buffered_bytes -= chunk.bytes();
++
++            output.push(std::move(chunk));
++        }
++        else if (input.hasData())
++        {
++            auto chunk = pullChunk();
++            output.push(std::move(chunk));
++        }
++    }
++
++    if (input.hasData() && (num_buffered_rows < max_rows_to_buffer || num_buffered_bytes < max_bytes_to_buffer))
++    {
++        auto chunk = pullChunk();
++        num_buffered_rows += chunk.getNumRows();
++        num_buffered_bytes += chunk.bytes();
++        chunks.push(std::move(chunk));
++    }
++
++    if (num_buffered_rows >= max_rows_to_buffer && num_buffered_bytes >= max_bytes_to_buffer)
++    {
++        input.setNotNeeded();
++        return Status::PortFull;
++    }
++
++    input.setNeeded();
++    return Status::NeedData;
++}
++
++Chunk BufferChunksTransform::pullChunk()
++{
++    auto chunk = input.pull();
++    num_processed_rows += chunk.getNumRows();
++
++    if (limit && num_processed_rows >= limit)
++        input.close();
++
++    return chunk;
++}
++
++}
+diff --git a/src/Processors/QueryPlan/BufferChunksTransform.h b/src/Processors/QueryPlan/BufferChunksTransform.h
+new file mode 100644
+index 000000000000..752f9910734e
+--- /dev/null
++++ b/src/Processors/QueryPlan/BufferChunksTransform.h
+@@ -0,0 +1,42 @@
++#pragma once
++#include <Processors/IProcessor.h>
++#include <queue>
++
++namespace DB
++{
++
++/// Transform that buffers chunks from the input
++/// up to the certain limit  and pushes chunks to
++/// the output whenever it is ready. It can be used
++/// to increase parallelism of execution, for example
++/// when it is adeded before MergingSortedTransform.
++class BufferChunksTransform : public IProcessor
++{
++public:
++    /// OR condition is used for the limits on rows and bytes.
++    BufferChunksTransform(
++        const Block & header_,
++        size_t max_rows_to_buffer_,
++        size_t max_bytes_to_buffer_,
++        size_t limit_);
++
++    Status prepare() override;
++    String getName() const override { return "BufferChunks"; }
++
++private:
++    Chunk pullChunk();
++
++    InputPort & input;
++    OutputPort & output;
++
++    size_t max_rows_to_buffer;
++    size_t max_bytes_to_buffer;
++    size_t limit;
++
++    std::queue<Chunk> chunks;
++    size_t num_buffered_rows = 0;
++    size_t num_buffered_bytes = 0;
++    size_t num_processed_rows = 0;
++};
++
++}
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizeReadInOrder.cpp b/src/Processors/QueryPlan/Optimizations/optimizeReadInOrder.cpp
+index 537555afa2a7..e1ef38022b57 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizeReadInOrder.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizeReadInOrder.cpp
+@@ -919,15 +919,23 @@ void optimizeReadInOrder(QueryPlan::Node & node, QueryPlan::Nodes & nodes)
+     {
+         auto & union_node = node.children.front();
+ 
+-        std::vector<InputOrderInfoPtr> infos;
++        bool use_buffering = false;
+         const SortDescription * max_sort_descr = nullptr;
++
++        std::vector<InputOrderInfoPtr> infos;
+         infos.reserve(node.children.size());
++
+         for (auto * child : union_node->children)
+         {
+             infos.push_back(buildInputOrderInfo(*sorting, *child, steps_to_update));
+ 
+-            if (infos.back() && (!max_sort_descr || max_sort_descr->size() < infos.back()->sort_description_for_merging.size()))
+-                max_sort_descr = &infos.back()->sort_description_for_merging;
++            if (infos.back())
++            {
++                if (!max_sort_descr || max_sort_descr->size() < infos.back()->sort_description_for_merging.size())
++                    max_sort_descr = &infos.back()->sort_description_for_merging;
++
++                use_buffering |= infos.back()->limit == 0;
++            }
+         }
+ 
+         if (!max_sort_descr || max_sort_descr->empty())
+@@ -972,12 +980,13 @@ void optimizeReadInOrder(QueryPlan::Node & node, QueryPlan::Nodes & nodes)
+             }
+         }
+ 
+-        sorting->convertToFinishSorting(*max_sort_descr);
++        sorting->convertToFinishSorting(*max_sort_descr, use_buffering);
+     }
+     else if (auto order_info = buildInputOrderInfo(*sorting, *node.children.front(), steps_to_update))
+     {
+-        sorting->convertToFinishSorting(order_info->sort_description_for_merging);
+-        /// update data stream's sorting properties
++        /// Use buffering only if have filter or don't have limit.
++        bool use_buffering = order_info->limit == 0;
++        sorting->convertToFinishSorting(order_info->sort_description_for_merging, use_buffering);
+         updateStepsDataStreams(steps_to_update);
+     }
+ }
+@@ -1091,7 +1100,7 @@ size_t tryReuseStorageOrderingForWindowFunctions(QueryPlan::Node * parent_node,
+         bool can_read = read_from_merge_tree->requestReadingInOrder(order_info->used_prefix_of_sorting_key_size, order_info->direction, order_info->limit);
+         if (!can_read)
+             return 0;
+-        sorting->convertToFinishSorting(order_info->sort_description_for_merging);
++        sorting->convertToFinishSorting(order_info->sort_description_for_merging, false);
+     }
+ 
+     return 0;
+diff --git a/src/Processors/QueryPlan/SortingStep.cpp b/src/Processors/QueryPlan/SortingStep.cpp
+index 8f40e523b42a..1c40f84d23db 100644
+--- a/src/Processors/QueryPlan/SortingStep.cpp
++++ b/src/Processors/QueryPlan/SortingStep.cpp
+@@ -1,5 +1,4 @@
+ #include <memory>
+-#include <stdexcept>
+ #include <IO/Operators.h>
+ #include <Interpreters/Context.h>
+ #include <Processors/Merges/MergingSortedTransform.h>
+@@ -8,6 +7,7 @@
+ #include <Processors/Transforms/LimitsCheckingTransform.h>
+ #include <Processors/Transforms/MergeSortingTransform.h>
+ #include <Processors/Transforms/PartialSortingTransform.h>
++#include <Processors/QueryPlan/BufferChunksTransform.h>
+ #include <QueryPipeline/QueryPipelineBuilder.h>
+ #include <Common/JSONBuilder.h>
+ 
+@@ -38,6 +38,7 @@ SortingStep::Settings::Settings(const Context & context)
+     tmp_data = context.getTempDataOnDisk();
+     min_free_disk_space = settings.min_free_disk_space_for_temporary_data;
+     max_block_bytes = settings.prefer_external_sort_block_bytes;
++    read_in_order_use_buffering = settings.read_in_order_use_buffering;
+ }
+ 
+ SortingStep::Settings::Settings(size_t max_block_size_)
+@@ -153,10 +154,11 @@ void SortingStep::updateLimit(size_t limit_)
+     }
+ }
+ 
+-void SortingStep::convertToFinishSorting(SortDescription prefix_description_)
++void SortingStep::convertToFinishSorting(SortDescription prefix_description_, bool use_buffering_)
+ {
+     type = Type::FinishSorting;
+     prefix_description = std::move(prefix_description_);
++    use_buffering = use_buffering_;
+ }
+ 
+ void SortingStep::scatterByPartitionIfNeeded(QueryPipelineBuilder& pipeline)
+@@ -244,6 +246,14 @@ void SortingStep::mergingSorted(QueryPipelineBuilder & pipeline, const SortDescr
+     /// If there are several streams, then we merge them into one
+     if (pipeline.getNumStreams() > 1)
+     {
++        if (use_buffering && sort_settings.read_in_order_use_buffering)
++        {
++            pipeline.addSimpleTransform([&](const Block & header)
++            {
++                return std::make_shared<BufferChunksTransform>(header, sort_settings.max_block_size, sort_settings.max_block_bytes, limit_);
++            });
++        }
++
+         auto transform = std::make_shared<MergingSortedTransform>(
+             pipeline.getHeader(),
+             pipeline.getNumStreams(),
+@@ -373,9 +383,8 @@ void SortingStep::transformPipeline(QueryPipelineBuilder & pipeline, const Build
+         mergingSorted(pipeline, prefix_description, (need_finish_sorting ? 0 : limit));
+ 
+         if (need_finish_sorting)
+-        {
+             finishSorting(pipeline, prefix_description, result_description, limit);
+-        }
++
+         return;
+     }
+ 
+diff --git a/src/Processors/QueryPlan/SortingStep.h b/src/Processors/QueryPlan/SortingStep.h
+index 49dcf9f31215..b4a49394a13f 100644
+--- a/src/Processors/QueryPlan/SortingStep.h
++++ b/src/Processors/QueryPlan/SortingStep.h
+@@ -28,6 +28,7 @@ class SortingStep : public ITransformingStep
+         TemporaryDataOnDiskScopePtr tmp_data = nullptr;
+         size_t min_free_disk_space = 0;
+         size_t max_block_bytes = 0;
++        size_t read_in_order_use_buffering = 0;
+ 
+         explicit Settings(const Context & context);
+         explicit Settings(size_t max_block_size_);
+@@ -80,7 +81,7 @@ class SortingStep : public ITransformingStep
+ 
+     const SortDescription & getSortDescription() const { return result_description; }
+ 
+-    void convertToFinishSorting(SortDescription prefix_description);
++    void convertToFinishSorting(SortDescription prefix_description, bool use_buffering_);
+ 
+     Type getType() const { return type; }
+     const Settings & getSettings() const { return sort_settings; }
+@@ -126,6 +127,7 @@ class SortingStep : public ITransformingStep
+ 
+     UInt64 limit;
+     bool always_read_till_end = false;
++    bool use_buffering = false;
+ 
+     Settings sort_settings;
+ 

@@ -1,0 +1,216 @@
+diff --git a/dbms/src/Interpreters/Context.cpp b/dbms/src/Interpreters/Context.cpp
+index d43a1c7b916b..394a4d23c9f0 100644
+--- a/dbms/src/Interpreters/Context.cpp
++++ b/dbms/src/Interpreters/Context.cpp
+@@ -1348,15 +1348,21 @@ std::shared_ptr<Cluster> Context::tryGetCluster(const std::string & cluster_name
+ }
+ 
+ 
++void Context::reloadClusterConfig()
++{
++    std::lock_guard<std::mutex> lock(shared->clusters_mutex);
++    auto & config = shared->clusters_config ? *shared->clusters_config : getConfigRef();
++    shared->clusters = std::make_unique<Clusters>(config, settings);
++}
++
++
+ Clusters & Context::getClusters() const
+ {
++    std::lock_guard<std::mutex> lock(shared->clusters_mutex);
++    if (!shared->clusters)
+     {
+-        std::lock_guard<std::mutex> lock(shared->clusters_mutex);
+-        if (!shared->clusters)
+-        {
+-            auto & config = shared->clusters_config ? *shared->clusters_config : getConfigRef();
+-            shared->clusters = std::make_unique<Clusters>(config, settings);
+-        }
++        auto & config = shared->clusters_config ? *shared->clusters_config : getConfigRef();
++        shared->clusters = std::make_unique<Clusters>(config, settings);
+     }
+ 
+     return *shared->clusters;
+diff --git a/dbms/src/Interpreters/Context.h b/dbms/src/Interpreters/Context.h
+index 33e43c03df8a..374c48b1fd66 100644
+--- a/dbms/src/Interpreters/Context.h
++++ b/dbms/src/Interpreters/Context.h
+@@ -318,6 +318,7 @@ class Context
+     Clusters & getClusters() const;
+     std::shared_ptr<Cluster> getCluster(const std::string & cluster_name) const;
+     std::shared_ptr<Cluster> tryGetCluster(const std::string & cluster_name) const;
++    void reloadClusterConfig();
+     void setClustersConfig(const ConfigurationPtr & config);
+ 
+     Compiler & getCompiler();
+diff --git a/dbms/src/Interpreters/InterpreterSystemQuery.cpp b/dbms/src/Interpreters/InterpreterSystemQuery.cpp
+index 60888c4f1a55..419a4937a72a 100644
+--- a/dbms/src/Interpreters/InterpreterSystemQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterSystemQuery.cpp
+@@ -75,6 +75,8 @@ BlockIO InterpreterSystemQuery::execute()
+             break;
+         case Type::DROP_DNS_CACHE:
+             DNSCache::instance().drop();
++            /// Reinitialize clusters to update their resolved_addresses
++            context.reloadClusterConfig();
+             break;
+         case Type::DROP_MARK_CACHE:
+             context.dropMarkCache();
+diff --git a/dbms/src/Server/ConfigReloader.cpp b/dbms/src/Server/ConfigReloader.cpp
+index f032b8c4c516..1b841b2ba95f 100644
+--- a/dbms/src/Server/ConfigReloader.cpp
++++ b/dbms/src/Server/ConfigReloader.cpp
+@@ -53,11 +53,18 @@ void ConfigReloader::run()
+ 
+     while (true)
+     {
+-        bool zk_changed = zk_node_cache.getChangedEvent().tryWait(std::chrono::milliseconds(reload_interval).count());
+-        if (quit)
+-            return;
++        try
++        {
++            bool zk_changed = zk_node_cache.getChangedEvent().tryWait(std::chrono::milliseconds(reload_interval).count());
++            if (quit)
++                return;
+ 
+-        reloadIfNewer(zk_changed, /* throw_on_error = */ false, /* fallback_to_preprocessed = */ false);
++            reloadIfNewer(zk_changed, /* throw_on_error = */ false, /* fallback_to_preprocessed = */ false);
++        }
++        catch (...)
++        {
++            tryLogCurrentException(log, __PRETTY_FUNCTION__);
++        }
+     }
+ }
+ 
+diff --git a/dbms/src/Server/LocalServer.cpp b/dbms/src/Server/LocalServer.cpp
+index e61fed500038..eee209eafd0c 100644
+--- a/dbms/src/Server/LocalServer.cpp
++++ b/dbms/src/Server/LocalServer.cpp
+@@ -4,6 +4,8 @@
+ #include <Poco/Util/HelpFormatter.h>
+ #include <Poco/Util/OptionCallback.h>
+ #include <Poco/String.h>
++#include <Poco/Logger.h>
++#include <Poco/NullChannel.h>
+ #include <Databases/DatabaseOrdinary.h>
+ #include <Storages/System/attachSystemTables.h>
+ #include <Interpreters/Context.h>
+@@ -49,6 +51,13 @@ LocalServer::~LocalServer()
+ void LocalServer::initialize(Poco::Util::Application & self)
+ {
+     Poco::Util::Application::initialize(self);
++
++    // Turn off server logging to stderr
++    if (config().has("silent"))
++    {
++        Poco::Logger::root().setLevel("none");
++        Poco::Logger::root().setChannel(Poco::AutoPtr<Poco::NullChannel>(new Poco::NullChannel()));
++    }
+ }
+ 
+ 
+@@ -66,14 +75,21 @@ void LocalServer::defineOptions(Poco::Util::OptionSet& _options)
+     /// Arguments that define first query creating initial table:
+     /// (If structure argument is omitted then initial query is not generated)
+     _options.addOption(
+-        Poco::Util::Option("structure", "S", "Structe of initial table(list columns names with their types)")
++        Poco::Util::Option("structure", "S", "Structure of initial table(list columns names with their types)")
+             .required(false)
+             .repeatable(false)
+             .argument("[name Type]")
+             .binding("table-structure"));
+ 
++    /// Turn off logging
++    _options.addOption(
++        Poco::Util::Option("silent", "s", "Quiet mode, print only errors")
++            .required(false)
++            .repeatable(false)
++            .binding("silent"));
++
+     _options.addOption(
+-        Poco::Util::Option("table", "N", "Name of intial table")
++        Poco::Util::Option("table", "N", "Name of initial table")
+             .required(false)
+             .repeatable(false)
+             .argument("[table]")
+@@ -87,10 +103,10 @@ void LocalServer::defineOptions(Poco::Util::OptionSet& _options)
+             .binding("table-file"));
+ 
+     _options.addOption(
+-        Poco::Util::Option("input-format", "if", "Input format of intial table data")
++        Poco::Util::Option("input-format", "if", "Input format of initial table data")
+             .required(false)
+             .repeatable(false)
+-            .argument("[TSV]")
++            .argument("<TSV>")
+             .binding("table-data-format"));
+ 
+     /// List of queries to execute
+@@ -98,7 +114,7 @@ void LocalServer::defineOptions(Poco::Util::OptionSet& _options)
+         Poco::Util::Option("query", "q", "Queries to execute")
+             .required(false)
+             .repeatable(false)
+-            .argument("<query>", true)
++            .argument("<query>")
+             .binding("query"));
+ 
+     /// Default Output format
+@@ -109,9 +125,9 @@ void LocalServer::defineOptions(Poco::Util::OptionSet& _options)
+             .argument("[TSV]", true)
+             .binding("output-format"));
+ 
+-    /// Alias for previous one, required for clickhouse-client compability
++    /// Alias for previous one, required for clickhouse-client compatibility
+     _options.addOption(
+-        Poco::Util::Option("format", "", "Default ouput format")
++        Poco::Util::Option("format", "", "Default output format")
+             .required(false)
+             .repeatable(false)
+             .argument("[TSV]", true)
+@@ -304,7 +320,7 @@ try
+     /** Init dummy default DB
+       * NOTE: We force using isolated default database to avoid conflicts with default database from server enviroment
+       * Otherwise, metadata of temporary File(format, EXPLICIT_PATH) tables will pollute metadata/ directory;
+-      *  if such tables will not be dropped, clickhouse-server can not load them due to security reasons.
++      *  if such tables will not be dropped, clickhouse-server will not be able to load them due to security reasons.
+       */
+     const std::string default_database = "_local";
+     context->addDatabase(default_database, std::make_shared<DatabaseMemory>(default_database));
+diff --git a/dbms/src/Storages/MergeTree/MergeTreeDataPart.cpp b/dbms/src/Storages/MergeTree/MergeTreeDataPart.cpp
+index cb279460d164..3c329cbc79d6 100644
+--- a/dbms/src/Storages/MergeTree/MergeTreeDataPart.cpp
++++ b/dbms/src/Storages/MergeTree/MergeTreeDataPart.cpp
+@@ -759,7 +759,8 @@ void MergeTreeDataPart::loadRowsCount()
+ 
+             if (!(rows_count <= rows_approx && rows_approx < rows_count + storage.index_granularity))
+                 throw Exception(
+-                    "Unexpected size of column " + column.name + ": " + toString(rows_count) + " rows",
++                    "Unexpected size of column " + column.name + ": " + toString(rows_count) + " rows, expected "
++                    + toString(rows_approx) + "+-" + toString(storage.index_granularity) + " rows according to the index",
+                     ErrorCodes::LOGICAL_ERROR);
+ 
+             return;
+diff --git a/dbms/src/Storages/StorageMergeTree.cpp b/dbms/src/Storages/StorageMergeTree.cpp
+index 18a3faa7b609..d416d825a1e6 100644
+--- a/dbms/src/Storages/StorageMergeTree.cpp
++++ b/dbms/src/Storages/StorageMergeTree.cpp
+@@ -444,6 +444,7 @@ void StorageMergeTree::clearColumnInPartition(const ASTPtr & partition, const Fi
+     for (auto & transaction : transactions)
+         transaction->commit();
+ 
++    /// Recalculate columns size (not only for the modified column)
+     data.recalculateColumnSizes();
+ }
+ 
+diff --git a/dbms/src/Storages/StorageReplicatedMergeTree.cpp b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+index 6ae8e9cf340a..6860f014fbc8 100644
+--- a/dbms/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -1467,6 +1467,7 @@ void StorageReplicatedMergeTree::executeClearColumnInPartition(const LogEntry &
+ 
+     LOG_DEBUG(log, "Cleared column " << entry.column_name << " in " << modified_parts << " parts");
+ 
++    /// Recalculate columns size (not only for the modified column)
+     data.recalculateColumnSizes();
+ }
+ 

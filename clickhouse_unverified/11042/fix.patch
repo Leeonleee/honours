@@ -1,0 +1,169 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index eda76584f0b2..c3ab99bed49d 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -421,6 +421,7 @@ struct Settings : public SettingsCollection<Settings>
+     M(SettingBool, transform_null_in, false, "If enabled, NULL values will be matched with 'IN' operator as if they are considered equal.", 0) \
+     M(SettingBool, allow_nondeterministic_mutations, false, "Allow non-deterministic functions in ALTER UPDATE/ALTER DELETE statements", 0) \
+     M(SettingSeconds, lock_acquire_timeout, DBMS_DEFAULT_LOCK_ACQUIRE_TIMEOUT_SEC, "How long locking request should wait before failing", 0) \
++    M(SettingBool, materialize_ttl_after_modify, true, "Apply TTL for old data, after ALTER MODIFY TTL query", 0) \
+     \
+     /** Obsolete settings that do nothing but left for compatibility reasons. Remove each one after half a year of obsolescence. */ \
+     \
+diff --git a/src/DataStreams/TTLBlockInputStream.cpp b/src/DataStreams/TTLBlockInputStream.cpp
+index 692d2c0d5cfb..c9a407681663 100644
+--- a/src/DataStreams/TTLBlockInputStream.cpp
++++ b/src/DataStreams/TTLBlockInputStream.cpp
+@@ -34,22 +34,25 @@ TTLBlockInputStream::TTLBlockInputStream(
+ 
+     const auto & storage_columns = storage.getColumns();
+     const auto & column_defaults = storage_columns.getDefaults();
++
+     ASTPtr default_expr_list = std::make_shared<ASTExpressionList>();
++    for (const auto & [name, _] : storage.column_ttl_entries_by_name)
++    {
++        auto it = column_defaults.find(name);
++        if (it != column_defaults.end())
++        {
++            auto column = storage_columns.get(name);
++            auto expression = it->second.expression->clone();
++            default_expr_list->children.emplace_back(setAlias(addTypeConversionToAST(std::move(expression), column.type->getName()), it->first));
++        }
++    }
++
+     for (const auto & [name, ttl_info] : old_ttl_infos.columns_ttl)
+     {
+         if (force || isTTLExpired(ttl_info.min))
+         {
+             new_ttl_infos.columns_ttl.emplace(name, IMergeTreeDataPart::TTLInfo{});
+             empty_columns.emplace(name);
+-
+-            auto it = column_defaults.find(name);
+-
+-            if (it != column_defaults.end())
+-            {
+-                auto column = storage_columns.get(name);
+-                auto expression = it->second.expression->clone();
+-                default_expr_list->children.emplace_back(setAlias(addTypeConversionToAST(std::move(expression), column.type->getName()), it->first));
+-            }
+         }
+         else
+             new_ttl_infos.columns_ttl.emplace(name, ttl_info);
+diff --git a/src/Storages/AlterCommands.cpp b/src/Storages/AlterCommands.cpp
+index 1921177d0d40..6ffaf0750d3d 100644
+--- a/src/Storages/AlterCommands.cpp
++++ b/src/Storages/AlterCommands.cpp
+@@ -594,6 +594,27 @@ bool AlterCommand::isCommentAlter() const
+     return false;
+ }
+ 
++bool AlterCommand::isTTLAlter(const StorageInMemoryMetadata & metadata) const
++{
++    if (type == MODIFY_TTL)
++        return true;
++
++    if (!ttl || type != MODIFY_COLUMN)
++        return false;
++
++    bool ttl_changed = true;
++    for (const auto & [name, ttl_ast] : metadata.columns.getColumnTTLs())
++    {
++        if (name == column_name && queryToString(*ttl) == queryToString(*ttl_ast))
++        {
++            ttl_changed = false;
++            break;
++        }
++    }
++
++    return ttl_changed;
++}
++
+ std::optional<MutationCommand> AlterCommand::tryConvertToMutationCommand(StorageInMemoryMetadata & metadata) const
+ {
+     if (!isRequireMutationStage(metadata))
+@@ -944,13 +965,35 @@ bool AlterCommands::isCommentAlter() const
+     return std::all_of(begin(), end(), [](const AlterCommand & c) { return c.isCommentAlter(); });
+ }
+ 
++static MutationCommand createMaterializeTTLCommand()
++{
++    MutationCommand command;
++    auto ast = std::make_shared<ASTAlterCommand>();
++    ast->type = ASTAlterCommand::MATERIALIZE_TTL;
++    command.type = MutationCommand::MATERIALIZE_TTL;
++    command.ast = std::move(ast);
++    return command;
++}
+ 
+-MutationCommands AlterCommands::getMutationCommands(StorageInMemoryMetadata metadata) const
++MutationCommands AlterCommands::getMutationCommands(StorageInMemoryMetadata metadata, bool materialize_ttl) const
+ {
+     MutationCommands result;
+     for (const auto & alter_cmd : *this)
+         if (auto mutation_cmd = alter_cmd.tryConvertToMutationCommand(metadata); mutation_cmd)
+             result.push_back(*mutation_cmd);
++
++    if (materialize_ttl)
++    {
++        for (const auto & alter_cmd : *this)
++        {
++            if (alter_cmd.isTTLAlter(metadata))
++            {
++                result.push_back(createMaterializeTTLCommand());
++                break;
++            }
++        }
++    }
++
+     return result;
+ }
+ 
+diff --git a/src/Storages/AlterCommands.h b/src/Storages/AlterCommands.h
+index 94cf2a2ba37c..a42e7cce6465 100644
+--- a/src/Storages/AlterCommands.h
++++ b/src/Storages/AlterCommands.h
+@@ -118,6 +118,9 @@ struct AlterCommand
+     /// Checks that only comment changed by alter
+     bool isCommentAlter() const;
+ 
++    /// Checks that any TTL changed by alter
++    bool isTTLAlter(const StorageInMemoryMetadata & metadata) const;
++
+     /// If possible, convert alter command to mutation command. In other case
+     /// return empty optional. Some storages may execute mutations after
+     /// metadata changes.
+@@ -162,7 +165,7 @@ class AlterCommands : public std::vector<AlterCommand>
+     /// Return mutation commands which some storages may execute as part of
+     /// alter. If alter can be performed is pure metadata update, than result is
+     /// empty.
+-    MutationCommands getMutationCommands(StorageInMemoryMetadata metadata) const;
++    MutationCommands getMutationCommands(StorageInMemoryMetadata metadata, bool materialize_ttl) const;
+ };
+ 
+ }
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index e22e81d50413..35785c82d683 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -229,7 +229,7 @@ void StorageMergeTree::alter(
+     auto table_id = getStorageID();
+ 
+     StorageInMemoryMetadata metadata = getInMemoryMetadata();
+-    auto maybe_mutation_commands = commands.getMutationCommands(metadata);
++    auto maybe_mutation_commands = commands.getMutationCommands(metadata, context.getSettingsRef().materialize_ttl_after_modify);
+     commands.apply(metadata);
+ 
+     /// This alter can be performed at metadata level only
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index e6fc32ecbf9b..854f9e7d4201 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -3388,7 +3388,7 @@ void StorageReplicatedMergeTree::alter(
+         alter_entry->alter_version = new_metadata_version;
+         alter_entry->create_time = time(nullptr);
+ 
+-        auto maybe_mutation_commands = params.getMutationCommands(current_metadata);
++        auto maybe_mutation_commands = params.getMutationCommands(current_metadata, query_context.getSettingsRef().materialize_ttl_after_modify);
+         alter_entry->have_mutation = !maybe_mutation_commands.empty();
+ 
+         ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/log/log-", alter_entry->toString(), zkutil::CreateMode::PersistentSequential));

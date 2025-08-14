@@ -1,0 +1,655 @@
+diff --git a/src/Access/ContextAccess.cpp b/src/Access/ContextAccess.cpp
+index 4e409946666e..7584dd2f2b11 100644
+--- a/src/Access/ContextAccess.cpp
++++ b/src/Access/ContextAccess.cpp
+@@ -379,12 +379,12 @@ std::shared_ptr<const EnabledRowPolicies> ContextAccess::getEnabledRowPolicies()
+     return no_row_policies;
+ }
+ 
+-ASTPtr ContextAccess::getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, const ASTPtr & combine_with_expr) const
++RowPolicyFilterPtr ContextAccess::getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, RowPolicyFilterPtr combine_with_filter) const
+ {
+     std::lock_guard lock{mutex};
+     if (enabled_row_policies)
+-        return enabled_row_policies->getFilter(database, table_name, filter_type, combine_with_expr);
+-    return nullptr;
++        return enabled_row_policies->getFilter(database, table_name, filter_type, combine_with_filter);
++    return combine_with_filter;
+ }
+ 
+ std::shared_ptr<const EnabledQuota> ContextAccess::getQuota() const
+diff --git a/src/Access/ContextAccess.h b/src/Access/ContextAccess.h
+index ce1ea2d12204..84ef0ab722d5 100644
+--- a/src/Access/ContextAccess.h
++++ b/src/Access/ContextAccess.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ #include <Access/AccessRights.h>
+-#include <Access/Common/RowPolicyDefs.h>
++#include <Access/EnabledRowPolicies.h>
+ #include <Interpreters/ClientInfo.h>
+ #include <Core/UUID.h>
+ #include <base/scope_guard.h>
+@@ -87,7 +87,7 @@ class ContextAccess : public std::enable_shared_from_this<ContextAccess>
+ 
+     /// Returns the row policy filter for a specified table.
+     /// The function returns nullptr if there is no filter to apply.
+-    ASTPtr getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, const ASTPtr & combine_with_expr = nullptr) const;
++    RowPolicyFilterPtr getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, RowPolicyFilterPtr combine_with_filter = {}) const;
+ 
+     /// Returns the quota to track resource consumption.
+     std::shared_ptr<const EnabledQuota> getQuota() const;
+diff --git a/src/Access/EnabledRowPolicies.cpp b/src/Access/EnabledRowPolicies.cpp
+index e4f592884fe6..c00dcf9e3a7e 100644
+--- a/src/Access/EnabledRowPolicies.cpp
++++ b/src/Access/EnabledRowPolicies.cpp
+@@ -6,12 +6,18 @@
+ 
+ namespace DB
+ {
++
++bool RowPolicyFilter::empty() const
++{
++    bool value;
++    return !expression || (tryGetLiteralBool(expression.get(), value) && value);
++}
++
+ size_t EnabledRowPolicies::Hash::operator()(const MixedFiltersKey & key) const
+ {
+     return std::hash<std::string_view>{}(key.database) - std::hash<std::string_view>{}(key.table_name) + static_cast<size_t>(key.filter_type);
+ }
+ 
+-
+ EnabledRowPolicies::EnabledRowPolicies() : params()
+ {
+ }
+@@ -23,7 +29,7 @@ EnabledRowPolicies::EnabledRowPolicies(const Params & params_) : params(params_)
+ EnabledRowPolicies::~EnabledRowPolicies() = default;
+ 
+ 
+-ASTPtr EnabledRowPolicies::getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const
++RowPolicyFilterPtr EnabledRowPolicies::getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const
+ {
+     /// We don't lock `mutex` here.
+     auto loaded = mixed_filters.load();
+@@ -31,26 +37,36 @@ ASTPtr EnabledRowPolicies::getFilter(const String & database, const String & tab
+     if (it == loaded->end())
+         return {};
+ 
+-    auto filter = it->second.ast;
+-
+-    bool value;
+-    if (tryGetLiteralBool(filter.get(), value) && value)
+-        return nullptr; /// The condition is always true, no need to check it.
+-
+-    return filter;
++    return it->second;
+ }
+ 
+-ASTPtr EnabledRowPolicies::getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, const ASTPtr & combine_with_expr) const
++RowPolicyFilterPtr EnabledRowPolicies::getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, RowPolicyFilterPtr combine_with_filter) const
+ {
+-    ASTPtr filter = getFilter(database, table_name, filter_type);
+-    if (filter && combine_with_expr)
+-        filter = makeASTForLogicalAnd({filter, combine_with_expr});
+-    else if (!filter)
+-        filter = combine_with_expr;
++    RowPolicyFilterPtr filter = getFilter(database, table_name, filter_type);
++    if (filter && combine_with_filter)
++    {
++        auto new_filter = std::make_shared<RowPolicyFilter>(*filter);
+ 
+-    bool value;
+-    if (tryGetLiteralBool(filter.get(), value) && value)
+-        return nullptr;  /// The condition is always true, no need to check it.
++        if (filter->empty())
++        {
++            new_filter->expression = combine_with_filter->expression;
++        }
++        else if (combine_with_filter->empty())
++        {
++            new_filter->expression = filter->expression;
++        }
++        else
++        {
++            new_filter->expression = makeASTForLogicalAnd({filter->expression, combine_with_filter->expression});
++        }
++
++        std::copy(combine_with_filter->policies.begin(), combine_with_filter->policies.end(), std::back_inserter(new_filter->policies));
++        filter = new_filter;
++    }
++    else if (!filter)
++    {
++        filter = combine_with_filter;
++    }
+ 
+     return filter;
+ }
+diff --git a/src/Access/EnabledRowPolicies.h b/src/Access/EnabledRowPolicies.h
+index a3d3f009408e..b8e6b2e05493 100644
+--- a/src/Access/EnabledRowPolicies.h
++++ b/src/Access/EnabledRowPolicies.h
+@@ -1,12 +1,16 @@
+ #pragma once
+ 
+ #include <Access/Common/RowPolicyDefs.h>
++#include <Access/RowPolicy.h>
+ #include <base/types.h>
+ #include <Core/UUID.h>
++
+ #include <boost/container/flat_set.hpp>
+ #include <boost/smart_ptr/atomic_shared_ptr.hpp>
+-#include <unordered_map>
++
+ #include <memory>
++#include <unordered_map>
++#include <vector>
+ 
+ 
+ namespace DB
+@@ -14,6 +18,19 @@ namespace DB
+ class IAST;
+ using ASTPtr = std::shared_ptr<IAST>;
+ 
++struct RowPolicyFilter;
++using RowPolicyFilterPtr = std::shared_ptr<const RowPolicyFilter>;
++
++
++struct RowPolicyFilter
++{
++    ASTPtr expression;
++    std::shared_ptr<const std::pair<String, String>> database_and_table_name;
++    std::vector<RowPolicyPtr> policies;
++
++    bool empty() const;
++};
++
+ 
+ /// Provides fast access to row policies' conditions for a specific user and tables.
+ class EnabledRowPolicies
+@@ -39,8 +56,8 @@ class EnabledRowPolicies
+     /// Returns prepared filter for a specific table and operations.
+     /// The function can return nullptr, that means there is no filters applied.
+     /// The returned filter can be a combination of the filters defined by multiple row policies.
+-    ASTPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const;
+-    ASTPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, const ASTPtr & combine_with_expr) const;
++    RowPolicyFilterPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const;
++    RowPolicyFilterPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, RowPolicyFilterPtr combine_with_filter) const;
+ 
+ private:
+     friend class RowPolicyCache;
+@@ -57,18 +74,12 @@ class EnabledRowPolicies
+         friend bool operator!=(const MixedFiltersKey & left, const MixedFiltersKey & right) { return left.toTuple() != right.toTuple(); }
+     };
+ 
+-    struct MixedFiltersResult
+-    {
+-        ASTPtr ast;
+-        std::shared_ptr<const std::pair<String, String>> database_and_table_name;
+-    };
+-
+     struct Hash
+     {
+         size_t operator()(const MixedFiltersKey & key) const;
+     };
+ 
+-    using MixedFiltersMap = std::unordered_map<MixedFiltersKey, MixedFiltersResult, Hash>;
++    using MixedFiltersMap = std::unordered_map<MixedFiltersKey, RowPolicyFilterPtr, Hash>;
+ 
+     const Params params;
+     mutable boost::atomic_shared_ptr<const MixedFiltersMap> mixed_filters;
+diff --git a/src/Access/RowPolicyCache.cpp b/src/Access/RowPolicyCache.cpp
+index 34549e3fa629..1036df926097 100644
+--- a/src/Access/RowPolicyCache.cpp
++++ b/src/Access/RowPolicyCache.cpp
+@@ -212,6 +212,7 @@ void RowPolicyCache::mixFiltersFor(EnabledRowPolicies & enabled)
+     {
+         FiltersMixer mixer;
+         std::shared_ptr<const std::pair<String, String>> database_and_table_name;
++        std::vector<RowPolicyPtr> policies;
+     };
+ 
+     std::unordered_map<MixedFiltersKey, MixerWithNames, Hash> mixers;
+@@ -232,7 +233,10 @@ void RowPolicyCache::mixFiltersFor(EnabledRowPolicies & enabled)
+                 auto & mixer = mixers[key];
+                 mixer.database_and_table_name = info.database_and_table_name;
+                 if (match)
++                {
+                     mixer.mixer.add(info.parsed_filters[filter_type_i], policy.isRestrictive());
++                    mixer.policies.push_back(info.policy);
++                }
+             }
+         }
+     }
+@@ -240,9 +244,11 @@ void RowPolicyCache::mixFiltersFor(EnabledRowPolicies & enabled)
+     auto mixed_filters = boost::make_shared<MixedFiltersMap>();
+     for (auto & [key, mixer] : mixers)
+     {
+-        auto & mixed_filter = (*mixed_filters)[key];
+-        mixed_filter.database_and_table_name = mixer.database_and_table_name;
+-        mixed_filter.ast = std::move(mixer.mixer).getResult(access_control.isEnabledUsersWithoutRowPoliciesCanReadRows());
++        auto mixed_filter = std::make_shared<RowPolicyFilter>();
++        mixed_filter->database_and_table_name = std::move(mixer.database_and_table_name);
++        mixed_filter->expression = std::move(mixer.mixer).getResult(access_control.isEnabledUsersWithoutRowPoliciesCanReadRows());
++        mixed_filter->policies = std::move(mixer.policies);
++        mixed_filters->emplace(key, std::move(mixed_filter));
+     }
+ 
+     enabled.mixed_filters.store(mixed_filters);
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 9c949a17e644..2d3d378e9265 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -987,10 +987,12 @@ std::shared_ptr<const ContextAccess> Context::getAccess() const
+     return access ? access : ContextAccess::getFullAccess();
+ }
+ 
+-ASTPtr Context::getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const
++RowPolicyFilterPtr Context::getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const
+ {
+     auto lock = getLock();
+-    auto row_filter_of_initial_user = row_policies_of_initial_user ? row_policies_of_initial_user->getFilter(database, table_name, filter_type) : nullptr;
++    RowPolicyFilterPtr row_filter_of_initial_user;
++    if (row_policies_of_initial_user)
++        row_filter_of_initial_user = row_policies_of_initial_user->getFilter(database, table_name, filter_type);
+     return getAccess()->getRowPolicyFilter(database, table_name, filter_type, row_filter_of_initial_user);
+ }
+ 
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index eeb9e8da1483..0eaec2155885 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -45,6 +45,8 @@ struct User;
+ using UserPtr = std::shared_ptr<const User>;
+ struct EnabledRolesInfo;
+ class EnabledRowPolicies;
++struct RowPolicyFilter;
++using RowPolicyFilterPtr = std::shared_ptr<const RowPolicyFilter>;
+ class EnabledQuota;
+ struct QuotaUsage;
+ class AccessFlags;
+@@ -516,7 +518,7 @@ class Context: public std::enable_shared_from_this<Context>
+ 
+     std::shared_ptr<const ContextAccess> getAccess() const;
+ 
+-    ASTPtr getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const;
++    RowPolicyFilterPtr getRowPolicyFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const;
+ 
+     /// Finds and sets extra row policies to be used based on `client_info.initial_user`,
+     /// if the initial user exists.
+diff --git a/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp b/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
+index 6319949655bd..5df3abbb32e1 100644
+--- a/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
++++ b/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
+@@ -6,21 +6,21 @@
+ #include <QueryPipeline/QueryPipelineBuilder.h>
+ #include <Parsers/ExpressionListParsers.h>
+ #include <Parsers/parseQuery.h>
+-#include <Interpreters/TreeRewriter.h>
+ #include <Interpreters/ActionsDAG.h>
+ #include <Interpreters/ExpressionAnalyzer.h>
++#include <Interpreters/TreeRewriter.h>
+ #include <Processors/QueryPlan/IQueryPlanStep.h>
+ #include <Processors/QueryPlan/FilterStep.h>
+ 
++
+ namespace DB
+ {
+ 
+-void IInterpreterUnionOrSelectQuery::extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr &, ContextPtr) const
++void IInterpreterUnionOrSelectQuery::extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & /*ast*/, ContextPtr /*context_*/) const
+ {
+     elem.query_kind = "Select";
+ }
+ 
+-
+ QueryPipelineBuilder IInterpreterUnionOrSelectQuery::buildQueryPipeline()
+ {
+     QueryPlan query_plan;
+diff --git a/src/Interpreters/IInterpreterUnionOrSelectQuery.h b/src/Interpreters/IInterpreterUnionOrSelectQuery.h
+index a1c86f9de857..81554340669d 100644
+--- a/src/Interpreters/IInterpreterUnionOrSelectQuery.h
++++ b/src/Interpreters/IInterpreterUnionOrSelectQuery.h
+@@ -44,7 +44,7 @@ class IInterpreterUnionOrSelectQuery : public IInterpreter
+ 
+     size_t getMaxStreams() const { return max_streams; }
+ 
+-    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr &, ContextPtr) const override;
++    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context) const override;
+ 
+     /// Returns whether the query uses the view source from the Context
+     /// The view source is a virtual storage that currently only materialized views use to replace the source table
+diff --git a/src/Interpreters/InterpreterSelectIntersectExceptQuery.cpp b/src/Interpreters/InterpreterSelectIntersectExceptQuery.cpp
+index a134f7bb9138..15945cbbeef6 100644
+--- a/src/Interpreters/InterpreterSelectIntersectExceptQuery.cpp
++++ b/src/Interpreters/InterpreterSelectIntersectExceptQuery.cpp
+@@ -1,7 +1,10 @@
++#include <Access/AccessControl.h>
++
+ #include <Columns/getLeastSuperColumn.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/InterpreterSelectIntersectExceptQuery.h>
+ #include <Interpreters/InterpreterSelectQuery.h>
++#include <Interpreters/QueryLog.h>
+ #include <Parsers/ASTSelectIntersectExceptQuery.h>
+ #include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Processors/QueryPlan/DistinctStep.h>
+@@ -188,4 +191,25 @@ void InterpreterSelectIntersectExceptQuery::ignoreWithTotals()
+         interpreter->ignoreWithTotals();
+ }
+ 
++void InterpreterSelectIntersectExceptQuery::extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & /*ast*/, ContextPtr /*context_*/) const
++{
++    elem.query_kind = "Select";
++
++    for (const auto & interpreter : nested_interpreters)
++    {
++        if (const auto * select_interpreter = dynamic_cast<const InterpreterSelectQuery *>(interpreter.get()))
++        {
++            auto filter = select_interpreter->getRowPolicyFilter();
++            if (filter)
++            {
++                for (const auto & row_policy : filter->policies)
++                {
++                    auto name = row_policy->getFullName().toString();
++                    elem.used_row_policies.emplace(std::move(name));
++                }
++            }
++        }
++    }
++}
++
+ }
+diff --git a/src/Interpreters/InterpreterSelectIntersectExceptQuery.h b/src/Interpreters/InterpreterSelectIntersectExceptQuery.h
+index 79ee32e514a2..e93ab7bd2e9a 100644
+--- a/src/Interpreters/InterpreterSelectIntersectExceptQuery.h
++++ b/src/Interpreters/InterpreterSelectIntersectExceptQuery.h
+@@ -35,6 +35,8 @@ using Operator = ASTSelectIntersectExceptQuery::Operator;
+ 
+     void ignoreWithTotals() override;
+ 
++    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context) const override;
++
+ private:
+     static String getName() { return "SelectIntersectExceptQuery"; }
+ 
+diff --git a/src/Interpreters/InterpreterSelectQuery.cpp b/src/Interpreters/InterpreterSelectQuery.cpp
+index d8ac263e3d15..2948d7569868 100644
+--- a/src/Interpreters/InterpreterSelectQuery.cpp
++++ b/src/Interpreters/InterpreterSelectQuery.cpp
+@@ -1,3 +1,5 @@
++#include <Access/AccessControl.h>
++
+ #include <DataTypes/DataTypeAggregateFunction.h>
+ #include <DataTypes/DataTypeInterval.h>
+ 
+@@ -33,6 +35,7 @@
+ #include <Interpreters/JoinedTables.h>
+ #include <Interpreters/OpenTelemetrySpanLog.h>
+ #include <Interpreters/QueryAliasesVisitor.h>
++#include <Interpreters/QueryLog.h>
+ #include <Interpreters/replaceAliasColumnsInQuery.h>
+ #include <Interpreters/RewriteCountDistinctVisitor.h>
+ 
+@@ -112,7 +115,7 @@ namespace ErrorCodes
+ /// Assumes `storage` is set and the table filter (row-level security) is not empty.
+ FilterDAGInfoPtr generateFilterActions(
+     const StorageID & table_id,
+-    const ASTPtr & row_policy_filter,
++    const ASTPtr & row_policy_filter_expression,
+     const ContextPtr & context,
+     const StoragePtr & storage,
+     const StorageSnapshotPtr & storage_snapshot,
+@@ -133,9 +136,9 @@ FilterDAGInfoPtr generateFilterActions(
+     auto expr_list = select_ast->select();
+ 
+     /// The first column is our filter expression.
+-    /// the row_policy_filter should be cloned, because it may be changed by TreeRewriter.
++    /// the row_policy_filter_expression should be cloned, because it may be changed by TreeRewriter.
+     /// which make it possible an invalid expression, although it may be valid in whole select.
+-    expr_list->children.push_back(row_policy_filter->clone());
++    expr_list->children.push_back(row_policy_filter_expression->clone());
+ 
+     /// Keep columns that are required after the filter actions.
+     for (const auto & column_str : prerequisite_columns)
+@@ -613,13 +616,13 @@ InterpreterSelectQuery::InterpreterSelectQuery(
+             query_info.filter_asts.clear();
+ 
+             /// Fix source_header for filter actions.
+-            if (row_policy_filter)
++            if (row_policy_filter && !row_policy_filter->empty())
+             {
+                 filter_info = generateFilterActions(
+-                    table_id, row_policy_filter, context, storage, storage_snapshot, metadata_snapshot, required_columns,
++                    table_id, row_policy_filter->expression, context, storage, storage_snapshot, metadata_snapshot, required_columns,
+                     prepared_sets);
+ 
+-                query_info.filter_asts.push_back(row_policy_filter);
++                query_info.filter_asts.push_back(row_policy_filter->expression);
+             }
+ 
+             if (query_info.additional_filter_ast)
+@@ -1866,6 +1869,22 @@ void InterpreterSelectQuery::setProperClientInfo(size_t replica_num, size_t repl
+     context->getClientInfo().number_of_current_replica = replica_num;
+ }
+ 
++RowPolicyFilterPtr InterpreterSelectQuery::getRowPolicyFilter() const
++{
++    return row_policy_filter;
++}
++
++void InterpreterSelectQuery::extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & /*ast*/, ContextPtr /*context_*/) const
++{
++    elem.query_kind = "Select";
++
++    for (const auto & row_policy : row_policy_filter->policies)
++    {
++        auto name = row_policy->getFullName().toString();
++        elem.used_row_policies.emplace(std::move(name));
++    }
++}
++
+ bool InterpreterSelectQuery::shouldMoveToPrewhere()
+ {
+     const Settings & settings = context->getSettingsRef();
+diff --git a/src/Interpreters/InterpreterSelectQuery.h b/src/Interpreters/InterpreterSelectQuery.h
+index 3b933547422a..761eea8e1b8a 100644
+--- a/src/Interpreters/InterpreterSelectQuery.h
++++ b/src/Interpreters/InterpreterSelectQuery.h
+@@ -2,6 +2,7 @@
+ 
+ #include <memory>
+ 
++#include <Access/EnabledRowPolicies.h>
+ #include <Core/QueryProcessingStage.h>
+ #include <Interpreters/ExpressionActions.h>
+ #include <Interpreters/ExpressionAnalyzer.h>
+@@ -23,6 +24,7 @@ class Logger;
+ 
+ namespace DB
+ {
++
+ class SubqueryForSet;
+ class InterpreterSelectWithUnionQuery;
+ class Context;
+@@ -34,6 +36,9 @@ using GroupingSetsParamsList = std::vector<GroupingSetsParams>;
+ struct TreeRewriterResult;
+ using TreeRewriterResultPtr = std::shared_ptr<const TreeRewriterResult>;
+ 
++struct RowPolicy;
++using RowPolicyPtr = std::shared_ptr<const RowPolicy>;
++
+ 
+ /** Interprets the SELECT query. Returns the stream of blocks with the results of the query before `to_stage` stage.
+   */
+@@ -129,6 +134,10 @@ class InterpreterSelectQuery : public IInterpreterUnionOrSelectQuery
+ 
+     FilterDAGInfoPtr getAdditionalQueryInfo() const { return additional_filter_info; }
+ 
++    RowPolicyFilterPtr getRowPolicyFilter() const;
++
++    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context) const override;
++
+     static SortDescription getSortDescription(const ASTSelectQuery & query, const ContextPtr & context);
+     static UInt64 getLimitForSorting(const ASTSelectQuery & query, const ContextPtr & context);
+ 
+@@ -209,7 +218,7 @@ class InterpreterSelectQuery : public IInterpreterUnionOrSelectQuery
+     /// Is calculated in getSampleBlock. Is used later in readImpl.
+     ExpressionAnalysisResult analysis_result;
+     /// For row-level security.
+-    ASTPtr row_policy_filter;
++    RowPolicyFilterPtr row_policy_filter;
+     FilterDAGInfoPtr filter_info;
+ 
+     /// For additional_filter setting.
+diff --git a/src/Interpreters/InterpreterSelectWithUnionQuery.cpp b/src/Interpreters/InterpreterSelectWithUnionQuery.cpp
+index a679b17a5bdd..c695dae6d534 100644
+--- a/src/Interpreters/InterpreterSelectWithUnionQuery.cpp
++++ b/src/Interpreters/InterpreterSelectWithUnionQuery.cpp
+@@ -1,8 +1,11 @@
++#include <Access/AccessControl.h>
++
+ #include <Columns/getLeastSuperColumn.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/InterpreterSelectQuery.h>
+ #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+ #include <Interpreters/InterpreterSelectIntersectExceptQuery.h>
++#include <Interpreters/QueryLog.h>
+ #include <Parsers/ASTSelectQuery.h>
+ #include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Parsers/ASTSelectIntersectExceptQuery.h>
+@@ -22,6 +25,7 @@
+ 
+ #include <algorithm>
+ 
++
+ namespace DB
+ {
+ 
+@@ -382,4 +386,25 @@ void InterpreterSelectWithUnionQuery::ignoreWithTotals()
+         interpreter->ignoreWithTotals();
+ }
+ 
++void InterpreterSelectWithUnionQuery::extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & /*ast*/, ContextPtr /*context_*/) const
++{
++    elem.query_kind = "Select";
++
++    for (const auto & interpreter : nested_interpreters)
++    {
++        if (const auto * select_interpreter = dynamic_cast<const InterpreterSelectQuery *>(interpreter.get()))
++        {
++            auto filter = select_interpreter->getRowPolicyFilter();
++            if (filter)
++            {
++                for (const auto & row_policy : filter->policies)
++                {
++                    auto name = row_policy->getFullName().toString();
++                    elem.used_row_policies.emplace(std::move(name));
++                }
++            }
++        }
++    }
++}
++
+ }
+diff --git a/src/Interpreters/InterpreterSelectWithUnionQuery.h b/src/Interpreters/InterpreterSelectWithUnionQuery.h
+index ff763ec6490f..2ec4fbfceaf2 100644
+--- a/src/Interpreters/InterpreterSelectWithUnionQuery.h
++++ b/src/Interpreters/InterpreterSelectWithUnionQuery.h
+@@ -47,6 +47,8 @@ class InterpreterSelectWithUnionQuery : public IInterpreterUnionOrSelectQuery
+ 
+     bool supportsTransactions() const override { return true; }
+ 
++    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context) const override;
++
+ private:
+     std::vector<std::unique_ptr<IInterpreterUnionOrSelectQuery>> nested_interpreters;
+ 
+diff --git a/src/Interpreters/QueryLog.cpp b/src/Interpreters/QueryLog.cpp
+index 72d9ce441028..224ca9f11a89 100644
+--- a/src/Interpreters/QueryLog.cpp
++++ b/src/Interpreters/QueryLog.cpp
+@@ -1,4 +1,5 @@
+-#include <array>
++#include <Interpreters/QueryLog.h>
++
+ #include <Columns/ColumnArray.h>
+ #include <Columns/ColumnFixedString.h>
+ #include <Columns/ColumnString.h>
+@@ -13,15 +14,18 @@
+ #include <DataTypes/DataTypeMap.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
+ #include <DataTypes/DataTypeString.h>
++#include <DataTypes/DataTypeUUID.h>
+ #include <DataTypes/DataTypesNumber.h>
+ #include <Interpreters/ProfileEventsExt.h>
+-#include <Interpreters/QueryLog.h>
+-#include <Poco/Net/IPAddress.h>
+ #include <Common/ClickHouseRevision.h>
+ #include <Common/IPv6ToBinary.h>
+ #include <Common/ProfileEvents.h>
+ #include <Common/typeid_cast.h>
+ 
++#include <Poco/Net/IPAddress.h>
++
++#include <array>
++
+ 
+ namespace DB
+ {
+@@ -119,6 +123,8 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
+         {"used_storages", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+         {"used_table_functions", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+ 
++        {"used_row_policies", std::make_shared<DataTypeArray>(std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()))},
++
+         {"transaction_id", getTransactionIDDataType()},
+     };
+ 
+@@ -236,13 +242,14 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
+         auto & column_function_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
+         auto & column_storage_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
+         auto & column_table_function_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
++        auto & column_row_policies_names = typeid_cast<ColumnArray &>(*columns[i++]);
+ 
+-        auto fill_column = [](const std::unordered_set<String> & data, ColumnArray & column)
++        auto fill_column = [](const auto & data, ColumnArray & column)
+         {
+             size_t size = 0;
+-            for (const auto & name : data)
++            for (const auto & value : data)
+             {
+-                column.getData().insertData(name.data(), name.size());
++                column.getData().insert(value);
+                 ++size;
+             }
+             auto & offsets = column.getOffsets();
+@@ -258,6 +265,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
+         fill_column(used_functions, column_function_factory_objects);
+         fill_column(used_storages, column_storage_factory_objects);
+         fill_column(used_table_functions, column_table_function_factory_objects);
++        fill_column(used_row_policies, column_row_policies_names);
+     }
+ 
+     columns[i++]->insert(Tuple{tid.start_csn, tid.local_tid, tid.host_id});
+diff --git a/src/Interpreters/QueryLog.h b/src/Interpreters/QueryLog.h
+index bb912ccc8174..75cda9719a38 100644
+--- a/src/Interpreters/QueryLog.h
++++ b/src/Interpreters/QueryLog.h
+@@ -7,6 +7,7 @@
+ #include <Interpreters/ClientInfo.h>
+ #include <Interpreters/TransactionVersionMetadata.h>
+ 
++
+ namespace ProfileEvents
+ {
+     class Counters;
+@@ -73,6 +74,7 @@ struct QueryLogElement
+     std::unordered_set<String> used_functions;
+     std::unordered_set<String> used_storages;
+     std::unordered_set<String> used_table_functions;
++    std::set<String> used_row_policies;
+ 
+     Int32 exception_code{}; // because ErrorCodes are int
+     String exception;

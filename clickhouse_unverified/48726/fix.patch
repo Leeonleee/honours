@@ -1,0 +1,225 @@
+diff --git a/src/Backups/BackupCoordinationRemote.cpp b/src/Backups/BackupCoordinationRemote.cpp
+index 9a2fdf5dd6bb..4cd06061e1ba 100644
+--- a/src/Backups/BackupCoordinationRemote.cpp
++++ b/src/Backups/BackupCoordinationRemote.cpp
+@@ -256,7 +256,10 @@ void BackupCoordinationRemote::removeAllNodes()
+ 
+ void BackupCoordinationRemote::setStage(const String & new_stage, const String & message)
+ {
+-    stage_sync->set(current_host, new_stage, message);
++    if (is_internal)
++        stage_sync->set(current_host, new_stage, message);
++    else
++        stage_sync->set(current_host, new_stage, /* message */ "", /* all_hosts */ true);
+ }
+ 
+ void BackupCoordinationRemote::setError(const Exception & exception)
+@@ -779,8 +782,8 @@ bool BackupCoordinationRemote::hasConcurrentBackups(const std::atomic<size_t> &)
+                 String status;
+                 if (zk->tryGet(root_zookeeper_path + "/" + existing_backup_path + "/stage", status))
+                 {
+-                    /// If status is not COMPLETED it could be because the backup failed, check if 'error' exists
+-                    if (status != Stage::COMPLETED && !zk->exists(root_zookeeper_path + "/" + existing_backup_path + "/error"))
++                    /// Check if some other backup is in progress
++                    if (status == Stage::SCHEDULED_TO_START)
+                     {
+                         LOG_WARNING(log, "Found a concurrent backup: {}, current backup: {}", existing_backup_uuid, toString(backup_uuid));
+                         result = true;
+diff --git a/src/Backups/BackupCoordinationStage.h b/src/Backups/BackupCoordinationStage.h
+index 40a4b262caaa..41cd66346a21 100644
+--- a/src/Backups/BackupCoordinationStage.h
++++ b/src/Backups/BackupCoordinationStage.h
+@@ -43,6 +43,10 @@ namespace BackupCoordinationStage
+ 
+     /// Coordination stage meaning that a host finished its work.
+     constexpr const char * COMPLETED = "completed";
++
++    /// Coordination stage meaning that backup/restore has failed due to an error
++    /// Check '/error' for the error message
++    constexpr const char * ERROR = "error";
+ }
+ 
+ }
+diff --git a/src/Backups/BackupCoordinationStageSync.cpp b/src/Backups/BackupCoordinationStageSync.cpp
+index effb00085c3d..3d8c283f0847 100644
+--- a/src/Backups/BackupCoordinationStageSync.cpp
++++ b/src/Backups/BackupCoordinationStageSync.cpp
+@@ -8,11 +8,13 @@
+ #include <IO/ReadHelpers.h>
+ #include <IO/WriteBufferFromString.h>
+ #include <IO/WriteHelpers.h>
+-
++#include <Backups/BackupCoordinationStage.h>
+ 
+ namespace DB
+ {
+ 
++namespace Stage = BackupCoordinationStage;
++
+ namespace ErrorCodes
+ {
+     extern const int FAILED_TO_SYNC_BACKUP_OR_RESTORE;
+@@ -42,7 +44,7 @@ void BackupCoordinationStageSync::createRootNodes()
+     });
+ }
+ 
+-void BackupCoordinationStageSync::set(const String & current_host, const String & new_stage, const String & message)
++void BackupCoordinationStageSync::set(const String & current_host, const String & new_stage, const String & message, const bool & all_hosts)
+ {
+     auto holder = with_retries.createRetriesControlHolder("set");
+     holder.retries_ctl.retryLoop(
+@@ -50,14 +52,23 @@ void BackupCoordinationStageSync::set(const String & current_host, const String
+     {
+         with_retries.renewZooKeeper(zookeeper);
+ 
+-        /// Make an ephemeral node so the initiator can track if the current host is still working.
+-        String alive_node_path = zookeeper_path + "/alive|" + current_host;
+-        auto code = zookeeper->tryCreate(alive_node_path, "", zkutil::CreateMode::Ephemeral);
+-        if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
+-            throw zkutil::KeeperException(code, alive_node_path);
+-
+-        zookeeper->createIfNotExists(zookeeper_path + "/started|" + current_host, "");
+-        zookeeper->createIfNotExists(zookeeper_path + "/current|" + current_host + "|" + new_stage, message);
++        if (all_hosts)
++        {
++            auto code = zookeeper->trySet(zookeeper_path, new_stage);
++            if (code != Coordination::Error::ZOK)
++                throw zkutil::KeeperException(code, zookeeper_path);
++        }
++        else
++        {
++            /// Make an ephemeral node so the initiator can track if the current host is still working.
++            String alive_node_path = zookeeper_path + "/alive|" + current_host;
++            auto code = zookeeper->tryCreate(alive_node_path, "", zkutil::CreateMode::Ephemeral);
++            if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
++                throw zkutil::KeeperException(code, alive_node_path);
++
++            zookeeper->createIfNotExists(zookeeper_path + "/started|" + current_host, "");
++            zookeeper->createIfNotExists(zookeeper_path + "/current|" + current_host + "|" + new_stage, message);
++        }
+     });
+ }
+ 
+@@ -73,6 +84,10 @@ void BackupCoordinationStageSync::setError(const String & current_host, const Ex
+         writeStringBinary(current_host, buf);
+         writeException(exception, buf, true);
+         zookeeper->createIfNotExists(zookeeper_path + "/error", buf.str());
++
++        auto code = zookeeper->trySet(zookeeper_path, Stage::ERROR);
++        if (code != Coordination::Error::ZOK)
++            throw zkutil::KeeperException(code, zookeeper_path);
+     });
+ }
+ 
+diff --git a/src/Backups/BackupCoordinationStageSync.h b/src/Backups/BackupCoordinationStageSync.h
+index 56081f8779cd..2efaec46b3a8 100644
+--- a/src/Backups/BackupCoordinationStageSync.h
++++ b/src/Backups/BackupCoordinationStageSync.h
+@@ -15,7 +15,7 @@ class BackupCoordinationStageSync
+         Poco::Logger * log_);
+ 
+     /// Sets the stage of the current host and signal other hosts if there were other hosts waiting for that.
+-    void set(const String & current_host, const String & new_stage, const String & message);
++    void set(const String & current_host, const String & new_stage, const String & message, const bool & all_hosts = false);
+     void setError(const String & current_host, const Exception & exception);
+ 
+     /// Sets the stage of the current host and waits until all hosts come to the same stage.
+diff --git a/src/Backups/BackupsWorker.cpp b/src/Backups/BackupsWorker.cpp
+index 4b17174a8de0..0a6482fb7deb 100644
+--- a/src/Backups/BackupsWorker.cpp
++++ b/src/Backups/BackupsWorker.cpp
+@@ -368,6 +368,7 @@ void BackupsWorker::doBackup(
+ 
+             /// Wait until all the hosts have written their backup entries.
+             backup_coordination->waitForStage(Stage::COMPLETED);
++            backup_coordination->setStage(Stage::COMPLETED,"");
+         }
+         else
+         {
+@@ -385,7 +386,7 @@ void BackupsWorker::doBackup(
+             writeBackupEntries(backup, std::move(backup_entries), backup_id, backup_coordination, backup_settings.internal);
+ 
+             /// We have written our backup entries, we need to tell other hosts (they could be waiting for it).
+-            backup_coordination->setStage(Stage::COMPLETED, "");
++            backup_coordination->setStage(Stage::COMPLETED,"");
+         }
+ 
+         size_t num_files = 0;
+@@ -654,12 +655,26 @@ void BackupsWorker::doRestore(
+         /// (If this isn't ON CLUSTER query RestorerFromBackup will check access rights later.)
+         ClusterPtr cluster;
+         bool on_cluster = !restore_query->cluster.empty();
++
+         if (on_cluster)
+         {
+             restore_query->cluster = context->getMacros()->expand(restore_query->cluster);
+             cluster = context->getCluster(restore_query->cluster);
+             restore_settings.cluster_host_ids = cluster->getHostIDs();
++        }
++
++        /// Make a restore coordination.
++        if (!restore_coordination)
++            restore_coordination = makeRestoreCoordination(context, restore_settings, /* remote= */ on_cluster);
++
++        if (!allow_concurrent_restores && restore_coordination->hasConcurrentRestores(std::ref(num_active_restores)))
++            throw Exception(
++                ErrorCodes::CONCURRENT_ACCESS_NOT_SUPPORTED,
++                "Concurrent restores not supported, turn on setting 'allow_concurrent_restores'");
++
+ 
++        if (on_cluster)
++        {
+             /// We cannot just use access checking provided by the function executeDDLQueryOnCluster(): it would be incorrect
+             /// because different replicas can contain different set of tables and so the required access rights can differ too.
+             /// So the right way is pass through the entire cluster and check access for each host.
+@@ -676,15 +691,6 @@ void BackupsWorker::doRestore(
+             }
+         }
+ 
+-        /// Make a restore coordination.
+-        if (!restore_coordination)
+-            restore_coordination = makeRestoreCoordination(context, restore_settings, /* remote= */ on_cluster);
+-
+-        if (!allow_concurrent_restores && restore_coordination->hasConcurrentRestores(std::ref(num_active_restores)))
+-            throw Exception(
+-                ErrorCodes::CONCURRENT_ACCESS_NOT_SUPPORTED,
+-                "Concurrent restores not supported, turn on setting 'allow_concurrent_restores'");
+-
+         /// Do RESTORE.
+         if (on_cluster)
+         {
+@@ -703,6 +709,7 @@ void BackupsWorker::doRestore(
+ 
+             /// Wait until all the hosts have written their backup entries.
+             restore_coordination->waitForStage(Stage::COMPLETED);
++            restore_coordination->setStage(Stage::COMPLETED,"");
+         }
+         else
+         {
+diff --git a/src/Backups/RestoreCoordinationRemote.cpp b/src/Backups/RestoreCoordinationRemote.cpp
+index 860443665cfa..f95969b52a16 100644
+--- a/src/Backups/RestoreCoordinationRemote.cpp
++++ b/src/Backups/RestoreCoordinationRemote.cpp
+@@ -93,7 +93,10 @@ void RestoreCoordinationRemote::createRootNodes()
+ 
+ void RestoreCoordinationRemote::setStage(const String & new_stage, const String & message)
+ {
+-    stage_sync->set(current_host, new_stage, message);
++    if (is_internal)
++        stage_sync->set(current_host, new_stage, message);
++    else
++        stage_sync->set(current_host, new_stage, /* message */ "", /* all_hosts */ true);
+ }
+ 
+ void RestoreCoordinationRemote::setError(const Exception & exception)
+@@ -283,8 +286,8 @@ bool RestoreCoordinationRemote::hasConcurrentRestores(const std::atomic<size_t>
+                     String status;
+                     if (zk->tryGet(root_zookeeper_path + "/" + existing_restore_path + "/stage", status))
+                     {
+-                        /// If status is not COMPLETED it could be because the restore failed, check if 'error' exists
+-                        if (status != Stage::COMPLETED && !zk->exists(root_zookeeper_path + "/" + existing_restore_path + "/error"))
++                        /// Check if some other restore is in progress
++                        if (status == Stage::SCHEDULED_TO_START)
+                         {
+                             LOG_WARNING(log, "Found a concurrent restore: {}, current restore: {}", existing_restore_uuid, toString(restore_uuid));
+                             result = true;

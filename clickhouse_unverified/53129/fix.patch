@@ -1,0 +1,231 @@
+diff --git a/docs/en/operations/settings/settings.md b/docs/en/operations/settings/settings.md
+index de3cc00e4c94..29434ef556f1 100644
+--- a/docs/en/operations/settings/settings.md
++++ b/docs/en/operations/settings/settings.md
+@@ -98,6 +98,18 @@ Default value: 0.
+ </profiles>
+ ```
+ 
++## mutations_execute_nondeterministic_on_initiator {#mutations_execute_nondeterministic_on_initiator}
++
++If true constant nondeterministic functions (e.g. function `now()`) are executed on initiator and replaced to literals in `UPDATE` and `DELETE` queries. It helps to keep data in sync on replicas while executing mutations with constant nondeterministic functions. Default value: `false`.
++
++## mutations_execute_subqueries_on_initiator {#mutations_execute_subqueries_on_initiator}
++
++If true scalar subqueries are executed on initiator and replaced to literals in `UPDATE` and `DELETE` queries. Default value: `false`.
++
++## mutations_max_literal_size_to_replace {#mutations_max_literal_size_to_replace}
++
++The maximum size of serialized literal in bytes to replace in `UPDATE` and `DELETE` queries. Takes effect only if at least one the two settings above is enabled. Default value: 16384 (16 KiB).
++
+ ## distributed_product_mode {#distributed-product-mode}
+ 
+ Changes the behaviour of [distributed subqueries](../../sql-reference/operators/in.md).
+@@ -4298,7 +4310,7 @@ Use this setting only for backward compatibility if your use cases depend on old
+ ## session_timezone {#session_timezone}
+ 
+ Sets the implicit time zone of the current session or query.
+-The implicit time zone is the time zone applied to values of type DateTime/DateTime64 which have no explicitly specified time zone. 
++The implicit time zone is the time zone applied to values of type DateTime/DateTime64 which have no explicitly specified time zone.
+ The setting takes precedence over the globally configured (server-level) implicit time zone.
+ A value of '' (empty string) means that the implicit time zone of the current session or query is equal to the [server time zone](../server-configuration-parameters/settings.md#server_configuration_parameters-timezone).
+ 
+@@ -4333,7 +4345,7 @@ SELECT toDateTime64(toDateTime64('1999-12-12 23:23:23.123', 3), 3, 'Europe/Zuric
+ ```
+ 
+ :::warning
+-Not all functions that parse DateTime/DateTime64 respect `session_timezone`. This can lead to subtle errors. 
++Not all functions that parse DateTime/DateTime64 respect `session_timezone`. This can lead to subtle errors.
+ See the following example and explanation.
+ :::
+ 
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 714ac17a15df..3996ed4e3740 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -591,6 +591,9 @@ class IColumn;
+     M(Bool, insert_null_as_default, true, "Insert DEFAULT values instead of NULL in INSERT SELECT (UNION ALL)", 0) \
+     M(Bool, describe_extend_object_types, false, "Deduce concrete type of columns of type Object in DESCRIBE query", 0) \
+     M(Bool, describe_include_subcolumns, false, "If true, subcolumns of all table columns will be included into result of DESCRIBE query", 0) \
++    M(Bool, mutations_execute_nondeterministic_on_initiator, false, "If true nondeterministic function are executed on initiator and replaced to literals in UPDATE and DELETE queries", 0) \
++    M(Bool, mutations_execute_subqueries_on_initiator, false, "If true scalar subqueries are executed on initiator and replaced to literals in UPDATE and DELETE queries", 0) \
++    M(UInt64, mutations_max_literal_size_to_replace, 16384, "The maximum size of serialized literal in bytes to replace in UPDATE and DELETE queries", 0) \
+     \
+     M(Bool, use_query_cache, false, "Enable the query cache", 0) \
+     M(Bool, enable_writes_to_query_cache, true, "Enable storing results of SELECT queries in the query cache", 0) \
+diff --git a/src/Interpreters/InterpreterAlterQuery.cpp b/src/Interpreters/InterpreterAlterQuery.cpp
+index e82415f1aca9..7d1f99482383 100644
+--- a/src/Interpreters/InterpreterAlterQuery.cpp
++++ b/src/Interpreters/InterpreterAlterQuery.cpp
+@@ -132,6 +132,21 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
+                 throw Exception(ErrorCodes::INCORRECT_QUERY, "Cannot MATERIALIZE TTL as there is no TTL set for table {}",
+                     table->getStorageID().getNameForLogs());
+ 
++            if (mut_command->type == MutationCommand::UPDATE || mut_command->type == MutationCommand::DELETE)
++            {
++                /// TODO: add a check for result query size.
++                auto rewritten_command_ast = replaceNonDeterministicToScalars(*command_ast, getContext());
++                if (rewritten_command_ast)
++                {
++                    auto * new_alter_command = rewritten_command_ast->as<ASTAlterCommand>();
++                    mut_command = MutationCommand::parse(new_alter_command);
++                    if (!mut_command)
++                        throw Exception(ErrorCodes::LOGICAL_ERROR,
++                            "Alter command '{}' is rewritten to invalid command '{}'",
++                            queryToString(*command_ast), queryToString(*rewritten_command_ast));
++                }
++            }
++
+             mutation_commands.emplace_back(std::move(*mut_command));
+         }
+         else
+diff --git a/src/Interpreters/MutationsNonDeterministicHelpers.cpp b/src/Interpreters/MutationsNonDeterministicHelpers.cpp
+index 46c203e15bc8..119759265efa 100644
+--- a/src/Interpreters/MutationsNonDeterministicHelpers.cpp
++++ b/src/Interpreters/MutationsNonDeterministicHelpers.cpp
+@@ -63,6 +63,71 @@ class FirstNonDeterministicFunctionMatcher
+ using FirstNonDeterministicFunctionFinder = InDepthNodeVisitor<FirstNonDeterministicFunctionMatcher, true>;
+ using FirstNonDeterministicFunctionData = FirstNonDeterministicFunctionMatcher::Data;
+ 
++/// Executes and replaces with literals
++/// non-deterministic functions in query.
++/// Similar to ExecuteScalarSubqueriesVisitor.
++class ExecuteNonDeterministicConstFunctionsMatcher
++{
++public:
++
++    struct Data
++    {
++        ContextPtr context;
++        std::optional<size_t> max_literal_size;
++    };
++
++    static bool needChildVisit(const ASTPtr & ast, const ASTPtr & /*child*/)
++    {
++        /// Do not visit subqueries because they are executed separately.
++        return !ast->as<ASTSelectQuery>();
++    }
++
++    static void visit(ASTPtr & ast, const Data & data)
++    {
++        if (auto * function = ast->as<ASTFunction>())
++            visit(*function, ast, data);
++    }
++
++    static void visit(ASTFunction & function, ASTPtr & ast, const Data & data)
++    {
++        if (!FunctionFactory::instance().has(function.name))
++            return;
++
++        /// It makes sense to execute functions which are deterministic
++        /// in scope of query because they are usually constant expressions.
++        auto builder = FunctionFactory::instance().get(function.name, data.context);
++        if (builder->isDeterministic() || !builder->isDeterministicInScopeOfQuery())
++            return;
++
++        Field field;
++        DataTypePtr type;
++
++        try
++        {
++            std::tie(field, type) = evaluateConstantExpression(ast, data.context);
++        }
++        catch (...)
++        {
++            /// An exception can be thrown if the expression is not constant.
++            /// It's ok in that context and we just do nothing in that case.
++            /// It's bad pattern but it's quite hard to implement it in another way.
++            return;
++        }
++
++        auto column = type->createColumn();
++        column->insert(field);
++
++        Block scalar{{std::move(column), type, "_constant"}};
++        if (worthConvertingScalarToLiteral(scalar, data.max_literal_size))
++        {
++            auto literal = std::make_unique<ASTLiteral>(std::move(field));
++            ast = addTypeConversionToAST(std::move(literal), type->getName());
++        }
++    }
++};
++
++using ExecuteNonDeterministicConstFunctionsVisitor = InDepthNodeVisitor<ExecuteNonDeterministicConstFunctionsMatcher, true>;
++
+ }
+ 
+ FirstNonDeterministicFunctionResult findFirstNonDeterministicFunction(const MutationCommand & command, ContextPtr context)
+@@ -97,4 +162,51 @@ FirstNonDeterministicFunctionResult findFirstNonDeterministicFunction(const Muta
+     return {};
+ }
+ 
++ASTPtr replaceNonDeterministicToScalars(const ASTAlterCommand & alter_command, ContextPtr context)
++{
++    const auto & settings = context->getSettingsRef();
++    if (!settings.mutations_execute_subqueries_on_initiator
++        && !settings.mutations_execute_nondeterministic_on_initiator)
++        return nullptr;
++
++    auto query = alter_command.clone();
++    auto & new_alter_command = *query->as<ASTAlterCommand>();
++
++    if (settings.mutations_execute_subqueries_on_initiator)
++    {
++        Scalars scalars;
++        Scalars local_scalars;
++
++        ExecuteScalarSubqueriesVisitor::Data data{
++            WithContext{context},
++            /*subquery_depth=*/ 0,
++            scalars,
++            local_scalars,
++            /*only_analyze=*/ false,
++            /*is_create_parameterized_view=*/ false,
++            /*replace_only_to_literals=*/ true,
++            settings.mutations_max_literal_size_to_replace};
++
++        ExecuteScalarSubqueriesVisitor visitor(data);
++        if (new_alter_command.update_assignments)
++            visitor.visit(new_alter_command.update_assignments);
++        if (new_alter_command.predicate)
++            visitor.visit(new_alter_command.predicate);
++    }
++
++    if (settings.mutations_execute_nondeterministic_on_initiator)
++    {
++        ExecuteNonDeterministicConstFunctionsVisitor::Data data{
++            context, settings.mutations_max_literal_size_to_replace};
++
++        ExecuteNonDeterministicConstFunctionsVisitor visitor(data);
++        if (new_alter_command.update_assignments)
++            visitor.visit(new_alter_command.update_assignments);
++        if (new_alter_command.predicate)
++            visitor.visit(new_alter_command.predicate);
++    }
++
++    return query;
++}
++
+ }
+diff --git a/src/Interpreters/MutationsNonDeterministicHelpers.h b/src/Interpreters/MutationsNonDeterministicHelpers.h
+index eb3a3b1c7a45..5d9aa9752f16 100644
+--- a/src/Interpreters/MutationsNonDeterministicHelpers.h
++++ b/src/Interpreters/MutationsNonDeterministicHelpers.h
+@@ -7,6 +7,7 @@ namespace DB
+ {
+ 
+ struct MutationCommand;
++class ASTAlterCommand;
+ 
+ struct FirstNonDeterministicFunctionResult
+ {
+@@ -18,4 +19,9 @@ struct FirstNonDeterministicFunctionResult
+ /// may also be non-deterministic in expressions of mutation command.
+ FirstNonDeterministicFunctionResult findFirstNonDeterministicFunction(const MutationCommand & command, ContextPtr context);
+ 
++/// Executes non-deterministic functions and subqueries in expressions of mutation
++/// command and replaces them to the literals with a result of expressions.
++/// Returns rewritten query if expressions were replaced, nullptr otherwise.
++ASTPtr replaceNonDeterministicToScalars(const ASTAlterCommand & alter_command, ContextPtr context);
++
+ }

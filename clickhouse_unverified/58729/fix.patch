@@ -1,0 +1,563 @@
+diff --git a/src/DataTypes/DataTypeTuple.cpp b/src/DataTypes/DataTypeTuple.cpp
+index db8a14c537a8..9cce59b0dca4 100644
+--- a/src/DataTypes/DataTypeTuple.cpp
++++ b/src/DataTypes/DataTypeTuple.cpp
+@@ -320,7 +320,7 @@ SerializationPtr DataTypeTuple::doGetDefaultSerialization() const
+     {
+         String elem_name = have_explicit_names ? names[i] : toString(i + 1);
+         auto serialization = elems[i]->getDefaultSerialization();
+-        serializations[i] = std::make_shared<SerializationNamed>(serialization, elem_name);
++        serializations[i] = std::make_shared<SerializationNamed>(serialization, elem_name, SubstreamType::TupleElement);
+     }
+ 
+     return std::make_shared<SerializationTuple>(std::move(serializations), have_explicit_names);
+@@ -335,7 +335,7 @@ SerializationPtr DataTypeTuple::getSerialization(const SerializationInfo & info)
+     {
+         String elem_name = have_explicit_names ? names[i] : toString(i + 1);
+         auto serialization = elems[i]->getSerialization(*info_tuple.getElementInfo(i));
+-        serializations[i] = std::make_shared<SerializationNamed>(serialization, elem_name);
++        serializations[i] = std::make_shared<SerializationNamed>(serialization, elem_name, SubstreamType::TupleElement);
+     }
+ 
+     return std::make_shared<SerializationTuple>(std::move(serializations), have_explicit_names);
+diff --git a/src/DataTypes/NestedUtils.cpp b/src/DataTypes/NestedUtils.cpp
+index a7cc1b21389c..6a56f8855037 100644
+--- a/src/DataTypes/NestedUtils.cpp
++++ b/src/DataTypes/NestedUtils.cpp
+@@ -16,6 +16,7 @@
+ #include <Columns/ColumnConst.h>
+ 
+ #include <Parsers/IAST.h>
++#include <Storages/ColumnsDescription.h>
+ 
+ #include <boost/algorithm/string/case_conv.hpp>
+ 
+@@ -294,6 +295,12 @@ Names getAllNestedColumnsForTable(const Block & block, const std::string & table
+     return names;
+ }
+ 
++bool isSubcolumnOfNested(const String & column_name, const ColumnsDescription & columns)
++{
++    auto nested_subcolumn = columns.tryGetColumnOrSubcolumn(GetColumnsOptions::AllPhysical, column_name);
++    return nested_subcolumn && isNested(nested_subcolumn->getTypeInStorage()) && nested_subcolumn->isSubcolumn() && isArray(nested_subcolumn->type);
++}
++
+ }
+ 
+ NestedColumnExtractHelper::NestedColumnExtractHelper(const Block & block_, bool case_insentive_)
+diff --git a/src/DataTypes/NestedUtils.h b/src/DataTypes/NestedUtils.h
+index 85c29d2c08fb..a0f630acc55f 100644
+--- a/src/DataTypes/NestedUtils.h
++++ b/src/DataTypes/NestedUtils.h
+@@ -7,6 +7,8 @@
+ namespace DB
+ {
+ 
++class ColumnsDescription;
++
+ namespace Nested
+ {
+     std::string concatenateName(const std::string & nested_table_name, const std::string & nested_field_name);
+@@ -40,6 +42,9 @@ namespace Nested
+ 
+     /// Extract all column names that are nested for specifying table.
+     Names getAllNestedColumnsForTable(const Block & block, const std::string & table_name);
++
++    /// Returns true if @column_name is a subcolumn (of Array type) of any Nested column in @columns.
++    bool isSubcolumnOfNested(const String & column_name, const ColumnsDescription & columns);
+ }
+ 
+ /// Use this class to extract element columns from columns of nested type in a block, e.g. named Tuple.
+diff --git a/src/DataTypes/Serializations/ISerialization.cpp b/src/DataTypes/Serializations/ISerialization.cpp
+index e70dc6a2380a..80d498de38ae 100644
+--- a/src/DataTypes/Serializations/ISerialization.cpp
++++ b/src/DataTypes/Serializations/ISerialization.cpp
+@@ -49,11 +49,17 @@ ISerialization::Kind ISerialization::stringToKind(const String & str)
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown serialization kind '{}'", str);
+ }
+ 
++const std::set<SubstreamType> ISerialization::Substream::named_types
++{
++    TupleElement,
++    NamedOffsets,
++    NamedNullMap,
++};
++
+ String ISerialization::Substream::toString() const
+ {
+-    if (type == TupleElement)
+-        return fmt::format("TupleElement({}, escape_tuple_delimiter = {})",
+-            tuple_element_name, escape_tuple_delimiter ? "true" : "false");
++    if (named_types.contains(type))
++        return fmt::format("{}({})", type, name_of_substream);
+ 
+     return String(magic_enum::enum_name(type));
+ }
+@@ -110,8 +116,10 @@ void ISerialization::serializeBinaryBulkWithMultipleStreams(
+     SerializeBinaryBulkSettings & settings,
+     SerializeBinaryBulkStatePtr & /* state */) const
+ {
++    settings.path.push_back(Substream::Regular);
+     if (WriteBuffer * stream = settings.getter(settings.path))
+         serializeBinaryBulk(column, *stream, offset, limit);
++    settings.path.pop_back();
+ }
+ 
+ void ISerialization::deserializeBinaryBulkWithMultipleStreams(
+@@ -121,6 +129,8 @@ void ISerialization::deserializeBinaryBulkWithMultipleStreams(
+     DeserializeBinaryBulkStatePtr & /* state */,
+     SubstreamsCache * cache) const
+ {
++    settings.path.push_back(Substream::Regular);
++
+     auto cached_column = getFromSubstreamsCache(cache, settings.path);
+     if (cached_column)
+     {
+@@ -133,6 +143,8 @@ void ISerialization::deserializeBinaryBulkWithMultipleStreams(
+         column = std::move(mutable_column);
+         addToSubstreamsCache(cache, settings.path, column);
+     }
++
++    settings.path.pop_back();
+ }
+ 
+ namespace
+@@ -161,16 +173,18 @@ String getNameForSubstreamPath(
+             stream_name += ".dict";
+         else if (it->type == Substream::SparseOffsets)
+             stream_name += ".sparse.idx";
+-        else if (it->type == Substream::TupleElement)
++        else if (Substream::named_types.contains(it->type))
+         {
++            auto substream_name = "." + it->name_of_substream;
++
+             /// For compatibility reasons, we use %2E (escaped dot) instead of dot.
+             /// Because nested data may be represented not by Array of Tuple,
+-            ///  but by separate Array columns with names in a form of a.b,
+-            ///  and name is encoded as a whole.
+-            if (escape_tuple_delimiter && it->escape_tuple_delimiter)
+-                stream_name += escapeForFileName("." + it->tuple_element_name);
++            /// but by separate Array columns with names in a form of a.b,
++            /// and name is encoded as a whole.
++            if (it->type == Substream::TupleElement && escape_tuple_delimiter)
++                stream_name += escapeForFileName(substream_name);
+             else
+-                stream_name += "." + it->tuple_element_name;
++                stream_name += substream_name;
+         }
+     }
+ 
+@@ -184,23 +198,31 @@ String ISerialization::getFileNameForStream(const NameAndTypePair & column, cons
+     return getFileNameForStream(column.getNameInStorage(), path);
+ }
+ 
+-bool isOffsetsOfNested(const ISerialization::SubstreamPath & path)
++static bool isPossibleOffsetsOfNested(const ISerialization::SubstreamPath & path)
+ {
+-    if (path.empty())
+-        return false;
+-
+-    for (const auto & elem : path)
+-        if (elem.type == ISerialization::Substream::ArrayElements)
+-            return false;
+-
+-    return path.back().type == ISerialization::Substream::ArraySizes;
++    /// Arrays of Nested cannot be inside other types.
++    /// So it's ok to check only first element of path.
++
++    /// Array offsets as a part of serialization of Array type.
++    if (path.size() == 1
++        && path[0].type == ISerialization::Substream::ArraySizes)
++        return true;
++
++    /// Array offsets as a separate subcolumn.
++    if (path.size() == 2
++        && path[0].type == ISerialization::Substream::NamedOffsets
++        && path[1].type == ISerialization::Substream::Regular
++        && path[0].name_of_substream == "size0")
++        return true;
++
++    return false;
+ }
+ 
+ String ISerialization::getFileNameForStream(const String & name_in_storage, const SubstreamPath & path)
+ {
+     String stream_name;
+     auto nested_storage_name = Nested::extractTableName(name_in_storage);
+-    if (name_in_storage != nested_storage_name && isOffsetsOfNested(path))
++    if (name_in_storage != nested_storage_name && isPossibleOffsetsOfNested(path))
+         stream_name = escapeForFileName(nested_storage_name);
+     else
+         stream_name = escapeForFileName(name_in_storage);
+diff --git a/src/DataTypes/Serializations/ISerialization.h b/src/DataTypes/Serializations/ISerialization.h
+index 030c3c6d81ed..dcddd6a81613 100644
+--- a/src/DataTypes/Serializations/ISerialization.h
++++ b/src/DataTypes/Serializations/ISerialization.h
+@@ -9,7 +9,7 @@
+ #include <boost/noncopyable.hpp>
+ #include <unordered_map>
+ #include <memory>
+-#include <variant>
++#include <set>
+ 
+ namespace DB
+ {
+@@ -142,6 +142,8 @@ class ISerialization : private boost::noncopyable, public std::enable_shared_fro
+             NullMap,
+ 
+             TupleElement,
++            NamedOffsets,
++            NamedNullMap,
+ 
+             DictionaryKeys,
+             DictionaryIndexes,
+@@ -155,13 +157,13 @@ class ISerialization : private boost::noncopyable, public std::enable_shared_fro
+             Regular,
+         };
+ 
+-        Type type;
++        /// Types of substreams that can have arbitrary name.
++        static const std::set<Type> named_types;
+ 
+-        /// Index of tuple element, starting at 1 or name.
+-        String tuple_element_name;
++        Type type;
+ 
+-        /// Do we need to escape a dot in filenames for tuple elements.
+-        bool escape_tuple_delimiter = true;
++        /// Name of substream for type from 'named_types'.
++        String name_of_substream;
+ 
+         /// Data for current substream.
+         SubstreamData data;
+@@ -173,7 +175,6 @@ class ISerialization : private boost::noncopyable, public std::enable_shared_fro
+         mutable bool visited = false;
+ 
+         Substream(Type type_) : type(type_) {} /// NOLINT
+-
+         String toString() const;
+     };
+ 
+@@ -393,6 +394,7 @@ class ISerialization : private boost::noncopyable, public std::enable_shared_fro
+ using SerializationPtr = std::shared_ptr<const ISerialization>;
+ using Serializations = std::vector<SerializationPtr>;
+ using SerializationByName = std::unordered_map<String, SerializationPtr>;
++using SubstreamType = ISerialization::Substream::Type;
+ 
+ template <typename State, typename StatePtr>
+ State * ISerialization::checkAndGetState(const StatePtr & state) const
+@@ -415,6 +417,4 @@ State * ISerialization::checkAndGetState(const StatePtr & state) const
+     return state_concrete;
+ }
+ 
+-bool isOffsetsOfNested(const ISerialization::SubstreamPath & path);
+-
+ }
+diff --git a/src/DataTypes/Serializations/SerializationArray.cpp b/src/DataTypes/Serializations/SerializationArray.cpp
+index 0d99b741a232..6b597f2e699d 100644
+--- a/src/DataTypes/Serializations/SerializationArray.cpp
++++ b/src/DataTypes/Serializations/SerializationArray.cpp
+@@ -230,10 +230,10 @@ void SerializationArray::enumerateStreams(
+     const auto * column_array = data.column ? &assert_cast<const ColumnArray &>(*data.column) : nullptr;
+     auto offsets = column_array ? column_array->getOffsetsPtr() : nullptr;
+ 
+-    auto offsets_serialization =
+-        std::make_shared<SerializationNamed>(
+-            std::make_shared<SerializationNumber<UInt64>>(),
+-                "size" + std::to_string(getArrayLevel(settings.path)), false);
++    auto subcolumn_name = "size" + std::to_string(getArrayLevel(settings.path));
++    auto offsets_serialization = std::make_shared<SerializationNamed>(
++        std::make_shared<SerializationNumber<UInt64>>(),
++        subcolumn_name, SubstreamType::NamedOffsets);
+ 
+     auto offsets_column = offsets && !settings.position_independent_encoding
+         ? arrayOffsetsToSizes(*offsets)
+diff --git a/src/DataTypes/Serializations/SerializationNamed.cpp b/src/DataTypes/Serializations/SerializationNamed.cpp
+index ca60948ce687..2792827e690e 100644
+--- a/src/DataTypes/Serializations/SerializationNamed.cpp
++++ b/src/DataTypes/Serializations/SerializationNamed.cpp
+@@ -3,6 +3,23 @@
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++
++SerializationNamed::SerializationNamed(
++    const SerializationPtr & nested_,
++    const String & name_,
++    SubstreamType substream_type_)
++    : SerializationWrapper(nested_)
++    , name(name_)
++    , substream_type(substream_type_)
++{
++    if (!ISerialization::Substream::named_types.contains(substream_type))
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "SerializationNamed doesn't support substream type {}", substream_type);
++}
++
+ void SerializationNamed::enumerateStreams(
+     EnumerateStreamsSettings & settings,
+     const StreamCallback & callback,
+@@ -10,7 +27,7 @@ void SerializationNamed::enumerateStreams(
+ {
+     addToPath(settings.path);
+     settings.path.back().data = data;
+-    settings.path.back().creator = std::make_shared<SubcolumnCreator>(name, escape_delimiter);
++    settings.path.back().creator = std::make_shared<SubcolumnCreator>(name, substream_type);
+ 
+     nested_serialization->enumerateStreams(settings, callback, data);
+     settings.path.pop_back();
+@@ -70,9 +87,8 @@ void SerializationNamed::deserializeBinaryBulkWithMultipleStreams(
+ 
+ void SerializationNamed::addToPath(SubstreamPath & path) const
+ {
+-    path.push_back(Substream::TupleElement);
+-    path.back().tuple_element_name = name;
+-    path.back().escape_tuple_delimiter = escape_delimiter;
++    path.push_back(substream_type);
++    path.back().name_of_substream = name;
+ }
+ 
+ }
+diff --git a/src/DataTypes/Serializations/SerializationNamed.h b/src/DataTypes/Serializations/SerializationNamed.h
+index 52bbb0394421..0633ba2ea6f5 100644
+--- a/src/DataTypes/Serializations/SerializationNamed.h
++++ b/src/DataTypes/Serializations/SerializationNamed.h
+@@ -1,5 +1,4 @@
+ #pragma once
+-
+ #include <DataTypes/Serializations/SerializationWrapper.h>
+ 
+ namespace DB
+@@ -14,14 +13,10 @@ class SerializationNamed final : public SerializationWrapper
+ {
+ private:
+     String name;
+-    bool escape_delimiter;
++    SubstreamType substream_type;
+ 
+ public:
+-    SerializationNamed(const SerializationPtr & nested_, const String & name_, bool escape_delimiter_ = true)
+-        : SerializationWrapper(nested_)
+-        , name(name_), escape_delimiter(escape_delimiter_)
+-    {
+-    }
++    SerializationNamed(const SerializationPtr & nested_, const String & name_, SubstreamType substream_type_);
+ 
+     const String & getElementName() const { return name; }
+ 
+@@ -61,16 +56,18 @@ class SerializationNamed final : public SerializationWrapper
+     struct SubcolumnCreator : public ISubcolumnCreator
+     {
+         const String name;
+-        const bool escape_delimiter;
++        SubstreamType substream_type;
+ 
+-        SubcolumnCreator(const String & name_, bool escape_delimiter_)
+-            : name(name_), escape_delimiter(escape_delimiter_) {}
++        SubcolumnCreator(const String & name_, SubstreamType substream_type_)
++            : name(name_), substream_type(substream_type_)
++        {
++        }
+ 
+         DataTypePtr create(const DataTypePtr & prev) const override { return prev; }
+         ColumnPtr create(const ColumnPtr & prev) const override { return prev; }
+         SerializationPtr create(const SerializationPtr & prev) const override
+         {
+-            return std::make_shared<SerializationNamed>(prev, name, escape_delimiter);
++            return std::make_shared<SerializationNamed>(prev, name, substream_type);
+         }
+     };
+ 
+diff --git a/src/DataTypes/Serializations/SerializationNullable.cpp b/src/DataTypes/Serializations/SerializationNullable.cpp
+index d9efc6fff107..4b0ad0b54ba0 100644
+--- a/src/DataTypes/Serializations/SerializationNullable.cpp
++++ b/src/DataTypes/Serializations/SerializationNullable.cpp
+@@ -45,7 +45,9 @@ void SerializationNullable::enumerateStreams(
+     const auto * type_nullable = data.type ? &assert_cast<const DataTypeNullable &>(*data.type) : nullptr;
+     const auto * column_nullable = data.column ? &assert_cast<const ColumnNullable &>(*data.column) : nullptr;
+ 
+-    auto null_map_serialization = std::make_shared<SerializationNamed>(std::make_shared<SerializationNumber<UInt8>>(), "null", false);
++    auto null_map_serialization = std::make_shared<SerializationNamed>(
++        std::make_shared<SerializationNumber<UInt8>>(),
++        "null", SubstreamType::NamedNullMap);
+ 
+     settings.path.push_back(Substream::NullMap);
+     auto null_map_data = SubstreamData(null_map_serialization)
+diff --git a/src/Storages/MergeTree/IMergeTreeReader.cpp b/src/Storages/MergeTree/IMergeTreeReader.cpp
+index 120edd81e302..63ed8021f58b 100644
+--- a/src/Storages/MergeTree/IMergeTreeReader.cpp
++++ b/src/Storages/MergeTree/IMergeTreeReader.cpp
+@@ -1,6 +1,7 @@
+ #include <Storages/MergeTree/IMergeTreeReader.h>
+ #include <DataTypes/NestedUtils.h>
+ #include <DataTypes/DataTypeArray.h>
++#include <DataTypes/DataTypeNested.h>
+ #include <Common/escapeForFileName.h>
+ #include <Compression/CachedCompressedReadBuffer.h>
+ #include <Columns/ColumnArray.h>
+@@ -140,16 +141,29 @@ void IMergeTreeReader::evaluateMissingDefaults(Block additional_columns, Columns
+     }
+ }
+ 
++bool IMergeTreeReader::isSubcolumnOffsetsOfNested(const String & name_in_storage, const String & subcolumn_name) const
++{
++    /// We cannot read separate subcolumn with offsets from compact parts.
++    if (!data_part_info_for_read->isWidePart() || subcolumn_name != "size0")
++        return false;
++
++    return Nested::isSubcolumnOfNested(name_in_storage, part_columns);
++}
++
+ String IMergeTreeReader::getColumnNameInPart(const NameAndTypePair & required_column) const
+ {
+     auto name_in_storage = required_column.getNameInStorage();
++    auto subcolumn_name = required_column.getSubcolumnName();
++
+     if (alter_conversions->isColumnRenamed(name_in_storage))
+-    {
+         name_in_storage = alter_conversions->getColumnOldName(name_in_storage);
+-        return Nested::concatenateName(name_in_storage, required_column.getSubcolumnName());
+-    }
+ 
+-    return required_column.name;
++    /// A special case when we read subcolumn of shared offsets of Nested.
++    /// E.g. instead of requested column "n.arr1.size0" we must read column "n.size0" from disk.
++    if (isSubcolumnOffsetsOfNested(name_in_storage, subcolumn_name))
++        name_in_storage = Nested::splitName(name_in_storage).first;
++
++    return Nested::concatenateName(name_in_storage, subcolumn_name);
+ }
+ 
+ NameAndTypePair IMergeTreeReader::getColumnInPart(const NameAndTypePair & required_column) const
+diff --git a/src/Storages/MergeTree/IMergeTreeReader.h b/src/Storages/MergeTree/IMergeTreeReader.h
+index f3ea0c6c361b..997be064f280 100644
+--- a/src/Storages/MergeTree/IMergeTreeReader.h
++++ b/src/Storages/MergeTree/IMergeTreeReader.h
+@@ -65,14 +65,14 @@ class IMergeTreeReader : private boost::noncopyable
+ protected:
+     /// Returns actual column name in part, which can differ from table metadata.
+     String getColumnNameInPart(const NameAndTypePair & required_column) const;
+-
+     /// Returns actual column name and type in part, which can differ from table metadata.
+     NameAndTypePair getColumnInPart(const NameAndTypePair & required_column) const;
+     /// Returns actual serialization in part, which can differ from table metadata.
+     SerializationPtr getSerializationInPart(const NameAndTypePair & required_column) const;
++    /// Returns true if requested column is a subcolumn with offsets of Array which is part of Nested column.
++    bool isSubcolumnOffsetsOfNested(const String & name_in_storage, const String & subcolumn_name) const;
+ 
+     void checkNumberOfColumns(size_t num_columns_to_read) const;
+-
+     String getMessageForDiagnosticOfBrokenPart(size_t from_mark, size_t max_rows_to_read) const;
+ 
+     /// avg_value_size_hints are used to reduce the number of reallocations when creating columns of variable size.
+diff --git a/src/Storages/StorageLog.cpp b/src/Storages/StorageLog.cpp
+index fda628079c05..c7b0a9d06448 100644
+--- a/src/Storages/StorageLog.cpp
++++ b/src/Storages/StorageLog.cpp
+@@ -104,6 +104,8 @@ class LogSource final : public ISource
+     Chunk generate() override;
+ 
+ private:
++    NameAndTypePair getColumnOnDisk(const NameAndTypePair & column) const;
++
+     const size_t block_size;
+     const NamesAndTypesList columns;
+     const StorageLog & storage;
+@@ -149,6 +151,22 @@ class LogSource final : public ISource
+     bool isFinished();
+ };
+ 
++NameAndTypePair LogSource::getColumnOnDisk(const NameAndTypePair & column) const
++{
++    const auto & storage_columns = storage.columns_with_collected_nested;
++
++    /// A special case when we read subcolumn of shared offsets of Nested.
++    /// E.g. instead of requested column "n.arr1.size0" we must read column "n.size0" from disk.
++    auto name_in_storage = column.getNameInStorage();
++    if (column.getSubcolumnName() == "size0" && Nested::isSubcolumnOfNested(name_in_storage, storage_columns))
++    {
++        auto nested_name_in_storage = Nested::splitName(name_in_storage).first;
++        auto new_name = Nested::concatenateName(nested_name_in_storage, column.getSubcolumnName());
++        return storage_columns.getColumnOrSubcolumn(GetColumnsOptions::All, new_name);
++    }
++
++    return column;
++}
+ 
+ Chunk LogSource::generate()
+ {
+@@ -169,19 +187,21 @@ Chunk LogSource::generate()
+     for (const auto & name_type : columns)
+     {
+         ColumnPtr column;
++        auto name_type_on_disk = getColumnOnDisk(name_type);
++
+         try
+         {
+-            column = name_type.type->createColumn();
+-            readData(name_type, column, max_rows_to_read, caches[name_type.getNameInStorage()]);
++            column = name_type_on_disk.type->createColumn();
++            readData(name_type_on_disk, column, max_rows_to_read, caches[name_type_on_disk.getNameInStorage()]);
+         }
+         catch (Exception & e)
+         {
+-            e.addMessage("while reading column " + name_type.name + " at " + fullPath(storage.disk, storage.table_path));
++            e.addMessage("while reading column " + name_type_on_disk.name + " at " + fullPath(storage.disk, storage.table_path));
+             throw;
+         }
+ 
+         if (!column->empty())
+-            res.insert(ColumnWithTypeAndName(column, name_type.type, name_type.name));
++            res.insert(ColumnWithTypeAndName(column, name_type_on_disk.type, name_type_on_disk.name));
+     }
+ 
+     if (res)
+@@ -600,6 +620,7 @@ StorageLog::StorageLog(
+         }
+     }
+ 
++    columns_with_collected_nested = ColumnsDescription{Nested::collect(columns_.getAll())};
+     total_bytes = file_checker.getTotalSize();
+ }
+ 
+@@ -820,10 +841,6 @@ Pipe StorageLog::read(
+     if (num_streams > max_streams)
+         num_streams = max_streams;
+ 
+-    auto options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
+-    auto all_columns = storage_snapshot->getColumnsByNames(options, column_names);
+-    all_columns = Nested::convertToSubcolumns(all_columns);
+-
+     std::vector<size_t> offsets;
+     offsets.resize(num_data_files, 0);
+ 
+@@ -840,6 +857,12 @@ Pipe StorageLog::read(
+     ReadSettings read_settings = local_context->getReadSettings();
+     Pipes pipes;
+ 
++    /// Converting to subcolumns of Nested is needed for
++    /// correct reading of parts of Nested with shared offsets.
++    auto options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
++    auto all_columns = storage_snapshot->getColumnsByNames(options, column_names);
++    all_columns = Nested::convertToSubcolumns(all_columns);
++
+     for (size_t stream = 0; stream < num_streams; ++stream)
+     {
+         if (use_marks_file)
+diff --git a/src/Storages/StorageLog.h b/src/Storages/StorageLog.h
+index 5c699b0bb459..d5daed21b3c6 100644
+--- a/src/Storages/StorageLog.h
++++ b/src/Storages/StorageLog.h
+@@ -133,6 +133,9 @@ class StorageLog final : public IStorage, public WithMutableContext
+     size_t num_data_files = 0;
+     std::map<String, DataFile *> data_files_by_names;
+ 
++    /// The same as metadata->columns but after call of Nested::collect().
++    ColumnsDescription columns_with_collected_nested;
++
+     /// The Log engine uses the marks file, and the TinyLog engine doesn't.
+     const bool use_marks_file;
+ 

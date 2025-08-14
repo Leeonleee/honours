@@ -1,0 +1,203 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 2b880fb3418b..024d3f36fb7c 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -129,6 +129,7 @@ class IColumn;
+     \
+     M(Bool, allow_suspicious_low_cardinality_types, false, "In CREATE TABLE statement allows specifying LowCardinality modifier for types of small fixed size (8 or less). Enabling this may increase merge times and memory consumption.", 0) \
+     M(Bool, allow_suspicious_fixed_string_types, false, "In CREATE TABLE statement allows creating columns of type FixedString(n) with n > 256. FixedString with length >= 256 is suspicious and most likely indicates misusage", 0) \
++    M(Bool, allow_suspicious_indices, false, "Reject primary/secondary indexes and sorting keys with identical expressions", 0) \
+     M(Bool, compile_expressions, true, "Compile some scalar functions and operators to native code.", 0) \
+     M(UInt64, min_count_to_compile_expression, 3, "The number of identical expressions before they are JIT-compiled", 0) \
+     M(Bool, compile_aggregate_expressions, false, "Compile aggregate functions to native code. This feature has a bug and should not be used.", 0) \
+diff --git a/src/Core/SettingsChangesHistory.h b/src/Core/SettingsChangesHistory.h
+index eced3da2d59d..266d14f645b1 100644
+--- a/src/Core/SettingsChangesHistory.h
++++ b/src/Core/SettingsChangesHistory.h
+@@ -80,6 +80,7 @@ namespace SettingsChangesHistory
+ /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
+ static std::map<ClickHouseVersion, SettingsChangesHistory::SettingsChanges> settings_changes_history =
+ {
++    {"23.4", {{"allow_suspicious_indices", true, false, "If true, index can defined with identical expressions"}}},
+     {"23.4", {{"connect_timeout_with_failover_ms", 50, 1000, "Increase default connect timeout because of async connect"},
+               {"connect_timeout_with_failover_secure_ms", 100, 1000, "Increase default secure connect timeout because of async connect"},
+               {"hedged_connection_timeout_ms", 100, 50, "Start new connection in hedged requests after 50 ms instead of 100 to correspond with previous connect timeout"}}},
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index f5f126602237..afde1cd2fcad 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -42,9 +42,13 @@
+ #include <Interpreters/PartLog.h>
+ #include <Interpreters/TransactionLog.h>
+ #include <Interpreters/TreeRewriter.h>
++#include <Interpreters/Context_fwd.h>
+ #include <IO/S3Common.h>
++#include <IO/WriteHelpers.h>
+ #include <IO/Operators.h>
+ #include <IO/WriteBufferFromString.h>
++#include <Parsers/ASTExpressionList.h>
++#include <Parsers/ASTIndexDeclaration.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/ASTNameTypePair.h>
+@@ -54,6 +58,7 @@
+ #include <Parsers/ExpressionListParsers.h>
+ #include <Parsers/parseQuery.h>
+ #include <Parsers/queryToString.h>
++#include <Parsers/ASTAlterQuery.h>
+ #include <Processors/Formats/IInputFormat.h>
+ #include <Processors/QueryPlan/QueryIdHolder.h>
+ #include <Processors/QueryPlan/ReadFromMergeTree.h>
+@@ -76,6 +81,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <chrono>
+ #include <iomanip>
+ #include <limits>
+@@ -173,6 +179,19 @@ namespace ErrorCodes
+     extern const int SOCKET_TIMEOUT;
+ }
+ 
++static void checkSuspiciousIndices(const ASTFunction * index_function)
++{
++    std::unordered_set<UInt64> unique_index_expression_hashes;
++    for (const auto & child : index_function->arguments->children)
++    {
++        IAST::Hash hash = child->getTreeHash();
++        UInt64 first_half_of_hash = hash.first;
++
++        if (!unique_index_expression_hashes.emplace(first_half_of_hash).second)
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                    "Primary key or secondary index contains a duplicate expression. To suppress this exception, rerun the command with setting 'allow_suspicious_indices = 1'");
++    }
++}
+ 
+ static void checkSampleExpression(const StorageInMemoryMetadata & metadata, bool allow_sampling_expression_not_in_primary_key, bool check_sample_column_is_correct)
+ {
+@@ -440,7 +459,10 @@ static void checkKeyExpression(const ExpressionActions & expr, const Block & sam
+ }
+ 
+ void MergeTreeData::checkProperties(
+-    const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach) const
++    const StorageInMemoryMetadata & new_metadata,
++    const StorageInMemoryMetadata & old_metadata,
++    bool attach,
++    ContextPtr local_context) const
+ {
+     if (!new_metadata.sorting_key.definition_ast)
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "ORDER BY cannot be empty");
+@@ -454,7 +476,13 @@ void MergeTreeData::checkProperties(
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Primary key must be a prefix of the sorting key, but its length: "
+             "{} is greater than the sorting key length: {}", primary_key_size, sorting_key_size);
+ 
+-    NameSet primary_key_columns_set;
++    bool allow_suspicious_indices = getSettings()->allow_suspicious_indices;
++    if (local_context)
++        allow_suspicious_indices = local_context->getSettingsRef().allow_suspicious_indices;
++
++    if (!allow_suspicious_indices && !attach)
++        if (const auto * index_function = typeid_cast<ASTFunction *>(new_sorting_key.definition_ast.get()))
++            checkSuspiciousIndices(index_function);
+ 
+     for (size_t i = 0; i < sorting_key_size; ++i)
+     {
+@@ -468,9 +496,6 @@ void MergeTreeData::checkProperties(
+                                 "Primary key must be a prefix of the sorting key, "
+                                 "but the column in the position {} is {}", i, sorting_key_column +", not " + pk_column);
+ 
+-            if (!primary_key_columns_set.emplace(pk_column).second)
+-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Primary key contains duplicate columns");
+-
+         }
+     }
+ 
+@@ -531,6 +556,13 @@ void MergeTreeData::checkProperties(
+ 
+         for (const auto & index : new_metadata.secondary_indices)
+         {
++            if (!allow_suspicious_indices && !attach)
++            {
++                const auto * index_ast = typeid_cast<const ASTIndexDeclaration *>(index.definition_ast.get());
++                if (const auto * index_function = typeid_cast<const ASTFunction *>(index_ast->expr))
++                    checkSuspiciousIndices(index_function);
++            }
++
+             MergeTreeIndexFactory::instance().validate(index, attach);
+ 
+             if (indices_names.find(index.name) != indices_names.end())
+@@ -556,9 +588,13 @@ void MergeTreeData::checkProperties(
+     checkKeyExpression(*new_sorting_key.expression, new_sorting_key.sample_block, "Sorting", allow_nullable_key);
+ }
+ 
+-void MergeTreeData::setProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach)
++void MergeTreeData::setProperties(
++    const StorageInMemoryMetadata & new_metadata,
++    const StorageInMemoryMetadata & old_metadata,
++    bool attach,
++    ContextPtr local_context)
+ {
+-    checkProperties(new_metadata, old_metadata, attach);
++    checkProperties(new_metadata, old_metadata, attach, local_context);
+     setInMemoryMetadata(new_metadata);
+ }
+ 
+@@ -990,7 +1026,6 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
+     return res;
+ }
+ 
+-
+ String MergeTreeData::MergingParams::getModeName() const
+ {
+     switch (mode)
+@@ -3151,7 +3186,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
+         }
+     }
+ 
+-    checkProperties(new_metadata, old_metadata);
++    checkProperties(new_metadata, old_metadata, false, local_context);
+     checkTTLExpressions(new_metadata, old_metadata);
+ 
+     if (!columns_to_check_conversion.empty())
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index b03b7d4a71ee..42cbd311b868 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -1218,9 +1218,9 @@ class MergeTreeData : public IStorage, public WithMutableContext
+     /// The same for clearOldTemporaryDirectories.
+     std::mutex clear_old_temporary_directories_mutex;
+ 
+-    void checkProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false) const;
++    void checkProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false, ContextPtr local_context = nullptr) const;
+ 
+-    void setProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false);
++    void setProperties(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, bool attach = false, ContextPtr local_context = nullptr);
+ 
+     void checkPartitionKeyAndInitMinMax(const KeyDescription & new_partition_key);
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeSettings.h b/src/Storages/MergeTree/MergeTreeSettings.h
+index ad55c9d47f3b..ba98fca2f508 100644
+--- a/src/Storages/MergeTree/MergeTreeSettings.h
++++ b/src/Storages/MergeTree/MergeTreeSettings.h
+@@ -130,6 +130,7 @@ struct Settings;
+     M(UInt64, vertical_merge_algorithm_min_columns_to_activate, 11, "Minimal amount of non-PK columns to activate Vertical merge algorithm.", 0) \
+     \
+     /** Compatibility settings */ \
++    M(Bool, allow_suspicious_indices, false, "Reject primary/secondary indexes and sorting keys with identical expressions", 0) \
+     M(Bool, compatibility_allow_sampling_expression_not_in_primary_key, false, "Allow to create a table with sampling expression not in primary key. This is needed only to temporarily allow to run the server with wrong tables for backward compatibility.", 0) \
+     M(Bool, use_minimalistic_checksums_in_zookeeper, true, "Use small format (dozens bytes) for part checksums in ZooKeeper instead of ordinary ones (dozens KB). Before enabling check that all replicas support new format.", 0) \
+     M(Bool, use_minimalistic_part_header_in_zookeeper, true, "Store part header (checksums and columns) in a compact format and a single part znode instead of separate znodes (<part>/columns and <part>/checksums). This can dramatically reduce snapshot size in ZooKeeper. Before enabling check that all replicas support new format.", 0) \
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 5513603bca69..61b096b66895 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -348,7 +348,7 @@ void StorageMergeTree::alter(
+             changeSettings(new_metadata.settings_changes, table_lock_holder);
+             checkTTLExpressions(new_metadata, old_metadata);
+             /// Reinitialize primary key because primary key column types might have changed.
+-            setProperties(new_metadata, old_metadata);
++            setProperties(new_metadata, old_metadata, false, local_context);
+ 
+             DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
+ 

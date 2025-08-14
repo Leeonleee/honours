@@ -1,0 +1,331 @@
+diff --git a/src/Interpreters/InterserverIOHandler.h b/src/Interpreters/InterserverIOHandler.h
+index 4651c8cb9786..952c99ae46d0 100644
+--- a/src/Interpreters/InterserverIOHandler.h
++++ b/src/Interpreters/InterserverIOHandler.h
+@@ -32,7 +32,7 @@ class InterserverIOEndpoint
+ public:
+     virtual std::string getId(const std::string & path) const = 0;
+     virtual void processQuery(const Poco::Net::HTMLForm & params, ReadBuffer & body, WriteBuffer & out, Poco::Net::HTTPServerResponse & response) = 0;
+-    virtual ~InterserverIOEndpoint() {}
++    virtual ~InterserverIOEndpoint() = default;
+ 
+     /// You need to stop the data transfer if blocker is activated.
+     ActionBlocker blocker;
+diff --git a/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp b/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+index fcebc74cce15..2ab43f8f56c7 100644
+--- a/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+@@ -224,16 +224,28 @@ bool MergeTreeDataMergerMutator::selectPartsToMerge(
+     IMergeSelector::Partitions partitions;
+ 
+     const String * prev_partition_id = nullptr;
++    /// Previous part only in boundaries of partition frame
+     const MergeTreeData::DataPartPtr * prev_part = nullptr;
+     bool has_part_with_expired_ttl = false;
+     for (const MergeTreeData::DataPartPtr & part : data_parts)
+     {
++        /// Check predicate only for first part in each partition.
++        if (!prev_part)
++            /* Parts can be merged with themselves for TTL needs for example.
++            * So we have to check if this part is currently being inserted with quorum and so on and so forth.
++            * Obviously we have to check it manually only for the first part
++            * of each partition because it will be automatically checked for a pair of parts. */
++            if (!can_merge_callback(nullptr, part, nullptr))
++                continue;
++
+         const String & partition_id = part->info.partition_id;
+         if (!prev_partition_id || partition_id != *prev_partition_id || (prev_part && !can_merge_callback(*prev_part, part, nullptr)))
+         {
+             if (partitions.empty() || !partitions.back().empty())
+                 partitions.emplace_back();
++            /// New partition frame.
+             prev_partition_id = &partition_id;
++            prev_part = nullptr;
+         }
+ 
+         IMergeSelector::Part part_info;
+diff --git a/src/Storages/MergeTree/MergeTreeDataMergerMutator.h b/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
+index 6f4f8a03e9aa..f2f4ea95fd08 100644
+--- a/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
++++ b/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
+@@ -49,9 +49,8 @@ struct FutureMergedMutatedPart
+ class MergeTreeDataMergerMutator
+ {
+ public:
+-    using AllowedMergingPredicate = std::function<bool (const MergeTreeData::DataPartPtr &, const MergeTreeData::DataPartPtr &, String * reason)>;
++    using AllowedMergingPredicate = std::function<bool (const MergeTreeData::DataPartPtr &, const MergeTreeData::DataPartPtr &, String *)>;
+ 
+-public:
+     MergeTreeDataMergerMutator(MergeTreeData & data_, size_t background_pool_size);
+ 
+     /** Get maximum total size of parts to do merge, at current moment of time.
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 72044ab832cb..534118274aec 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1648,8 +1648,21 @@ ReplicatedMergeTreeMergePredicate::ReplicatedMergeTreeMergePredicate(
+ }
+ 
+ bool ReplicatedMergeTreeMergePredicate::operator()(
+-        const MergeTreeData::DataPartPtr & left, const MergeTreeData::DataPartPtr & right,
+-        String * out_reason) const
++    const MergeTreeData::DataPartPtr & left,
++    const MergeTreeData::DataPartPtr & right,
++    String * out_reason) const
++{
++    if (left)
++        return canMergeTwoParts(left, right, out_reason);
++    else
++        return canMergeSinglePart(right, out_reason);
++}
++
++
++bool ReplicatedMergeTreeMergePredicate::canMergeTwoParts(
++    const MergeTreeData::DataPartPtr & left,
++    const MergeTreeData::DataPartPtr & right,
++    String * out_reason) const
+ {
+     /// A sketch of a proof of why this method actually works:
+     ///
+@@ -1784,6 +1797,39 @@ bool ReplicatedMergeTreeMergePredicate::operator()(
+     return true;
+ }
+ 
++bool ReplicatedMergeTreeMergePredicate::canMergeSinglePart(
++    const MergeTreeData::DataPartPtr & part,
++    String * out_reason) const
++{
++    if (part->name == inprogress_quorum_part)
++    {
++        if (out_reason)
++            *out_reason = "Quorum insert for part " + part->name + " is currently in progress";
++        return false;
++    }
++
++    if (prev_virtual_parts.getContainingPart(part->info).empty())
++    {
++        if (out_reason)
++            *out_reason = "Entry for part " + part->name + " hasn't been read from the replication log yet";
++        return false;
++    }
++
++    std::lock_guard<std::mutex> lock(queue.state_mutex);
++
++    /// We look for containing parts in queue.virtual_parts (and not in prev_virtual_parts) because queue.virtual_parts is newer
++    /// and it is guaranteed that it will contain all merges assigned before this object is constructed.
++    String containing_part = queue.virtual_parts.getContainingPart(part->info);
++    if (containing_part != part->name)
++    {
++        if (out_reason)
++            *out_reason = "Part " + part->name + " has already been assigned a merge into " + containing_part;
++        return false;
++    }
++
++    return true;
++}
++
+ 
+ std::optional<std::pair<Int64, int>> ReplicatedMergeTreeMergePredicate::getDesiredMutationVersion(const MergeTreeData::DataPartPtr & part) const
+ {
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+index 2191104a2918..8e58c8b7af22 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+@@ -408,12 +408,22 @@ class ReplicatedMergeTreeMergePredicate
+ public:
+     ReplicatedMergeTreeMergePredicate(ReplicatedMergeTreeQueue & queue_, zkutil::ZooKeeperPtr & zookeeper);
+ 
++    /// Depending on the existence of left part checks a merge predicate for two parts or for single part.
++    bool operator()(const MergeTreeData::DataPartPtr & left,
++                    const MergeTreeData::DataPartPtr & right,
++                    String * out_reason = nullptr) const;
++
+     /// Can we assign a merge with these two parts?
+     /// (assuming that no merge was assigned after the predicate was constructed)
+     /// If we can't and out_reason is not nullptr, set it to the reason why we can't merge.
+-    bool operator()(
+-        const MergeTreeData::DataPartPtr & left, const MergeTreeData::DataPartPtr & right,
+-        String * out_reason = nullptr) const;
++    bool canMergeTwoParts(const MergeTreeData::DataPartPtr & left,
++                          const MergeTreeData::DataPartPtr & right,
++                          String * out_reason = nullptr) const;
++
++    /// Can we assign a merge this part and some other part?
++    /// For example a merge of a part and itself is needed for TTL.
++    /// This predicate is checked for the first part of each partitition.
++    bool canMergeSinglePart(const MergeTreeData::DataPartPtr & part, String * out_reason) const;
+ 
+     /// Return nonempty optional of desired mutation version and alter version.
+     /// If we have no alter (modify/drop) mutations in mutations queue, than we return biggest possible
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 1aac67177285..5110258834e8 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -552,8 +552,12 @@ bool StorageMergeTree::merge(
+     {
+         std::lock_guard lock(currently_processing_in_background_mutex);
+ 
+-        auto can_merge = [this, &lock] (const DataPartPtr & left, const DataPartPtr & right, String *)
++        auto can_merge = [this, &lock] (const DataPartPtr & left, const DataPartPtr & right, String *) -> bool
+         {
++            /// This predicate is checked for the first part of each partition.
++            /// (left = nullptr, right = "first part of partition")
++            if (!left)
++                return !currently_merging_mutating_parts.count(right);
+             return !currently_merging_mutating_parts.count(left) && !currently_merging_mutating_parts.count(right)
+                 && getCurrentMutationVersion(left, lock) == getCurrentMutationVersion(right, lock);
+         };
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 2a0dac0fe4c8..aa951ce19e1b 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -2223,7 +2223,7 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
+ 
+             FutureMergedMutatedPart future_merged_part;
+             if (max_source_parts_size_for_merge > 0 &&
+-                merger_mutator.selectPartsToMerge(future_merged_part, false, max_source_parts_size_for_merge, merge_pred))
++                merger_mutator.selectPartsToMerge(future_merged_part, false, max_source_parts_size_for_merge, merge_pred, nullptr))
+             {
+                 success = createLogEntryToMergeParts(zookeeper, future_merged_part.parts,
+                     future_merged_part.name, future_merged_part.type, deduplicate, force_ttl);
+@@ -2701,6 +2701,58 @@ void StorageReplicatedMergeTree::updateQuorum(const String & part_name)
+ }
+ 
+ 
++void StorageReplicatedMergeTree::cleanLastPartNode(const String & partition_id)
++{
++    auto zookeeper = getZooKeeper();
++
++    /// The name of the previous part for which the quorum was reached.
++    const String quorum_last_part_path = zookeeper_path + "/quorum/last_part";
++
++    /// Delete information from "last_part" node.
++
++    while (true)
++    {
++        Coordination::Stat added_parts_stat;
++        String old_added_parts = zookeeper->get(quorum_last_part_path, &added_parts_stat);
++
++        ReplicatedMergeTreeQuorumAddedParts parts_with_quorum(format_version);
++
++        if (!old_added_parts.empty())
++            parts_with_quorum.fromString(old_added_parts);
++
++        /// Delete information about particular partition.
++        if (!parts_with_quorum.added_parts.contains(partition_id))
++        {
++            /// There is no information about interested part.
++            break;
++        }
++
++        parts_with_quorum.added_parts.erase(partition_id);
++
++        String new_added_parts = parts_with_quorum.toString();
++
++        auto code = zookeeper->trySet(quorum_last_part_path, new_added_parts, added_parts_stat.version);
++
++        if (code == Coordination::ZOK)
++        {
++            break;
++        }
++        else if (code == Coordination::ZNONODE)
++        {
++            /// Node is deleted. It is impossible, but it is Ok.
++            break;
++        }
++        else if (code == Coordination::ZBADVERSION)
++        {
++            /// Node was updated meanwhile. We must re-read it and repeat all the actions.
++            continue;
++        }
++        else
++            throw Coordination::Exception(code, quorum_last_part_path);
++    }
++}
++
++
+ bool StorageReplicatedMergeTree::fetchPart(const String & part_name, const String & source_replica_path, bool to_detached, size_t quorum)
+ {
+     const auto part_info = MergeTreePartInfo::fromPartName(part_name, format_version);
+@@ -3561,6 +3613,9 @@ void StorageReplicatedMergeTree::dropPartition(const ASTPtr & query, const ASTPt
+                 waitForAllReplicasToProcessLogEntry(entry);
+         }
+     }
++
++    /// Cleaning possibly stored information about parts from /quorum/last_part node in ZooKeeper.
++    cleanLastPartNode(partition_id);
+ }
+ 
+ 
+@@ -4961,10 +5016,10 @@ void StorageReplicatedMergeTree::replacePartitionFrom(const StoragePtr & source_
+     }
+ }
+ 
+-void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, const Context & context)
++void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, const Context & query_context)
+ {
+-    auto lock1 = lockStructureForShare(false, context.getCurrentQueryId(), context.getSettingsRef().lock_acquire_timeout);
+-    auto lock2 = dest_table->lockStructureForShare(false, context.getCurrentQueryId(), context.getSettingsRef().lock_acquire_timeout);
++    auto lock1 = lockStructureForShare(false, query_context.getCurrentQueryId(), query_context.getSettingsRef().lock_acquire_timeout);
++    auto lock2 = dest_table->lockStructureForShare(false, query_context.getCurrentQueryId(), query_context.getSettingsRef().lock_acquire_timeout);
+ 
+     auto dest_table_storage = std::dynamic_pointer_cast<StorageReplicatedMergeTree>(dest_table);
+     if (!dest_table_storage)
+@@ -4979,7 +5034,7 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
+     Stopwatch watch;
+     MergeTreeData & src_data = dest_table_storage->checkStructureAndGetMergeTreeData(*this);
+     auto src_data_id = src_data.getStorageID();
+-    String partition_id = getPartitionIDFromQuery(partition, context);
++    String partition_id = getPartitionIDFromQuery(partition, query_context);
+ 
+     DataPartsVector src_all_parts = src_data.getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
+     DataPartsVector src_parts;
+@@ -5135,7 +5190,7 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
+     parts_to_remove.clear();
+     cleanup_thread.wakeup();
+ 
+-    if (context.getSettingsRef().replication_alter_partitions_sync > 1)
++    if (query_context.getSettingsRef().replication_alter_partitions_sync > 1)
+     {
+         lock2.release();
+         dest_table_storage->waitForAllReplicasToProcessLogEntry(entry);
+@@ -5150,11 +5205,14 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
+     log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results.back()).path_created;
+     entry_delete.znode_name = log_znode_path.substr(log_znode_path.find_last_of('/') + 1);
+ 
+-    if (context.getSettingsRef().replication_alter_partitions_sync > 1)
++    if (query_context.getSettingsRef().replication_alter_partitions_sync > 1)
+     {
+         lock1.release();
+         waitForAllReplicasToProcessLogEntry(entry_delete);
+     }
++
++    /// Cleaning possibly stored information about parts from /quorum/last_part node in ZooKeeper.
++    cleanLastPartNode(partition_id);
+ }
+ 
+ void StorageReplicatedMergeTree::getCommitPartOps(
+@@ -5245,6 +5303,9 @@ bool StorageReplicatedMergeTree::waitForShrinkingQueueSize(size_t queue_size, UI
+ 
+     /// Let's fetch new log entries firstly
+     queue.pullLogsToQueue(getZooKeeper());
++    /// This is significant, because the execution of this task could be delayed at BackgroundPool.
++    /// And we force it to be executed.
++    queue_task_handle->wake();
+ 
+     Poco::Event target_size_event;
+     auto callback = [&target_size_event, queue_size] (size_t new_queue_size)
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index 01dd32614f9b..17b454f27577 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -464,6 +464,9 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+     /// With the quorum being tracked, add a replica to the quorum for the part.
+     void updateQuorum(const String & part_name);
+ 
++    /// Deletes info from quorum/last_part node for particular partition_id.
++    void cleanLastPartNode(const String & partition_id);
++
+     /// Creates new block number if block with such block_id does not exist
+     std::optional<EphemeralLockInZooKeeper> allocateBlockNumber(
+         const String & partition_id, zkutil::ZooKeeperPtr & zookeeper,

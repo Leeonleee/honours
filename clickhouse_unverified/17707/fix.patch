@@ -1,0 +1,836 @@
+diff --git a/contrib/boost b/contrib/boost
+index a04e72c0464f..a7ceabe4747e 160000
+--- a/contrib/boost
++++ b/contrib/boost
+@@ -1,1 +1,1 @@
+-Subproject commit a04e72c0464f0c31d3384f18f0c0db36a05538e0
++Subproject commit a7ceabe4747ecc3309dd3dcd9de4b29660dfd298
+diff --git a/docs/en/sql-reference/statements/create/quota.md b/docs/en/sql-reference/statements/create/quota.md
+index 29752050b694..20537b98a468 100644
+--- a/docs/en/sql-reference/statements/create/quota.md
++++ b/docs/en/sql-reference/statements/create/quota.md
+@@ -11,7 +11,7 @@ Syntax:
+ 
+ ``` sql
+ CREATE QUOTA [IF NOT EXISTS | OR REPLACE] name [ON CLUSTER cluster_name]
+-    [KEYED BY {'none' | 'user name' | 'ip address' | 'client key' | 'client key or user name' | 'client key or ip address'}]
++    [KEYED BY {'none' | 'user name' | 'ip address' | 'forwarded ip address' | 'client key' | 'client key or user name' | 'client key or ip address'}]
+     [FOR [RANDOMIZED] INTERVAL number {SECOND | MINUTE | HOUR | DAY | WEEK | MONTH | QUARTER | YEAR}
+         {MAX { {QUERIES | ERRORS | RESULT ROWS | RESULT BYTES | READ ROWS | READ BYTES | EXECUTION TIME} = number } [,...] |
+          NO LIMITS | TRACKING ONLY} [,...]]
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index 26339c5ad3fb..ad849f3c6e5a 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -951,7 +951,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+                 socket.setReceiveTimeout(settings.receive_timeout);
+                 socket.setSendTimeout(settings.send_timeout);
+                 servers.emplace_back(std::make_unique<Poco::Net::TCPServer>(
+-                    new TCPHandlerFactory(*this),
++                    new TCPHandlerFactory(*this, /* secure */ false, /* proxy protocol */ false),
+                     server_pool,
+                     socket,
+                     new Poco::Net::TCPServerParams));
+@@ -959,6 +959,22 @@ int Server::main(const std::vector<std::string> & /*args*/)
+                 LOG_INFO(log, "Listening for connections with native protocol (tcp): {}", address.toString());
+             });
+ 
++            /// TCP with PROXY protocol, see https://github.com/wolfeidau/proxyv2/blob/master/docs/proxy-protocol.txt
++            create_server("tcp_with_proxy_port", [&](UInt16 port)
++            {
++                Poco::Net::ServerSocket socket;
++                auto address = socket_bind_listen(socket, listen_host, port);
++                socket.setReceiveTimeout(settings.receive_timeout);
++                socket.setSendTimeout(settings.send_timeout);
++                servers.emplace_back(std::make_unique<Poco::Net::TCPServer>(
++                    new TCPHandlerFactory(*this, /* secure */ false, /* proxy protocol */ true),
++                    server_pool,
++                    socket,
++                    new Poco::Net::TCPServerParams));
++
++                LOG_INFO(log, "Listening for connections with native protocol (tcp) with PROXY: {}", address.toString());
++            });
++
+             /// TCP with SSL
+             create_server("tcp_port_secure", [&](UInt16 port)
+             {
+@@ -968,7 +984,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+                 socket.setReceiveTimeout(settings.receive_timeout);
+                 socket.setSendTimeout(settings.send_timeout);
+                 servers.emplace_back(std::make_unique<Poco::Net::TCPServer>(
+-                    new TCPHandlerFactory(*this, /* secure= */ true),
++                    new TCPHandlerFactory(*this, /* secure */ true, /* proxy protocol */ false),
+                     server_pool,
+                     socket,
+                     new Poco::Net::TCPServerParams));
+diff --git a/programs/server/config.d/tcp_with_proxy.xml b/programs/server/config.d/tcp_with_proxy.xml
+new file mode 120000
+index 000000000000..6dc2b3fd1b93
+--- /dev/null
++++ b/programs/server/config.d/tcp_with_proxy.xml
+@@ -0,0 +1,1 @@
++../../../tests/config/config.d/tcp_with_proxy.xml
+\ No newline at end of file
+diff --git a/programs/server/config.xml b/programs/server/config.xml
+index dde3702a44bd..9426ebd6c9ae 100644
+--- a/programs/server/config.xml
++++ b/programs/server/config.xml
+@@ -64,11 +64,18 @@
+     <http_port>8123</http_port>
+     <tcp_port>9000</tcp_port>
+     <mysql_port>9004</mysql_port>
++
+     <!-- For HTTPS and SSL over native protocol. -->
+     <!--
+     <https_port>8443</https_port>
+     <tcp_port_secure>9440</tcp_port_secure>
+     -->
++
++    <!-- TCP with PROXY protocol (PROXY header sent for every connection) -->
++    <!--
++    <tcp_with_proxy_port>9010</tcp_with_proxy_port>
++    -->
++
+     <!-- Used with https_port and tcp_port_secure. Full ssl options list: https://github.com/ClickHouse-Extras/poco/blob/master/NetSSL_OpenSSL/include/Poco/Net/SSLManager.h#L71 -->
+     <openSSL>
+         <server> <!-- Used for https server AND secure tcp port -->
+diff --git a/src/Access/AccessControlManager.cpp b/src/Access/AccessControlManager.cpp
+index a95d65ebb592..e874bda5b696 100644
+--- a/src/Access/AccessControlManager.cpp
++++ b/src/Access/AccessControlManager.cpp
+@@ -15,6 +15,8 @@
+ #include <common/find_symbols.h>
+ #include <Poco/ExpireCache.h>
+ #include <boost/algorithm/string/join.hpp>
++#include <boost/algorithm/string/split.hpp>
++#include <boost/algorithm/string/trim.hpp>
+ #include <filesystem>
+ #include <mutex>
+ 
+@@ -419,6 +421,18 @@ std::shared_ptr<const ContextAccess> AccessControlManager::getContextAccess(
+     params.http_method = client_info.http_method;
+     params.address = client_info.current_address.host();
+     params.quota_key = client_info.quota_key;
++
++    /// Extract the last entry from comma separated list of X-Forwarded-For addresses.
++    /// Only the last proxy can be trusted (if any).
++    Strings forwarded_addresses;
++    boost::split(forwarded_addresses, client_info.forwarded_for, boost::is_any_of(","));
++    if (!forwarded_addresses.empty())
++    {
++        String & last_forwarded_address = forwarded_addresses.back();
++        boost::trim(last_forwarded_address);
++        params.forwarded_address = last_forwarded_address;
++    }
++
+     return getContextAccess(params);
+ }
+ 
+@@ -444,9 +458,14 @@ std::shared_ptr<const EnabledRowPolicies> AccessControlManager::getEnabledRowPol
+ 
+ 
+ std::shared_ptr<const EnabledQuota> AccessControlManager::getEnabledQuota(
+-    const UUID & user_id, const String & user_name, const boost::container::flat_set<UUID> & enabled_roles, const Poco::Net::IPAddress & address, const String & custom_quota_key) const
++    const UUID & user_id,
++    const String & user_name,
++    const boost::container::flat_set<UUID> & enabled_roles,
++    const Poco::Net::IPAddress & address,
++    const String & forwarded_address,
++    const String & custom_quota_key) const
+ {
+-    return quota_cache->getEnabledQuota(user_id, user_name, enabled_roles, address, custom_quota_key);
++    return quota_cache->getEnabledQuota(user_id, user_name, enabled_roles, address, forwarded_address, custom_quota_key);
+ }
+ 
+ 
+diff --git a/src/Access/AccessControlManager.h b/src/Access/AccessControlManager.h
+index c960b330ee6a..07edfd934753 100644
+--- a/src/Access/AccessControlManager.h
++++ b/src/Access/AccessControlManager.h
+@@ -135,6 +135,7 @@ class AccessControlManager : public MultipleAccessStorage
+         const String & user_name,
+         const boost::container::flat_set<UUID> & enabled_roles,
+         const Poco::Net::IPAddress & address,
++        const String & forwarded_address,
+         const String & custom_quota_key) const;
+ 
+     std::vector<QuotaUsage> getAllQuotasUsage() const;
+diff --git a/src/Access/ContextAccess.cpp b/src/Access/ContextAccess.cpp
+index 0459022cb1ad..0e4f3fe78714 100644
+--- a/src/Access/ContextAccess.cpp
++++ b/src/Access/ContextAccess.cpp
+@@ -258,9 +258,12 @@ void ContextAccess::setRolesInfo(const std::shared_ptr<const EnabledRolesInfo> &
+ {
+     assert(roles_info_);
+     roles_info = roles_info_;
+-    enabled_row_policies = manager->getEnabledRowPolicies(*params.user_id, roles_info->enabled_roles);
+-    enabled_quota = manager->getEnabledQuota(*params.user_id, user_name, roles_info->enabled_roles, params.address, params.quota_key);
+-    enabled_settings = manager->getEnabledSettings(*params.user_id, user->settings, roles_info->enabled_roles, roles_info->settings_from_enabled_roles);
++    enabled_row_policies = manager->getEnabledRowPolicies(
++        *params.user_id, roles_info->enabled_roles);
++    enabled_quota = manager->getEnabledQuota(
++        *params.user_id, user_name, roles_info->enabled_roles, params.address, params.forwarded_address, params.quota_key);
++    enabled_settings = manager->getEnabledSettings(
++        *params.user_id, user->settings, roles_info->enabled_roles, roles_info->settings_from_enabled_roles);
+     calculateAccessRights();
+ }
+ 
+diff --git a/src/Access/ContextAccess.h b/src/Access/ContextAccess.h
+index fd7d7c019229..319c8edb0768 100644
+--- a/src/Access/ContextAccess.h
++++ b/src/Access/ContextAccess.h
+@@ -41,9 +41,16 @@ struct ContextAccessParams
+     ClientInfo::Interface interface = ClientInfo::Interface::TCP;
+     ClientInfo::HTTPMethod http_method = ClientInfo::HTTPMethod::UNKNOWN;
+     Poco::Net::IPAddress address;
++    String forwarded_address;
+     String quota_key;
+ 
+-    auto toTuple() const { return std::tie(user_id, current_roles, use_default_roles, readonly, allow_ddl, allow_introspection, current_database, interface, http_method, address, quota_key); }
++    auto toTuple() const
++    {
++        return std::tie(
++            user_id, current_roles, use_default_roles, readonly, allow_ddl, allow_introspection,
++            current_database, interface, http_method, address, forwarded_address, quota_key);
++    }
++
+     friend bool operator ==(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return lhs.toTuple() == rhs.toTuple(); }
+     friend bool operator !=(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return !(lhs == rhs); }
+     friend bool operator <(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return lhs.toTuple() < rhs.toTuple(); }
+diff --git a/src/Access/EnabledQuota.h b/src/Access/EnabledQuota.h
+index 25e804dd0502..7ae107e45e33 100644
+--- a/src/Access/EnabledQuota.h
++++ b/src/Access/EnabledQuota.h
+@@ -25,9 +25,10 @@ class EnabledQuota : public boost::noncopyable
+         String user_name;
+         boost::container::flat_set<UUID> enabled_roles;
+         Poco::Net::IPAddress client_address;
++        String forwarded_address;
+         String client_key;
+ 
+-        auto toTuple() const { return std::tie(user_id, enabled_roles, user_name, client_address, client_key); }
++        auto toTuple() const { return std::tie(user_id, enabled_roles, user_name, client_address, forwarded_address, client_key); }
+         friend bool operator ==(const Params & lhs, const Params & rhs) { return lhs.toTuple() == rhs.toTuple(); }
+         friend bool operator !=(const Params & lhs, const Params & rhs) { return !(lhs == rhs); }
+         friend bool operator <(const Params & lhs, const Params & rhs) { return lhs.toTuple() < rhs.toTuple(); }
+diff --git a/src/Access/Quota.h b/src/Access/Quota.h
+index 5bbea36cfda4..b636e83ec409 100644
+--- a/src/Access/Quota.h
++++ b/src/Access/Quota.h
+@@ -76,6 +76,7 @@ struct Quota : public IAccessEntity
+         NONE,       /// All users share the same quota.
+         USER_NAME,  /// Connections with the same user name share the same quota.
+         IP_ADDRESS, /// Connections from the same IP share the same quota.
++        FORWARDED_IP_ADDRESS, /// Use X-Forwarded-For HTTP header instead of IP address.
+         CLIENT_KEY, /// Client should explicitly supply a key to use.
+         CLIENT_KEY_OR_USER_NAME,  /// Same as CLIENT_KEY, but use USER_NAME if the client doesn't supply a key.
+         CLIENT_KEY_OR_IP_ADDRESS, /// Same as CLIENT_KEY, but use IP_ADDRESS if the client doesn't supply a key.
+@@ -205,12 +206,16 @@ inline const Quota::KeyTypeInfo & Quota::KeyTypeInfo::get(KeyType type)
+         if (tokens.size() > 1)
+         {
+             for (const auto & token : tokens)
++            {
+                 for (auto kt : ext::range(KeyType::MAX))
++                {
+                     if (KeyTypeInfo::get(kt).name == token)
+                     {
+                         init_base_types.push_back(kt);
+                         break;
+                     }
++                }
++            }
+         }
+         return KeyTypeInfo{raw_name_, std::move(init_name), std::move(init_base_types)};
+     };
+@@ -232,6 +237,11 @@ inline const Quota::KeyTypeInfo & Quota::KeyTypeInfo::get(KeyType type)
+             static const auto info = make_info("IP_ADDRESS");
+             return info;
+         }
++        case KeyType::FORWARDED_IP_ADDRESS:
++        {
++            static const auto info = make_info("FORWARDED_IP_ADDRESS");
++            return info;
++        }
+         case KeyType::CLIENT_KEY:
+         {
+             static const auto info = make_info("CLIENT_KEY");
+diff --git a/src/Access/QuotaCache.cpp b/src/Access/QuotaCache.cpp
+index d3ebca9529c3..0f814bced4e9 100644
+--- a/src/Access/QuotaCache.cpp
++++ b/src/Access/QuotaCache.cpp
+@@ -48,11 +48,21 @@ String QuotaCache::QuotaInfo::calculateKey(const EnabledQuota & enabled) const
+     switch (quota->key_type)
+     {
+         case KeyType::NONE:
++        {
+             return "";
++        }
+         case KeyType::USER_NAME:
++        {
+             return params.user_name;
++        }
+         case KeyType::IP_ADDRESS:
++        {
+             return params.client_address.toString();
++        }
++        case KeyType::FORWARDED_IP_ADDRESS:
++        {
++            return params.forwarded_address;
++        }
+         case KeyType::CLIENT_KEY:
+         {
+             if (!params.client_key.empty())
+@@ -170,7 +180,7 @@ QuotaCache::QuotaCache(const AccessControlManager & access_control_manager_)
+ QuotaCache::~QuotaCache() = default;
+ 
+ 
+-std::shared_ptr<const EnabledQuota> QuotaCache::getEnabledQuota(const UUID & user_id, const String & user_name, const boost::container::flat_set<UUID> & enabled_roles, const Poco::Net::IPAddress & client_address, const String & client_key)
++std::shared_ptr<const EnabledQuota> QuotaCache::getEnabledQuota(const UUID & user_id, const String & user_name, const boost::container::flat_set<UUID> & enabled_roles, const Poco::Net::IPAddress & client_address, const String & forwarded_address, const String & client_key)
+ {
+     std::lock_guard lock{mutex};
+     ensureAllQuotasRead();
+@@ -180,6 +190,7 @@ std::shared_ptr<const EnabledQuota> QuotaCache::getEnabledQuota(const UUID & use
+     params.user_name = user_name;
+     params.enabled_roles = enabled_roles;
+     params.client_address = client_address;
++    params.forwarded_address = forwarded_address;
+     params.client_key = client_key;
+     auto it = enabled_quotas.find(params);
+     if (it != enabled_quotas.end())
+diff --git a/src/Access/QuotaCache.h b/src/Access/QuotaCache.h
+index 0bb5c11a82b1..31d274c4ff62 100644
+--- a/src/Access/QuotaCache.h
++++ b/src/Access/QuotaCache.h
+@@ -20,7 +20,14 @@ class QuotaCache
+     QuotaCache(const AccessControlManager & access_control_manager_);
+     ~QuotaCache();
+ 
+-    std::shared_ptr<const EnabledQuota> getEnabledQuota(const UUID & user_id, const String & user_name, const boost::container::flat_set<UUID> & enabled_roles, const Poco::Net::IPAddress & address, const String & client_key);
++    std::shared_ptr<const EnabledQuota> getEnabledQuota(
++        const UUID & user_id,
++        const String & user_name,
++        const boost::container::flat_set<UUID> & enabled_roles,
++        const Poco::Net::IPAddress & address,
++        const String & forwarded_address,
++        const String & client_key);
++
+     std::vector<QuotaUsage> getAllQuotasUsage() const;
+ 
+ private:
+diff --git a/src/Access/UsersConfigAccessStorage.cpp b/src/Access/UsersConfigAccessStorage.cpp
+index eb993d696c6c..b3f151c30308 100644
+--- a/src/Access/UsersConfigAccessStorage.cpp
++++ b/src/Access/UsersConfigAccessStorage.cpp
+@@ -215,6 +215,8 @@ namespace
+         String quota_config = "quotas." + quota_name;
+         if (config.has(quota_config + ".keyed_by_ip"))
+             quota->key_type = KeyType::IP_ADDRESS;
++        else if (config.has(quota_config + ".keyed_by_forwarded_ip"))
++            quota->key_type = KeyType::FORWARDED_IP_ADDRESS;
+         else if (config.has(quota_config + ".keyed"))
+             quota->key_type = KeyType::CLIENT_KEY_OR_USER_NAME;
+         else
+diff --git a/src/Core/Defines.h b/src/Core/Defines.h
+index 9b6578092c9a..f1cd1a8a7080 100644
+--- a/src/Core/Defines.h
++++ b/src/Core/Defines.h
+@@ -73,8 +73,10 @@
+ /// Minimum revision supporting interserver secret.
+ #define DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET 54441
+ 
++#define DBMS_MIN_REVISION_WITH_X_FORWARDED_FOR_IN_CLIENT_INFO 54443
++
+ /// Version of ClickHouse TCP protocol. Increment it manually when you change the protocol.
+-#define DBMS_TCP_PROTOCOL_VERSION 54442
++#define DBMS_TCP_PROTOCOL_VERSION 54443
+ 
+ /// The boundary on which the blocks for asynchronous file operations should be aligned.
+ #define DEFAULT_AIO_FILE_BLOCK_SIZE 4096
+diff --git a/src/IO/ReadHelpers.cpp b/src/IO/ReadHelpers.cpp
+index 8232ce0b22db..e290da39535c 100644
+--- a/src/IO/ReadHelpers.cpp
++++ b/src/IO/ReadHelpers.cpp
+@@ -194,12 +194,12 @@ inline void appendToStringOrVector(PODArray<char> & s, ReadBuffer & rb, const ch
+     s.insert(rb.position(), end);
+ }
+ 
+-template <typename Vector>
+-void readStringInto(Vector & s, ReadBuffer & buf)
++template <char... chars, typename Vector>
++void readStringUntilCharsInto(Vector & s, ReadBuffer & buf)
+ {
+     while (!buf.eof())
+     {
+-        char * next_pos = find_first_symbols<'\t', '
+'>(buf.position(), buf.buffer().end());
++        char * next_pos = find_first_symbols<chars...>(buf.position(), buf.buffer().end());
+ 
+         appendToStringOrVector(s, buf, next_pos);
+         buf.position() = next_pos;
+@@ -210,21 +210,30 @@ void readStringInto(Vector & s, ReadBuffer & buf)
+ }
+ 
+ template <typename Vector>
+-void readNullTerminated(Vector & s, ReadBuffer & buf)
++void readStringInto(Vector & s, ReadBuffer & buf)
+ {
+-    while (!buf.eof())
+-    {
+-        char * next_pos = find_first_symbols<'\0'>(buf.position(), buf.buffer().end());
++    readStringUntilCharsInto<'\t', '
+'>(s, buf);
++}
+ 
+-        appendToStringOrVector(s, buf, next_pos);
+-        buf.position() = next_pos;
++template <typename Vector>
++void readStringUntilWhitespaceInto(Vector & s, ReadBuffer & buf)
++{
++    readStringUntilCharsInto<' '>(s, buf);
++}
+ 
+-        if (buf.hasPendingData())
+-            break;
+-    }
++template <typename Vector>
++void readNullTerminated(Vector & s, ReadBuffer & buf)
++{
++    readStringUntilCharsInto<'\0'>(s, buf);
+     buf.ignore();
+ }
+ 
++void readStringUntilWhitespace(String & s, ReadBuffer & buf)
++{
++    s.clear();
++    readStringUntilWhitespaceInto(s, buf);
++}
++
+ template void readNullTerminated<PODArray<char>>(PODArray<char> & s, ReadBuffer & buf);
+ template void readNullTerminated<String>(String & s, ReadBuffer & buf);
+ 
+diff --git a/src/IO/ReadHelpers.h b/src/IO/ReadHelpers.h
+index a4531ebc24db..39a0d60059f7 100644
+--- a/src/IO/ReadHelpers.h
++++ b/src/IO/ReadHelpers.h
+@@ -476,6 +476,9 @@ void readStringUntilEOF(String & s, ReadBuffer & buf);
+ // Buffer pointer is left at EOL, don't forget to advance it.
+ void readEscapedStringUntilEOL(String & s, ReadBuffer & buf);
+ 
++/// Only 0x20 as whitespace character
++void readStringUntilWhitespace(String & s, ReadBuffer & buf);
++
+ 
+ /** Read string in CSV format.
+   * Parsing rules:
+@@ -527,6 +530,9 @@ bool tryReadJSONStringInto(Vector & s, ReadBuffer & buf)
+     return readJSONStringInto<Vector, bool>(s, buf);
+ }
+ 
++template <typename Vector>
++void readStringUntilWhitespaceInto(Vector & s, ReadBuffer & buf);
++
+ /// This could be used as template parameter for functions above, if you want to just skip data.
+ struct NullOutput
+ {
+diff --git a/src/Interpreters/ClientInfo.cpp b/src/Interpreters/ClientInfo.cpp
+index 4dbec8af3a41..30aa8a0c6920 100644
+--- a/src/Interpreters/ClientInfo.cpp
++++ b/src/Interpreters/ClientInfo.cpp
+@@ -49,6 +49,9 @@ void ClientInfo::write(WriteBuffer & out, const UInt64 server_protocol_revision)
+     {
+         writeBinary(UInt8(http_method), out);
+         writeBinary(http_user_agent, out);
++
++        if (server_protocol_revision >= DBMS_MIN_REVISION_WITH_X_FORWARDED_FOR_IN_CLIENT_INFO)
++            writeBinary(forwarded_for, out);
+     }
+ 
+     if (server_protocol_revision >= DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO)
+@@ -120,6 +123,9 @@ void ClientInfo::read(ReadBuffer & in, const UInt64 client_protocol_revision)
+         http_method = HTTPMethod(read_http_method);
+ 
+         readBinary(http_user_agent, in);
++
++        if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_X_FORWARDED_FOR_IN_CLIENT_INFO)
++            readBinary(forwarded_for, in);
+     }
+ 
+     if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO)
+diff --git a/src/Interpreters/ClientInfo.h b/src/Interpreters/ClientInfo.h
+index 36cde339995c..e188420d6075 100644
+--- a/src/Interpreters/ClientInfo.h
++++ b/src/Interpreters/ClientInfo.h
+@@ -83,6 +83,12 @@ class ClientInfo
+     HTTPMethod http_method = HTTPMethod::UNKNOWN;
+     String http_user_agent;
+ 
++    /// Comma separated list of forwarded IP addresses (from X-Forwarded-For for HTTP interface).
++    /// It's expected that proxy appends the forwarded address to the end of the list.
++    /// The element can be trusted only if you trust the corresponding proxy.
++    /// NOTE This field can also be reused in future for TCP interface with PROXY v1/v2 protocols.
++    String forwarded_for;
++
+     /// Common
+     String quota_key;
+ 
+diff --git a/src/Interpreters/QueryLog.cpp b/src/Interpreters/QueryLog.cpp
+index c2273a1db2c5..e5d68870f875 100644
+--- a/src/Interpreters/QueryLog.cpp
++++ b/src/Interpreters/QueryLog.cpp
+@@ -77,6 +77,7 @@ Block QueryLogElement::createBlock()
+         {std::make_shared<DataTypeUInt32>(),                                  "client_version_patch"},
+         {std::make_shared<DataTypeUInt8>(),                                   "http_method"},
+         {std::make_shared<DataTypeString>(),                                  "http_user_agent"},
++        {std::make_shared<DataTypeString>(),                                  "forwarded_for"},
+         {std::make_shared<DataTypeString>(),                                  "quota_key"},
+ 
+         {std::make_shared<DataTypeUInt32>(),                                  "revision"},
+@@ -181,6 +182,7 @@ void QueryLogElement::appendClientInfo(const ClientInfo & client_info, MutableCo
+ 
+     columns[i++]->insert(UInt64(client_info.http_method));
+     columns[i++]->insert(client_info.http_user_agent);
++    columns[i++]->insert(client_info.forwarded_for);
+ 
+     columns[i++]->insert(client_info.quota_key);
+ }
+diff --git a/src/Interpreters/QueryThreadLog.cpp b/src/Interpreters/QueryThreadLog.cpp
+index 8fea360085b8..986bedcfc158 100644
+--- a/src/Interpreters/QueryThreadLog.cpp
++++ b/src/Interpreters/QueryThreadLog.cpp
+@@ -60,6 +60,7 @@ Block QueryThreadLogElement::createBlock()
+         {std::make_shared<DataTypeUInt32>(),        "client_version_patch"},
+         {std::make_shared<DataTypeUInt8>(),         "http_method"},
+         {std::make_shared<DataTypeString>(),        "http_user_agent"},
++        {std::make_shared<DataTypeString>(),        "forwarded_for"},
+         {std::make_shared<DataTypeString>(),        "quota_key"},
+ 
+         {std::make_shared<DataTypeUInt32>(),        "revision"},
+diff --git a/src/Parsers/ParserCreateQuotaQuery.cpp b/src/Parsers/ParserCreateQuotaQuery.cpp
+index 324519b9c017..68c53d2fc1d8 100644
+--- a/src/Parsers/ParserCreateQuotaQuery.cpp
++++ b/src/Parsers/ParserCreateQuotaQuery.cpp
+@@ -63,11 +63,13 @@ namespace
+             boost::replace_all(name, " ", "_");
+ 
+             for (auto kt : ext::range(Quota::KeyType::MAX))
++            {
+                 if (KeyTypeInfo::get(kt).name == name)
+                 {
+                     key_type = kt;
+                     return true;
+                 }
++            }
+ 
+             String all_types_str;
+             for (auto kt : ext::range(Quota::KeyType::MAX))
+diff --git a/src/Parsers/ParserCreateQuotaQuery.h b/src/Parsers/ParserCreateQuotaQuery.h
+index 1f1df0588bd9..b44838225ac0 100644
+--- a/src/Parsers/ParserCreateQuotaQuery.h
++++ b/src/Parsers/ParserCreateQuotaQuery.h
+@@ -7,7 +7,7 @@ namespace DB
+ {
+ /** Parses queries like
+   * CREATE QUOTA [IF NOT EXISTS | OR REPLACE] name
+-  *      [KEYED BY {none | user_name | ip_address | client_key | client_key, user_name | client_key, ip_address} | NOT KEYED]
++  *      [KEYED BY {none | user_name | ip_address | forwarded_ip_address | client_key | client_key, user_name | client_key, ip_address} | NOT KEYED]
+   *      [FOR [RANDOMIZED] INTERVAL number {second | minute | hour | day | week | month | quarter | year}
+   *       {MAX {{queries | errors | result_rows | result_bytes | read_rows | read_bytes | execution_time} = number} [,...] |
+   *        NO LIMITS | TRACKING ONLY} [,...]]
+@@ -15,7 +15,7 @@ namespace DB
+   *
+   * ALTER QUOTA [IF EXISTS] name
+   *      [RENAME TO new_name]
+-  *      [KEYED BY {none | user_name | ip_address | client_key | client_key, user_name | client_key, ip_address} | NOT KEYED]
++  *      [KEYED BY {none | user_name | ip_address | forwarded_ip_address | client_key | client_key, user_name | client_key, ip_address} | NOT KEYED]
+   *      [FOR [RANDOMIZED] INTERVAL number {second | minute | hour | day | week | month | quarter | year}
+   *       {MAX {{queries | errors | result_rows | result_bytes | read_rows | read_bytes | execution_time} = number} [,...] |
+   *        NO LIMITS | TRACKING ONLY} [,...]]
+diff --git a/src/Server/HTTPHandler.cpp b/src/Server/HTTPHandler.cpp
+index 34d510e4cb29..ed154ba65f27 100644
+--- a/src/Server/HTTPHandler.cpp
++++ b/src/Server/HTTPHandler.cpp
+@@ -280,10 +280,31 @@ void HTTPHandler::processQuery(
+         }
+     }
+ 
++    /// Set client info. It will be used for quota accounting parameters in 'setUser' method.
++
++    ClientInfo & client_info = context.getClientInfo();
++    client_info.query_kind = ClientInfo::QueryKind::INITIAL_QUERY;
++    client_info.interface = ClientInfo::Interface::HTTP;
++
++    ClientInfo::HTTPMethod http_method = ClientInfo::HTTPMethod::UNKNOWN;
++    if (request.getMethod() == Poco::Net::HTTPServerRequest::HTTP_GET)
++        http_method = ClientInfo::HTTPMethod::GET;
++    else if (request.getMethod() == Poco::Net::HTTPServerRequest::HTTP_POST)
++        http_method = ClientInfo::HTTPMethod::POST;
++
++    client_info.http_method = http_method;
++    client_info.http_user_agent = request.get("User-Agent", "");
++    client_info.forwarded_for = request.get("X-Forwarded-For", "");
++
++    /// This will also set client_info.current_user and current_address
+     context.setUser(user, password, request.clientAddress());
+     if (!quota_key.empty())
+         context.setQuotaKey(quota_key);
+ 
++    /// Query sent through HTTP interface is initial.
++    client_info.initial_user = client_info.current_user;
++    client_info.initial_address = client_info.current_address;
++
+     /// The user could specify session identifier and session timeout.
+     /// It allows to modify settings, create temporary tables and reuse them in subsequent requests.
+ 
+@@ -335,6 +356,8 @@ void HTTPHandler::processQuery(
+     context.setCurrentQueryId(params.get("query_id",
+         request.get("X-ClickHouse-Query-Id", "")));
+ 
++    client_info.initial_query_id = client_info.current_query_id;
++
+     /// The client can pass a HTTP header indicating supported compression method (gzip or deflate).
+     String http_response_compression_methods = request.get("Accept-Encoding", "");
+     CompressionMethod http_response_compression_method = CompressionMethod::None;
+@@ -561,24 +584,6 @@ void HTTPHandler::processQuery(
+     /// Origin header.
+     used_output.out->addHeaderCORS(settings.add_http_cors_header && !request.get("Origin", "").empty());
+ 
+-    ClientInfo & client_info = context.getClientInfo();
+-    client_info.query_kind = ClientInfo::QueryKind::INITIAL_QUERY;
+-    client_info.interface = ClientInfo::Interface::HTTP;
+-
+-    /// Query sent through HTTP interface is initial.
+-    client_info.initial_user = client_info.current_user;
+-    client_info.initial_query_id = client_info.current_query_id;
+-    client_info.initial_address = client_info.current_address;
+-
+-    ClientInfo::HTTPMethod http_method = ClientInfo::HTTPMethod::UNKNOWN;
+-    if (request.getMethod() == Poco::Net::HTTPServerRequest::HTTP_GET)
+-        http_method = ClientInfo::HTTPMethod::GET;
+-    else if (request.getMethod() == Poco::Net::HTTPServerRequest::HTTP_POST)
+-        http_method = ClientInfo::HTTPMethod::POST;
+-
+-    client_info.http_method = http_method;
+-    client_info.http_user_agent = request.get("User-Agent", "");
+-
+     auto append_callback = [&context] (ProgressCallback callback)
+     {
+         auto prev = context.getProgressCallback();
+diff --git a/src/Server/HTTPHandlerFactory.cpp b/src/Server/HTTPHandlerFactory.cpp
+index 8915ea747ca9..9eac60355d23 100644
+--- a/src/Server/HTTPHandlerFactory.cpp
++++ b/src/Server/HTTPHandlerFactory.cpp
+@@ -31,10 +31,10 @@ HTTPRequestHandlerFactoryMain::HTTPRequestHandlerFactoryMain(const std::string &
+ 
+ Poco::Net::HTTPRequestHandler * HTTPRequestHandlerFactoryMain::createRequestHandler(const Poco::Net::HTTPServerRequest & request)
+ {
+-    LOG_TRACE(log, "HTTP Request for {}. Method: {}, Address: {}, User-Agent: {}{}, Content Type: {}, Transfer Encoding: {}",
+-        name, request.getMethod(), request.clientAddress().toString(), request.has("User-Agent") ? request.get("User-Agent") : "none",
++    LOG_TRACE(log, "HTTP Request for {}. Method: {}, Address: {}, User-Agent: {}{}, Content Type: {}, Transfer Encoding: {}, X-Forwarded-For: {}",
++        name, request.getMethod(), request.clientAddress().toString(), request.get("User-Agent", "(none)"),
+         (request.hasContentLength() ? (", Length: " + std::to_string(request.getContentLength())) : ("")),
+-        request.getContentType(), request.getTransferEncoding());
++        request.getContentType(), request.getTransferEncoding(), request.get("X-Forwarded-For", "(none)"));
+ 
+     for (auto & handler_factory : child_factories)
+     {
+diff --git a/src/Server/TCPHandler.cpp b/src/Server/TCPHandler.cpp
+index 1f55a3af6353..e84c89bd1650 100644
+--- a/src/Server/TCPHandler.cpp
++++ b/src/Server/TCPHandler.cpp
+@@ -11,6 +11,7 @@
+ #include <Compression/CompressedWriteBuffer.h>
+ #include <IO/ReadBufferFromPocoSocket.h>
+ #include <IO/WriteBufferFromPocoSocket.h>
++#include <IO/LimitReadBuffer.h>
+ #include <IO/ReadHelpers.h>
+ #include <IO/WriteHelpers.h>
+ #include <IO/copyData.h>
+@@ -76,6 +77,10 @@ void TCPHandler::runImpl()
+     in = std::make_shared<ReadBufferFromPocoSocket>(socket());
+     out = std::make_shared<WriteBufferFromPocoSocket>(socket());
+ 
++    /// Support for PROXY protocol
++    if (parse_proxy_protocol && !receiveProxyHeader())
++        return;
++
+     if (in->eof())
+     {
+         LOG_WARNING(log, "Client has not sent any data.");
+@@ -728,6 +733,78 @@ void TCPHandler::sendExtremes(const Block & extremes)
+ }
+ 
+ 
++bool TCPHandler::receiveProxyHeader()
++{
++    if (in->eof())
++    {
++        LOG_WARNING(log, "Client has not sent any data.");
++        return false;
++    }
++
++    String forwarded_address;
++
++    /// Only PROXYv1 is supported.
++    /// Validation of protocol is not fully performed.
++
++    LimitReadBuffer limit_in(*in, 107, true); /// Maximum length from the specs.
++
++    assertString("PROXY ", limit_in);
++
++    if (limit_in.eof())
++    {
++        LOG_WARNING(log, "Incomplete PROXY header is received.");
++        return false;
++    }
++
++    /// TCP4 / TCP6 / UNKNOWN
++    if ('T' == *limit_in.position())
++    {
++        assertString("TCP", limit_in);
++
++        if (limit_in.eof())
++        {
++            LOG_WARNING(log, "Incomplete PROXY header is received.");
++            return false;
++        }
++
++        if ('4' != *limit_in.position() && '6' != *limit_in.position())
++        {
++            LOG_WARNING(log, "Unexpected protocol in PROXY header is received.");
++            return false;
++        }
++
++        ++limit_in.position();
++        assertChar(' ', limit_in);
++
++        /// Read the first field and ignore other.
++        readStringUntilWhitespace(forwarded_address, limit_in);
++
++        /// Skip until \r
+
++        while (!limit_in.eof() && *limit_in.position() != '\r')
++            ++limit_in.position();
++        assertString("\r
+", limit_in);
++    }
++    else if (checkString("UNKNOWN", limit_in))
++    {
++        /// This is just a health check, there is no subsequent data in this connection.
++
++        while (!limit_in.eof() && *limit_in.position() != '\r')
++            ++limit_in.position();
++        assertString("\r
+", limit_in);
++        return false;
++    }
++    else
++    {
++        LOG_WARNING(log, "Unexpected protocol in PROXY header is received.");
++        return false;
++    }
++
++    LOG_TRACE(log, "Forwarded client address from PROXY header: {}", forwarded_address);
++    connection_context.getClientInfo().forwarded_for = forwarded_address;
++    return true;
++}
++
++
+ void TCPHandler::receiveHello()
+ {
+     /// Receive `hello` packet.
+diff --git a/src/Server/TCPHandler.h b/src/Server/TCPHandler.h
+index 2f2bf35e59e0..e12e9bcf4d0f 100644
+--- a/src/Server/TCPHandler.h
++++ b/src/Server/TCPHandler.h
+@@ -101,9 +101,18 @@ struct LastBlockInputParameters
+ class TCPHandler : public Poco::Net::TCPServerConnection
+ {
+ public:
+-    TCPHandler(IServer & server_, const Poco::Net::StreamSocket & socket_)
++    /** parse_proxy_protocol_ - if true, expect and parse the header of PROXY protocol in every connection
++      * and set the information about forwarded address accordingly.
++      * See https://github.com/wolfeidau/proxyv2/blob/master/docs/proxy-protocol.txt
++      *
++      * Note: immediate IP address is always used for access control (accept-list of IP networks),
++      *  because it allows to check the IP ranges of the trusted proxy.
++      * Proxy-forwarded (original client) IP address is used for quota accounting if quota is keyed by forwarded IP.
++      */
++    TCPHandler(IServer & server_, const Poco::Net::StreamSocket & socket_, bool parse_proxy_protocol_)
+         : Poco::Net::TCPServerConnection(socket_)
+         , server(server_)
++        , parse_proxy_protocol(parse_proxy_protocol_)
+         , log(&Poco::Logger::get("TCPHandler"))
+         , connection_context(server.context())
+         , query_context(server.context())
+@@ -118,6 +127,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+ 
+ private:
+     IServer & server;
++    bool parse_proxy_protocol = false;
+     Poco::Logger * log;
+ 
+     String client_name;
+@@ -158,6 +168,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+ 
+     void runImpl();
+ 
++    bool receiveProxyHeader();
+     void receiveHello();
+     bool receivePacket();
+     void receiveQuery();
+diff --git a/src/Server/TCPHandlerFactory.h b/src/Server/TCPHandlerFactory.h
+index 5ecd427bf8b6..5096983274dd 100644
+--- a/src/Server/TCPHandlerFactory.h
++++ b/src/Server/TCPHandlerFactory.h
+@@ -15,6 +15,7 @@ class TCPHandlerFactory : public Poco::Net::TCPServerConnectionFactory
+ {
+ private:
+     IServer & server;
++    bool parse_proxy_protocol = false;
+     Poco::Logger * log;
+ 
+     class DummyTCPHandler : public Poco::Net::TCPServerConnection
+@@ -25,8 +26,12 @@ class TCPHandlerFactory : public Poco::Net::TCPServerConnectionFactory
+     };
+ 
+ public:
+-    explicit TCPHandlerFactory(IServer & server_, bool secure_ = false)
+-        : server(server_)
++    /** parse_proxy_protocol_ - if true, expect and parse the header of PROXY protocol in every connection
++      * and set the information about forwarded address accordingly.
++      * See https://github.com/wolfeidau/proxyv2/blob/master/docs/proxy-protocol.txt
++      */
++    TCPHandlerFactory(IServer & server_, bool secure_, bool parse_proxy_protocol_)
++        : server(server_), parse_proxy_protocol(parse_proxy_protocol_)
+         , log(&Poco::Logger::get(std::string("TCP") + (secure_ ? "S" : "") + "HandlerFactory"))
+     {
+     }
+@@ -36,7 +41,7 @@ class TCPHandlerFactory : public Poco::Net::TCPServerConnectionFactory
+         try
+         {
+             LOG_TRACE(log, "TCP Request. Address: {}", socket.peerAddress().toString());
+-            return new TCPHandler(server, socket);
++            return new TCPHandler(server, socket, parse_proxy_protocol);
+         }
+         catch (const Poco::Net::NetException &)
+         {
+diff --git a/src/Storages/System/StorageSystemProcesses.cpp b/src/Storages/System/StorageSystemProcesses.cpp
+index d899a1708bf7..178eedd9ad71 100644
+--- a/src/Storages/System/StorageSystemProcesses.cpp
++++ b/src/Storages/System/StorageSystemProcesses.cpp
+@@ -43,6 +43,7 @@ NamesAndTypesList StorageSystemProcesses::getNamesAndTypes()
+ 
+         {"http_method", std::make_shared<DataTypeUInt8>()},
+         {"http_user_agent", std::make_shared<DataTypeString>()},
++        {"forwarded_for", std::make_shared<DataTypeString>()},
+ 
+         {"quota_key", std::make_shared<DataTypeString>()},
+ 
+@@ -98,6 +99,7 @@ void StorageSystemProcesses::fillData(MutableColumns & res_columns, const Contex
+ 
+         res_columns[i++]->insert(UInt64(process.client_info.http_method));
+         res_columns[i++]->insert(process.client_info.http_user_agent);
++        res_columns[i++]->insert(process.client_info.forwarded_for);
+ 
+         res_columns[i++]->insert(process.client_info.quota_key);
+ 

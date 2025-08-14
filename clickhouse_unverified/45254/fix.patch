@@ -1,0 +1,736 @@
+diff --git a/src/Analyzer/Passes/GroupingFunctionsResolvePass.cpp b/src/Analyzer/Passes/GroupingFunctionsResolvePass.cpp
+new file mode 100644
+index 000000000000..55152fccee90
+--- /dev/null
++++ b/src/Analyzer/Passes/GroupingFunctionsResolvePass.cpp
+@@ -0,0 +1,253 @@
++#include <Analyzer/Passes/GroupingFunctionsResolvePass.h>
++
++#include <Core/ColumnNumbers.h>
++
++#include <Functions/grouping.h>
++
++#include <Interpreters/Context.h>
++
++#include <Analyzer/InDepthQueryTreeVisitor.h>
++#include <Analyzer/QueryNode.h>
++#include <Analyzer/HashUtils.h>
++#include <Analyzer/FunctionNode.h>
++#include <Analyzer/ColumnNode.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int BAD_ARGUMENTS;
++    extern const int LOGICAL_ERROR;
++}
++
++namespace
++{
++
++enum class GroupByKind
++{
++    ORDINARY,
++    ROLLUP,
++    CUBE,
++    GROUPING_SETS
++};
++
++class GroupingFunctionResolveVisitor : public InDepthQueryTreeVisitor<GroupingFunctionResolveVisitor>
++{
++public:
++    GroupingFunctionResolveVisitor(GroupByKind group_by_kind_,
++        QueryTreeNodePtrWithHashMap<size_t> aggregation_key_to_index_,
++        ColumnNumbersList grouping_sets_keys_indices_,
++        ContextPtr context_)
++        : group_by_kind(group_by_kind_)
++        , aggregation_key_to_index(std::move(aggregation_key_to_index_))
++        , grouping_sets_keys_indexes(std::move(grouping_sets_keys_indices_))
++        , context(std::move(context_))
++    {
++    }
++
++    void visitImpl(const QueryTreeNodePtr & node)
++    {
++        auto * function_node = node->as<FunctionNode>();
++        if (!function_node || function_node->getFunctionName() != "grouping")
++            return;
++
++        auto & function_arguments = function_node->getArguments().getNodes();
++
++        ColumnNumbers arguments_indexes;
++        arguments_indexes.reserve(function_arguments.size());
++
++        for (const auto & argument : function_arguments)
++        {
++            auto it = aggregation_key_to_index.find(argument);
++            if (it == aggregation_key_to_index.end())
++                throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                    "Argument {} of GROUPING function is not a part of GROUP BY clause",
++                    argument->formatASTForErrorMessage());
++
++            arguments_indexes.push_back(it->second);
++        }
++
++        FunctionOverloadResolverPtr grouping_function_resolver;
++        bool add_grouping_set_column = false;
++
++        bool force_grouping_standard_compatibility = context->getSettingsRef().force_grouping_standard_compatibility;
++        size_t aggregation_keys_size = aggregation_key_to_index.size();
++
++        switch (group_by_kind)
++        {
++            case GroupByKind::ORDINARY:
++            {
++                auto grouping_ordinary_function = std::make_shared<FunctionGroupingOrdinary>(arguments_indexes,
++                    force_grouping_standard_compatibility);
++                grouping_function_resolver = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_ordinary_function));
++                break;
++            }
++            case GroupByKind::ROLLUP:
++            {
++                auto grouping_rollup_function = std::make_shared<FunctionGroupingForRollup>(arguments_indexes,
++                    aggregation_keys_size,
++                    force_grouping_standard_compatibility);
++                grouping_function_resolver = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_rollup_function));
++                add_grouping_set_column = true;
++                break;
++            }
++            case GroupByKind::CUBE:
++            {
++                auto grouping_cube_function = std::make_shared<FunctionGroupingForCube>(arguments_indexes,
++                    aggregation_keys_size,
++                    force_grouping_standard_compatibility);
++                grouping_function_resolver = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_cube_function));
++                add_grouping_set_column = true;
++                break;
++            }
++            case GroupByKind::GROUPING_SETS:
++            {
++                auto grouping_grouping_sets_function = std::make_shared<FunctionGroupingForGroupingSets>(arguments_indexes,
++                    grouping_sets_keys_indexes,
++                    force_grouping_standard_compatibility);
++                grouping_function_resolver = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_grouping_sets_function));
++                add_grouping_set_column = true;
++                break;
++            }
++        }
++
++        if (add_grouping_set_column)
++        {
++            QueryTreeNodeWeakPtr column_source;
++            auto grouping_set_column = NameAndTypePair{"__grouping_set", std::make_shared<DataTypeUInt64>()};
++            auto grouping_set_argument_column = std::make_shared<ColumnNode>(std::move(grouping_set_column), std::move(column_source));
++            function_arguments.insert(function_arguments.begin(), std::move(grouping_set_argument_column));
++        }
++
++        function_node->resolveAsFunction(grouping_function_resolver->build(function_node->getArgumentColumns()));
++    }
++
++    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
++    {
++        return !(child_node->getNodeType() == QueryTreeNodeType::QUERY || child_node->getNodeType() == QueryTreeNodeType::UNION);
++    }
++
++private:
++    GroupByKind group_by_kind;
++    QueryTreeNodePtrWithHashMap<size_t> aggregation_key_to_index;
++    ColumnNumbersList grouping_sets_keys_indexes;
++    ContextPtr context;
++};
++
++void resolveGroupingFunctions(QueryTreeNodePtr & query_node, ContextPtr context)
++{
++    auto & query_node_typed = query_node->as<QueryNode &>();
++
++    size_t aggregation_node_index = 0;
++    QueryTreeNodePtrWithHashMap<size_t> aggregation_key_to_index;
++
++    std::vector<QueryTreeNodes> grouping_sets_used_aggregation_keys_list;
++
++    if (query_node_typed.hasGroupBy())
++    {
++        /// It is expected by execution layer that if there are only 1 grouping set it will be removed
++        if (query_node_typed.isGroupByWithGroupingSets() && query_node_typed.getGroupBy().getNodes().size() == 1)
++        {
++            auto & grouping_set_list_node = query_node_typed.getGroupBy().getNodes().front()->as<ListNode &>();
++            query_node_typed.getGroupBy().getNodes() = std::move(grouping_set_list_node.getNodes());
++            query_node_typed.setIsGroupByWithGroupingSets(false);
++        }
++
++        if (query_node_typed.isGroupByWithGroupingSets())
++        {
++            for (const auto & grouping_set_keys_list_node : query_node_typed.getGroupBy().getNodes())
++            {
++                auto & grouping_set_keys_list_node_typed = grouping_set_keys_list_node->as<ListNode &>();
++
++                grouping_sets_used_aggregation_keys_list.emplace_back();
++                auto & grouping_sets_used_aggregation_keys = grouping_sets_used_aggregation_keys_list.back();
++
++                for (auto & grouping_set_key_node : grouping_set_keys_list_node_typed.getNodes())
++                {
++                    if (aggregation_key_to_index.contains(grouping_set_key_node))
++                        continue;
++
++                    grouping_sets_used_aggregation_keys.push_back(grouping_set_key_node);
++                    aggregation_key_to_index.emplace(grouping_set_key_node, aggregation_node_index);
++                    ++aggregation_node_index;
++                }
++            }
++        }
++        else
++        {
++            for (auto & group_by_key_node : query_node_typed.getGroupBy().getNodes())
++            {
++                if (aggregation_key_to_index.contains(group_by_key_node))
++                    continue;
++
++                aggregation_key_to_index.emplace(group_by_key_node, aggregation_node_index);
++                ++aggregation_node_index;
++            }
++        }
++    }
++
++    /// Indexes of aggregation keys used in each grouping set (only for GROUP BY GROUPING SETS)
++    ColumnNumbersList grouping_sets_keys_indexes;
++
++    for (const auto & grouping_set_used_aggregation_keys : grouping_sets_used_aggregation_keys_list)
++    {
++        grouping_sets_keys_indexes.emplace_back();
++        auto & grouping_set_keys_indexes = grouping_sets_keys_indexes.back();
++
++        for (const auto & used_aggregation_key : grouping_set_used_aggregation_keys)
++        {
++            auto aggregation_node_index_it = aggregation_key_to_index.find(used_aggregation_key);
++            if (aggregation_node_index_it == aggregation_key_to_index.end())
++                throw Exception(ErrorCodes::LOGICAL_ERROR,
++                    "Aggregation key {} in GROUPING SETS is not found in GROUP BY keys",
++                    used_aggregation_key->formatASTForErrorMessage());
++
++            grouping_set_keys_indexes.push_back(aggregation_node_index_it->second);
++        }
++    }
++
++    GroupByKind group_by_kind = GroupByKind::ORDINARY;
++    if (query_node_typed.isGroupByWithRollup())
++        group_by_kind = GroupByKind::ROLLUP;
++    else if (query_node_typed.isGroupByWithCube())
++        group_by_kind = GroupByKind::CUBE;
++    else if (query_node_typed.isGroupByWithGroupingSets())
++        group_by_kind = GroupByKind::GROUPING_SETS;
++
++    GroupingFunctionResolveVisitor visitor(group_by_kind,
++        std::move(aggregation_key_to_index),
++        std::move(grouping_sets_keys_indexes),
++        std::move(context));
++    visitor.visit(query_node);
++}
++
++class GroupingFunctionsResolveVisitor : public InDepthQueryTreeVisitor<GroupingFunctionsResolveVisitor>
++{
++public:
++    explicit GroupingFunctionsResolveVisitor(ContextPtr context_)
++        : context(std::move(context_))
++    {}
++
++    void visitImpl(QueryTreeNodePtr & node)
++    {
++        if (node->getNodeType() != QueryTreeNodeType::QUERY)
++            return;
++
++        resolveGroupingFunctions(node, context);
++    }
++
++private:
++    ContextPtr context;
++};
++
++}
++
++void GroupingFunctionsResolvePass::run(QueryTreeNodePtr query_tree_node, ContextPtr context)
++{
++    GroupingFunctionsResolveVisitor visitor(std::move(context));
++    visitor.visit(query_tree_node);
++}
++
++}
++
+diff --git a/src/Analyzer/Passes/GroupingFunctionsResolvePass.h b/src/Analyzer/Passes/GroupingFunctionsResolvePass.h
+new file mode 100644
+index 000000000000..070c8dd9389d
+--- /dev/null
++++ b/src/Analyzer/Passes/GroupingFunctionsResolvePass.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <Analyzer/IQueryTreePass.h>
++
++namespace DB
++{
++
++/** Resolve GROUPING functions in query node.
++  * GROUPING function is replaced with specialized GROUPING function based on GROUP BY modifiers.
++  * For ROLLUP, CUBE, GROUPING SETS specialized GROUPING function take special __grouping_set column as argument
++  * and previous GROUPING function arguments.
++  *
++  * Example: SELECT grouping(id) FROM test_table GROUP BY id;
++  * Result: SELECT groupingOrdinary(id) FROM test_table GROUP BY id;
++  *
++  * Example: SELECT grouping(id), grouping(value) FROM test_table GROUP BY GROUPING SETS ((id), (value));
++  * Result: SELECT groupingForGroupingSets(__grouping_set, id), groupingForGroupingSets(__grouping_set, value)
++  * FROM test_table GROUP BY GROUPING SETS ((id), (value));
++  */
++class GroupingFunctionsResolvePass final : public IQueryTreePass
++{
++public:
++    String getName() override { return "GroupingFunctionsResolvePass"; }
++
++    String getDescription() override { return "Resolve GROUPING functions based on GROUP BY modifiers"; }
++
++    void run(QueryTreeNodePtr query_tree_node, ContextPtr context) override;
++
++};
++
++}
+diff --git a/src/Analyzer/Passes/QueryAnalysisPass.cpp b/src/Analyzer/Passes/QueryAnalysisPass.cpp
+index 695a542fc421..b5efd090e4ce 100644
+--- a/src/Analyzer/Passes/QueryAnalysisPass.cpp
++++ b/src/Analyzer/Passes/QueryAnalysisPass.cpp
+@@ -4352,7 +4352,8 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
+             bool force_grouping_standard_compatibility = scope.context->getSettingsRef().force_grouping_standard_compatibility;
+             auto grouping_function = std::make_shared<FunctionGrouping>(force_grouping_standard_compatibility);
+             auto grouping_function_adaptor = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_function));
+-            function_node.resolveAsFunction(grouping_function_adaptor->build({}));
++            function_node.resolveAsFunction(grouping_function_adaptor->build(argument_columns));
++
+             return result_projection_names;
+         }
+     }
+diff --git a/src/Analyzer/QueryTreePassManager.cpp b/src/Analyzer/QueryTreePassManager.cpp
+index 66b060de6c4a..33fc5f1cb6bd 100644
+--- a/src/Analyzer/QueryTreePassManager.cpp
++++ b/src/Analyzer/QueryTreePassManager.cpp
+@@ -32,6 +32,7 @@
+ #include <Analyzer/Passes/IfTransformStringsToEnumPass.h>
+ #include <Analyzer/Passes/ConvertOrLikeChainPass.h>
+ #include <Analyzer/Passes/OptimizeRedundantFunctionsInOrderByPass.h>
++#include <Analyzer/Passes/GroupingFunctionsResolvePass.h>
+ 
+ namespace DB
+ {
+@@ -67,7 +68,7 @@ class ValidationChecker : public InDepthQueryTreeVisitor<ValidationChecker>
+ private:
+     void visitColumn(ColumnNode * column) const
+     {
+-        if (column->getColumnSourceOrNull() == nullptr)
++        if (column->getColumnSourceOrNull() == nullptr && column->getColumnName() != "__grouping_set")
+             throw Exception(ErrorCodes::LOGICAL_ERROR,
+                 "Column {} {} query tree node does not have valid source node after running {} pass",
+                 column->getColumnName(), column->getColumnType(), pass_name);
+@@ -258,6 +259,8 @@ void addQueryTreePasses(QueryTreePassManager & manager)
+         manager.addPass(std::make_unique<IfTransformStringsToEnumPass>());
+ 
+     manager.addPass(std::make_unique<ConvertOrLikeChainPass>());
++
++    manager.addPass(std::make_unique<GroupingFunctionsResolvePass>());
+ }
+ 
+ }
+diff --git a/src/Planner/CollectTableExpressionData.cpp b/src/Planner/CollectTableExpressionData.cpp
+index 897959fa456f..0b820e849f31 100644
+--- a/src/Planner/CollectTableExpressionData.cpp
++++ b/src/Planner/CollectTableExpressionData.cpp
+@@ -35,6 +35,9 @@ class CollectSourceColumnsVisitor : public InDepthQueryTreeVisitor<CollectSource
+         if (!column_node)
+             return;
+ 
++        if (column_node->getColumnName() == "__grouping_set")
++            return;
++
+         auto column_source_node = column_node->getColumnSource();
+         auto column_source_node_type = column_source_node->getNodeType();
+ 
+diff --git a/src/Planner/PlannerAggregation.cpp b/src/Planner/PlannerAggregation.cpp
+index 05e7b5418e3e..67ce474b37ca 100644
+--- a/src/Planner/PlannerAggregation.cpp
++++ b/src/Planner/PlannerAggregation.cpp
+@@ -1,188 +1,13 @@
+ #include <Planner/PlannerAggregation.h>
+ 
+-#include <Functions/grouping.h>
+-
+-#include <Analyzer/InDepthQueryTreeVisitor.h>
+ #include <Analyzer/ConstantNode.h>
+-#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/FunctionNode.h>
+-#include <Analyzer/QueryNode.h>
+-#include <Analyzer/AggregationUtils.h>
+-
+-#include <Interpreters/Context.h>
+-
+-#include <Processors/QueryPlan/AggregatingStep.h>
+ 
+ #include <Planner/PlannerActionsVisitor.h>
+ 
+ namespace DB
+ {
+ 
+-namespace ErrorCodes
+-{
+-    extern const int LOGICAL_ERROR;
+-    extern const int BAD_ARGUMENTS;
+-}
+-
+-namespace
+-{
+-
+-enum class GroupByKind
+-{
+-    ORDINARY,
+-    ROLLUP,
+-    CUBE,
+-    GROUPING_SETS
+-};
+-
+-class GroupingFunctionResolveVisitor : public InDepthQueryTreeVisitor<GroupingFunctionResolveVisitor>
+-{
+-public:
+-    GroupingFunctionResolveVisitor(GroupByKind group_by_kind_,
+-        const Names & aggregation_keys_,
+-        const GroupingSetsParamsList & grouping_sets_parameters_list_,
+-        const PlannerContext & planner_context_)
+-        : group_by_kind(group_by_kind_)
+-        , planner_context(planner_context_)
+-    {
+-        size_t aggregation_keys_size = aggregation_keys_.size();
+-        for (size_t i = 0; i < aggregation_keys_size; ++i)
+-            aggegation_key_to_index.emplace(aggregation_keys_[i], i);
+-
+-        for (const auto & grouping_sets_parameter : grouping_sets_parameters_list_)
+-        {
+-            grouping_sets_keys_indices.emplace_back();
+-            auto & grouping_set_keys_indices = grouping_sets_keys_indices.back();
+-
+-            for (const auto & used_key : grouping_sets_parameter.used_keys)
+-            {
+-                auto aggregation_key_index_it = aggegation_key_to_index.find(used_key);
+-                if (aggregation_key_index_it == aggegation_key_to_index.end())
+-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+-                        "Aggregation key {} in GROUPING SETS is not found in GROUP BY keys");
+-
+-                grouping_set_keys_indices.push_back(aggregation_key_index_it->second);
+-            }
+-        }
+-    }
+-
+-    void visitImpl(const QueryTreeNodePtr & node)
+-    {
+-        auto * function_node = node->as<FunctionNode>();
+-        if (!function_node || function_node->getFunctionName() != "grouping")
+-            return;
+-
+-        size_t aggregation_keys_size = aggegation_key_to_index.size();
+-
+-        ColumnNumbers arguments_indexes;
+-
+-        for (const auto & argument : function_node->getArguments().getNodes())
+-        {
+-            String action_node_name = calculateActionNodeName(argument, planner_context);
+-
+-            auto it = aggegation_key_to_index.find(action_node_name);
+-            if (it == aggegation_key_to_index.end())
+-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                    "Argument of GROUPING function {} is not a part of GROUP BY clause",
+-                    argument->formatASTForErrorMessage());
+-
+-            arguments_indexes.push_back(it->second);
+-        }
+-
+-        QueryTreeNodeWeakPtr column_source;
+-        auto grouping_set_argument_column = std::make_shared<ColumnNode>(NameAndTypePair{"__grouping_set", std::make_shared<DataTypeUInt64>()}, column_source);
+-        function_node->getArguments().getNodes().clear();
+-
+-        bool force_grouping_standard_compatibility = planner_context.getQueryContext()->getSettingsRef().force_grouping_standard_compatibility;
+-
+-        switch (group_by_kind)
+-        {
+-            case GroupByKind::ORDINARY:
+-            {
+-                auto grouping_ordinary_function = std::make_shared<FunctionGroupingOrdinary>(arguments_indexes, force_grouping_standard_compatibility);
+-                auto grouping_ordinary_function_adaptor = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_ordinary_function));
+-                function_node->resolveAsFunction(grouping_ordinary_function_adaptor->build({}));
+-                break;
+-            }
+-            case GroupByKind::ROLLUP:
+-            {
+-                auto grouping_rollup_function = std::make_shared<FunctionGroupingForRollup>(arguments_indexes, aggregation_keys_size, force_grouping_standard_compatibility);
+-                auto grouping_rollup_function_adaptor = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_rollup_function));
+-                function_node->resolveAsFunction(grouping_rollup_function_adaptor->build({}));
+-                function_node->getArguments().getNodes().push_back(std::move(grouping_set_argument_column));
+-                break;
+-            }
+-            case GroupByKind::CUBE:
+-            {
+-                auto grouping_cube_function = std::make_shared<FunctionGroupingForCube>(arguments_indexes, aggregation_keys_size, force_grouping_standard_compatibility);
+-                auto grouping_cube_function_adaptor = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_cube_function));
+-                function_node->resolveAsFunction(grouping_cube_function_adaptor->build({}));
+-                function_node->getArguments().getNodes().push_back(std::move(grouping_set_argument_column));
+-                break;
+-            }
+-            case GroupByKind::GROUPING_SETS:
+-            {
+-                auto grouping_grouping_sets_function = std::make_shared<FunctionGroupingForGroupingSets>(arguments_indexes, grouping_sets_keys_indices, force_grouping_standard_compatibility);
+-                auto grouping_grouping_sets_function_adaptor = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(grouping_grouping_sets_function));
+-                function_node->resolveAsFunction(grouping_grouping_sets_function_adaptor->build({}));
+-                function_node->getArguments().getNodes().push_back(std::move(grouping_set_argument_column));
+-                break;
+-            }
+-        }
+-    }
+-
+-    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
+-    {
+-        return !(child_node->getNodeType() == QueryTreeNodeType::QUERY || child_node->getNodeType() == QueryTreeNodeType::UNION);
+-    }
+-
+-private:
+-    GroupByKind group_by_kind;
+-    std::unordered_map<std::string, size_t> aggegation_key_to_index;
+-    // Indexes of aggregation keys used in each grouping set (only for GROUP BY GROUPING SETS)
+-    ColumnNumbersList grouping_sets_keys_indices;
+-    const PlannerContext & planner_context;
+-};
+-
+-void resolveGroupingFunctions(QueryTreeNodePtr & node,
+-    GroupByKind group_by_kind,
+-    const Names & aggregation_keys,
+-    const GroupingSetsParamsList & grouping_sets_parameters_list,
+-    const PlannerContext & planner_context)
+-{
+-    auto & query_node_typed = node->as<QueryNode &>();
+-
+-    GroupingFunctionResolveVisitor visitor(group_by_kind, aggregation_keys, grouping_sets_parameters_list, planner_context);
+-
+-    if (query_node_typed.hasHaving())
+-        visitor.visit(query_node_typed.getHaving());
+-
+-    if (query_node_typed.hasOrderBy())
+-        visitor.visit(query_node_typed.getOrderByNode());
+-
+-    visitor.visit(query_node_typed.getProjectionNode());
+-}
+-
+-}
+-
+-void resolveGroupingFunctions(QueryTreeNodePtr & query_node,
+-    const Names & aggregation_keys,
+-    const GroupingSetsParamsList & grouping_sets_parameters_list,
+-    const PlannerContext & planner_context)
+-{
+-    auto & query_node_typed = query_node->as<QueryNode &>();
+-
+-    GroupByKind group_by_kind = GroupByKind::ORDINARY;
+-    if (query_node_typed.isGroupByWithRollup())
+-        group_by_kind = GroupByKind::ROLLUP;
+-    else if (query_node_typed.isGroupByWithCube())
+-        group_by_kind = GroupByKind::CUBE;
+-    else if (query_node_typed.isGroupByWithGroupingSets())
+-        group_by_kind = GroupByKind::GROUPING_SETS;
+-
+-    resolveGroupingFunctions(query_node, group_by_kind, aggregation_keys, grouping_sets_parameters_list, planner_context);
+-}
+-
+ AggregateDescriptions extractAggregateDescriptions(const QueryTreeNodes & aggregate_function_nodes, const PlannerContext & planner_context)
+ {
+     QueryTreeNodeToName node_to_name;
+diff --git a/src/Planner/PlannerAggregation.h b/src/Planner/PlannerAggregation.h
+index 6dfd7faca22e..2c12361e9544 100644
+--- a/src/Planner/PlannerAggregation.h
++++ b/src/Planner/PlannerAggregation.h
+@@ -11,15 +11,6 @@
+ namespace DB
+ {
+ 
+-/** Resolve GROUPING functions in query node.
+-  * GROUPING function is replaced with specialized GROUPING function based on GROUP BY modifiers.
+-  * For ROLLUP, CUBE, GROUPING SETS specialized GROUPING function take special __grouping_set column as argument.
+-  */
+-void resolveGroupingFunctions(QueryTreeNodePtr & query_node,
+-    const Names & aggregation_keys,
+-    const GroupingSetsParamsList & grouping_sets_parameters_list,
+-    const PlannerContext & planner_context);
+-
+ /// Extract aggregate descriptions from aggregate function nodes
+ AggregateDescriptions extractAggregateDescriptions(const QueryTreeNodes & aggregate_function_nodes, const PlannerContext & planner_context);
+ 
+diff --git a/src/Planner/PlannerExpressionAnalysis.cpp b/src/Planner/PlannerExpressionAnalysis.cpp
+index 91a04b090fc5..b1017c99c3e9 100644
+--- a/src/Planner/PlannerExpressionAnalysis.cpp
++++ b/src/Planner/PlannerExpressionAnalysis.cpp
+@@ -52,7 +52,7 @@ FilterAnalysisResult analyzeFilter(const QueryTreeNodePtr & filter_expression_no
+ /** Construct aggregation analysis result if query tree has GROUP BY or aggregates.
+   * Actions before aggregation are added into actions chain, if result is not null optional.
+   */
+-std::optional<AggregationAnalysisResult> analyzeAggregation(QueryTreeNodePtr & query_tree,
++std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & join_tree_input_columns,
+     const PlannerContextPtr & planner_context,
+     ActionsChain & actions_chain)
+@@ -79,7 +79,6 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(QueryTreeNodePtr & q
+ 
+     GroupingSetsParamsList grouping_sets_parameters_list;
+     bool group_by_with_constant_keys = false;
+-    bool disable_grouping_sets = false;
+ 
+     PlannerActionsVisitor actions_visitor(planner_context);
+ 
+@@ -137,13 +136,6 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(QueryTreeNodePtr & q
+ 
+                 grouping_sets_parameter.used_keys = std::move(grouping_sets_keys);
+             }
+-
+-            /// It is expected by execution layer that if there are only 1 grouping sets it will be removed
+-            if (grouping_sets_parameters_list.size() == 1)
+-            {
+-                disable_grouping_sets = true;
+-                grouping_sets_parameters_list.clear();
+-            }
+         }
+         else
+         {
+@@ -190,11 +182,9 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(QueryTreeNodePtr & q
+     /** For non ordinary GROUP BY we add virtual __grouping_set column
+       * With set number, which is used as an additional key at the stage of merging aggregating data.
+       */
+-    if (query_node.isGroupByWithRollup() || query_node.isGroupByWithCube() || (query_node.isGroupByWithGroupingSets() && !disable_grouping_sets))
++    if (query_node.isGroupByWithRollup() || query_node.isGroupByWithCube() || query_node.isGroupByWithGroupingSets())
+         aggregates_columns.emplace_back(nullptr, std::make_shared<DataTypeUInt64>(), "__grouping_set");
+ 
+-    resolveGroupingFunctions(query_tree, aggregation_keys, grouping_sets_parameters_list, *planner_context);
+-
+     /// Only aggregation keys and aggregates are available for next steps after GROUP BY step
+     auto aggregate_step = std::make_unique<ActionsChainStep>(before_aggregation_actions, ActionsChainStep::AvailableOutputColumnsStrategy::OUTPUT_NODES, aggregates_columns);
+     actions_chain.addStep(std::move(aggregate_step));
+@@ -212,7 +202,7 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(QueryTreeNodePtr & q
+ /** Construct window analysis result if query tree has window functions.
+   * Actions before window functions are added into actions chain, if result is not null optional.
+   */
+-std::optional<WindowAnalysisResult> analyzeWindow(QueryTreeNodePtr & query_tree,
++std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & join_tree_input_columns,
+     const PlannerContextPtr & planner_context,
+     ActionsChain & actions_chain)
+@@ -417,7 +407,7 @@ LimitByAnalysisResult analyzeLimitBy(const QueryNode & query_node,
+ 
+ }
+ 
+-PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(QueryTreeNodePtr query_tree,
++PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & join_tree_input_columns,
+     const PlannerContextPtr & planner_context)
+ {
+@@ -463,14 +453,8 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(QueryTreeNodePtr
+     project_names_actions->project(projection_analysis_result.projection_column_names_with_display_aliases);
+     actions_chain.addStep(std::make_unique<ActionsChainStep>(project_names_actions));
+ 
+-    // std::cout << "Chain dump before finalize" << std::endl;
+-    // std::cout << actions_chain.dump() << std::endl;
+-
+     actions_chain.finalize();
+ 
+-    // std::cout << "Chain dump after finalize" << std::endl;
+-    // std::cout << actions_chain.dump() << std::endl;
+-
+     projection_analysis_result.project_names_actions = std::move(project_names_actions);
+ 
+     PlannerExpressionsAnalysisResult expressions_analysis_result(std::move(projection_analysis_result));
+diff --git a/src/Planner/PlannerExpressionAnalysis.h b/src/Planner/PlannerExpressionAnalysis.h
+index aefb3c369d09..d697641964c1 100644
+--- a/src/Planner/PlannerExpressionAnalysis.h
++++ b/src/Planner/PlannerExpressionAnalysis.h
+@@ -168,7 +168,7 @@ class PlannerExpressionsAnalysisResult
+ };
+ 
+ /// Build expression analysis result for query tree, join tree input columns and planner context
+-PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(QueryTreeNodePtr query_tree,
++PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & join_tree_input_columns,
+     const PlannerContextPtr & planner_context);
+ 
+diff --git a/src/Planner/PlannerJoinTree.cpp b/src/Planner/PlannerJoinTree.cpp
+index 6a48f322ba51..2484bd093eca 100644
+--- a/src/Planner/PlannerJoinTree.cpp
++++ b/src/Planner/PlannerJoinTree.cpp
+@@ -248,7 +248,7 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(const QueryTreeNodePtr & tabl
+         if (max_streams == 0)
+             max_streams = 1;
+ 
+-        /// If necessary, we request more sources than the number of threads - to distribute the work evenly over the threads.
++        /// If necessary, we request more sources than the number of threads - to distribute the work evenly over the threads
+         if (max_streams > 1 && !is_remote)
+             max_streams = static_cast<size_t>(max_streams * settings.max_streams_to_max_threads_ratio);
+ 
+@@ -841,7 +841,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
+     std::vector<ColumnIdentifierSet> table_expressions_outer_scope_columns(table_expressions_stack_size);
+     ColumnIdentifierSet current_outer_scope_columns = outer_scope_columns;
+ 
+-    for (Int64 i = table_expressions_stack_size - 1; i >= 0; --i)
++    for (Int64 i = static_cast<Int64>(table_expressions_stack_size) - 1; i >= 0; --i)
+     {
+         table_expressions_outer_scope_columns[i] = current_outer_scope_columns;
+ 
+@@ -859,7 +859,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
+         {
+             if (query_plans_stack.empty())
+                 throw Exception(ErrorCodes::LOGICAL_ERROR,
+-                    "Expected at least 1 query plan on stack before ARRAY JOIN processing");
++                    "Expected at least 1 query plan on stack before ARRAY JOIN processing. Actual {}",
++                    query_plans_stack.size());
+ 
+             auto query_plan = std::move(query_plans_stack.back());
+             query_plans_stack.back() = buildQueryPlanForArrayJoinNode(table_expression,
+@@ -868,11 +869,10 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
+         }
+         else if (auto * join_node = table_expression->as<JoinNode>())
+         {
+-            size_t table_expressions_column_nodes_with_names_stack_size = query_plans_stack.size();
+-            if (table_expressions_column_nodes_with_names_stack_size < 2)
++            if (query_plans_stack.size() < 2)
+                 throw Exception(ErrorCodes::LOGICAL_ERROR,
+                     "Expected at least 2 query plans on stack before JOIN processing. Actual {}",
+-                    table_expressions_column_nodes_with_names_stack_size);
++                    query_plans_stack.size());
+ 
+             auto right_query_plan = std::move(query_plans_stack.back());
+             query_plans_stack.pop_back();
+@@ -901,8 +901,10 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
+         }
+     }
+ 
+-    if (query_plans_stack.empty())
+-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected at least 1 query plan for JOIN TREE");
++    if (query_plans_stack.size() != 1)
++        throw Exception(ErrorCodes::LOGICAL_ERROR,
++            "Expected 1 query plan for JOIN TREE. Actual {}",
++            query_plans_stack.size());
+ 
+     return std::move(query_plans_stack.back());
+ }
+diff --git a/src/Storages/StorageDistributed.cpp b/src/Storages/StorageDistributed.cpp
+index 5111bd38e58d..c0818302fb2f 100644
+--- a/src/Storages/StorageDistributed.cpp
++++ b/src/Storages/StorageDistributed.cpp
+@@ -578,9 +578,9 @@ std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryP
+ 
+     bool has_aggregates = query_info.has_aggregates;
+     if (query_info.syntax_analyzer_result)
+-        has_aggregates = query_info.syntax_analyzer_result->aggregates.empty();
++        has_aggregates = !query_info.syntax_analyzer_result->aggregates.empty();
+ 
+-    if (!has_aggregates || group_by)
++    if (has_aggregates || group_by)
+     {
+         if (!optimize_sharding_key_aggregation || !group_by || !expr_contains_sharding_key(group_by->children))
+             return {};

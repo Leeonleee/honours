@@ -1,0 +1,428 @@
+diff --git a/src/Common/Macros.cpp b/src/Common/Macros.cpp
+index f66e3462e825..ec5a863c0f54 100644
+--- a/src/Common/Macros.cpp
++++ b/src/Common/Macros.cpp
+@@ -92,7 +92,7 @@ String Macros::expand(const String & s,
+             res += info.table_id.table_name;
+             info.expanded_table = true;
+         }
+-        else if (macro_name == "uuid")
++        else if (macro_name == "uuid" && !info.expand_special_macros_only)
+         {
+             if (info.table_id.uuid == UUIDHelpers::Nil)
+                 throw Exception("Macro 'uuid' and empty arguments of ReplicatedMergeTree "
+@@ -109,12 +109,12 @@ String Macros::expand(const String & s,
+         else if (info.shard && macro_name == "shard")
+         {
+             res += *info.shard;
+-            info.expanded_uuid = true;
++            info.expanded_other = true;
+         }
+         else if (info.replica && macro_name == "replica")
+         {
+             res += *info.replica;
+-            info.expanded_uuid = true;
++            info.expanded_other = true;
+         }
+         else if (info.ignore_unknown || info.expand_special_macros_only)
+         {
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index adfcd83f5a7a..0bd16a0e722f 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -1,5 +1,6 @@
+ #include <Databases/DatabaseAtomic.h>
+ #include <Databases/DatabaseOnDisk.h>
++#include <Databases/DatabaseReplicated.h>
+ #include <IO/ReadHelpers.h>
+ #include <IO/WriteHelpers.h>
+ #include <IO/ReadBufferFromFile.h>
+@@ -151,11 +152,15 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
+ {
+     if (typeid(*this) != typeid(to_database))
+     {
+-        if (!typeid_cast<DatabaseOrdinary *>(&to_database))
++        if (typeid_cast<DatabaseOrdinary *>(&to_database))
++        {
++            /// Allow moving tables between Atomic and Ordinary (with table lock)
++            DatabaseOnDisk::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary);
++            return;
++        }
++
++        if (!allowMoveTableToOtherDatabaseEngine(to_database))
+             throw Exception("Moving tables between databases of different engines is not supported", ErrorCodes::NOT_IMPLEMENTED);
+-        /// Allow moving tables between Atomic and Ordinary (with table lock)
+-        DatabaseOnDisk::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary);
+-        return;
+     }
+ 
+     if (exchange && !supportsRenameat2())
+@@ -230,15 +235,19 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
+     if (dictionary && !table->isDictionary())
+         throw Exception(ErrorCodes::INCORRECT_QUERY, "Use RENAME/EXCHANGE TABLE (instead of RENAME/EXCHANGE DICTIONARY) for tables");
+ 
+-    table->checkTableCanBeRenamed();
++    StorageID old_table_id = table->getStorageID();
++    StorageID new_table_id = {other_db.database_name, to_table_name, old_table_id.uuid};
++    table->checkTableCanBeRenamed({new_table_id});
+     assert_can_move_mat_view(table);
+     StoragePtr other_table;
++    StorageID other_table_new_id = StorageID::createEmpty();
+     if (exchange)
+     {
+         other_table = other_db.getTableUnlocked(to_table_name, other_db_lock);
+         if (dictionary && !other_table->isDictionary())
+             throw Exception(ErrorCodes::INCORRECT_QUERY, "Use RENAME/EXCHANGE TABLE (instead of RENAME/EXCHANGE DICTIONARY) for tables");
+-        other_table->checkTableCanBeRenamed();
++        other_table_new_id = {database_name, table_name, other_table->getStorageID().uuid};
++        other_table->checkTableCanBeRenamed(other_table_new_id);
+         assert_can_move_mat_view(other_table);
+     }
+ 
+@@ -260,11 +269,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
+     if (exchange)
+         other_table_data_path = detach(other_db, to_table_name, other_table->storesDataOnDisk());
+ 
+-    auto old_table_id = table->getStorageID();
+-
+-    table->renameInMemory({other_db.database_name, to_table_name, old_table_id.uuid});
++    table->renameInMemory(new_table_id);
+     if (exchange)
+-        other_table->renameInMemory({database_name, table_name, other_table->getStorageID().uuid});
++        other_table->renameInMemory(other_table_new_id);
+ 
+     if (!inside_database)
+     {
+diff --git a/src/Databases/DatabaseAtomic.h b/src/Databases/DatabaseAtomic.h
+index eae700d28c54..b748e53244dd 100644
+--- a/src/Databases/DatabaseAtomic.h
++++ b/src/Databases/DatabaseAtomic.h
+@@ -63,7 +63,7 @@ class DatabaseAtomic : public DatabaseOrdinary
+ 
+     void waitDetachedTableNotInUse(const UUID & uuid) override;
+     void checkDetachedTableNotInUse(const UUID & uuid) override;
+-    void setDetachedTableNotInUseForce(const UUID & uuid);
++    void setDetachedTableNotInUseForce(const UUID & uuid) override;
+ 
+ protected:
+     void commitAlterTable(const StorageID & table_id, const String & table_metadata_tmp_path, const String & table_metadata_path, const String & statement, ContextPtr query_context) override;
+@@ -76,6 +76,8 @@ class DatabaseAtomic : public DatabaseOrdinary
+ 
+     void tryCreateMetadataSymlink();
+ 
++    virtual bool allowMoveTableToOtherDatabaseEngine(IDatabase & /*to_database*/) const { return false; }
++
+     //TODO store path in DatabaseWithOwnTables::tables
+     using NameToPathMap = std::unordered_map<String, String>;
+     NameToPathMap table_name_to_path;
+diff --git a/src/Databases/DatabaseOnDisk.cpp b/src/Databases/DatabaseOnDisk.cpp
+index f12009cef1ae..2b2d1e0ba2c8 100644
+--- a/src/Databases/DatabaseOnDisk.cpp
++++ b/src/Databases/DatabaseOnDisk.cpp
+@@ -415,11 +415,13 @@ void DatabaseOnDisk::renameTable(
+     }
+     catch (const Exception &)
+     {
++        setDetachedTableNotInUseForce(prev_uuid);
+         attachTable(local_context, table_name, table, table_data_relative_path);
+         throw;
+     }
+     catch (const Poco::Exception & e)
+     {
++        setDetachedTableNotInUseForce(prev_uuid);
+         attachTable(local_context, table_name, table, table_data_relative_path);
+         /// Better diagnostics.
+         throw Exception{Exception::CreateFromPocoTag{}, e};
+diff --git a/src/Databases/DatabaseOnDisk.h b/src/Databases/DatabaseOnDisk.h
+index 64122ae66e52..a118c8da6782 100644
+--- a/src/Databases/DatabaseOnDisk.h
++++ b/src/Databases/DatabaseOnDisk.h
+@@ -95,6 +95,7 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+                                    const String & table_metadata_tmp_path, const String & table_metadata_path, ContextPtr query_context);
+ 
+     virtual void removeDetachedPermanentlyFlag(ContextPtr context, const String & table_name, const String & table_metadata_path, bool attach) const;
++    virtual void setDetachedTableNotInUseForce(const UUID & /*uuid*/) {}
+ 
+     const String metadata_path;
+     const String data_path;
+diff --git a/src/Databases/DatabaseReplicated.cpp b/src/Databases/DatabaseReplicated.cpp
+index 2a07ba8375dd..7fea8699d595 100644
+--- a/src/Databases/DatabaseReplicated.cpp
++++ b/src/Databases/DatabaseReplicated.cpp
+@@ -45,6 +45,7 @@ namespace ErrorCodes
+ 
+ static constexpr const char * DROPPED_MARK = "DROPPED";
+ static constexpr const char * BROKEN_TABLES_SUFFIX = "_broken_tables";
++static constexpr const char * BROKEN_REPLICATED_TABLES_SUFFIX = "_broken_replicated_tables";
+ 
+ 
+ zkutil::ZooKeeperPtr DatabaseReplicated::getZooKeeper() const
+@@ -410,6 +411,8 @@ void DatabaseReplicated::checkQueryValid(const ASTPtr & query, ContextPtr query_
+ 
+             Macros::MacroExpansionInfo info;
+             info.table_id = {getDatabaseName(), create->getTable(), create->uuid};
++            info.shard = getShardName();
++            info.replica = getReplicaName();
+             query_context->getMacros()->expand(maybe_path, info);
+             bool maybe_shard_macros = info.expanded_other;
+             info.expanded_other = false;
+@@ -505,6 +508,9 @@ static UUID getTableUUIDIfReplicated(const String & metadata, ContextPtr context
+ 
+ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeeper, UInt32 our_log_ptr, UInt32 max_log_ptr)
+ {
++    is_recovering = true;
++    SCOPE_EXIT({ is_recovering = false; });
++
+     /// Let's compare local (possibly outdated) metadata with (most actual) metadata stored in ZooKeeper
+     /// and try to update the set of local tables.
+     /// We could drop all local tables and create the new ones just like it's new replica.
+@@ -582,6 +588,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+ 
+     String db_name = getDatabaseName();
+     String to_db_name = getDatabaseName() + BROKEN_TABLES_SUFFIX;
++    String to_db_name_replicated = getDatabaseName() + BROKEN_REPLICATED_TABLES_SUFFIX;
+     if (total_tables * db_settings.max_broken_tables_ratio < tables_to_detach.size())
+         throw Exception(ErrorCodes::DATABASE_REPLICATION_FAILED, "Too many tables to recreate: {} of {}", tables_to_detach.size(), total_tables);
+     else if (!tables_to_detach.empty())
+@@ -593,6 +600,13 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+         String query = fmt::format("CREATE DATABASE IF NOT EXISTS {} ENGINE=Ordinary", backQuoteIfNeed(to_db_name));
+         auto query_context = Context::createCopy(getContext());
+         executeQuery(query, query_context, true);
++
++        /// But we want to avoid discarding UUID of ReplicatedMergeTree tables, because it will not work
++        /// if zookeeper_path contains {uuid} macro. Replicated database do not recreate replicated tables on recovery,
++        /// so it's ok to save UUID of replicated table.
++        query = fmt::format("CREATE DATABASE IF NOT EXISTS {} ENGINE=Atomic", backQuoteIfNeed(to_db_name_replicated));
++        query_context = Context::createCopy(getContext());
++        executeQuery(query, query_context, true);
+     }
+ 
+     size_t moved_tables = 0;
+@@ -607,6 +621,18 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+ 
+         auto table = tryGetTable(table_name, getContext());
+ 
++        auto move_table_to_database = [&](const String & broken_table_name, const String & to_database_name)
++        {
++            /// Table probably stores some data. Let's move it to another database.
++            String to_name = fmt::format("{}_{}_{}", broken_table_name, max_log_ptr, thread_local_rng() % 1000);
++            LOG_DEBUG(log, "Will RENAME TABLE {} TO {}.{}", backQuoteIfNeed(broken_table_name), backQuoteIfNeed(to_database_name), backQuoteIfNeed(to_name));
++            assert(db_name < to_database_name);
++            DDLGuardPtr to_table_guard = DatabaseCatalog::instance().getDDLGuard(to_database_name, to_name);
++            auto to_db_ptr = DatabaseCatalog::instance().getDatabase(to_database_name);
++            DatabaseAtomic::renameTable(make_query_context(), broken_table_name, *to_db_ptr, to_name, false, false);
++            ++moved_tables;
++        };
++
+         if (!table->storesDataOnDisk())
+         {
+             LOG_DEBUG(log, "Will DROP TABLE {}, because it does not store data on disk and can be safely dropped", backQuoteIfNeed(table_name));
+@@ -616,16 +642,13 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+             table->flushAndShutdown();
+             DatabaseAtomic::dropTable(make_query_context(), table_name, true);
+         }
++        else if (!table->supportsReplication())
++        {
++            move_table_to_database(table_name, to_db_name);
++        }
+         else
+         {
+-            /// Table probably stores some data. Let's move it to another database.
+-            String to_name = fmt::format("{}_{}_{}", table_name, max_log_ptr, thread_local_rng() % 1000);
+-            LOG_DEBUG(log, "Will RENAME TABLE {} TO {}.{}", backQuoteIfNeed(table_name), backQuoteIfNeed(to_db_name), backQuoteIfNeed(to_name));
+-            assert(db_name < to_db_name);
+-            DDLGuardPtr to_table_guard = DatabaseCatalog::instance().getDDLGuard(to_db_name, to_name);
+-            auto to_db_ptr = DatabaseCatalog::instance().getDatabase(to_db_name);
+-            DatabaseAtomic::renameTable(make_query_context(), table_name, *to_db_ptr, to_name, false, false);
+-            ++moved_tables;
++            move_table_to_database(table_name, to_db_name_replicated);
+         }
+     }
+ 
+diff --git a/src/Databases/DatabaseReplicated.h b/src/Databases/DatabaseReplicated.h
+index ac212e168b87..72d19a5340af 100644
+--- a/src/Databases/DatabaseReplicated.h
++++ b/src/Databases/DatabaseReplicated.h
+@@ -98,6 +98,11 @@ class DatabaseReplicated : public DatabaseAtomic
+ 
+     void createEmptyLogEntry(const ZooKeeperPtr & current_zookeeper);
+ 
++    bool allowMoveTableToOtherDatabaseEngine(IDatabase & to_database) const override
++    {
++        return is_recovering && typeid_cast<DatabaseAtomic *>(&to_database);
++    }
++
+     String zookeeper_path;
+     String shard_name;
+     String replica_name;
+@@ -107,6 +112,7 @@ class DatabaseReplicated : public DatabaseAtomic
+     zkutil::ZooKeeperPtr getZooKeeper() const;
+ 
+     std::atomic_bool is_readonly = true;
++    std::atomic_bool is_recovering = false;
+     std::unique_ptr<DatabaseReplicatedDDLWorker> ddl_worker;
+     UInt32 max_log_ptr_at_creation = 0;
+ 
+diff --git a/src/Storages/IStorage.h b/src/Storages/IStorage.h
+index 013f7e97682b..82fc12eddfbc 100644
+--- a/src/Storages/IStorage.h
++++ b/src/Storages/IStorage.h
+@@ -416,7 +416,7 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+         throw Exception("Truncate is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
+-    virtual void checkTableCanBeRenamed() const {}
++    virtual void checkTableCanBeRenamed(const StorageID & /*new_name*/) const {}
+ 
+     /** Rename the table.
+       * Renaming a name in a file with metadata, the name in the list of tables in the RAM, is done separately.
+diff --git a/src/Storages/MergeTree/registerStorageMergeTree.cpp b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+index 82be9f1708a2..b2c41c7df681 100644
+--- a/src/Storages/MergeTree/registerStorageMergeTree.cpp
++++ b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+@@ -307,7 +307,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+     /// For Replicated.
+     String zookeeper_path;
+     String replica_name;
+-    bool allow_renaming = true;
++    StorageReplicatedMergeTree::RenamingRestrictions renaming_restrictions = StorageReplicatedMergeTree::RenamingRestrictions::ALLOW_ANY;
+ 
+     if (replicated)
+     {
+@@ -376,7 +376,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+         bool allow_uuid_macro = is_on_cluster || is_replicated_database || args.query.attach;
+ 
+         /// Unfold {database} and {table} macro on table creation, so table can be renamed.
+-        /// We also unfold {uuid} macro, so path will not be broken after moving table from Atomic to Ordinary database.
+         if (!args.attach)
+         {
+             if (is_replicated_database && !is_extended_storage_def)
+@@ -386,12 +385,13 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+             /// NOTE: it's not recursive
+             info.expand_special_macros_only = true;
+             info.table_id = args.table_id;
+-            if (!allow_uuid_macro)
+-                info.table_id.uuid = UUIDHelpers::Nil;
++            /// Avoid unfolding {uuid} macro on this step.
++            /// We did unfold it in previous versions to make moving table from Atomic to Ordinary database work correctly,
++            /// but now it's not allowed (and it was the only reason to unfold {uuid} macro).
++            info.table_id.uuid = UUIDHelpers::Nil;
+             zookeeper_path = args.getContext()->getMacros()->expand(zookeeper_path, info);
+ 
+             info.level = 0;
+-            info.table_id.uuid = UUIDHelpers::Nil;
+             replica_name = args.getContext()->getMacros()->expand(replica_name, info);
+         }
+ 
+@@ -419,8 +419,11 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+         /// We do not allow renaming table with these macros in metadata, because zookeeper_path will be broken after RENAME TABLE.
+         /// NOTE: it may happen if table was created by older version of ClickHouse (< 20.10) and macros was not unfolded on table creation
+         /// or if one of these macros is recursively expanded from some other macro.
++        /// Also do not allow to move table from Atomic to Ordinary database if there's {uuid} macro
+         if (info.expanded_database || info.expanded_table)
+-            allow_renaming = false;
++            renaming_restrictions = StorageReplicatedMergeTree::RenamingRestrictions::DO_NOT_ALLOW;
++        else if (info.expanded_uuid)
++            renaming_restrictions = StorageReplicatedMergeTree::RenamingRestrictions::ALLOW_PRESERVING_UUID;
+     }
+ 
+     /// This merging param maybe used as part of sorting key
+@@ -681,7 +684,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+             merging_params,
+             std::move(storage_settings),
+             args.has_force_restore_data_flag,
+-            allow_renaming);
++            renaming_restrictions);
+     else
+         return StorageMergeTree::create(
+             args.table_id,
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 66a5baf555ba..3688e98629b2 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -237,7 +237,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
+     const MergingParams & merging_params_,
+     std::unique_ptr<MergeTreeSettings> settings_,
+     bool has_force_restore_data_flag,
+-    bool allow_renaming_)
++    RenamingRestrictions renaming_restrictions_)
+     : MergeTreeData(table_id_,
+                     relative_data_path_,
+                     metadata_,
+@@ -264,7 +264,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
+     , part_check_thread(*this)
+     , restarting_thread(*this)
+     , part_moves_between_shards_orchestrator(*this)
+-    , allow_renaming(allow_renaming_)
++    , renaming_restrictions(renaming_restrictions_)
+     , replicated_fetches_pool_size(getContext()->getSettingsRef().background_fetches_pool_size)
+     , replicated_fetches_throttler(std::make_shared<Throttler>(getSettings()->max_replicated_fetches_network_bandwidth, getContext()->getReplicatedFetchesThrottler()))
+     , replicated_sends_throttler(std::make_shared<Throttler>(getSettings()->max_replicated_sends_network_bandwidth, getContext()->getReplicatedSendsThrottler()))
+@@ -5131,17 +5131,26 @@ void StorageReplicatedMergeTree::checkTableCanBeDropped() const
+     getContext()->checkTableCanBeDropped(table_id.database_name, table_id.table_name, getTotalActiveSizeInBytes());
+ }
+ 
+-void StorageReplicatedMergeTree::checkTableCanBeRenamed() const
++void StorageReplicatedMergeTree::checkTableCanBeRenamed(const StorageID & new_name) const
+ {
+-    if (!allow_renaming)
++    if (renaming_restrictions == RenamingRestrictions::ALLOW_ANY)
++        return;
++
++    if (renaming_restrictions == RenamingRestrictions::DO_NOT_ALLOW)
+         throw Exception("Cannot rename Replicated table, because zookeeper_path contains implicit 'database' or 'table' macro. "
+                         "We cannot rename path in ZooKeeper, so path may become inconsistent with table name. If you really want to rename table, "
+                         "you should edit metadata file first and restart server or reattach the table.", ErrorCodes::NOT_IMPLEMENTED);
++
++    assert(renaming_restrictions == RenamingRestrictions::ALLOW_PRESERVING_UUID);
++    if (!new_name.hasUUID() && getStorageID().hasUUID())
++        throw Exception("Cannot move Replicated table to Ordinary database, because zookeeper_path contains implicit 'uuid' macro. "
++                        "If you really want to rename table, "
++                        "you should edit metadata file first and restart server or reattach the table.", ErrorCodes::NOT_IMPLEMENTED);
+ }
+ 
+ void StorageReplicatedMergeTree::rename(const String & new_path_to_table_data, const StorageID & new_table_id)
+ {
+-    checkTableCanBeRenamed();
++    checkTableCanBeRenamed(new_table_id);
+     MergeTreeData::rename(new_path_to_table_data, new_table_id);
+ 
+     /// Update table name in zookeeper
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index 317544c8bb8e..a5291062218f 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -143,7 +143,14 @@ class StorageReplicatedMergeTree final : public shared_ptr_helper<StorageReplica
+ 
+     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr query_context, TableExclusiveLockHolder &) override;
+ 
+-    void checkTableCanBeRenamed() const override;
++    enum RenamingRestrictions
++    {
++        ALLOW_ANY,
++        ALLOW_PRESERVING_UUID,
++        DO_NOT_ALLOW,
++    };
++
++    void checkTableCanBeRenamed(const StorageID & new_name) const override;
+ 
+     void rename(const String & new_path_to_table_data, const StorageID & new_table_id) override;
+ 
+@@ -414,7 +421,7 @@ class StorageReplicatedMergeTree final : public shared_ptr_helper<StorageReplica
+     bool other_replicas_fixed_granularity = false;
+ 
+     /// Do not allow RENAME TABLE if zookeeper_path contains {database} or {table} macro
+-    const bool allow_renaming;
++    const RenamingRestrictions renaming_restrictions;
+ 
+     const size_t replicated_fetches_pool_size;
+ 
+@@ -799,7 +806,7 @@ class StorageReplicatedMergeTree final : public shared_ptr_helper<StorageReplica
+         const MergingParams & merging_params_,
+         std::unique_ptr<MergeTreeSettings> settings_,
+         bool has_force_restore_data_flag,
+-        bool allow_renaming_);
++        RenamingRestrictions renaming_restrictions_);
+ };
+ 
+ String getPartNamePossiblyFake(MergeTreeDataFormatVersion format_version, const MergeTreePartInfo & part_info);

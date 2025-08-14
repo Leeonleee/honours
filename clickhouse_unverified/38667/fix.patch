@@ -1,0 +1,3250 @@
+diff --git a/src/Common/FST.cpp b/src/Common/FST.cpp
+new file mode 100644
+index 000000000000..b409d37919ff
+--- /dev/null
++++ b/src/Common/FST.cpp
+@@ -0,0 +1,480 @@
++#include "FST.h"
++#include <algorithm>
++#include <cassert>
++#include <iostream>
++#include <memory>
++#include <vector>
++#include <Common/Exception.h>
++#include <city.h>
++
++/// "paper" in the comments in this file refers to:
++/// [Direct Construction of Minimal Acyclic Subsequential Transduers] by Stoyan Mihov and Denis Maurel, University of Tours, France
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int BAD_ARGUMENTS;
++};
++
++namespace FST
++{
++
++UInt64 Arc::serialize(WriteBuffer& write_buffer) const
++{
++    UInt64 written_bytes = 0;
++    bool has_output = output != 0;
++
++    /// First UInt64 is target_index << 1 + has_output
++    assert(target != nullptr);
++    UInt64 first = ((target->state_index) << 1) + has_output;
++    writeVarUInt(first, write_buffer);
++    written_bytes += getLengthOfVarUInt(first);
++
++    /// Second UInt64 is output (optional based on whether has_output is not zero)
++    if (has_output)
++    {
++        writeVarUInt(output, write_buffer);
++        written_bytes += getLengthOfVarUInt(output);
++    }
++    return written_bytes;
++}
++
++bool operator==(const Arc & arc1, const Arc & arc2)
++{
++    assert(arc1.target != nullptr && arc2.target != nullptr);
++    return (arc1.output == arc2.output && arc1.target->id == arc2.target->id);
++}
++
++void LabelsAsBitmap::addLabel(char label)
++{
++    UInt8 index = label;
++    UInt256 bit_label = 1;
++    bit_label <<= index;
++
++    data |= bit_label;
++}
++
++UInt64 LabelsAsBitmap::getIndex(char label) const
++{
++    UInt64 bit_count = 0;
++
++    UInt8 index = label;
++    int which_int64 = 0;
++    while (true)
++    {
++        if (index < 64)
++        {
++            UInt64 mask = index == 63 ? (-1) : (1ULL << (index + 1)) - 1;
++
++            bit_count += std::popcount(mask & data.items[which_int64]);
++            break;
++        }
++        index -= 64;
++        bit_count += std::popcount(data.items[which_int64]);
++
++        which_int64++;
++    }
++    return bit_count;
++}
++
++UInt64 LabelsAsBitmap::serialize(WriteBuffer& write_buffer)
++{
++    writeVarUInt(data.items[0], write_buffer);
++    writeVarUInt(data.items[1], write_buffer);
++    writeVarUInt(data.items[2], write_buffer);
++    writeVarUInt(data.items[3], write_buffer);
++
++    return getLengthOfVarUInt(data.items[0])
++        + getLengthOfVarUInt(data.items[1])
++        + getLengthOfVarUInt(data.items[2])
++        + getLengthOfVarUInt(data.items[3]);
++}
++
++bool LabelsAsBitmap::hasLabel(char label) const
++{
++    UInt8 index = label;
++    UInt256 bit_label = 1;
++    bit_label <<= index;
++
++    return ((data & bit_label) != 0);
++}
++
++Arc* State::getArc(char label) const
++{
++    auto it = arcs.find(label);
++    if (it == arcs.cend())
++        return nullptr;
++
++    return const_cast<Arc *>(&it->second);
++}
++
++void State::addArc(char label, Output output, StatePtr target)
++{
++    arcs[label] = Arc(output, target);
++}
++
++void State::clear()
++{
++    id = 0;
++    state_index = 0;
++    flag = 0;
++
++    arcs.clear();
++}
++
++UInt64 State::hash() const
++{
++    std::vector<char> values;
++    values.reserve(arcs.size() * (sizeof(Output) + sizeof(UInt64) + 1));
++    for (const auto & [label, arc] : arcs)
++    {
++        values.push_back(label);
++        const auto * ptr = reinterpret_cast<const char*>(&arc.output);
++        std::copy(ptr, ptr + sizeof(Output), std::back_inserter(values));
++
++        ptr = reinterpret_cast<const char*>(&arc.target->id);
++        std::copy(ptr, ptr + sizeof(UInt64), std::back_inserter(values));
++    }
++
++    return CityHash_v1_0_2::CityHash64(values.data(), values.size());
++}
++
++bool operator== (const State & state1, const State & state2)
++{
++    if (state1.arcs.size() != state2.arcs.size())
++        return false;
++
++    for (const auto & [label, arc] : state1.arcs)
++    {
++        const auto it = state2.arcs.find(label);
++        if (it == state2.arcs.cend())
++            return false;
++
++        if (it->second != arc)
++            return false;
++    }
++    return true;
++}
++
++UInt64 State::serialize(WriteBuffer& write_buffer)
++{
++    UInt64 written_bytes = 0;
++
++    /// Serialize flag
++    write_buffer.write(flag);
++    written_bytes += 1;
++
++    if (getEncodingMethod() == EncodingMethod::Sequential)
++    {
++        /// Serialize all labels
++        std::vector<char> labels;
++        labels.reserve(arcs.size());
++
++        for (auto& [label, state] : arcs)
++        {
++            labels.push_back(label);
++        }
++
++        UInt8 label_size = labels.size();
++        write_buffer.write(label_size);
++        written_bytes += 1;
++
++        write_buffer.write(labels.data(), labels.size());
++        written_bytes += labels.size();
++
++        /// Serialize all arcs
++        for (char label : labels)
++        {
++            Arc* arc = getArc(label);
++            assert(arc != nullptr);
++            written_bytes += arc->serialize(write_buffer);
++        }
++    }
++    else
++    {
++        /// Serialize bitmap
++        LabelsAsBitmap bmp;
++        for (auto & [label, state] : arcs)
++        {
++            bmp.addLabel(label);
++        }
++        written_bytes += bmp.serialize(write_buffer);
++
++        /// Serialize all arcs
++        for (auto & [label, state] : arcs)
++        {
++            Arc* arc = getArc(label);
++            assert(arc != nullptr);
++            written_bytes += arc->serialize(write_buffer);
++        }
++    }
++
++    return written_bytes;
++}
++
++FSTBuilder::FSTBuilder(WriteBuffer& write_buffer_) : write_buffer(write_buffer_)
++{
++    for (auto & temp_state : temp_states)
++    {
++        temp_state = std::make_shared<State>();
++    }
++}
++
++/// See FindMinimized in the paper pseudo code l11-l21.
++StatePtr FSTBuilder::findMinimized(const State & state, bool & found)
++{
++    found = false;
++    auto hash = state.hash();
++
++    /// MEMBER: in the paper pseudo code l15
++    auto it = minimized_states.find(hash);
++
++    if (it != minimized_states.cend() && *it->second == state)
++    {
++        found = true;
++        return it->second;
++    }
++
++    /// COPY_STATE: in the paper pseudo code l17
++    StatePtr p = std::make_shared<State>(state);
++
++    /// INSERT: in the paper pseudo code l18
++    minimized_states[hash] = p;
++    return p;
++}
++
++/// See the paper pseudo code l33-34.
++size_t FSTBuilder::getCommonPrefixLength(const String & word1, const String & word2)
++{
++    size_t i = 0;
++    while (i < word1.size() && i < word2.size() && word1[i] == word2[i])
++        i++;
++    return i;
++}
++
++/// See the paper pseudo code l33-39 and l70-72(when down_to is 0).
++void FSTBuilder::minimizePreviousWordSuffix(Int64 down_to)
++{
++    for (Int64 i = static_cast<Int64>(previous_word.size()); i >= down_to; --i)
++    {
++        bool found = false;
++        auto minimized_state = findMinimized(*temp_states[i], found);
++
++        if (i != 0)
++        {
++            Output output = 0;
++            Arc* arc = temp_states[i - 1]->getArc(previous_word[i - 1]);
++            if (arc)
++                output = arc->output;
++
++            /// SET_TRANSITION
++            temp_states[i - 1]->addArc(previous_word[i - 1], output, minimized_state);
++        }
++        if (minimized_state->id == 0)
++            minimized_state->id = next_id++;
++
++        if (i > 0 && temp_states[i - 1]->id == 0)
++            temp_states[i - 1]->id = next_id++;
++
++        if (!found)
++        {
++            minimized_state->state_index = previous_state_index;
++
++            previous_written_bytes = minimized_state->serialize(write_buffer);
++            previous_state_index += previous_written_bytes;
++        }
++    }
++}
++
++void FSTBuilder::add(const std::string & current_word, Output current_output)
++{
++    /// We assume word size is no greater than MAX_TERM_LENGTH(256).
++    /// FSTs without word size limitation would be inefficient and easy to cause memory bloat
++    /// Note that when using "split" tokenizer, if a granule has tokens which are longer than
++    /// MAX_TERM_LENGTH, the granule cannot be dropped and will be fully-scanned. It doesn't affect "ngram" tokenizers.
++    /// Another limitation is that if the query string has tokens which exceed this length
++    /// it will fallback to default searching when using "split" tokenizers.
++    auto current_word_len = current_word.size();
++
++    if (current_word_len > MAX_TERM_LENGTH)
++        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Too long term ({}) passed to FST builder.", current_word_len);
++
++    size_t prefix_length_plus1 = getCommonPrefixLength(current_word, previous_word) + 1;
++
++    minimizePreviousWordSuffix(prefix_length_plus1);
++
++    /// Initialize the tail state, see paper pseudo code l39-43
++    for (size_t i = prefix_length_plus1; i <= current_word.size(); ++i)
++    {
++        /// CLEAR_STATE: l41
++        temp_states[i]->clear();
++
++        /// SET_TRANSITION: l42
++        temp_states[i - 1]->addArc(current_word[i - 1], 0, temp_states[i]);
++    }
++
++    /// We assume the current word is different with previous word
++    /// See paper pseudo code l44-47
++    temp_states[current_word_len]->setFinal(true);
++
++    /// Adjust outputs on the arcs
++    /// See paper pseudo code l48-63
++    for (size_t i = 1; i <= prefix_length_plus1 - 1; ++i)
++    {
++        Arc * arc_ptr = temp_states[i - 1]->getArc(current_word[i - 1]);
++        assert(arc_ptr != nullptr);
++
++        Output common_prefix = std::min(arc_ptr->output, current_output);
++        Output word_suffix = arc_ptr->output - common_prefix;
++        arc_ptr->output = common_prefix;
++
++        /// For each arc, adjust its output
++        if (word_suffix != 0)
++        {
++            for (auto & [label, arc] : temp_states[i]->arcs)
++            {
++                arc.output += word_suffix;
++            }
++        }
++        /// Reduce current_output
++        current_output -= common_prefix;
++    }
++
++    /// Set last temp state's output
++    /// paper pseudo code l66-67 (assuming CurrentWord != PreviousWorld)
++    Arc * arc = temp_states[prefix_length_plus1 - 1]->getArc(current_word[prefix_length_plus1 - 1]);
++    assert(arc != nullptr);
++    arc->output = current_output;
++
++    previous_word = current_word;
++}
++
++UInt64 FSTBuilder::build()
++{
++    minimizePreviousWordSuffix(0);
++
++    /// Save initial state index
++
++    previous_state_index -= previous_written_bytes;
++    UInt8 length = getLengthOfVarUInt(previous_state_index);
++    writeVarUInt(previous_state_index, write_buffer);
++    write_buffer.write(length);
++
++    return previous_state_index + previous_written_bytes + length + 1;
++}
++
++FiniteStateTransducer::FiniteStateTransducer(std::vector<UInt8> data_) : data(std::move(data_))
++{
++}
++
++void FiniteStateTransducer::clear()
++{
++    data.clear();
++}
++
++std::pair<UInt64, bool> FiniteStateTransducer::getOutput(const String & term)
++{
++    std::pair<UInt64, bool> result{ 0, false };
++
++    /// Read index of initial state
++    ReadBufferFromMemory read_buffer(data.data(), data.size());
++    read_buffer.seek(data.size()-1, SEEK_SET);
++
++    UInt8 length{ 0 };
++    read_buffer.readStrict(reinterpret_cast<char&>(length));
++
++    /// FST contains no terms
++    if (length == 0)
++        return { 0, false };
++
++    read_buffer.seek(data.size() - 1 - length, SEEK_SET);
++    UInt64 state_index{ 0 };
++    readVarUInt(state_index, read_buffer);
++
++    for (size_t i = 0; i <= term.size(); ++i)
++    {
++        UInt64 arc_output{ 0 };
++
++        /// Read flag
++        State temp_state;
++
++        read_buffer.seek(state_index, SEEK_SET);
++        temp_state.readFlag(read_buffer);
++        if (i == term.size())
++        {
++            result.second = temp_state.isFinal();
++            break;
++        }
++
++        UInt8 label = term[i];
++        if (temp_state.getEncodingMethod() == State::EncodingMethod::Sequential)
++        {
++            /// Read number of labels
++            UInt8 label_num{ 0 };
++            read_buffer.readStrict(reinterpret_cast<char&>(label_num));
++
++            if (label_num == 0)
++                return { 0, false };
++
++            auto labels_position = read_buffer.getPosition();
++
++            /// Find the index of the label from "labels" bytes
++            auto begin_it{ data.begin() + labels_position };
++            auto end_it{ data.begin() + labels_position + label_num };
++
++            auto pos = std::find(begin_it, end_it, label);
++
++            if (pos == end_it)
++                return { 0, false };
++
++            /// Read the arc for the label
++            UInt64 arc_index = (pos - begin_it);
++            auto arcs_start_postion = labels_position + label_num;
++
++            read_buffer.seek(arcs_start_postion, SEEK_SET);
++            for (size_t j = 0; j <= arc_index; j++)
++            {
++                state_index = 0;
++                arc_output = 0;
++                readVarUInt(state_index, read_buffer);
++                if (state_index & 0x1) // output is followed
++                {
++                    readVarUInt(arc_output, read_buffer);
++                }
++                state_index >>= 1;
++            }
++        }
++        else
++        {
++            LabelsAsBitmap bmp;
++
++            readVarUInt(bmp.data.items[0], read_buffer);
++            readVarUInt(bmp.data.items[1], read_buffer);
++            readVarUInt(bmp.data.items[2], read_buffer);
++            readVarUInt(bmp.data.items[3], read_buffer);
++
++            if (!bmp.hasLabel(label))
++                return { 0, false };
++
++            /// Read the arc for the label
++            size_t arc_index = bmp.getIndex(label);
++            for (size_t j = 0; j < arc_index; j++)
++            {
++                state_index = 0;
++                arc_output = 0;
++                readVarUInt(state_index, read_buffer);
++                if (state_index & 0x1) // output is followed
++                {
++                    readVarUInt(arc_output, read_buffer);
++                }
++                state_index >>= 1;
++            }
++        }
++        /// Accumulate the output value
++        result.first += arc_output;
++    }
++    return result;
++}
++}
++}
+diff --git a/src/Common/FST.h b/src/Common/FST.h
+new file mode 100644
+index 000000000000..6bb4fdba7e23
+--- /dev/null
++++ b/src/Common/FST.h
+@@ -0,0 +1,182 @@
++#pragma once
++#include <array>
++#include <map>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++#include <Core/Types.h>
++#include <IO/ReadHelpers.h>
++#include <IO/WriteBuffer.h>
++#include <base/types.h>
++
++namespace DB
++{
++/// Finite State Transducer is an efficient way to represent term dictionary.
++/// It can be viewed as a map of <term, output> where output is an integer.
++/// Detailed explanation can be found in the following paper
++/// [Direct Construction of Minimal Acyclic Subsequential Transduers] by Stoyan Mihov and Denis Maurel, University of Tours, France
++namespace FST
++{
++using Output = UInt64;
++
++class State;
++using StatePtr = std::shared_ptr<State>;
++
++/// Arc represents a transition from one state to another
++/// It includes the target state to which the arc points and the arc's output.
++struct Arc
++{
++    Arc() = default;
++
++    explicit Arc(Output output_, const StatePtr & target_) : output{output_}, target{target_} { }
++
++    /// 0 means the arc has no output
++    Output output = 0;
++
++    StatePtr target;
++
++    UInt64 serialize(WriteBuffer & write_buffer) const;
++};
++
++bool operator==(const Arc & arc1, const Arc & arc2);
++
++/// LabelsAsBitmap implements a 256-bit bitmap for all labels of a state. Each bit represents
++/// a label's presence and the index value of the bit represents the corresponding label
++class LabelsAsBitmap
++{
++public:
++    void addLabel(char label);
++    bool hasLabel(char label) const;
++
++    /// computes the rank
++    UInt64 getIndex(char label) const;
++
++    UInt64 serialize(WriteBuffer& write_buffer);
++private:
++    friend class State;
++    friend class FiniteStateTransducer;
++    /// data holds a 256-bit bitmap for all labels of a state. Its 256 bits correspond to 256
++    /// possible label values.
++    UInt256 data{ 0 };
++};
++
++/// State implements the State in Finite State Transducer
++/// Each state contains all its arcs and a flag indicating if it is final state
++class State
++{
++public:
++    static constexpr size_t MAX_ARCS_IN_SEQUENTIAL_METHOD = 32;
++    enum class EncodingMethod
++    {
++        /// Serialize arcs sequentially
++        Sequential = 0,
++
++        /// Serialize arcs by using bitmap
++        /// Note this is NOT enabled for now since it is experimental
++        Bitmap,
++    };
++    State() = default;
++
++    State(const State & state) = default;
++
++    UInt64 hash() const;
++
++    Arc * getArc(char label) const;
++
++    void addArc(char label, Output output, StatePtr target);
++
++    void clear();
++
++    UInt64 serialize(WriteBuffer & write_buffer);
++
++    bool isFinal() const
++    {
++        return flag_values.is_final == 1;
++    }
++    void setFinal(bool value)
++    {
++        flag_values.is_final = value;
++    }
++    EncodingMethod getEncodingMethod() const
++    {
++        return flag_values.encoding_method;
++    }
++    void readFlag(ReadBuffer & read_buffer)
++    {
++        read_buffer.readStrict(reinterpret_cast<char&>(flag));
++    }
++
++    /// Transient ID of the state which is used for building FST. It won't be serialized
++    UInt64 id = 0;
++
++    /// State index which indicates location of state in FST
++    UInt64 state_index = 0;
++
++    /// Arcs which are started from state, the 'char' is the label on the arc
++    std::unordered_map<char, Arc> arcs;
++private:
++    struct FlagValues
++    {
++        unsigned int is_final : 1;
++        EncodingMethod encoding_method : 3;
++    };
++
++    union
++    {
++        FlagValues flag_values;
++        uint8_t flag = 0;
++    };
++};
++
++bool operator==(const State & state1, const State & state2);
++
++inline constexpr size_t MAX_TERM_LENGTH = 256;
++
++/// FSTBuilder is used to build Finite State Transducer by adding words incrementally.
++/// Note that all the words have to be added in sorted order in order to achieve minimized result.
++/// In the end, the caller should call build() to serialize minimized FST to WriteBuffer
++class FSTBuilder
++{
++public:
++    explicit FSTBuilder(WriteBuffer & write_buffer_);
++
++    void add(const std::string & word, Output output);
++    UInt64 build();
++private:
++    StatePtr findMinimized(const State & s, bool & found);
++    void minimizePreviousWordSuffix(Int64 down_to);
++    static size_t getCommonPrefixLength(const String & word1, const String & word2);
++
++    std::array<StatePtr, MAX_TERM_LENGTH + 1> temp_states;
++    String previous_word;
++    StatePtr initial_state;
++
++    /// map of (state_hash, StatePtr)
++    std::unordered_map<UInt64, StatePtr> minimized_states;
++
++    /// Next available ID of state
++    UInt64 next_id = 1;
++
++    WriteBuffer & write_buffer;
++    UInt64 previous_written_bytes = 0;
++    UInt64 previous_state_index = 0;
++};
++
++//FiniteStateTransducer is constructed by using minimized FST blob(which is loaded from index storage)
++// It is used to retrieve output by given term
++class FiniteStateTransducer
++{
++public:
++    FiniteStateTransducer() = default;
++    explicit FiniteStateTransducer(std::vector<UInt8> data_);
++    std::pair<UInt64, bool> getOutput(const String & term);
++    void clear();
++    std::vector<UInt8> & getData() { return data; }
++
++private:
++    std::vector<UInt8> data;
++};
++}
++}
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index f58bd7ebafbf..1ade4ba28682 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -182,6 +182,7 @@ static constexpr UInt64 operator""_GiB(unsigned long long value)
+     M(UInt64, merge_tree_max_rows_to_use_cache, (128 * 8192), "The maximum number of rows per request, to use the cache of uncompressed data. If the request is large, the cache is not used. (For large queries not to flush out the cache.)", 0) \
+     M(UInt64, merge_tree_max_bytes_to_use_cache, (192 * 10 * 1024 * 1024), "The maximum number of bytes per request, to use the cache of uncompressed data. If the request is large, the cache is not used. (For large queries not to flush out the cache.)", 0) \
+     M(Bool, do_not_merge_across_partitions_select_final, false, "Merge parts only in one partition in select final", 0) \
++    M(Bool, allow_experimental_inverted_index, false, "If it is set to true, allow to use experimental inverted index.", 0) \
+     \
+     M(UInt64, mysql_max_rows_to_insert, 65536, "The maximum number of rows in MySQL batch insertion of the MySQL storage engine", 0) \
+     \
+diff --git a/src/Interpreters/GinFilter.cpp b/src/Interpreters/GinFilter.cpp
+new file mode 100644
+index 000000000000..8965d3721d22
+--- /dev/null
++++ b/src/Interpreters/GinFilter.cpp
+@@ -0,0 +1,185 @@
++#include <string>
++#include <algorithm>
++#include <city.h>
++#include <Columns/ColumnArray.h>
++#include <Columns/ColumnNullable.h>
++#include <Columns/ColumnLowCardinality.h>
++#include <DataTypes/DataTypeArray.h>
++#include <DataTypes/DataTypeNullable.h>
++#include <DataTypes/DataTypeLowCardinality.h>
++#include <Storages/MergeTree/MergeTreeIndexGin.h>
++#include <Storages/MergeTree/MergeTreeIndexFullText.h>
++#include <Disks/DiskLocal.h>
++#include <Storages/MergeTree/GinIndexStore.h>
++#include <Interpreters/GinFilter.h>
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int BAD_ARGUMENTS;
++}
++GinFilterParameters::GinFilterParameters(size_t ngrams_, Float64 density_)
++    : ngrams(ngrams_), density(density_)
++{
++    if (ngrams > 8)
++        throw Exception("The size of gin filter cannot be greater than 8", ErrorCodes::BAD_ARGUMENTS);
++    if (density <= 0 || density > 1)
++        throw Exception("The density of gin filter must be between 0 and 1", ErrorCodes::BAD_ARGUMENTS);
++}
++
++GinFilter::GinFilter(const GinFilterParameters & params_)
++    : params(params_)
++{
++}
++
++void GinFilter::add(const char* data, size_t len, UInt32 rowID, GinIndexStorePtr& store, UInt64 limit) const
++{
++    if (len > FST::MAX_TERM_LENGTH)
++        return;
++
++    String term(data, len);
++    auto it = store->getPostings().find(term);
++
++    if (it != store->getPostings().end())
++    {
++        if (!it->second->contains(rowID))
++            it->second->add(rowID);
++    }
++    else
++    {
++        UInt64 threshold = std::lround(limit * params.density);
++        GinIndexStore::GinIndexPostingsBuilderPtr builder = std::make_shared<GinIndexPostingsBuilder>(threshold);
++        builder->add(rowID);
++
++        store->setPostingsBuilder(term, builder);
++    }
++}
++
++/// This method assumes segmentIDs are in increasing order, which is true since rows are
++/// digested sequentially and segments are created sequentially too.
++void GinFilter::addRowRangeToGinFilter(UInt32 segmentID, UInt32 rowIDStart, UInt32 rowIDEnd)
++{
++    /// check segment ids are monotonic increasing
++    assert(rowid_ranges.empty() || rowid_ranges.back().segment_id <= segmentID);
++
++    if (!rowid_ranges.empty())
++    {
++        /// Try to merge the rowID range with the last one in the container
++        GinSegmentWithRowIDRange & last_rowid_range = rowid_ranges.back();
++
++        if (last_rowid_range.segment_id == segmentID &&
++            last_rowid_range.range_end+1 == rowIDStart)
++        {
++            last_rowid_range.range_end = rowIDEnd;
++            return;
++        }
++    }
++    rowid_ranges.push_back({segmentID, rowIDStart, rowIDEnd});
++}
++
++void GinFilter::clear()
++{
++    terms.clear();
++    rowid_ranges.clear();
++    query_string.clear();
++}
++
++bool GinFilter::hasEmptyPostingsList(const PostingsCache& postings_cache)
++{
++    if (postings_cache.empty())
++        return true;
++
++    for (const auto& term_postings : postings_cache)
++    {
++        const SegmentedPostingsListContainer& container = term_postings.second;
++        if (container.empty())
++            return true;
++    }
++    return false;
++}
++
++bool GinFilter::matchInRange(const PostingsCache& postings_cache, UInt32 segment_id, UInt32 range_start, UInt32 range_end)
++{
++    /// Check for each terms
++    GinIndexPostingsList intersection_result;
++    bool intersection_result_init = false;
++
++    for (const auto& term_postings : postings_cache)
++    {
++        /// Check if it is in the same segment by searching for segment_id
++        const SegmentedPostingsListContainer& container = term_postings.second;
++        auto container_it = container.find(segment_id);
++        if (container_it == container.cend())
++        {
++            return false;
++        }
++        auto min_in_container = container_it->second->minimum();
++        auto max_in_container = container_it->second->maximum();
++
++        //check if the postings list has always match flag
++        if (container_it->second->cardinality() == 1 && UINT32_MAX == min_in_container)
++        {
++            continue; //always match
++        }
++
++        if (range_start > max_in_container ||  min_in_container > range_end)
++        {
++            return false;
++        }
++
++        /// Delay initialization as late as possible
++        if (!intersection_result_init)
++        {
++            intersection_result_init = true;
++            intersection_result.addRange(range_start, range_end+1);
++        }
++        intersection_result &= *container_it->second;
++        if (intersection_result.cardinality() == 0)
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool GinFilter::match(const PostingsCache& postings_cache) const
++{
++    if (hasEmptyPostingsList(postings_cache))
++    {
++        return false;
++    }
++
++    /// Check for each row ID ranges
++    for (const auto &rowid_range: rowid_ranges)
++    {
++        if (matchInRange(postings_cache, rowid_range.segment_id, rowid_range.range_start, rowid_range.range_end))
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool GinFilter::contains(const GinFilter & filter, PostingsCacheForStore &cache_store) const
++{
++    if (filter.getTerms().empty())
++        return true;
++
++    PostingsCachePtr postings_cache = cache_store.getPostings(filter.getQueryString());
++    if (postings_cache == nullptr)
++    {
++        GinIndexStoreDeserializer reader(cache_store.store);
++        postings_cache = reader.createPostingsCacheFromTerms(filter.getTerms());
++        cache_store.cache[filter.getQueryString()] = postings_cache;
++    }
++
++    return match(*postings_cache);
++}
++
++String GinFilter::getName()
++{
++    return FilterName;
++}
++
++}
+diff --git a/src/Interpreters/GinFilter.h b/src/Interpreters/GinFilter.h
+new file mode 100644
+index 000000000000..0bcd4156f945
+--- /dev/null
++++ b/src/Interpreters/GinFilter.h
+@@ -0,0 +1,108 @@
++#pragma once
++
++#include <vector>
++#include <memory>
++#include <Storages/MergeTree/GinIndexStore.h>
++namespace DB
++{
++struct GinFilterParameters
++{
++    explicit GinFilterParameters(size_t ngrams_, Float64 density_);
++
++    size_t ngrams;
++    Float64 density;
++};
++
++struct GinSegmentWithRowIDRange
++{
++    /// Segment ID of the row ID range
++    UInt32 segment_id;
++
++    /// First row ID in the range
++    UInt32 range_start;
++
++    /// Last row ID in the range (inclusive)
++    UInt32 range_end;
++};
++
++/// GinFilter provides underlying functionalities for building inverted index and also
++/// it does filtering the unmatched rows according to its query string.
++/// It also builds and uses skipping index which stores (segmentID, RowIDStart, RowIDEnd) triples.
++class GinFilter
++{
++public:
++    using GinSegmentWithRowIDRanges = std::vector<GinSegmentWithRowIDRange>;
++
++    explicit GinFilter(const GinFilterParameters& params_);
++
++    /// Add term(which length is 'len' and located at 'data') and its row ID to
++    /// the postings list builder for building inverted index for the given store.
++    void add(const char* data, size_t len, UInt32 rowID, GinIndexStorePtr& store, UInt64 limit) const;
++
++    /// Accumulate (segmentID, RowIDStart, RowIDEnd) for building skipping index
++    void addRowRangeToGinFilter(UInt32 segmentID, UInt32 rowIDStart, UInt32 rowIDEnd);
++
++    /// Clear the content
++    void clear();
++
++    /// Check if the filter(built from query string) contains any rows in given filter 'af' by using
++    /// given postings list cache
++    bool contains(const GinFilter & filter, PostingsCacheForStore &cache_store) const;
++
++    /// Const getter for the row ID ranges
++    const GinSegmentWithRowIDRanges& getFilter() const { return rowid_ranges; }
++
++    /// Mutable getter for the row ID ranges
++    GinSegmentWithRowIDRanges& getFilter() { return rowid_ranges; }
++
++    /// Set the query string of the filter
++    void setQueryString(const char* data, size_t len)
++    {
++        query_string = String(data, len);
++    }
++
++    /// Const getter of the query string
++    const String &getQueryString() const { return query_string; }
++
++    /// Add term which are tokens generated from the query string
++    void addTerm(const char* data, size_t len)
++    {
++        if (len > FST::MAX_TERM_LENGTH)
++            return;
++        terms.push_back(String(data, len));
++    }
++
++    /// Const getter of terms(generated from the query string)
++    const std::vector<String>& getTerms() const { return terms;}
++
++    /// Check if the given postings list cache has matched rows by using the filter
++    bool match(const PostingsCache& postings_cache) const;
++
++    /// Get filter name ("inverted")
++    static String getName();
++
++    /// Constant of filter name
++    static constexpr auto FilterName = "inverted";
++private:
++    /// Filter parameters
++    const GinFilterParameters& params;
++
++    /// Query string of the filter
++    String query_string;
++
++    /// Tokenized terms from query string
++    std::vector<String> terms;
++
++    /// Row ID ranges which are (segmentID, RowIDStart, RowIDEnd)
++    GinSegmentWithRowIDRanges rowid_ranges;
++
++    /// Helper method for checking if postings list cache is empty
++    static bool hasEmptyPostingsList(const PostingsCache& postings_cache);
++
++    /// Helper method to check if the postings list cache has intersection with given row ID range
++    static bool matchInRange(const PostingsCache& postings_cache, UInt32 segment_id, UInt32 range_start, UInt32 range_end);
++};
++
++using GinFilterPtr = std::shared_ptr<GinFilter>;
++
++}
+diff --git a/src/Interpreters/ITokenExtractor.h b/src/Interpreters/ITokenExtractor.h
+index afcc8442d583..77de4233b63c 100644
+--- a/src/Interpreters/ITokenExtractor.h
++++ b/src/Interpreters/ITokenExtractor.h
+@@ -3,7 +3,7 @@
+ #include <base/types.h>
+ 
+ #include <Interpreters/BloomFilter.h>
+-
++#include <Interpreters/GinFilter.h>
+ 
+ namespace DB
+ {
+@@ -37,6 +37,15 @@ struct ITokenExtractor
+ 
+     virtual void stringLikeToBloomFilter(const char * data, size_t length, BloomFilter & bloom_filter) const = 0;
+ 
++    virtual void stringToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const = 0;
++
++    virtual void stringPaddedToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const
++    {
++        return stringToGinFilter(data, length, gin_filter);
++    }
++
++    virtual void stringLikeToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const = 0;
++
+ };
+ 
+ using TokenExtractorPtr = const ITokenExtractor *;
+@@ -71,6 +80,36 @@ class ITokenExtractorHelper : public ITokenExtractor
+         while (cur < length && static_cast<const Derived *>(this)->nextInStringLike(data, length, &cur, token))
+             bloom_filter.add(token.c_str(), token.size());
+     }
++    void stringToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const override
++    {
++        gin_filter.setQueryString(data, length);
++        size_t cur = 0;
++        size_t token_start = 0;
++        size_t token_len = 0;
++
++        while (cur < length && static_cast<const Derived *>(this)->nextInString(data, length, &cur, &token_start, &token_len))
++            gin_filter.addTerm(data + token_start, token_len);
++    }
++
++    void stringPaddedToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const override
++    {
++        gin_filter.setQueryString(data, length);
++        size_t cur = 0;
++        size_t token_start = 0;
++        size_t token_len = 0;
++
++        while (cur < length && static_cast<const Derived *>(this)->nextInStringPadded(data, length, &cur, &token_start, &token_len))
++            gin_filter.addTerm(data + token_start, token_len);
++    }
++
++    void stringLikeToGinFilter(const char * data, size_t length, GinFilter & gin_filter) const override
++    {
++        gin_filter.setQueryString(data, length);
++        size_t cur = 0;
++        String token;
++        while (cur < length && static_cast<const Derived *>(this)->nextInStringLike(data, length, &cur, token))
++            gin_filter.addTerm(token.c_str(), token.size());
++    }
+ };
+ 
+ 
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index b8538a0aff87..bea88885d207 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -41,6 +41,7 @@
+ #include <Interpreters/InterpreterInsertQuery.h>
+ #include <Interpreters/InterpreterRenameQuery.h>
+ #include <Interpreters/AddDefaultDatabaseVisitor.h>
++#include <Interpreters/GinFilter.h>
+ 
+ #include <Access/Common/AccessRightsElement.h>
+ 
+@@ -100,6 +101,7 @@ namespace ErrorCodes
+     extern const int ENGINE_REQUIRED;
+     extern const int UNKNOWN_STORAGE;
+     extern const int SYNTAX_ERROR;
++    extern const int SUPPORT_IS_DISABLED;
+ }
+ 
+ namespace fs = std::filesystem;
+@@ -677,12 +679,18 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
+         if (create.columns_list->indices)
+             for (const auto & index : create.columns_list->indices->children)
+             {
+-                properties.indices.push_back(
+-                    IndexDescription::getIndexFromAST(index->clone(), properties.columns, getContext()));
+-                    if (properties.indices.back().type == "annoy" && !getContext()->getSettingsRef().allow_experimental_annoy_index)
+-                        throw Exception("Annoy index is disabled. Turn on allow_experimental_annoy_index", ErrorCodes::INCORRECT_QUERY);
+-            }
++                IndexDescription index_desc = IndexDescription::getIndexFromAST(index->clone(), properties.columns, getContext());
++                if (index_desc.type == GinFilter::FilterName && getContext()->getSettingsRef().allow_experimental_inverted_index == false)
++                {
++                    throw Exception(
++                            "Experimental Inverted Index feature is not enabled (the setting 'allow_experimental_inverted_index')",
++                            ErrorCodes::SUPPORT_IS_DISABLED);
++                }
++                if (index_desc.type == "annoy" && !getContext()->getSettingsRef().allow_experimental_annoy_index)
++                    throw Exception("Annoy index is disabled. Turn on allow_experimental_annoy_index", ErrorCodes::INCORRECT_QUERY);
+ 
++                properties.indices.push_back(index_desc);
++            }
+         if (create.columns_list->projections)
+             for (const auto & projection_ast : create.columns_list->projections->children)
+             {
+diff --git a/src/Storages/AlterCommands.cpp b/src/Storages/AlterCommands.cpp
+index f39f830bcc0e..1d4df05c723b 100644
+--- a/src/Storages/AlterCommands.cpp
++++ b/src/Storages/AlterCommands.cpp
+@@ -13,6 +13,7 @@
+ #include <Interpreters/ExpressionAnalyzer.h>
+ #include <Interpreters/TreeRewriter.h>
+ #include <Interpreters/RenameColumnVisitor.h>
++#include <Interpreters/GinFilter.h>
+ #include <Parsers/ASTAlterQuery.h>
+ #include <Parsers/ASTColumnDeclaration.h>
+ #include <Parsers/ASTConstraintDeclaration.h>
+@@ -904,7 +905,26 @@ std::optional<MutationCommand> AlterCommand::tryConvertToMutationCommand(Storage
+     return result;
+ }
+ 
+-
++bool AlterCommands::hasInvertedIndex(const StorageInMemoryMetadata & metadata, ContextPtr context)
++{
++    for (const auto & index : metadata.secondary_indices)
++    {
++        IndexDescription index_desc;
++        try
++        {
++            index_desc = IndexDescription::getIndexFromAST(index.definition_ast, metadata.columns, context);
++        }
++        catch (...)
++        {
++            continue;
++        }
++        if (index.type == GinFilter::FilterName)
++        {
++            return true;
++        }
++    }
++    return false;
++}
+ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context) const
+ {
+     if (!prepared)
+diff --git a/src/Storages/AlterCommands.h b/src/Storages/AlterCommands.h
+index c91c82e9c7a6..a79827b355d0 100644
+--- a/src/Storages/AlterCommands.h
++++ b/src/Storages/AlterCommands.h
+@@ -210,6 +210,9 @@ class AlterCommands : public std::vector<AlterCommand>
+     /// empty. If some TTL changes happened than, depending on materialize_ttl
+     /// additional mutation command (MATERIALIZE_TTL) will be returned.
+     MutationCommands getMutationCommands(StorageInMemoryMetadata metadata, bool materialize_ttl, ContextPtr context, bool with_alters=false) const;
++
++    /// Check if commands have any inverted index
++    static bool hasInvertedIndex(const StorageInMemoryMetadata & metadata, ContextPtr context);
+ };
+ 
+ }
+diff --git a/src/Storages/MergeTree/DataPartStorageOnDisk.cpp b/src/Storages/MergeTree/DataPartStorageOnDisk.cpp
+index 215d6034a531..73e7ae547954 100644
+--- a/src/Storages/MergeTree/DataPartStorageOnDisk.cpp
++++ b/src/Storages/MergeTree/DataPartStorageOnDisk.cpp
+@@ -741,6 +741,17 @@ std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDisk::writeFile(
+     return volume->getDisk()->writeFile(fs::path(root_path) / part_dir / name, buf_size, WriteMode::Rewrite, settings);
+ }
+ 
++std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDisk::writeFile(
++    const String & name,
++    size_t buf_size,
++    WriteMode mode,
++    const WriteSettings & settings)
++{
++    if (transaction)
++        return transaction->writeFile(fs::path(root_path) / part_dir / name, buf_size, mode, settings, /* autocommit = */ false);
++    return volume->getDisk()->writeFile(fs::path(root_path) / part_dir / name, buf_size, mode, settings);
++}
++
+ std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDisk::writeTransactionFile(WriteMode mode) const
+ {
+     return volume->getDisk()->writeFile(fs::path(root_path) / part_dir / "txn_version.txt", 256, mode);
+diff --git a/src/Storages/MergeTree/DataPartStorageOnDisk.h b/src/Storages/MergeTree/DataPartStorageOnDisk.h
+index fd408af9cf1b..3e82d44d71e5 100644
+--- a/src/Storages/MergeTree/DataPartStorageOnDisk.h
++++ b/src/Storages/MergeTree/DataPartStorageOnDisk.h
+@@ -112,6 +112,11 @@ class DataPartStorageOnDisk final : public IDataPartStorage
+     void createFile(const String & name) override;
+     void moveFile(const String & from_name, const String & to_name) override;
+     void replaceFile(const String & from_name, const String & to_name) override;
++    std::unique_ptr<WriteBufferFromFileBase> writeFile(
++        const String & name,
++        size_t buf_size,
++        DB::WriteMode mode,
++        const WriteSettings & settings) override;
+ 
+     void removeFile(const String & name) override;
+     void removeFileIfExists(const String & name) override;
+diff --git a/src/Storages/MergeTree/GinIndexStore.cpp b/src/Storages/MergeTree/GinIndexStore.cpp
+new file mode 100644
+index 000000000000..995f4f9f88c3
+--- /dev/null
++++ b/src/Storages/MergeTree/GinIndexStore.cpp
+@@ -0,0 +1,487 @@
++#include <Storages/MergeTree/GinIndexStore.h>
++#include <vector>
++#include <unordered_map>
++#include <iostream>
++#include <numeric>
++#include <algorithm>
++#include <Columns/ColumnString.h>
++#include <IO/WriteHelpers.h>
++#include <IO/ReadHelpers.h>
++#include <DataTypes/DataTypesNumber.h>
++#include <DataTypes/DataTypeString.h>
++#include <DataTypes/DataTypeArray.h>
++#include <IO/ReadBufferFromFile.h>
++#include <IO/WriteBufferFromFile.h>
++#include <IO/WriteBufferFromVector.h>
++#include <Common/FST.h>
++
++namespace DB
++{
++
++using TokenPostingsBuilderPair = std::pair<std::string_view, GinIndexStore::GinIndexPostingsBuilderPtr>;
++using TokenPostingsBuilderPairs = std::vector<TokenPostingsBuilderPair>;
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int UNKNOWN_FORMAT_VERSION;
++};
++
++GinIndexStore::GinIndexStore(const String & name_, DataPartStoragePtr storage_)
++    : name(name_)
++    , storage(storage_)
++{
++}
++GinIndexStore::GinIndexStore(const String& name_, DataPartStoragePtr storage_, MutableDataPartStoragePtr data_part_storage_builder_, UInt64 max_digestion_size_)
++    : name(name_)
++    , storage(storage_)
++    , data_part_storage_builder(data_part_storage_builder_)
++    , max_digestion_size(max_digestion_size_)
++{
++}
++
++GinIndexPostingsBuilder::GinIndexPostingsBuilder(UInt64 limit) : rowid_lst{}, size_limit(limit)
++{}
++
++bool GinIndexPostingsBuilder::contains(UInt32 row_id) const
++{
++    if (useRoaring())
++        return rowid_bitmap.contains(row_id);
++
++    const auto * const it = std::find(rowid_lst.begin(), rowid_lst.begin()+rowid_lst_length, row_id);
++    return it != rowid_lst.begin() + rowid_lst_length;
++}
++
++void GinIndexPostingsBuilder::add(UInt32 row_id)
++{
++    if (containsAllRows())
++    {
++        return;
++    }
++    if (useRoaring())
++    {
++        if (rowid_bitmap.cardinality() == size_limit)
++        {
++            //reset the postings list with MATCH ALWAYS;
++            rowid_lst_length = 1; //makes sure useRoaring() returns false;
++            rowid_lst[0] = UINT32_MAX; //set CONTAINS ALL flag;
++        }
++        else
++        {
++            rowid_bitmap.add(row_id);
++        }
++        return;
++    }
++    assert(rowid_lst_length < MIN_SIZE_FOR_ROARING_ENCODING);
++    rowid_lst[rowid_lst_length] = row_id;
++    rowid_lst_length++;
++
++    if (rowid_lst_length == MIN_SIZE_FOR_ROARING_ENCODING)
++    {
++        for (size_t i = 0; i < rowid_lst_length; i++)
++            rowid_bitmap.add(rowid_lst[i]);
++
++        rowid_lst_length = UsesBitMap;
++    }
++}
++
++bool GinIndexPostingsBuilder::useRoaring() const
++{
++    return rowid_lst_length == UsesBitMap;
++}
++
++bool GinIndexPostingsBuilder::containsAllRows() const
++{
++    return rowid_lst[0] == UINT32_MAX;
++}
++
++UInt64 GinIndexPostingsBuilder::serialize(WriteBuffer &buffer) const
++{
++    UInt64 written_bytes = 0;
++    buffer.write(rowid_lst_length);
++    written_bytes += 1;
++
++    if (!useRoaring())
++    {
++        for (size_t i = 0; i <  rowid_lst_length; ++i)
++        {
++            writeVarUInt(rowid_lst[i], buffer);
++            written_bytes += getLengthOfVarUInt(rowid_lst[i]);
++        }
++    }
++    else
++    {
++        auto size = rowid_bitmap.getSizeInBytes();
++
++        writeVarUInt(size, buffer);
++        written_bytes += getLengthOfVarUInt(size);
++
++        auto buf = std::make_unique<char[]>(size);
++        rowid_bitmap.write(buf.get());
++        buffer.write(buf.get(), size);
++        written_bytes += size;
++    }
++    return written_bytes;
++}
++
++GinIndexPostingsListPtr GinIndexPostingsBuilder::deserialize(ReadBuffer &buffer)
++{
++    UInt8 postings_list_size = 0;
++    buffer.readStrict(reinterpret_cast<char&>(postings_list_size));
++
++    if (postings_list_size != UsesBitMap)
++    {
++        assert(postings_list_size < MIN_SIZE_FOR_ROARING_ENCODING);
++        GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>();
++        UInt32 row_ids[MIN_SIZE_FOR_ROARING_ENCODING];
++
++        for (auto i = 0; i < postings_list_size; ++i)
++        {
++            readVarUInt(row_ids[i], buffer);
++        }
++        postings_list->addMany(postings_list_size, row_ids);
++        return postings_list;
++    }
++    else
++    {
++        size_t size{0};
++        readVarUInt(size, buffer);
++        auto buf = std::make_unique<char[]>(size);
++        buffer.readStrict(reinterpret_cast<char*>(buf.get()), size);
++
++        GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(buf.get()));
++
++        return postings_list;
++    }
++}
++
++bool GinIndexStore::exists() const
++{
++    String id_file_name = getName() + GIN_SEGMENT_ID_FILE_TYPE;
++    return storage->exists(id_file_name);
++}
++
++UInt32 GinIndexStore::getNextSegmentIDRange(const String& file_name, size_t n)
++{
++    std::lock_guard guard(gin_index_store_mutex);
++
++    /// When the method is called for the first time, the file doesn't exist yet, need to create it
++    /// and write segment ID 1.
++    if (!storage->exists(file_name))
++    {
++        /// Create file and write initial segment id = 1
++        std::unique_ptr<DB::WriteBufferFromFileBase> ostr = this->data_part_storage_builder->writeFile(file_name, DBMS_DEFAULT_BUFFER_SIZE, {});
++
++        /// Write version
++        writeChar(static_cast<char>(CURRENT_GIN_FILE_FORMAT_VERSION), *ostr);
++
++        writeVarUInt(1, *ostr);
++        ostr->sync();
++    }
++
++    /// read id in file
++    UInt32 result = 0;
++    {
++        std::unique_ptr<DB::ReadBufferFromFileBase> istr = this->storage->readFile(file_name, {}, std::nullopt, std::nullopt);
++
++        /// Skip version
++        istr->seek(1, SEEK_SET);
++
++        readVarUInt(result, *istr);
++    }
++    //save result+n
++    {
++        std::unique_ptr<DB::WriteBufferFromFileBase> ostr = this->data_part_storage_builder->writeFile(file_name, DBMS_DEFAULT_BUFFER_SIZE, {});
++
++        /// Write version
++        writeChar(static_cast<char>(CURRENT_GIN_FILE_FORMAT_VERSION), *ostr);
++
++        writeVarUInt(result + n, *ostr);
++        ostr->sync();
++    }
++    return result;
++}
++
++UInt32 GinIndexStore::getNextRowIDRange(size_t numIDs)
++{
++    UInt32 result =current_segment.next_row_id;
++    current_segment.next_row_id += numIDs;
++    return result;
++}
++
++UInt32 GinIndexStore::getNextSegmentID()
++{
++    String sid_file_name = getName() + GIN_SEGMENT_ID_FILE_TYPE;
++    return getNextSegmentIDRange(sid_file_name, 1);
++}
++
++UInt32 GinIndexStore::getNumOfSegments()
++{
++    if (cached_segment_num)
++        return cached_segment_num;
++
++    String sid_file_name = getName() + GIN_SEGMENT_ID_FILE_TYPE;
++    if (!storage->exists(sid_file_name))
++        return 0;
++
++    UInt32 result = 0;
++    {
++        std::unique_ptr<DB::ReadBufferFromFileBase> istr = this->storage->readFile(sid_file_name, {}, std::nullopt, std::nullopt);
++
++        uint8_t version = 0;
++        readBinary(version, *istr);
++
++        if (version > CURRENT_GIN_FILE_FORMAT_VERSION)
++            throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "Unsupported inverted index version {}", version);
++
++        readVarUInt(result, *istr);
++    }
++
++    cached_segment_num = result - 1;
++    return cached_segment_num;
++}
++
++bool GinIndexStore::needToWrite() const
++{
++    assert(max_digestion_size > 0);
++    return current_size > max_digestion_size;
++}
++
++void GinIndexStore::finalize()
++{
++    if (!current_postings.empty())
++    {
++        writeSegment();
++    }
++}
++
++void GinIndexStore::initFileStreams()
++{
++    String segment_file_name = getName() + GIN_SEGMENT_FILE_TYPE;
++    String term_dict_file_name = getName() + GIN_DICTIONARY_FILE_TYPE;
++    String postings_file_name = getName() + GIN_POSTINGS_FILE_TYPE;
++
++    segment_file_stream = data_part_storage_builder->writeFile(segment_file_name, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Append, {});
++    term_dict_file_stream = data_part_storage_builder->writeFile(term_dict_file_name, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Append, {});
++    postings_file_stream = data_part_storage_builder->writeFile(postings_file_name, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Append, {});
++}
++
++void GinIndexStore::writeSegment()
++{
++    if (segment_file_stream == nullptr)
++    {
++        initFileStreams();
++    }
++
++    /// Write segment
++    segment_file_stream->write(reinterpret_cast<char*>(&current_segment), sizeof(GinIndexSegment));
++    TokenPostingsBuilderPairs token_postings_list_pairs;
++    token_postings_list_pairs.reserve(current_postings.size());
++
++    for (const auto& [token, postings_list] : current_postings)
++    {
++        token_postings_list_pairs.push_back({token, postings_list});
++    }
++
++    /// Sort token-postings list pairs since all tokens have to be added in FST in sorted order
++    std::sort(token_postings_list_pairs.begin(), token_postings_list_pairs.end(),
++                    [](const TokenPostingsBuilderPair& a, const TokenPostingsBuilderPair & b)
++                    {
++                        return a.first < b.first;
++                    });
++
++    ///write postings
++    std::vector<UInt64> posting_list_byte_sizes(current_postings.size(), 0);
++
++    for (size_t current_index = 0; const auto& [token, postings_list] : token_postings_list_pairs)
++    {
++        auto posting_list_byte_size = postings_list->serialize(*postings_file_stream);
++
++        posting_list_byte_sizes[current_index] = posting_list_byte_size;
++        current_index++;
++        current_segment.postings_start_offset += posting_list_byte_size;
++    }
++    ///write item dictionary
++    std::vector<UInt8> buffer;
++    WriteBufferFromVector<std::vector<UInt8>> write_buf(buffer);
++    FST::FSTBuilder builder(write_buf);
++
++    UInt64 offset = 0;
++    for (size_t current_index = 0; const auto& [token, postings_list] : token_postings_list_pairs)
++    {
++        String str_token{token};
++        builder.add(str_token, offset);
++        offset += posting_list_byte_sizes[current_index];
++        current_index++;
++    }
++
++    builder.build();
++    write_buf.finalize();
++
++    /// Write FST size
++    writeVarUInt(buffer.size(), *term_dict_file_stream);
++    current_segment.term_dict_start_offset += getLengthOfVarUInt(buffer.size());
++
++    /// Write FST content
++    term_dict_file_stream->write(reinterpret_cast<char*>(buffer.data()), buffer.size());
++    current_segment.term_dict_start_offset += buffer.size();
++
++    current_size = 0;
++    current_postings.clear();
++    current_segment.segment_id = getNextSegmentID();
++
++    segment_file_stream->sync();
++    term_dict_file_stream->sync();
++    postings_file_stream->sync();
++}
++
++GinIndexStoreDeserializer::GinIndexStoreDeserializer(const GinIndexStorePtr & store_)
++    : store(store_)
++{
++    initFileStreams();
++}
++
++void GinIndexStoreDeserializer::initFileStreams()
++{
++    String segment_file_name = store->getName() + GinIndexStore::GIN_SEGMENT_FILE_TYPE;
++    String term_dict_file_name = store->getName() + GinIndexStore::GIN_DICTIONARY_FILE_TYPE;
++    String postings_file_name = store->getName() + GinIndexStore::GIN_POSTINGS_FILE_TYPE;
++
++    segment_file_stream = store->storage->readFile(segment_file_name, {}, std::nullopt, std::nullopt);
++    term_dict_file_stream = store->storage->readFile(term_dict_file_name, {}, std::nullopt, std::nullopt);
++    postings_file_stream = store->storage->readFile(postings_file_name, {}, std::nullopt, std::nullopt);
++}
++void GinIndexStoreDeserializer::readSegments()
++{
++    auto num_segments = store->getNumOfSegments();
++    if (num_segments == 0)
++        return;
++
++    GinIndexSegments segments (num_segments);
++
++    assert(segment_file_stream != nullptr);
++
++    segment_file_stream->readStrict(reinterpret_cast<char*>(segments.data()), num_segments * sizeof(GinIndexSegment));
++    for (size_t i = 0; i < num_segments; ++i)
++    {
++        auto seg_id = segments[i].segment_id;
++        auto term_dict = std::make_shared<SegmentTermDictionary>();
++        term_dict->postings_start_offset = segments[i].postings_start_offset;
++        term_dict->term_dict_start_offset = segments[i].term_dict_start_offset;
++        store->term_dicts[seg_id] = term_dict;
++    }
++}
++
++void GinIndexStoreDeserializer::readSegmentTermDictionaries()
++{
++    for (UInt32 seg_index = 0; seg_index < store->getNumOfSegments(); ++seg_index)
++    {
++        readSegmentTermDictionary(seg_index);
++    }
++}
++
++void GinIndexStoreDeserializer::readSegmentTermDictionary(UInt32 segment_id)
++{
++    /// Check validity of segment_id
++    auto it = store->term_dicts.find(segment_id);
++    if (it == store->term_dicts.end())
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid segment id {}", segment_id);
++    }
++
++    assert(term_dict_file_stream != nullptr);
++
++    /// Set file pointer of term dictionary file
++    term_dict_file_stream->seek(it->second->term_dict_start_offset, SEEK_SET);
++
++    it->second->offsets.getData().clear();
++    /// Read FST size
++    size_t fst_size{0};
++    readVarUInt(fst_size, *term_dict_file_stream);
++
++    /// Read FST content
++    it->second->offsets.getData().resize(fst_size);
++    term_dict_file_stream->readStrict(reinterpret_cast<char*>(it->second->offsets.getData().data()), fst_size);
++}
++
++SegmentedPostingsListContainer GinIndexStoreDeserializer::readSegmentedPostingsLists(const String& term)
++{
++    assert(postings_file_stream != nullptr);
++
++    SegmentedPostingsListContainer container;
++    for (auto const& seg_term_dict : store->term_dicts)
++    {
++        auto segment_id = seg_term_dict.first;
++
++        auto [offset, found] = seg_term_dict.second->offsets.getOutput(term);
++        if (!found)
++            continue;
++
++        // Set postings file pointer for reading postings list
++        postings_file_stream->seek(seg_term_dict.second->postings_start_offset + offset, SEEK_SET);
++
++        // Read posting list
++        auto postings_list = GinIndexPostingsBuilder::deserialize(*postings_file_stream);
++        container[segment_id] = postings_list;
++    }
++    return container;
++}
++
++PostingsCachePtr GinIndexStoreDeserializer::createPostingsCacheFromTerms(const std::vector<String>& terms)
++{
++    auto postings_cache = std::make_shared<PostingsCache>();
++    for (const auto& term : terms)
++    {
++        // Make sure don't read for duplicated terms
++        if (postings_cache->find(term) != postings_cache->end())
++            continue;
++
++        auto container = readSegmentedPostingsLists(term);
++        (*postings_cache)[term] = container;
++    }
++    return postings_cache;
++}
++
++GinIndexStoreFactory& GinIndexStoreFactory::instance()
++{
++    static GinIndexStoreFactory instance;
++    return instance;
++}
++
++GinIndexStorePtr GinIndexStoreFactory::get(const String& name, DataPartStoragePtr storage)
++{
++    const String& part_path = storage->getRelativePath();
++    String key = name + ":" + part_path;
++
++    std::lock_guard lock(stores_mutex);
++    GinIndexStores::const_iterator it = stores.find(key);
++
++    if (it == stores.end())
++    {
++        GinIndexStorePtr store = std::make_shared<GinIndexStore>(name, storage);
++        if (!store->exists())
++            return nullptr;
++
++        GinIndexStoreDeserializer deserializer(store);
++        deserializer.readSegments();
++        deserializer.readSegmentTermDictionaries();
++
++        stores[key] = store;
++
++        return store;
++    }
++    return it->second;
++}
++
++void GinIndexStoreFactory::remove(const String& part_path)
++{
++    std::lock_guard lock(stores_mutex);
++    for (auto it = stores.begin(); it != stores.end();)
++    {
++        if (it->first.find(part_path) != String::npos)
++            it = stores.erase(it);
++        else
++            ++it;
++    }
++}
++}
+diff --git a/src/Storages/MergeTree/GinIndexStore.h b/src/Storages/MergeTree/GinIndexStore.h
+new file mode 100644
+index 000000000000..c326322191f8
+--- /dev/null
++++ b/src/Storages/MergeTree/GinIndexStore.h
+@@ -0,0 +1,304 @@
++#pragma once
++
++#include <array>
++#include <vector>
++#include <unordered_map>
++#include <mutex>
++#include <Core/Block.h>
++#include <Disks/IDisk.h>
++#include <IO/ReadBufferFromFileBase.h>
++#include <IO/WriteBufferFromFileBase.h>
++#include <roaring.hh>
++#include <Common/FST.h>
++#include <Storages/MergeTree/IDataPartStorage.h>
++
++/// GinIndexStore manages the inverted index for a data part, and it is made up of one or more immutable
++/// index segments.
++///
++/// There are 4 types of index files in a store:
++///  1. Segment ID file(.gin_sid): it contains one byte for version followed by the next available segment ID.
++///  2. Segment Metadata file(.gin_seg): it contains index segment metadata.
++///     - Its file format is an array of GinIndexSegment as defined in this file.
++///     - postings_start_offset points to the file(.gin_post) starting position for the segment's postings list.
++///     - term_dict_start_offset points to the file(.gin_dict) starting position for the segment's term dictionaries.
++///  3. Term Dictionary file(.gin_dict): it contains term dictionaries.
++///     - It contains an array of (FST_size, FST_blob) which has size and actual data of FST.
++///  4. Postings Lists(.gin_post): it contains postings lists data.
++///     - It contains an array of serialized postings lists.
++///
++/// During the searching in the segment, the segment's meta data can be found in .gin_seg file. From the meta data,
++/// the starting position of its term dictionary is used to locate its FST. Then FST is read into memory.
++/// By using the term and FST, the offset("output" in FST) of the postings list for the term
++/// in FST is found. The offset plus the postings_start_offset is the file location in .gin_post file
++/// for its postings list.
++
++namespace DB
++{
++enum : uint8_t
++{
++    GIN_VERSION_0 = 0,
++    GIN_VERSION_1 = 1, /// Initial version
++};
++
++static constexpr auto CURRENT_GIN_FILE_FORMAT_VERSION = GIN_VERSION_1;
++
++/// GinIndexPostingsList which uses 32-bit Roaring
++using GinIndexPostingsList = roaring::Roaring;
++
++using GinIndexPostingsListPtr = std::shared_ptr<GinIndexPostingsList>;
++
++/// Gin Index Postings List Builder.
++class GinIndexPostingsBuilder
++{
++public:
++    constexpr static int MIN_SIZE_FOR_ROARING_ENCODING = 16;
++
++    GinIndexPostingsBuilder(UInt64 limit);
++
++    /// Check whether a row_id is already added
++    bool contains(UInt32 row_id) const;
++
++    /// Add a row_id into the builder
++    void add(UInt32 row_id);
++
++    /// Check whether the builder is using roaring bitmap
++    bool useRoaring() const;
++
++    /// Check whether the postings list has been flagged to contain all row ids
++    bool containsAllRows() const;
++
++    /// Serialize the content of builder to given WriteBuffer, returns the bytes of serialized data
++    UInt64 serialize(WriteBuffer &buffer) const;
++
++    /// Deserialize the postings list data from given ReadBuffer, return a pointer to the GinIndexPostingsList created by deserialization
++    static GinIndexPostingsListPtr deserialize(ReadBuffer &buffer);
++private:
++    /// When the list length is no greater than MIN_SIZE_FOR_ROARING_ENCODING, array 'rowid_lst' is used
++    std::array<UInt32, MIN_SIZE_FOR_ROARING_ENCODING> rowid_lst;
++
++    /// When the list length is greater than MIN_SIZE_FOR_ROARING_ENCODING, Roaring bitmap 'rowid_bitmap' is used
++    roaring::Roaring rowid_bitmap;
++
++    /// rowid_lst_length stores the number of row IDs in 'rowid_lst' array, can also be a flag(0xFF) indicating that roaring bitmap is used
++    UInt8 rowid_lst_length{0};
++
++    static constexpr UInt8 UsesBitMap = 0xFF;
++    /// Clear the postings list and reset it with MATCHALL flags when the size of the postings list is beyond the limit
++    UInt64 size_limit;
++};
++
++/// Container for postings lists for each segment
++using SegmentedPostingsListContainer = std::unordered_map<UInt32, GinIndexPostingsListPtr>;
++
++/// Postings lists and terms built from query string
++using PostingsCache = std::unordered_map<std::string, SegmentedPostingsListContainer>;
++using PostingsCachePtr = std::shared_ptr<PostingsCache>;
++
++/// Gin Index Segment information, which contains:
++struct GinIndexSegment
++{
++    ///  Segment ID retrieved from next available ID from file .gin_sid
++    UInt32 segment_id = 0;
++
++    /// Next row ID for this segment
++    UInt32 next_row_id = 1;
++
++    /// .gin_post file offset of this segment's postings lists
++    UInt64 postings_start_offset = 0;
++
++    /// .term_dict file offset of this segment's term dictionaries
++    UInt64 term_dict_start_offset = 0;
++};
++
++using GinIndexSegments = std::vector<GinIndexSegment>;
++
++struct SegmentTermDictionary
++{
++    /// .gin_post file offset of this segment's postings lists
++    UInt64 postings_start_offset;
++
++    /// .gin_dict file offset of this segment's term dictionaries
++    UInt64 term_dict_start_offset;
++
++    /// Finite State Transducer, which can be viewed as a map of <term, offset>, where offset is the
++    /// offset to the term's posting list in postings list file
++    FST::FiniteStateTransducer offsets;
++};
++
++using SegmentTermDictionaryPtr = std::shared_ptr<SegmentTermDictionary>;
++
++/// Term dictionaries indexed by segment ID
++using SegmentTermDictionaries = std::unordered_map<UInt32, SegmentTermDictionaryPtr>;
++
++/// Gin Index Store which has Gin Index meta data for the corresponding Data Part
++class GinIndexStore
++{
++public:
++    using GinIndexPostingsBuilderPtr = std::shared_ptr<GinIndexPostingsBuilder>;
++    /// Container for all term's Gin Index Postings List Builder
++    using GinIndexPostingsBuilderContainer = std::unordered_map<std::string, GinIndexPostingsBuilderPtr>;
++
++    explicit GinIndexStore(const String & name_, DataPartStoragePtr storage_);
++
++    GinIndexStore(const String& name_, DataPartStoragePtr storage_, MutableDataPartStoragePtr data_part_storage_builder_, UInt64 max_digestion_size_);
++
++    /// Check existence by checking the existence of file .gin_sid
++    bool exists() const;
++
++    /// Get a range of next 'numIDs' available row IDs
++    UInt32 getNextRowIDRange(size_t numIDs);
++
++    /// Get next available segment ID by updating file .gin_sid
++    UInt32 getNextSegmentID();
++
++    /// Get total number of segments in the store
++    UInt32 getNumOfSegments();
++
++    /// Get current postings list builder
++    const GinIndexPostingsBuilderContainer& getPostings() const { return current_postings; }
++
++    /// Set postings list builder for given term
++    void setPostingsBuilder(const String & term, GinIndexPostingsBuilderPtr builder) { current_postings[term] = builder; }
++    /// Check if we need to write segment to Gin index files
++    bool needToWrite() const;
++
++    /// Accumulate the size of text data which has been digested
++    void incrementCurrentSizeBy(UInt64 sz) { current_size += sz; }
++
++    UInt32 getCurrentSegmentID() const { return current_segment.segment_id;}
++
++    /// Do last segment writing
++    void finalize();
++
++    /// method for writing segment data to Gin index files
++    void writeSegment();
++
++    const String & getName() const {return name;}
++
++private:
++    friend class GinIndexStoreDeserializer;
++
++    /// Initialize all indexing files for this store
++    void initFileStreams();
++
++    /// Get a range of next available segment IDs by updating file .gin_sid
++    UInt32 getNextSegmentIDRange(const String &file_name, size_t n);
++
++    String name;
++    DataPartStoragePtr storage;
++    MutableDataPartStoragePtr data_part_storage_builder;
++
++    UInt32 cached_segment_num = 0;
++
++    std::mutex gin_index_store_mutex;
++
++    /// Terms dictionaries which are loaded from .gin_dict files
++    SegmentTermDictionaries term_dicts;
++
++    /// container for building postings lists during index construction
++    GinIndexPostingsBuilderContainer current_postings;
++
++    /// The following is for segmentation of Gin index
++    GinIndexSegment current_segment{};
++    UInt64 current_size = 0;
++    const UInt64 max_digestion_size = 0;
++
++    /// File streams for segment, term dictionaries and postings lists
++    std::unique_ptr<WriteBufferFromFileBase> segment_file_stream;
++    std::unique_ptr<WriteBufferFromFileBase> term_dict_file_stream;
++    std::unique_ptr<WriteBufferFromFileBase> postings_file_stream;
++
++    static constexpr auto GIN_SEGMENT_ID_FILE_TYPE = ".gin_sid";
++    static constexpr auto GIN_SEGMENT_FILE_TYPE = ".gin_seg";
++    static constexpr auto GIN_DICTIONARY_FILE_TYPE = ".gin_dict";
++    static constexpr auto GIN_POSTINGS_FILE_TYPE = ".gin_post";
++};
++
++using GinIndexStorePtr = std::shared_ptr<GinIndexStore>;
++
++/// GinIndexStores indexed by part file path
++using GinIndexStores = std::unordered_map<std::string, GinIndexStorePtr>;
++
++/// PostingsCacheForStore contains postings lists from 'store' which are retrieved from Gin index files for the terms in query strings
++/// PostingsCache is per query string(one query can have multiple query strings): when skipping index(row ID ranges) is used for the part during the
++/// query, the postings cache is created and associated with the store where postings lists are read
++/// for the tokenized query string. The postings caches are released automatically when the query is done.
++struct PostingsCacheForStore
++{
++    /// Which store to retrieve postings lists
++    GinIndexStorePtr store;
++
++    /// map of <query, postings lists>
++    std::unordered_map<String, PostingsCachePtr> cache;
++
++    /// Get postings lists for query string, return nullptr if not found
++    PostingsCachePtr getPostings(const String &query_string) const
++    {
++        auto it {cache.find(query_string)};
++
++        if (it == cache.cend())
++        {
++            return nullptr;
++        }
++        return it->second;
++    }
++};
++
++/// GinIndexStore Factory, which is a singleton for storing GinIndexStores
++class GinIndexStoreFactory : private boost::noncopyable
++{
++public:
++    /// Get singleton of GinIndexStoreFactory
++    static GinIndexStoreFactory& instance();
++
++    /// Get GinIndexStore by using index name, disk and part_path (which are combined to create key in stores)
++    GinIndexStorePtr get(const String& name, DataPartStoragePtr storage);
++
++    /// Remove all Gin index files which are under the same part_path
++    void remove(const String& part_path);
++
++private:
++    GinIndexStores stores;
++    std::mutex stores_mutex;
++};
++
++/// Term dictionary information, which contains:
++
++/// Gin Index Store Reader which helps to read segments, term dictionaries and postings list
++class GinIndexStoreDeserializer : private boost::noncopyable
++{
++public:
++    explicit GinIndexStoreDeserializer(const GinIndexStorePtr & store_);
++
++    /// Read all segment information from .gin_seg files
++    void readSegments();
++
++    /// Read all term dictionaries from .gin_dict files
++    void readSegmentTermDictionaries();
++
++    /// Read term dictionary for given segment id
++    void readSegmentTermDictionary(UInt32 segment_id);
++
++    /// Read postings lists for the term
++    SegmentedPostingsListContainer readSegmentedPostingsLists(const String& term);
++
++    /// Read postings lists for terms(which are created by tokenzing query string)
++    PostingsCachePtr createPostingsCacheFromTerms(const std::vector<String>& terms);
++
++private:
++    /// Initialize Gin index files
++    void initFileStreams();
++
++    /// The store for the reader
++    GinIndexStorePtr store;
++
++    /// File streams for reading Gin Index
++    std::unique_ptr<ReadBufferFromFileBase> segment_file_stream;
++    std::unique_ptr<ReadBufferFromFileBase> term_dict_file_stream;
++    std::unique_ptr<ReadBufferFromFileBase> postings_file_stream;
++
++    /// Current segment, used in building index
++    GinIndexSegment current_segment;
++};
++
++}
+diff --git a/src/Storages/MergeTree/IDataPartStorage.h b/src/Storages/MergeTree/IDataPartStorage.h
+index d7c0c9c76e3f..70cc4d3fe702 100644
+--- a/src/Storages/MergeTree/IDataPartStorage.h
++++ b/src/Storages/MergeTree/IDataPartStorage.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <IO/ReadSettings.h>
++#include <IO/WriteSettings.h>
+ #include <base/types.h>
+ #include <Core/NamesAndTypes.h>
+ #include <Interpreters/TransactionVersionMetadata.h>
+@@ -215,6 +216,7 @@ class IDataPartStorage : public boost::noncopyable
+         const String & name,
+         size_t buf_size,
+         const WriteSettings & settings) = 0;
++    virtual std::unique_ptr<WriteBufferFromFileBase> writeFile(const String & name, size_t buf_size, WriteMode mode, const WriteSettings & settings) = 0;
+ 
+     /// A special const method to write transaction file.
+     /// It's const, because file with transaction metadata
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.cpp b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+index 98d0fa3de308..ec2ea4482906 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.cpp
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+@@ -1673,6 +1673,8 @@ void IMergeTreeDataPart::remove()
+     metadata_manager->deleteAll(false);
+     metadata_manager->assertAllDeleted(false);
+ 
++    GinIndexStoreFactory::instance().remove(getDataPartStoragePtr()->getRelativePath());
++
+     std::list<IDataPartStorage::ProjectionChecksums> projection_checksums;
+ 
+     for (const auto & [p_name, projection_part] : projection_parts)
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index b1384dc799fd..9659ec2177cb 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -2774,6 +2774,13 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
+         if (!mutation_commands.empty())
+             throw Exception(ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN, "The following alter commands: '{}' will modify data on disk, but setting `allow_non_metadata_alters` is disabled", queryToString(mutation_commands.ast()));
+     }
++
++    if (commands.hasInvertedIndex(new_metadata, getContext()) && !settings.allow_experimental_inverted_index)
++    {
++        throw Exception(
++                "Experimental Inverted Index feature is not enabled (the setting 'allow_experimental_inverted_index')",
++                ErrorCodes::SUPPORT_IS_DISABLED);
++    }
+     commands.apply(new_metadata, getContext());
+ 
+     /// Set of columns that shouldn't be altered.
+diff --git a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
+index fbcf8cb241c1..e9629f83d096 100644
+--- a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
+@@ -1,6 +1,6 @@
+ #include <Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h>
++#include <Storages/MergeTree/MergeTreeIndexGin.h>
+ #include <Common/MemoryTrackerBlockerInThread.h>
+-
+ #include <utility>
+ #include "IO/WriteBufferFromFileDecorator.h"
+ 
+@@ -212,7 +212,14 @@ void MergeTreeDataPartWriterOnDisk::initSkipIndices()
+                         default_codec, settings.max_compress_block_size,
+                         marks_compression_codec, settings.marks_compress_block_size,
+                         settings.query_write_settings));
+-        skip_indices_aggregators.push_back(index_helper->createIndexAggregator());
++
++        GinIndexStorePtr store = nullptr;
++        if (dynamic_cast<const MergeTreeIndexGinFilter *>(&*index_helper) != nullptr)
++        {
++            store = std::make_shared<GinIndexStore>(stream_name, data_part->getDataPartStoragePtr(), data_part->getDataPartStoragePtr(), storage.getSettings()->max_digestion_size_per_segment);
++            gin_index_stores[stream_name] = store;
++        }
++        skip_indices_aggregators.push_back(index_helper->createIndexAggregatorForPart(store));
+         skip_index_accumulated_marks.push_back(0);
+     }
+ }
+@@ -268,6 +275,18 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(const Block
+         auto & stream = *skip_indices_streams[i];
+         WriteBuffer & marks_out = stream.compress_marks ? stream.marks_compressed_hashing : stream.marks_hashing;
+ 
++        GinIndexStorePtr store = nullptr;
++        if (dynamic_cast<const MergeTreeIndexGinFilter *>(&*index_helper) != nullptr)
++        {
++            String stream_name = index_helper->getFileName();
++            auto it = gin_index_stores.find(stream_name);
++            if (it == gin_index_stores.cend())
++            {
++                throw Exception("Index '" + stream_name + "' does not exist", ErrorCodes::LOGICAL_ERROR);
++            }
++            store = it->second;
++        }
++
+         for (const auto & granule : granules_to_write)
+         {
+             if (skip_index_accumulated_marks[i] == index_helper->index.granularity)
+@@ -278,7 +297,7 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(const Block
+ 
+             if (skip_indices_aggregators[i]->empty() && granule.mark_on_start)
+             {
+-                skip_indices_aggregators[i] = index_helper->createIndexAggregator();
++                skip_indices_aggregators[i] = index_helper->createIndexAggregatorForPart(store);
+ 
+                 if (stream.compressed_hashing.offset() >= settings.min_compress_block_size)
+                     stream.compressed_hashing.next();
+@@ -380,7 +399,11 @@ void MergeTreeDataPartWriterOnDisk::finishSkipIndicesSerialization(bool sync)
+         if (sync)
+             stream->sync();
+     }
+-
++    for (auto & store: gin_index_stores)
++    {
++        store.second->finalize();
++    }
++    gin_index_stores.clear();
+     skip_indices_streams.clear();
+     skip_indices_aggregators.clear();
+     skip_index_accumulated_marks.clear();
+diff --git a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h
+index ab1adfe7f590..2377a129ac04 100644
+--- a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h
++++ b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h
+@@ -162,6 +162,7 @@ class MergeTreeDataPartWriterOnDisk : public IMergeTreeDataPartWriter
+     /// Data is already written up to this mark.
+     size_t current_mark = 0;
+ 
++    GinIndexStores gin_index_stores;
+ private:
+     void initSkipIndices();
+     void initPrimaryIndex();
+diff --git a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+index 1ca1779e4b0d..9cae53c71c77 100644
+--- a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+@@ -9,6 +9,7 @@
+ #include <Storages/MergeTree/KeyCondition.h>
+ #include <Storages/MergeTree/MergeTreeDataPartUUID.h>
+ #include <Storages/MergeTree/StorageFromMergeTreeDataPart.h>
++#include <Storages/MergeTree/MergeTreeIndexGin.h>
+ #include <Storages/ReadInOrderOptimizer.h>
+ #include <Storages/VirtualColumnUtils.h>
+ #include <Parsers/ASTIdentifier.h>
+@@ -1687,6 +1688,14 @@ MarkRanges MergeTreeDataSelectExecutor::filterMarksUsingIndex(
+     /// this variable is stored to avoid reading the same granule twice.
+     MergeTreeIndexGranulePtr granule = nullptr;
+     size_t last_index_mark = 0;
++
++    PostingsCacheForStore cache_in_store;
++
++    if (dynamic_cast<const MergeTreeIndexGinFilter *>(&*index_helper) != nullptr)
++    {
++        cache_in_store.store = GinIndexStoreFactory::instance().get(index_helper->getFileName(), part->getDataPartStoragePtr());
++    }
++
+     for (size_t i = 0; i < ranges.size(); ++i)
+     {
+         const MarkRange & index_range = index_ranges[i];
+@@ -1700,6 +1709,7 @@ MarkRanges MergeTreeDataSelectExecutor::filterMarksUsingIndex(
+         {
+             if (index_mark != index_range.begin || !granule || last_index_mark != index_range.begin)
+                 granule = reader.read();
++            const auto * gin_filter_condition = dynamic_cast<const MergeTreeConditionGinFilter *>(&*condition);
+             // Cast to Ann condition
+             auto ann_condition = std::dynamic_pointer_cast<ApproximateNearestNeighbour::IMergeTreeIndexConditionAnn>(condition);
+             if (ann_condition != nullptr)
+@@ -1726,7 +1736,13 @@ MarkRanges MergeTreeDataSelectExecutor::filterMarksUsingIndex(
+                 continue;
+             }
+ 
+-            if (!condition->mayBeTrueOnGranule(granule))
++            bool result{false};
++            if (!gin_filter_condition)
++                result = condition->mayBeTrueOnGranule(granule);
++            else
++                result = cache_in_store.store ? gin_filter_condition->mayBeTrueOnGranuleInPart(granule, cache_in_store) : true;
++
++            if (!result)
+             {
+                 ++granules_dropped;
+                 continue;
+diff --git a/src/Storages/MergeTree/MergeTreeIndexFullText.cpp b/src/Storages/MergeTree/MergeTreeIndexFullText.cpp
+index fd98b0597d49..411141f028be 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexFullText.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexFullText.cpp
+@@ -183,6 +183,7 @@ MergeTreeConditionFullText::MergeTreeConditionFullText(
+     rpn = std::move(builder).extractRPN();
+ }
+ 
++/// Keep in-sync with MergeTreeConditionGinFilter::alwaysUnknownOrTrue
+ bool MergeTreeConditionFullText::alwaysUnknownOrTrue() const
+ {
+     /// Check like in KeyCondition.
+diff --git a/src/Storages/MergeTree/MergeTreeIndexGin.cpp b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+new file mode 100644
+index 000000000000..26f3fcb4fb6f
+--- /dev/null
++++ b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+@@ -0,0 +1,786 @@
++
++#include <algorithm>
++
++#include <Columns/ColumnArray.h>
++#include <DataTypes/DataTypesNumber.h>
++#include <DataTypes/DataTypeArray.h>
++#include <IO/WriteHelpers.h>
++#include <IO/ReadHelpers.h>
++#include <Interpreters/GinFilter.h>
++#include <Interpreters/ExpressionActions.h>
++#include <Interpreters/ExpressionAnalyzer.h>
++#include <Interpreters/TreeRewriter.h>
++#include <Interpreters/misc.h>
++#include <Storages/MergeTree/MergeTreeData.h>
++#include <Storages/MergeTree/RPNBuilder.h>
++#include <Storages/MergeTree/MergeTreeIndexGin.h>
++#include <Storages/MergeTree/MergeTreeIndexUtils.h>
++#include <Parsers/ASTIdentifier.h>
++#include <Parsers/ASTLiteral.h>
++#include <Parsers/ASTSubquery.h>
++#include <Core/Defines.h>
++
++#include <Poco/Logger.h>
++#include <Columns/ColumnNullable.h>
++#include <Columns/ColumnLowCardinality.h>
++#include <DataTypes/DataTypeNullable.h>
++#include <DataTypes/DataTypeLowCardinality.h>
++
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int INCORRECT_QUERY;
++}
++
++MergeTreeIndexGranuleGinFilter::MergeTreeIndexGranuleGinFilter(
++    const String & index_name_,
++    size_t columns_number,
++    const GinFilterParameters & params_)
++    : index_name(index_name_)
++    , params(params_)
++    , gin_filters(
++        columns_number, GinFilter(params))
++    , has_elems(false)
++{
++}
++
++void MergeTreeIndexGranuleGinFilter::serializeBinary(WriteBuffer & ostr) const
++{
++    if (empty())
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Attempt to write empty fulltext index {}.", backQuote(index_name));
++
++    const auto & size_type = std::make_shared<DataTypeUInt32>();
++    auto size_serialization = size_type->getDefaultSerialization();
++
++    for (const auto & gin_filter : gin_filters)
++    {
++        size_t filter_size = gin_filter.getFilter().size();
++        size_serialization->serializeBinary(filter_size, ostr, {});
++        ostr.write(reinterpret_cast<const char*>(gin_filter.getFilter().data()), filter_size * sizeof(GinFilter::GinSegmentWithRowIDRanges::value_type));
++    }
++}
++
++void MergeTreeIndexGranuleGinFilter::deserializeBinary(ReadBuffer & istr, MergeTreeIndexVersion version)
++{
++    if (version != 1)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown index version {}.", version);
++
++    Field field_rows;
++    const auto & size_type = std::make_shared<DataTypeUInt32>();
++
++    auto size_serialization = size_type->getDefaultSerialization();
++    for (auto & gin_filter : gin_filters)
++    {
++        size_serialization->deserializeBinary(field_rows, istr, {});
++        size_t filter_size = field_rows.get<size_t>();
++
++        if (filter_size == 0)
++            continue;
++
++        gin_filter.getFilter().assign(filter_size, {});
++        istr.readStrict(reinterpret_cast<char*>(gin_filter.getFilter().data()), filter_size * sizeof(GinFilter::GinSegmentWithRowIDRanges::value_type));
++    }
++    has_elems = true;
++}
++
++
++MergeTreeIndexAggregatorGinFilter::MergeTreeIndexAggregatorGinFilter(
++    GinIndexStorePtr store_,
++    const Names & index_columns_,
++    const String & index_name_,
++    const GinFilterParameters & params_,
++    TokenExtractorPtr token_extractor_)
++    : store(store_)
++    , index_columns(index_columns_)
++    , index_name (index_name_)
++    , params(params_)
++    , token_extractor(token_extractor_)
++    , granule(
++        std::make_shared<MergeTreeIndexGranuleGinFilter>(
++            index_name, index_columns.size(), params))
++{
++}
++
++MergeTreeIndexGranulePtr MergeTreeIndexAggregatorGinFilter::getGranuleAndReset()
++{
++    auto new_granule = std::make_shared<MergeTreeIndexGranuleGinFilter>(
++        index_name, index_columns.size(), params);
++    new_granule.swap(granule);
++    return new_granule;
++}
++
++void MergeTreeIndexAggregatorGinFilter::addToGinFilter(UInt32 rowID, const char* data, size_t length, GinFilter& gin_filter, UInt64 limit)
++{
++    size_t cur = 0;
++    size_t token_start = 0;
++    size_t token_len = 0;
++
++    while (cur < length && token_extractor->nextInStringPadded(data, length, &cur, &token_start, &token_len))
++    {
++        gin_filter.add(data + token_start, token_len, rowID, store, limit);
++    }
++}
++
++void MergeTreeIndexAggregatorGinFilter::update(const Block & block, size_t * pos, size_t limit)
++{
++    if (*pos >= block.rows())
++        throw Exception(
++                "The provided position is not less than the number of block rows. Position: "
++                + toString(*pos) + ", Block rows: " + toString(block.rows()) + ".", ErrorCodes::LOGICAL_ERROR);
++
++    size_t rows_read = std::min(limit, block.rows() - *pos);
++    auto row_id = store->getNextRowIDRange(rows_read);
++    auto start_row_id = row_id;
++
++    for (size_t col = 0; col < index_columns.size(); ++col)
++    {
++        const auto & column_with_type = block.getByName(index_columns[col]);
++        const auto & column = column_with_type.column;
++        size_t current_position = *pos;
++
++        bool need_to_write = false;
++        if (isArray(column_with_type.type))
++        {
++            const auto & column_array = assert_cast<const ColumnArray &>(*column);
++            const auto & column_offsets = column_array.getOffsets();
++            const auto & column_key = column_array.getData();
++
++            for (size_t i = 0; i < rows_read; ++i)
++            {
++                size_t element_start_row = column_offsets[current_position - 1];
++                size_t elements_size = column_offsets[current_position] - element_start_row;
++
++                for (size_t row_num = 0; row_num < elements_size; ++row_num)
++                {
++                    auto ref = column_key.getDataAt(element_start_row + row_num);
++                    addToGinFilter(row_id, ref.data, ref.size, granule->gin_filters[col], rows_read);
++                    store->incrementCurrentSizeBy(ref.size);
++                }
++                current_position += 1;
++                row_id++;
++
++                if (store->needToWrite())
++                    need_to_write = true;
++            }
++        }
++        else
++        {
++            for (size_t i = 0; i < rows_read; ++i)
++            {
++                auto ref = column->getDataAt(current_position + i);
++                addToGinFilter(row_id, ref.data, ref.size, granule->gin_filters[col], rows_read);
++                store->incrementCurrentSizeBy(ref.size);
++                row_id++;
++                if (store->needToWrite())
++                    need_to_write = true;
++            }
++        }
++        granule->gin_filters[col].addRowRangeToGinFilter(store->getCurrentSegmentID(), start_row_id, static_cast<UInt32>(start_row_id + rows_read - 1));
++        if (need_to_write)
++        {
++            store->writeSegment();
++        }
++    }
++
++    granule->has_elems = true;
++    *pos += rows_read;
++}
++
++MergeTreeConditionGinFilter::MergeTreeConditionGinFilter(
++    const SelectQueryInfo & query_info,
++    ContextPtr context_,
++    const Block & index_sample_block,
++    const GinFilterParameters & params_,
++    TokenExtractorPtr token_extactor_)
++    :  WithContext(context_), header(index_sample_block)
++    , params(params_)
++    , token_extractor(token_extactor_)
++    , prepared_sets(query_info.prepared_sets)
++{
++    if (context_->getSettingsRef().allow_experimental_analyzer)
++    {
++        if (!query_info.filter_actions_dag)
++        {
++            rpn.push_back(RPNElement::FUNCTION_UNKNOWN);
++            return;
++        }
++        rpn = std::move(
++                RPNBuilder<RPNElement>(
++                        query_info.filter_actions_dag->getOutputs().at(0), context_,
++                        [&](const RPNBuilderTreeNode & node, RPNElement & out)
++                        {
++                            return this->traverseAtomAST(node, out);
++                        }).extractRPN());
++    }
++
++    ASTPtr filter_node = buildFilterNode(query_info.query);
++
++    if (!filter_node)
++    {
++        rpn.push_back(RPNElement::FUNCTION_UNKNOWN);
++        return;
++    }
++
++    auto block_with_constants = KeyCondition::getBlockWithConstants(query_info.query, query_info.syntax_analyzer_result, context_);
++    RPNBuilder<RPNElement> builder(
++        filter_node,
++        context_,
++        std::move(block_with_constants),
++        query_info.prepared_sets,
++        [&](const RPNBuilderTreeNode & node, RPNElement & out) { return traverseAtomAST(node, out); });
++    rpn = std::move(builder).extractRPN();
++
++}
++
++/// Keep in-sync with MergeTreeConditionFullText::alwaysUnknownOrTrue
++bool MergeTreeConditionGinFilter::alwaysUnknownOrTrue() const
++{
++    /// Check like in KeyCondition.
++    std::vector<bool> rpn_stack;
++
++    for (const auto & element : rpn)
++    {
++        if (element.function == RPNElement::FUNCTION_UNKNOWN
++            || element.function == RPNElement::ALWAYS_TRUE)
++        {
++            rpn_stack.push_back(true);
++        }
++        else if (element.function == RPNElement::FUNCTION_EQUALS
++             || element.function == RPNElement::FUNCTION_NOT_EQUALS
++             || element.function == RPNElement::FUNCTION_HAS
++             || element.function == RPNElement::FUNCTION_IN
++             || element.function == RPNElement::FUNCTION_NOT_IN
++             || element.function == RPNElement::FUNCTION_MULTI_SEARCH
++             || element.function == RPNElement::ALWAYS_FALSE)
++        {
++            rpn_stack.push_back(false);
++        }
++        else if (element.function == RPNElement::FUNCTION_NOT)
++        {
++            // do nothing
++        }
++        else if (element.function == RPNElement::FUNCTION_AND)
++        {
++            auto arg1 = rpn_stack.back();
++            rpn_stack.pop_back();
++            auto arg2 = rpn_stack.back();
++            rpn_stack.back() = arg1 && arg2;
++        }
++        else if (element.function == RPNElement::FUNCTION_OR)
++        {
++            auto arg1 = rpn_stack.back();
++            rpn_stack.pop_back();
++            auto arg2 = rpn_stack.back();
++            rpn_stack.back() = arg1 || arg2;
++        }
++        else
++            throw Exception("Unexpected function type in KeyCondition::RPNElement", ErrorCodes::LOGICAL_ERROR);
++    }
++
++    return rpn_stack[0];
++}
++
++bool MergeTreeConditionGinFilter::mayBeTrueOnGranuleInPart(MergeTreeIndexGranulePtr idx_granule,[[maybe_unused]] PostingsCacheForStore &cache_store) const
++{
++    std::shared_ptr<MergeTreeIndexGranuleGinFilter> granule
++            = std::dynamic_pointer_cast<MergeTreeIndexGranuleGinFilter>(idx_granule);
++    if (!granule)
++        throw Exception(
++                "GinFilter index condition got a granule with the wrong type.", ErrorCodes::LOGICAL_ERROR);
++
++    /// Check like in KeyCondition.
++    std::vector<BoolMask> rpn_stack;
++    for (const auto & element : rpn)
++    {
++        if (element.function == RPNElement::FUNCTION_UNKNOWN)
++        {
++            rpn_stack.emplace_back(true, true);
++        }
++        else if (element.function == RPNElement::FUNCTION_EQUALS
++             || element.function == RPNElement::FUNCTION_NOT_EQUALS
++             || element.function == RPNElement::FUNCTION_HAS)
++        {
++            rpn_stack.emplace_back(granule->gin_filters[element.key_column].contains(*element.gin_filter, cache_store), true);
++
++            if (element.function == RPNElement::FUNCTION_NOT_EQUALS)
++                rpn_stack.back() = !rpn_stack.back();
++        }
++        else if (element.function == RPNElement::FUNCTION_IN
++             || element.function == RPNElement::FUNCTION_NOT_IN)
++        {
++            std::vector<bool> result(element.set_gin_filters.back().size(), true);
++
++            for (size_t column = 0; column < element.set_key_position.size(); ++column)
++            {
++                const size_t key_idx = element.set_key_position[column];
++
++                const auto & gin_filters = element.set_gin_filters[column];
++                for (size_t row = 0; row < gin_filters.size(); ++row)
++                    result[row] = result[row] && granule->gin_filters[key_idx].contains(gin_filters[row], cache_store);
++            }
++
++            rpn_stack.emplace_back(
++                    std::find(std::cbegin(result), std::cend(result), true) != std::end(result), true);
++            if (element.function == RPNElement::FUNCTION_NOT_IN)
++                rpn_stack.back() = !rpn_stack.back();
++        }
++        else if (element.function == RPNElement::FUNCTION_MULTI_SEARCH)
++        {
++            std::vector<bool> result(element.set_gin_filters.back().size(), true);
++
++            const auto & gin_filters = element.set_gin_filters[0];
++
++            for (size_t row = 0; row < gin_filters.size(); ++row)
++                result[row] = result[row] && granule->gin_filters[element.key_column].contains(gin_filters[row], cache_store);
++
++            rpn_stack.emplace_back(
++                    std::find(std::cbegin(result), std::cend(result), true) != std::end(result), true);
++        }
++        else if (element.function == RPNElement::FUNCTION_NOT)
++        {
++            rpn_stack.back() = !rpn_stack.back();
++        }
++        else if (element.function == RPNElement::FUNCTION_AND)
++        {
++            auto arg1 = rpn_stack.back();
++            rpn_stack.pop_back();
++            auto arg2 = rpn_stack.back();
++            rpn_stack.back() = arg1 & arg2;
++        }
++        else if (element.function == RPNElement::FUNCTION_OR)
++        {
++            auto arg1 = rpn_stack.back();
++            rpn_stack.pop_back();
++            auto arg2 = rpn_stack.back();
++            rpn_stack.back() = arg1 | arg2;
++        }
++        else if (element.function == RPNElement::ALWAYS_FALSE)
++        {
++            rpn_stack.emplace_back(false, true);
++        }
++        else if (element.function == RPNElement::ALWAYS_TRUE)
++        {
++            rpn_stack.emplace_back(true, false);
++        }
++        else
++            throw Exception("Unexpected function type in GinFilterCondition::RPNElement", ErrorCodes::LOGICAL_ERROR);
++    }
++
++    if (rpn_stack.size() != 1)
++        throw Exception("Unexpected stack size in GinFilterCondition::mayBeTrueOnGranule", ErrorCodes::LOGICAL_ERROR);
++
++    return rpn_stack[0].can_be_true;
++}
++
++bool MergeTreeConditionGinFilter::traverseAtomAST(const RPNBuilderTreeNode & node, RPNElement & out)
++{
++    {
++        Field const_value;
++        DataTypePtr const_type;
++
++        if (node.tryGetConstant(const_value, const_type))
++        {
++            /// Check constant like in KeyCondition
++            if (const_value.getType() == Field::Types::UInt64
++                || const_value.getType() == Field::Types::Int64
++                || const_value.getType() == Field::Types::Float64)
++            {
++                /// Zero in all types is represented in memory the same way as in UInt64.
++                out.function = const_value.get<UInt64>()
++                            ? RPNElement::ALWAYS_TRUE
++                            : RPNElement::ALWAYS_FALSE;
++
++                return true;
++            }
++        }
++    }
++
++    if (node.isFunction())
++    {
++        const auto function = node.toFunctionNode();
++        // auto arguments_size = function.getArgumentsSize();
++        auto function_name = function.getFunctionName();
++
++        size_t function_arguments_size = function.getArgumentsSize();
++        if (function_arguments_size != 2)
++            return false;
++        auto lhs_argument = function.getArgumentAt(0);
++        auto rhs_argument = function.getArgumentAt(1);
++
++        if (functionIsInOrGlobalInOperator(function_name))
++        {
++            if (tryPrepareSetGinFilter(lhs_argument, rhs_argument, out))
++            {
++                if (function_name == "notIn")
++                {
++                    out.function = RPNElement::FUNCTION_NOT_IN;
++                    return true;
++                }
++                else if (function_name == "in")
++                {
++                    out.function = RPNElement::FUNCTION_IN;
++                    return true;
++                }
++            }
++        }
++        else if (function_name == "equals" ||
++                 function_name == "notEquals" ||
++                 function_name == "has" ||
++                 function_name == "mapContains" ||
++                 function_name == "like" ||
++                 function_name == "notLike" ||
++                 function_name == "hasToken" ||
++                 function_name == "startsWith" ||
++                 function_name == "endsWith" ||
++                 function_name == "multiSearchAny")
++        {
++            Field const_value;
++            DataTypePtr const_type;
++            if (rhs_argument.tryGetConstant(const_value, const_type))
++            {
++                if (traverseASTEquals(function_name, lhs_argument, const_type, const_value, out))
++                    return true;
++            }
++            else if (lhs_argument.tryGetConstant(const_value, const_type) && (function_name == "equals" || function_name == "notEquals"))
++            {
++                if (traverseASTEquals(function_name, rhs_argument, const_type, const_value, out))
++                    return true;
++            }
++        }
++    }
++
++    return false;
++}
++
++bool MergeTreeConditionGinFilter::traverseASTEquals(
++    const String & function_name,
++    const RPNBuilderTreeNode & key_ast,
++    const DataTypePtr & value_type,
++    const Field & value_field,
++    RPNElement & out)
++{
++    auto value_data_type = WhichDataType(value_type);
++    if (!value_data_type.isStringOrFixedString() && !value_data_type.isArray())
++        return false;
++
++    Field const_value = value_field;
++    size_t key_column_num = 0;
++    bool key_exists = header.has(key_ast.getColumnName());
++    bool map_key_exists = header.has(fmt::format("mapKeys({})", key_ast.getColumnName()));
++
++    if (key_ast.isFunction())
++    {
++        const auto function = key_ast.toFunctionNode();
++        if (function.getFunctionName() == "arrayElement")
++        {
++            /** Try to parse arrayElement for mapKeys index.
++              * It is important to ignore keys like column_map['Key'] = '' because if key does not exists in map
++              * we return default value for arrayElement.
++              *
++              * We cannot skip keys that does not exist in map if comparison is with default type value because
++              * that way we skip necessary granules where map key does not exists.
++              */
++            if (value_field == value_type->getDefault())
++                return false;
++
++            auto first_argument = function.getArgumentAt(0);
++            const auto map_column_name = first_argument.getColumnName();
++            auto map_keys_index_column_name = fmt::format("mapKeys({})", map_column_name);
++            auto map_values_index_column_name = fmt::format("mapValues({})", map_column_name);
++
++            if (header.has(map_keys_index_column_name))
++            {
++                auto argument = function.getArgumentAt(1);
++                DataTypePtr const_type;
++                if (argument.tryGetConstant(const_value, const_type))
++                {
++                    key_column_num = header.getPositionByName(map_keys_index_column_name);
++                    key_exists = true;
++                }
++                else
++                {
++                    return false;
++                }
++            }
++            else if (header.has(map_values_index_column_name))
++            {
++                key_column_num = header.getPositionByName(map_values_index_column_name);
++                key_exists = true;
++            }
++            else
++            {
++                return false;
++            }
++        }
++    }
++
++    if (!key_exists && !map_key_exists)
++        return false;
++
++    if (map_key_exists && (function_name == "has" || function_name == "mapContains"))
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_HAS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "has")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_HAS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++
++    if (function_name == "notEquals")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_NOT_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "equals")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "like")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringLikeToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "notLike")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_NOT_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringLikeToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "hasToken")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "startsWith")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "endsWith")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_EQUALS;
++        out.gin_filter = std::make_unique<GinFilter>(params);
++        const auto & value = const_value.get<String>();
++        token_extractor->stringToGinFilter(value.data(), value.size(), *out.gin_filter);
++        return true;
++    }
++    else if (function_name == "multiSearchAny")
++    {
++        out.key_column = key_column_num;
++        out.function = RPNElement::FUNCTION_MULTI_SEARCH;
++
++        /// 2d vector is not needed here but is used because already exists for FUNCTION_IN
++        std::vector<std::vector<GinFilter>> gin_filters;
++        gin_filters.emplace_back();
++        for (const auto & element : const_value.get<Array>())
++        {
++            if (element.getType() != Field::Types::String)
++                return false;
++
++            gin_filters.back().emplace_back(params);
++            const auto & value = element.get<String>();
++            token_extractor->stringToGinFilter(value.data(), value.size(), gin_filters.back().back());
++        }
++        out.set_gin_filters = std::move(gin_filters);
++        return true;
++    }
++
++    return false;
++}
++
++bool MergeTreeConditionGinFilter::tryPrepareSetGinFilter(
++    const RPNBuilderTreeNode & lhs,
++    const RPNBuilderTreeNode & rhs,
++    RPNElement & out)
++{
++    std::vector<KeyTuplePositionMapping> key_tuple_mapping;
++    DataTypes data_types;
++
++    if (lhs.isFunction() && lhs.toFunctionNode().getFunctionName() == "tuple")
++    {
++        const auto function = lhs.toFunctionNode();
++        auto arguments_size = function.getArgumentsSize();
++        for (size_t i = 0; i < arguments_size; ++i)
++        {
++            if (header.has(function.getArgumentAt(i).getColumnName()))
++            {
++                auto key = header.getPositionByName(function.getArgumentAt(i).getColumnName());
++                key_tuple_mapping.emplace_back(i, key);
++                data_types.push_back(header.getByPosition(key).type);
++            }
++        }
++    }
++    else
++    {
++        if (header.has(lhs.getColumnName()))
++        {
++            auto key = header.getPositionByName(lhs.getColumnName());
++            key_tuple_mapping.emplace_back(0, key);
++            data_types.push_back(header.getByPosition(key).type);
++        }
++    }
++
++    if (key_tuple_mapping.empty())
++        return false;
++
++    ConstSetPtr prepared_set = rhs.tryGetPreparedSet();
++    if (!prepared_set && !prepared_set->hasExplicitSetElements())
++        return false;
++
++    for (const auto & data_type : prepared_set->getDataTypes())
++        if (data_type->getTypeId() != TypeIndex::String && data_type->getTypeId() != TypeIndex::FixedString)
++            return false;
++
++    std::vector<std::vector<GinFilter>> gin_filters;
++    std::vector<size_t> key_position;
++
++    Columns columns = prepared_set->getSetElements();
++    for (const auto & elem : key_tuple_mapping)
++    {
++        gin_filters.emplace_back();
++        gin_filters.back().reserve(prepared_set->getTotalRowCount());
++        key_position.push_back(elem.key_index);
++
++        size_t tuple_idx = elem.tuple_index;
++        const auto & column = columns[tuple_idx];
++        for (size_t row = 0; row < prepared_set->getTotalRowCount(); ++row)
++        {
++            gin_filters.back().emplace_back(params);
++            auto ref = column->getDataAt(row);
++            token_extractor->stringToGinFilter(ref.data, ref.size, gin_filters.back().back());
++        }
++    }
++
++    out.set_key_position = std::move(key_position);
++    out.set_gin_filters = std::move(gin_filters);
++
++    return true;
++}
++
++MergeTreeIndexGranulePtr MergeTreeIndexGinFilter::createIndexGranule() const
++{
++    return std::make_shared<MergeTreeIndexGranuleGinFilter>(index.name, index.column_names.size(), params);
++}
++
++MergeTreeIndexAggregatorPtr MergeTreeIndexGinFilter::createIndexAggregator() const
++{
++    /// should not be called: createIndexAggregatorForPart should be used
++    assert(false);
++    return nullptr;
++}
++
++MergeTreeIndexAggregatorPtr MergeTreeIndexGinFilter::createIndexAggregatorForPart(const GinIndexStorePtr &store) const
++{
++    return std::make_shared<MergeTreeIndexAggregatorGinFilter>(store, index.column_names, index.name, params, token_extractor.get());
++}
++
++MergeTreeIndexConditionPtr MergeTreeIndexGinFilter::createIndexCondition(
++        const SelectQueryInfo & query, ContextPtr context) const
++{
++    return std::make_shared<MergeTreeConditionGinFilter>(query, context, index.sample_block, params, token_extractor.get());
++};
++
++bool MergeTreeIndexGinFilter::mayBenefitFromIndexForIn(const ASTPtr & node) const
++{
++    return std::find(std::cbegin(index.column_names), std::cend(index.column_names), node->getColumnName()) != std::cend(index.column_names);
++}
++
++MergeTreeIndexPtr ginIndexCreator(
++    const IndexDescription & index)
++{
++    size_t n = index.arguments.empty() ? 0 : index.arguments[0].get<size_t>();
++    Float64 density = index.arguments.size() < 2 ? 1.0f : index.arguments[1].get<Float64>();
++    GinFilterParameters params(n, density);
++
++    /// Use SplitTokenExtractor when n is 0, otherwise use NgramTokenExtractor
++    if (n > 0)
++    {
++        auto tokenizer = std::make_unique<NgramTokenExtractor>(n);
++        return std::make_shared<MergeTreeIndexGinFilter>(index, params, std::move(tokenizer));
++    }
++    else
++    {
++        auto tokenizer = std::make_unique<SplitTokenExtractor>();
++        return std::make_shared<MergeTreeIndexGinFilter>(index, params, std::move(tokenizer));
++    }
++}
++
++void ginIndexValidator(const IndexDescription & index, bool /*attach*/)
++{
++    for (const auto & index_data_type : index.data_types)
++    {
++        WhichDataType data_type(index_data_type);
++
++        if (data_type.isArray())
++        {
++            const auto & gin_type = assert_cast<const DataTypeArray &>(*index_data_type);
++            data_type = WhichDataType(gin_type.getNestedType());
++        }
++        else if (data_type.isLowCarnality())
++        {
++            const auto & low_cardinality = assert_cast<const DataTypeLowCardinality &>(*index_data_type);
++            data_type = WhichDataType(low_cardinality.getDictionaryType());
++        }
++
++        if (!data_type.isString() && !data_type.isFixedString())
++            throw Exception("Inverted index can be used only with `String`, `FixedString`, `LowCardinality(String)`, `LowCardinality(FixedString)` column or Array with `String` or `FixedString` values column.", ErrorCodes::INCORRECT_QUERY);
++    }
++
++    if (index.type != GinFilter::getName())
++        throw Exception("Unknown index type: " + backQuote(index.name), ErrorCodes::LOGICAL_ERROR);
++
++    if (index.arguments.size() > 2)
++        throw Exception("Inverted index must have less than two arguments.", ErrorCodes::INCORRECT_QUERY);
++
++    if (!index.arguments.empty() && index.arguments[0].getType() != Field::Types::UInt64)
++        throw Exception("The first Inverted index argument must be positive integer.", ErrorCodes::INCORRECT_QUERY);
++
++    if (index.arguments.size() == 2 && (index.arguments[1].getType() != Field::Types::Float64 || index.arguments[1].get<Float64>() <= 0 || index.arguments[1].get<Float64>() > 1))
++        throw Exception("The second Inverted index argument must be a float between 0 and 1.", ErrorCodes::INCORRECT_QUERY);
++
++    size_t ngrams = index.arguments.empty() ? 0 : index.arguments[0].get<size_t>();
++    Float64 density = index.arguments.size() < 2 ? 1.0f : index.arguments[1].get<Float64>();
++
++    /// Just validate
++    GinFilterParameters params(ngrams, density);
++}
++
++}
+diff --git a/src/Storages/MergeTree/MergeTreeIndexGin.h b/src/Storages/MergeTree/MergeTreeIndexGin.h
+new file mode 100644
+index 000000000000..d915d4938103
+--- /dev/null
++++ b/src/Storages/MergeTree/MergeTreeIndexGin.h
+@@ -0,0 +1,183 @@
++#pragma once
++#include <atomic>
++#include <base/types.h>
++
++#include <memory>
++
++#include <Storages/MergeTree/MergeTreeData.h>
++#include <Storages/MergeTree/KeyCondition.h>
++#include <Interpreters/ITokenExtractor.h>
++#include <Interpreters/GinFilter.h>
++
++namespace DB
++{
++struct MergeTreeIndexGranuleGinFilter final : public IMergeTreeIndexGranule
++{
++    explicit MergeTreeIndexGranuleGinFilter(
++        const String & index_name_,
++        size_t columns_number,
++        const GinFilterParameters & params_);
++
++    ~MergeTreeIndexGranuleGinFilter() override = default;
++
++    void serializeBinary(WriteBuffer & ostr) const override;
++    void deserializeBinary(ReadBuffer & istr, MergeTreeIndexVersion version) override;
++
++    bool empty() const override { return !has_elems; }
++
++    String index_name;
++    GinFilterParameters params;
++
++    std::vector<GinFilter> gin_filters;
++    bool has_elems;
++};
++
++using MergeTreeIndexGranuleGinFilterPtr = std::shared_ptr<MergeTreeIndexGranuleGinFilter>;
++
++struct MergeTreeIndexAggregatorGinFilter final : IMergeTreeIndexAggregator
++{
++    explicit MergeTreeIndexAggregatorGinFilter(
++        GinIndexStorePtr store_,
++        const Names & index_columns_,
++        const String & index_name_,
++        const GinFilterParameters & params_,
++        TokenExtractorPtr token_extractor_);
++
++    ~MergeTreeIndexAggregatorGinFilter() override = default;
++
++    bool empty() const override { return !granule || granule->empty(); }
++    MergeTreeIndexGranulePtr getGranuleAndReset() override;
++
++    void update(const Block & block, size_t * pos, size_t limit) override;
++
++    void addToGinFilter(UInt32 rowID, const char* data, size_t length, GinFilter& gin_filter, UInt64 limit);
++
++    GinIndexStorePtr store;
++    Names index_columns;
++    const String index_name;
++    const GinFilterParameters params;
++    TokenExtractorPtr token_extractor;
++
++    MergeTreeIndexGranuleGinFilterPtr granule;
++};
++
++
++class MergeTreeConditionGinFilter final : public IMergeTreeIndexCondition, WithContext
++{
++public:
++    MergeTreeConditionGinFilter(
++            const SelectQueryInfo & query_info,
++            ContextPtr context,
++            const Block & index_sample_block,
++            const GinFilterParameters & params_,
++            TokenExtractorPtr token_extactor_);
++
++    ~MergeTreeConditionGinFilter() override = default;
++
++    bool alwaysUnknownOrTrue() const override;
++    bool mayBeTrueOnGranule([[maybe_unused]]MergeTreeIndexGranulePtr idx_granule) const override
++    {
++        /// should call mayBeTrueOnGranuleInPart instead
++        assert(false);
++        return false;
++    }
++    bool mayBeTrueOnGranuleInPart(MergeTreeIndexGranulePtr idx_granule, [[maybe_unused]] PostingsCacheForStore& cache_store) const;
++private:
++    struct KeyTuplePositionMapping
++    {
++        KeyTuplePositionMapping(size_t tuple_index_, size_t key_index_) : tuple_index(tuple_index_), key_index(key_index_) {}
++
++        size_t tuple_index;
++        size_t key_index;
++    };
++    /// Uses RPN like KeyCondition
++    struct RPNElement
++    {
++        enum Function
++        {
++            /// Atoms of a Boolean expression.
++            FUNCTION_EQUALS,
++            FUNCTION_NOT_EQUALS,
++            FUNCTION_HAS,
++            FUNCTION_IN,
++            FUNCTION_NOT_IN,
++            FUNCTION_MULTI_SEARCH,
++            FUNCTION_UNKNOWN, /// Can take any value.
++            /// Operators of the logical expression.
++            FUNCTION_NOT,
++            FUNCTION_AND,
++            FUNCTION_OR,
++            /// Constants
++            ALWAYS_FALSE,
++            ALWAYS_TRUE,
++        };
++
++        RPNElement( /// NOLINT
++                Function function_ = FUNCTION_UNKNOWN, size_t key_column_ = 0, std::unique_ptr<GinFilter> && const_gin_filter_ = nullptr)
++                : function(function_), key_column(key_column_), gin_filter(std::move(const_gin_filter_)) {}
++
++        Function function = FUNCTION_UNKNOWN;
++        /// For FUNCTION_EQUALS, FUNCTION_NOT_EQUALS and FUNCTION_MULTI_SEARCH
++        size_t key_column;
++
++        /// For FUNCTION_EQUALS, FUNCTION_NOT_EQUALS
++        std::unique_ptr<GinFilter> gin_filter;
++
++        /// For FUNCTION_IN, FUNCTION_NOT_IN and FUNCTION_MULTI_SEARCH
++        std::vector<std::vector<GinFilter>> set_gin_filters;
++
++        /// For FUNCTION_IN and FUNCTION_NOT_IN
++        std::vector<size_t> set_key_position;
++    };
++
++    using RPN = std::vector<RPNElement>;
++
++    bool traverseAtomAST(const RPNBuilderTreeNode & node, RPNElement & out);
++
++    bool traverseASTEquals(
++        const String & function_name,
++        const RPNBuilderTreeNode & key_ast,
++        const DataTypePtr & value_type,
++        const Field & value_field,
++        RPNElement & out);
++
++    bool tryPrepareSetGinFilter(const RPNBuilderTreeNode & lhs, const RPNBuilderTreeNode & rhs, RPNElement & out);
++
++    static bool createFunctionEqualsCondition(
++        RPNElement & out, const Field & value, const GinFilterParameters & params, TokenExtractorPtr token_extractor);
++
++    const Block & header;
++    GinFilterParameters params;
++    TokenExtractorPtr token_extractor;
++    RPN rpn;
++    /// Sets from syntax analyzer.
++    PreparedSetsPtr prepared_sets;
++};
++
++class MergeTreeIndexGinFilter final : public IMergeTreeIndex
++{
++public:
++    MergeTreeIndexGinFilter(
++        const IndexDescription & index_,
++        const GinFilterParameters & params_,
++        std::unique_ptr<ITokenExtractor> && token_extractor_)
++        : IMergeTreeIndex(index_)
++        , params(params_)
++        , token_extractor(std::move(token_extractor_)) {}
++
++    ~MergeTreeIndexGinFilter() override = default;
++
++    MergeTreeIndexGranulePtr createIndexGranule() const override;
++    MergeTreeIndexAggregatorPtr createIndexAggregator() const override;
++    MergeTreeIndexAggregatorPtr createIndexAggregatorForPart(const GinIndexStorePtr &store) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(
++            const SelectQueryInfo & query, ContextPtr context) const override;
++
++    bool mayBenefitFromIndexForIn(const ASTPtr & node) const override;
++
++    GinFilterParameters params;
++    /// Function for selecting next token.
++    std::unique_ptr<ITokenExtractor> token_extractor;
++};
++
++}
+diff --git a/src/Storages/MergeTree/MergeTreeIndices.cpp b/src/Storages/MergeTree/MergeTreeIndices.cpp
+index eeeef27699f7..e5e376e7f69d 100644
+--- a/src/Storages/MergeTree/MergeTreeIndices.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndices.cpp
+@@ -3,7 +3,6 @@
+ #include <Parsers/ParserCreateQuery.h>
+ #include <IO/WriteHelpers.h>
+ #include <IO/ReadHelpers.h>
+-
+ #include <numeric>
+ 
+ #include <boost/algorithm/string.hpp>
+@@ -106,6 +105,9 @@ MergeTreeIndexFactory::MergeTreeIndexFactory()
+     registerCreator("annoy", annoyIndexCreator);
+     registerValidator("annoy", annoyIndexValidator);
+ #endif
++    registerCreator("inverted", ginIndexCreator);
++    registerValidator("inverted", ginIndexValidator);
++
+ }
+ 
+ MergeTreeIndexFactory & MergeTreeIndexFactory::instance()
+diff --git a/src/Storages/MergeTree/MergeTreeIndices.h b/src/Storages/MergeTree/MergeTreeIndices.h
+index 6a671c31944e..52cf8c850b32 100644
+--- a/src/Storages/MergeTree/MergeTreeIndices.h
++++ b/src/Storages/MergeTree/MergeTreeIndices.h
+@@ -1,10 +1,12 @@
+ #pragma once
+ 
+ #include <string>
++#include <map>
+ #include <unordered_map>
+ #include <vector>
+ #include <memory>
+ #include <utility>
++#include <mutex>
+ #include <Core/Block.h>
+ #include <Storages/StorageInMemoryMetadata.h>
+ #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
+@@ -14,6 +16,8 @@
+ #include <Interpreters/ExpressionActions.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
+ 
++#include <Storages/MergeTree/GinIndexStore.h>
++
+ constexpr auto INDEX_FILE_PREFIX = "skp_idx_";
+ 
+ namespace DB
+@@ -162,6 +166,11 @@ struct IMergeTreeIndex
+ 
+     virtual MergeTreeIndexAggregatorPtr createIndexAggregator() const = 0;
+ 
++    virtual MergeTreeIndexAggregatorPtr createIndexAggregatorForPart([[maybe_unused]]const GinIndexStorePtr &store) const
++    {
++        return createIndexAggregator();
++    }
++
+     virtual MergeTreeIndexConditionPtr createIndexCondition(
+         const SelectQueryInfo & query_info, ContextPtr context) const = 0;
+ 
+@@ -228,5 +237,7 @@ void hypothesisIndexValidator(const IndexDescription & index, bool attach);
+ MergeTreeIndexPtr annoyIndexCreator(const IndexDescription & index);
+ void annoyIndexValidator(const IndexDescription & index, bool attach);
+ #endif
++MergeTreeIndexPtr ginIndexCreator(const IndexDescription& index);
++void ginIndexValidator(const IndexDescription& index, bool attach);
+ 
+ }
+diff --git a/src/Storages/MergeTree/MergeTreeSettings.h b/src/Storages/MergeTree/MergeTreeSettings.h
+index 204f7b941d07..ae1bace79e3a 100644
+--- a/src/Storages/MergeTree/MergeTreeSettings.h
++++ b/src/Storages/MergeTree/MergeTreeSettings.h
+@@ -25,6 +25,7 @@ struct Settings;
+     M(UInt64, min_compress_block_size, 0, "When granule is written, compress the data in buffer if the size of pending uncompressed data is larger or equal than the specified threshold. If this setting is not set, the corresponding global setting is used.", 0) \
+     M(UInt64, max_compress_block_size, 0, "Compress the pending uncompressed data in buffer if its size is larger or equal than the specified threshold. Block of data will be compressed even if the current granule is not finished. If this setting is not set, the corresponding global setting is used.", 0) \
+     M(UInt64, index_granularity, 8192, "How many rows correspond to one primary key value.", 0) \
++    M(UInt64, max_digestion_size_per_segment, 1024 * 1024 * 256, "Max number of bytes to digest per segment to build GIN index.", 0) \
+     \
+     /** Data storing format settings. */ \
+     M(UInt64, min_bytes_for_wide_part, 10485760, "Minimal uncompressed size in bytes to create part in wide format instead of compact", 0) \

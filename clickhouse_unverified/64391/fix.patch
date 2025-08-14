@@ -1,0 +1,153 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index dc61a049de80..b8f5a8b5a75a 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -260,6 +260,8 @@ class IColumn;
+     M(Bool, force_primary_key, false, "Throw an exception if there is primary key in a table, and it is not used.", 0) \
+     M(Bool, use_skip_indexes, true, "Use data skipping indexes during query execution.", 0) \
+     M(Bool, use_skip_indexes_if_final, false, "If query has FINAL, then skipping data based on indexes may produce incorrect result, hence disabled by default.", 0) \
++    M(Bool, materialize_skip_indexes_on_insert, true, "If true skip indexes are calculated on inserts, otherwise skip indexes will be calculated only during merges", 0) \
++    M(Bool, materialize_statistics_on_insert, true, "If true statistics are calculated on inserts, otherwise statistics will be calculated only during merges", 0) \
+     M(String, ignore_data_skipping_indices, "", "Comma separated list of strings or literals with the name of the data skipping indices that should be excluded during query execution.", 0) \
+     \
+     M(String, force_data_skipping_indices, "", "Comma separated list of strings or literals with the name of the data skipping indices that should be used during query execution, otherwise an exception will be thrown.", 0) \
+diff --git a/src/Core/SettingsChangesHistory.h b/src/Core/SettingsChangesHistory.h
+index 3a0f2ca1e270..9352b22132f0 100644
+--- a/src/Core/SettingsChangesHistory.h
++++ b/src/Core/SettingsChangesHistory.h
+@@ -85,7 +85,9 @@ namespace SettingsChangesHistory
+ /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
+ static std::map<ClickHouseVersion, SettingsChangesHistory::SettingsChanges> settings_changes_history =
+ {
+-    {"24.6", {{"input_format_parquet_use_native_reader", false, false, "When reading Parquet files, to use native reader instead of arrow reader."},
++    {"24.6", {{"materialize_skip_indexes_on_insert", true, true, "Added new setting to allow to disable materialization of skip indexes on insert"},
++              {"materialize_statistics_on_insert", true, true, "Added new setting to allow to disable materialization of statistics on insert"},
++              {"input_format_parquet_use_native_reader", false, false, "When reading Parquet files, to use native reader instead of arrow reader."},
+               {"hdfs_throw_on_zero_files_match", false, false, "Allow to throw an error when ListObjects request cannot match any files in HDFS engine instead of empty query result"},
+               {"azure_throw_on_zero_files_match", false, false, "Allow to throw an error when ListObjects request cannot match any files in AzureBlobStorage engine instead of empty query result"},
+               {"s3_validate_request_settings", true, true, "Allow to disable S3 request settings validation"},
+diff --git a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
+index 0a8920790e01..bcf51bfcd3d2 100644
+--- a/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp
+@@ -176,6 +176,7 @@ MergeTreeDataPartWriterOnDisk::MergeTreeDataPartWriterOnDisk(
+ 
+     if (settings.rewrite_primary_key)
+         initPrimaryIndex();
++
+     initSkipIndices();
+     initStatistics();
+ }
+@@ -272,6 +273,9 @@ void MergeTreeDataPartWriterOnDisk::initStatistics()
+ 
+ void MergeTreeDataPartWriterOnDisk::initSkipIndices()
+ {
++    if (skip_indices.empty())
++        return;
++
+     ParserCodec codec_parser;
+     auto ast = parseQuery(codec_parser, "(" + Poco::toUpper(settings.marks_compression_codec) + ")", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+     CompressionCodecPtr marks_compression_codec = CompressionCodecFactory::instance().get(ast, nullptr);
+diff --git a/src/Storages/MergeTree/MergeTreeDataWriter.cpp b/src/Storages/MergeTree/MergeTreeDataWriter.cpp
+index df4087b85460..2ffd23df0150 100644
+--- a/src/Storages/MergeTree/MergeTreeDataWriter.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataWriter.cpp
+@@ -464,7 +464,13 @@ MergeTreeDataWriter::TemporaryPart MergeTreeDataWriter::writeTempPartImpl(
+ 
+     temp_part.temporary_directory_lock = data.getTemporaryPartDirectoryHolder(part_dir);
+ 
+-    auto indices = MergeTreeIndexFactory::instance().getMany(metadata_snapshot->getSecondaryIndices());
++    MergeTreeIndices indices;
++    if (context->getSettingsRef().materialize_skip_indexes_on_insert)
++        indices = MergeTreeIndexFactory::instance().getMany(metadata_snapshot->getSecondaryIndices());
++
++    Statistics statistics;
++    if (context->getSettingsRef().materialize_statistics_on_insert)
++        statistics = MergeTreeStatisticsFactory::instance().getMany(metadata_snapshot->getColumns());
+ 
+     /// If we need to calculate some columns to sort.
+     if (metadata_snapshot->hasSortingKey() || metadata_snapshot->hasSecondaryIndices())
+@@ -596,7 +602,7 @@ MergeTreeDataWriter::TemporaryPart MergeTreeDataWriter::writeTempPartImpl(
+         metadata_snapshot,
+         columns,
+         indices,
+-        MergeTreeStatisticsFactory::instance().getMany(metadata_snapshot->getColumns()),
++        statistics,
+         compression_codec,
+         context->getCurrentTransaction() ? context->getCurrentTransaction()->tid : Tx::PrehistoricTID,
+         false,
+diff --git a/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp b/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
+index 6f1c5302b0ef..3844ac182681 100644
+--- a/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
++++ b/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
+@@ -261,9 +261,9 @@ void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const RPNBuilderTree
+         cond.columns_size = getColumnsSize(cond.table_columns);
+ 
+         cond.viable =
+-            !has_invalid_column &&
++            !has_invalid_column
+             /// Condition depend on some column. Constant expressions are not moved.
+-            !cond.table_columns.empty()
++            && !cond.table_columns.empty()
+             && !cannotBeMoved(node, where_optimizer_context)
+             /// When use final, do not take into consideration the conditions with non-sorting keys. Because final select
+             /// need to use all sorting keys, it will cause correctness issues if we filter other columns before final merge.
+@@ -273,17 +273,15 @@ void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const RPNBuilderTree
+             /// Do not move conditions involving all queried columns.
+             && cond.table_columns.size() < queried_columns.size();
+ 
+-        if (cond.viable)
+-            cond.good = isConditionGood(node, table_columns);
+-
+         if (where_optimizer_context.use_statistic)
+         {
+             cond.good = cond.viable;
+-
+             cond.selectivity = estimator.estimateSelectivity(node);
+-
+-            if (node.getASTNode() != nullptr)
+-                LOG_TEST(log, "Condition {} has selectivity {}", node.getASTNode()->dumpTree(), cond.selectivity);
++            LOG_TEST(log, "Condition {} has selectivity {}", node.getColumnName(), cond.selectivity);
++        }
++        else if (cond.viable)
++        {
++            cond.good = isConditionGood(node, table_columns);
+         }
+ 
+         if (where_optimizer_context.move_primary_key_columns_to_end_of_prewhere)
+@@ -363,6 +361,7 @@ std::optional<MergeTreeWhereOptimizer::OptimizeResult> MergeTreeWhereOptimizer::
+     /// Move condition and all other conditions depend on the same set of columns.
+     auto move_condition = [&](Conditions::iterator cond_it)
+     {
++        LOG_TRACE(log, "Condition {} moved to PREWHERE", cond_it->node.getColumnName());
+         prewhere_conditions.splice(prewhere_conditions.end(), where_conditions, cond_it);
+         total_size_of_moved_conditions += cond_it->columns_size;
+         total_number_of_moved_columns += cond_it->table_columns.size();
+@@ -371,9 +370,14 @@ std::optional<MergeTreeWhereOptimizer::OptimizeResult> MergeTreeWhereOptimizer::
+         for (auto jt = where_conditions.begin(); jt != where_conditions.end();)
+         {
+             if (jt->viable && jt->columns_size == cond_it->columns_size && jt->table_columns == cond_it->table_columns)
++            {
++                LOG_TRACE(log, "Condition {} moved to PREWHERE", jt->node.getColumnName());
+                 prewhere_conditions.splice(prewhere_conditions.end(), where_conditions, jt++);
++            }
+             else
++            {
+                 ++jt;
++            }
+         }
+     };
+ 
+diff --git a/src/Storages/Statistics/Estimator.cpp b/src/Storages/Statistics/Estimator.cpp
+index 7e0e465c7bff..e272014c1c29 100644
+--- a/src/Storages/Statistics/Estimator.cpp
++++ b/src/Storages/Statistics/Estimator.cpp
+@@ -112,7 +112,7 @@ Float64 ConditionEstimator::estimateSelectivity(const RPNBuilderTreeNode & node)
+     auto [op, val] = extractBinaryOp(node, col);
+     if (op == "equals")
+     {
+-        if (val < - threshold || val > threshold)
++        if (val < -threshold || val > threshold)
+             return default_normal_cond_factor;
+         else
+             return default_good_cond_factor;

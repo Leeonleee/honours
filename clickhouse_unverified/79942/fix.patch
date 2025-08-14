@@ -1,0 +1,281 @@
+diff --git a/src/Analyzer/JoinNode.cpp b/src/Analyzer/JoinNode.cpp
+index a3e9ca728bfb..0be0cc8110d1 100644
+--- a/src/Analyzer/JoinNode.cpp
++++ b/src/Analyzer/JoinNode.cpp
+@@ -1,4 +1,5 @@
+ #include <Analyzer/JoinNode.h>
++#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/ListNode.h>
+ #include <Analyzer/Utils.h>
+ #include <IO/Operators.h>
+@@ -37,6 +38,77 @@ JoinNode::JoinNode(QueryTreeNodePtr left_table_expression_,
+     children[join_expression_child_index] = std::move(join_expression_);
+ }
+ 
++/// There is a special workaround for the case when ARRAY JOIN alias is used in USING statement.
++/// Example: ... ARRAY JOIN arr AS dummy INNER JOIN system.one USING (dummy);
++///
++/// In case of ARRAY JOIN, the column is renamed, so the query tree will look like:
++/// JOIN EXPRESSION
++/// LIST
++///   COLUMN id: 16, column_name: dummy
++///     EXPRESSION
++///       LIST
++///         COLUMN id: 18, column_name: __array_join_exp_1
++///         COLUMN id: 19, column_name: dummy
++///
++/// Previously, when we convert QueryTree back to ast, the query would look like:
++/// ARRAY JOIN arr AS __array_join_exp_1 ALL INNER JOIN system.one USING (__array_join_exp_1)
++/// Which is incorrect query (which is broken in distributed case) because system.one do not have __array_join_exp_1.
++///
++/// In order to mitigate this, the syntax 'USING (__array_join_exp_1 AS dummy)' is introduced,
++/// which means that '__array_join_exp_1' is taken from left, 'dummy' is taken from right,
++/// and the USING column name is also 'dummy'
++///
++/// See 03448_analyzer_array_join_alias_in_join_using_bug
++static ASTPtr tryMakeUsingColumnASTWithAlias(const QueryTreeNodePtr & node)
++{
++    const auto * column_node = node->as<ColumnNode>();
++    if (!column_node)
++        return nullptr;
++
++    const auto & expr = column_node->getExpression();
++    if (!expr)
++        return nullptr;
++
++    const auto * expr_list_node = expr->as<ListNode>();
++    if (!expr_list_node)
++        return nullptr;
++
++    if (expr_list_node->getNodes().size() != 2)
++        return nullptr;
++
++    const auto * lhs_column_node = expr_list_node->getNodes()[0]->as<ColumnNode>();
++    const auto * rhs_column_node = expr_list_node->getNodes()[1]->as<ColumnNode>();
++    if (!lhs_column_node || !rhs_column_node)
++        return nullptr;
++
++    if (lhs_column_node->getColumnName() == rhs_column_node->getColumnName())
++        return nullptr;
++
++    auto node_ast = std::make_shared<ASTIdentifier>(lhs_column_node->getColumnName());
++    node_ast->setAlias(rhs_column_node->getColumnName());
++    return node_ast;
++}
++
++static ASTPtr makeUsingAST(const QueryTreeNodePtr & node)
++{
++    const auto & list_node = node->as<ListNode &>();
++
++    auto expr_list = std::make_shared<ASTExpressionList>();
++    expr_list->children.reserve(list_node.getNodes().size());
++
++    for (const auto & child : list_node.getNodes())
++    {
++        ASTPtr node_ast = tryMakeUsingColumnASTWithAlias(child);
++
++        if (!node_ast)
++            node_ast = child->toAST();
++
++        expr_list->children.push_back(std::move(node_ast));
++    }
++
++    return expr_list;
++}
++
+ ASTPtr JoinNode::toASTTableJoin() const
+ {
+     auto join_ast = std::make_shared<ASTTableJoin>();
+@@ -46,16 +118,14 @@ ASTPtr JoinNode::toASTTableJoin() const
+ 
+     if (children[join_expression_child_index])
+     {
+-        auto join_expression_ast = children[join_expression_child_index]->toAST();
+-
+         if (is_using_join_expression)
+         {
+-            join_ast->using_expression_list = join_expression_ast;
++            join_ast->using_expression_list = makeUsingAST(children[join_expression_child_index]);
+             join_ast->children.push_back(join_ast->using_expression_list);
+         }
+         else
+         {
+-            join_ast->on_expression = join_expression_ast;
++            join_ast->on_expression = children[join_expression_child_index]->toAST();
+             join_ast->children.push_back(join_ast->on_expression);
+         }
+     }
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.cpp b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+index 64a649475ffe..9f365db6d73a 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.cpp
++++ b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+@@ -5307,9 +5307,11 @@ void QueryAnalyzer::resolveJoin(QueryTreeNodePtr & join_node, IdentifierResolveS
+             if (settings[Setting::analyzer_compatibility_join_using_top_level_identifier])
+                 result_left_table_expression = try_resolve_identifier_from_query_projection(identifier_full_name, join_node_typed.getLeftTableExpression(), scope);
+ 
+-            IdentifierLookup identifier_lookup{identifier_node->getIdentifier(), IdentifierLookupContext::EXPRESSION};
+             if (!result_left_table_expression)
++            {
++                IdentifierLookup identifier_lookup{identifier_node->getIdentifier(), IdentifierLookupContext::EXPRESSION};
+                 result_left_table_expression = identifier_resolver.tryResolveIdentifierFromJoinTreeNode(identifier_lookup, join_node_typed.getLeftTableExpression(), scope).resolved_identifier;
++            }
+ 
+             /** Here we may try to resolve identifier from projection in case it's not resolved from left table expression
+               * and analyzer_compatibility_join_using_top_level_identifier is disabled.
+@@ -5353,19 +5355,23 @@ void QueryAnalyzer::resolveJoin(QueryTreeNodePtr & join_node, IdentifierResolveS
+                     identifier_full_name,
+                     scope.scope_node->formatASTForErrorMessage());
+ 
++            /// Here we allow syntax 'USING (a AS b)' which means that 'a' is taken from left and 'b' is taken from right.
++            /// See 03449_join_using_allow_alias.sql and the comment in JoinNode.cpp
++            const auto & right_name = identifier_node->hasAlias() ? identifier_node->getAlias() : identifier_full_name;
++            IdentifierLookup identifier_lookup{Identifier(right_name), IdentifierLookupContext::EXPRESSION};
+             auto result_right_table_expression = identifier_resolver.tryResolveIdentifierFromJoinTreeNode(identifier_lookup, join_node_typed.getRightTableExpression(), scope).resolved_identifier;
+             if (!result_right_table_expression)
+                 throw Exception(ErrorCodes::UNKNOWN_IDENTIFIER,
+                     "JOIN {} using identifier '{}' cannot be resolved from right table expression. In scope {}",
+                     join_node_typed.formatASTForErrorMessage(),
+-                    identifier_full_name,
++                    right_name,
+                     scope.scope_node->formatASTForErrorMessage());
+ 
+             if (result_right_table_expression->getNodeType() != QueryTreeNodeType::COLUMN)
+                 throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+                     "JOIN {} using identifier '{}' must be resolved into column node from right table expression. In scope {}",
+                     join_node_typed.formatASTForErrorMessage(),
+-                    identifier_full_name,
++                    right_name,
+                     scope.scope_node->formatASTForErrorMessage());
+ 
+             auto expression_types = DataTypes{result_left_table_expression->getResultType(), result_right_table_expression->getResultType()};
+@@ -5377,7 +5383,7 @@ void QueryAnalyzer::resolveJoin(QueryTreeNodePtr & join_node, IdentifierResolveS
+                     join_node_typed.formatASTForErrorMessage(),
+                     result_left_table_expression->getResultType()->getName(),
+                     result_right_table_expression->getResultType()->getName(),
+-                    identifier_full_name,
++                    right_name,
+                     scope.scope_node->formatASTForErrorMessage());
+ 
+             NameAndTypePair join_using_column(identifier_full_name, common_type);
+diff --git a/src/Interpreters/ClusterProxy/executeQuery.cpp b/src/Interpreters/ClusterProxy/executeQuery.cpp
+index 4016910d394e..7be64f3e1c3f 100644
+--- a/src/Interpreters/ClusterProxy/executeQuery.cpp
++++ b/src/Interpreters/ClusterProxy/executeQuery.cpp
+@@ -749,7 +749,7 @@ void executeQueryWithParallelReplicas(
+ {
+     QueryTreeNodePtr modified_query_tree = query_tree->clone();
+     rewriteJoinToGlobalJoin(modified_query_tree, context);
+-    modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree);
++    modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
+ 
+     auto header
+         = InterpreterSelectQueryAnalyzer::getSampleBlock(modified_query_tree, context, SelectQueryOptions(processed_stage).analyze());
+diff --git a/src/Parsers/ASTTablesInSelectQuery.cpp b/src/Parsers/ASTTablesInSelectQuery.cpp
+index 706ba11bfdf8..608ef47be8f9 100644
+--- a/src/Parsers/ASTTablesInSelectQuery.cpp
++++ b/src/Parsers/ASTTablesInSelectQuery.cpp
+@@ -5,7 +5,6 @@
+ #include <IO/Operators.h>
+ #include <Parsers/ASTFunction.h>
+ 
+-
+ namespace DB
+ {
+ 
+@@ -252,6 +251,10 @@ void ASTTableJoin::formatImplAfterTable(WriteBuffer & ostr, const FormatSettings
+     {
+         ostr << (settings.hilite ? hilite_keyword : "") << " USING " << (settings.hilite ? hilite_none : "");
+         ostr << "(";
++        /// We should always print alias for 'USING (a AS b)' syntax (supported with analyzer only).
++        /// Otherwise query like 'SELECT a AS b FROM t1 JOIN t2 USING (a AS b)' will be broken.
++        /// See 03448_analyzer_array_join_alias_in_join_using_bug.sql
++        frame.ignore_printed_asts_with_alias = true;
+         using_expression_list->format(ostr, settings, state, frame);
+         ostr << ")";
+     }
+diff --git a/src/Parsers/ASTWithAlias.cpp b/src/Parsers/ASTWithAlias.cpp
+index b7d4a68f120c..2269a1ade7b1 100644
+--- a/src/Parsers/ASTWithAlias.cpp
++++ b/src/Parsers/ASTWithAlias.cpp
+@@ -19,7 +19,7 @@ void ASTWithAlias::formatImpl(WriteBuffer & ostr, const FormatSettings & setting
+ {
+     /// If we have previously output this node elsewhere in the query, now it is enough to output only the alias.
+     /// This is needed because the query can become extraordinary large after substitution of aliases.
+-    if (!alias.empty() && !state.printed_asts_with_alias.emplace(frame.current_select, alias, getTreeHash(/*ignore_aliases=*/ true)).second)
++    if (!alias.empty() && !frame.ignore_printed_asts_with_alias && !state.printed_asts_with_alias.emplace(frame.current_select, alias, getTreeHash(/*ignore_aliases=*/ true)).second)
+     {
+         ostr << (settings.hilite ? IAST::hilite_identifier : "");
+         settings.writeIdentifier(ostr, alias, /*ambiguous=*/false);
+diff --git a/src/Parsers/IAST.h b/src/Parsers/IAST.h
+index 87362d9a329d..347c924b877c 100644
+--- a/src/Parsers/IAST.h
++++ b/src/Parsers/IAST.h
+@@ -249,6 +249,7 @@ class IAST : public std::enable_shared_from_this<IAST>, public TypePromotion<IAS
+         bool expression_list_always_start_on_new_line = false;  /// Line feed and indent before expression list even if it's of single element.
+         bool expression_list_prepend_whitespace = false; /// Prepend whitespace (if it is required)
+         bool surround_each_list_element_with_parens = false;
++        bool ignore_printed_asts_with_alias = false; /// Ignore FormatState::printed_asts_with_alias
+         bool allow_operators = true; /// Format some functions, such as "plus", "in", etc. as operators.
+         size_t list_element_index = 0;
+         std::string create_engine_name;
+diff --git a/src/Planner/findParallelReplicasQuery.cpp b/src/Planner/findParallelReplicasQuery.cpp
+index 09a11307d089..710f56fa5493 100644
+--- a/src/Planner/findParallelReplicasQuery.cpp
++++ b/src/Planner/findParallelReplicasQuery.cpp
+@@ -494,7 +494,7 @@ JoinTreeQueryPlan buildQueryPlanForParallelReplicas(
+         modified_query_tree, context, SelectQueryOptions(processed_stage).analyze());
+ 
+     rewriteJoinToGlobalJoin(modified_query_tree, context);
+-    modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree);
++    modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
+     ASTPtr modified_query_ast = queryNodeToDistributedSelectQuery(modified_query_tree);
+ 
+     Block header = InterpreterSelectQueryAnalyzer::getSampleBlock(
+diff --git a/src/Storages/StorageDistributed.cpp b/src/Storages/StorageDistributed.cpp
+index 1333548cea82..e364231bf838 100644
+--- a/src/Storages/StorageDistributed.cpp
++++ b/src/Storages/StorageDistributed.cpp
+@@ -930,7 +930,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
+         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTree());
+     }
+ 
+-    return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify);
++    return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
+ }
+ 
+ }
+diff --git a/src/Storages/buildQueryTreeForShard.cpp b/src/Storages/buildQueryTreeForShard.cpp
+index a5eee5d33edd..413b303e1f52 100644
+--- a/src/Storages/buildQueryTreeForShard.cpp
++++ b/src/Storages/buildQueryTreeForShard.cpp
+@@ -352,7 +352,7 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
+ 
+ }
+ 
+-QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify)
++QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table)
+ {
+     CollectColumnSourceToColumnsVisitor collect_column_source_to_columns_visitor;
+     collect_column_source_to_columns_visitor.visit(query_tree_to_modify);
+@@ -373,7 +373,7 @@ QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_contex
+         {
+             QueryTreeNodePtr join_table_expression;
+             const auto join_kind = join_node->getKind();
+-            if (join_kind == JoinKind::Left || join_kind == JoinKind::Inner)
++            if (!allow_global_join_for_right_table || join_kind == JoinKind::Left || join_kind == JoinKind::Inner)
+             {
+                 join_table_expression = join_node->getRightTableExpression();
+             }
+diff --git a/src/Storages/buildQueryTreeForShard.h b/src/Storages/buildQueryTreeForShard.h
+index 5b00b89c7294..90cbfd36f660 100644
+--- a/src/Storages/buildQueryTreeForShard.h
++++ b/src/Storages/buildQueryTreeForShard.h
+@@ -16,7 +16,7 @@ using PlannerContextPtr = std::shared_ptr<PlannerContext>;
+ class Context;
+ using ContextPtr = std::shared_ptr<const Context>;
+ 
+-QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify);
++QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table);
+ 
+ void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
+ 

@@ -1,0 +1,502 @@
+diff --git a/src/Analyzer/Passes/UniqToCountPass.cpp b/src/Analyzer/Passes/UniqToCountPass.cpp
+new file mode 100644
+index 000000000000..7533a99107b2
+--- /dev/null
++++ b/src/Analyzer/Passes/UniqToCountPass.cpp
+@@ -0,0 +1,198 @@
++#include "UniqToCountPass.h"
++
++#include <AggregateFunctions/AggregateFunctionFactory.h>
++#include <AggregateFunctions/IAggregateFunction.h>
++
++#include <Analyzer/ColumnNode.h>
++#include <Analyzer/FunctionNode.h>
++#include <Analyzer/InDepthQueryTreeVisitor.h>
++#include <Analyzer/QueryNode.h>
++
++namespace DB
++{
++
++namespace
++{
++
++bool matchFnUniq(String func_name)
++{
++    auto name = Poco::toLower(func_name);
++    return name == "uniq" || name == "uniqHLL12" || name == "uniqExact" || name == "uniqTheta" || name == "uniqCombined"
++        || name == "uniqCombined64";
++}
++
++/// Extract the corresponding projection columns for group by node list.
++/// For example:
++///     SELECT a as aa, any(b) FROM table group by a;  ->  aa(ColumnNode)
++NamesAndTypes extractProjectionColumnsForGroupBy(const QueryNode * query_node)
++{
++    if (!query_node->hasGroupBy())
++        return {};
++
++    NamesAndTypes result;
++    for (const auto & group_by_ele : query_node->getGroupByNode()->getChildren())
++    {
++        const auto & projection_columns = query_node->getProjectionColumns();
++        const auto & projection_nodes = query_node->getProjection().getNodes();
++
++        assert(projection_columns.size() == projection_nodes.size());
++
++        for (size_t i = 0; i < projection_columns.size(); i++)
++        {
++            if (projection_nodes[i]->isEqual(*group_by_ele))
++                result.push_back(projection_columns[i]);
++        }
++    }
++    return result;
++}
++
++/// Whether query_columns equals subquery_columns.
++///     query_columns: query columns from query
++///     subquery_columns: projection columns from subquery
++bool nodeListEquals(const QueryTreeNodes & query_columns, const NamesAndTypes & subquery_columns)
++{
++    if (query_columns.size() != subquery_columns.size())
++        return false;
++
++    for (const auto & query_column : query_columns)
++    {
++        auto find = std::find_if(
++            subquery_columns.begin(),
++            subquery_columns.end(),
++            [&](const auto & subquery_column) -> bool
++            {
++                if (auto * column_node = query_column->as<ColumnNode>())
++                {
++                    return subquery_column == column_node->getColumn();
++                }
++                return false;
++            });
++
++        if (find == subquery_columns.end())
++            return false;
++    }
++    return true;
++}
++
++/// Whether subquery_columns contains all columns in subquery_columns.
++///     query_columns: query columns from query
++///     subquery_columns: projection columns from subquery
++bool nodeListContainsAll(const QueryTreeNodes & query_columns, const NamesAndTypes & subquery_columns)
++{
++    if (query_columns.size() > subquery_columns.size())
++        return false;
++
++    for (const auto & query_column : query_columns)
++    {
++        auto find = std::find_if(
++            subquery_columns.begin(),
++            subquery_columns.end(),
++            [&](const auto & subquery_column) -> bool
++            {
++                if (auto * column_node = query_column->as<ColumnNode>())
++                {
++                    return subquery_column == column_node->getColumn();
++                }
++                return false;
++            });
++
++        if (find == subquery_columns.end())
++            return false;
++    }
++    return true;
++}
++
++}
++
++class UniqToCountVisitor : public InDepthQueryTreeVisitor<UniqToCountVisitor>
++{
++public:
++    using Base = InDepthQueryTreeVisitor<UniqToCountVisitor>;
++    using Base::Base;
++
++    void visitImpl(QueryTreeNodePtr & node)
++    {
++        auto * query_node = node->as<QueryNode>();
++        if (!query_node)
++            return;
++
++        /// Check that query has only single table expression which is subquery
++        auto * subquery_node = query_node->getJoinTree()->as<QueryNode>();
++        if (!subquery_node)
++            return;
++
++        /// Check that query has only single node in projection
++        auto & projection_nodes = query_node->getProjection().getNodes();
++        if (projection_nodes.size() != 1)
++            return;
++
++        /// Check that projection_node is a function
++        auto & projection_node = projection_nodes[0];
++        auto * function_node = projection_node->as<FunctionNode>();
++        if (!function_node)
++            return;
++
++        /// Check that query single projection node is `uniq` or its variants
++        if (!matchFnUniq(function_node->getFunctionName()))
++            return;
++
++        auto & uniq_arguments_nodes = function_node->getArguments().getNodes();
++
++        /// Whether query matches 'SELECT uniq(x ...) FROM (SELECT DISTINCT x ...)'
++        auto match_subquery_with_distinct = [&]() -> bool
++        {
++            if (!subquery_node->isDistinct())
++                return false;
++
++            /// uniq expression list == subquery projection columns
++            if (!nodeListEquals(uniq_arguments_nodes, subquery_node->getProjectionColumns()))
++                return false;
++
++            return true;
++        };
++
++        /// Whether query matches 'SELECT uniq(x ...) FROM (SELECT x ... GROUP BY x ...)'
++        auto match_subquery_with_group_by = [&]() -> bool
++        {
++            if (!subquery_node->hasGroupBy())
++                return false;
++
++            /// uniq argument node list == subquery group by node list
++            auto group_by_columns = extractProjectionColumnsForGroupBy(subquery_node);
++
++            if (!nodeListEquals(uniq_arguments_nodes, group_by_columns))
++                return false;
++
++            /// subquery projection columns must contain all columns in uniq argument node list
++            if (!nodeListContainsAll(uniq_arguments_nodes, subquery_node->getProjectionColumns()))
++                return false;
++
++            return true;
++        };
++
++        /// Replace uniq of initial query to count
++        if (match_subquery_with_distinct() || match_subquery_with_group_by())
++        {
++            AggregateFunctionProperties properties;
++            auto aggregate_function = AggregateFunctionFactory::instance().get("count", {}, {}, properties);
++
++            function_node->resolveAsAggregateFunction(std::move(aggregate_function));
++            function_node->getArguments().getNodes().clear();
++
++            /// Update projection columns
++            query_node->resolveProjectionColumns({{"count()", function_node->getResultType()}});
++        }
++    }
++};
++
++
++void UniqToCountPass::run(QueryTreeNodePtr query_tree_node, ContextPtr context)
++{
++    if (!context->getSettings().optimize_uniq_to_count)
++        return;
++
++    UniqToCountVisitor visitor;
++    visitor.visit(query_tree_node);
++}
++
++}
+diff --git a/src/Analyzer/Passes/UniqToCountPass.h b/src/Analyzer/Passes/UniqToCountPass.h
+new file mode 100644
+index 000000000000..4992d524e5e7
+--- /dev/null
++++ b/src/Analyzer/Passes/UniqToCountPass.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Analyzer/IQueryTreePass.h>
++
++namespace DB
++{
++
++/** Optimize `uniq` and its variants(except uniqUpTo) into `count` over subquery.
++ *     Example: 'SELECT uniq(x ...) FROM (SELECT DISTINCT x ...)' to
++ *     Result: 'SELECT count() FROM (SELECT DISTINCT x ...)'
++ *
++ *     Example: 'SELECT uniq(x ...) FROM (SELECT x ... GROUP BY x ...)' to
++ *     Result: 'SELECT count() FROM (SELECT x ... GROUP BY x ...)'
++ *
++ *     Note that we can rewrite all uniq variants except uniqUpTo.
++ */
++class UniqToCountPass final : public IQueryTreePass
++{
++public:
++    String getName() override { return "UniqToCount"; }
++
++    String getDescription() override
++    {
++        return "Rewrite uniq and its variants(except uniqUpTo) to count if subquery has distinct or group by clause.";
++    }
++
++    void run(QueryTreeNodePtr query_tree_node, ContextPtr context) override;
++};
++
++}
+diff --git a/src/Analyzer/QueryTreePassManager.cpp b/src/Analyzer/QueryTreePassManager.cpp
+index a6da2a666150..dd75b0f586d8 100644
+--- a/src/Analyzer/QueryTreePassManager.cpp
++++ b/src/Analyzer/QueryTreePassManager.cpp
+@@ -18,6 +18,7 @@
+ #include <Analyzer/Utils.h>
+ #include <Analyzer/Passes/QueryAnalysisPass.h>
+ #include <Analyzer/Passes/CountDistinctPass.h>
++#include <Analyzer/Passes/UniqToCountPass.h>
+ #include <Analyzer/Passes/FunctionToSubcolumnsPass.h>
+ #include <Analyzer/Passes/RewriteAggregateFunctionWithIfPass.h>
+ #include <Analyzer/Passes/SumIfToCountIfPass.h>
+@@ -246,6 +247,7 @@ void addQueryTreePasses(QueryTreePassManager & manager)
+     manager.addPass(std::make_unique<ConvertLogicalExpressionToCNFPass>());
+ 
+     manager.addPass(std::make_unique<CountDistinctPass>());
++    manager.addPass(std::make_unique<UniqToCountPass>());
+     manager.addPass(std::make_unique<RewriteAggregateFunctionWithIfPass>());
+     manager.addPass(std::make_unique<SumIfToCountIfPass>());
+     manager.addPass(std::make_unique<RewriteArrayExistsToHasPass>());
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 24be644ee550..4ed04b6ea1ea 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -776,6 +776,7 @@ class IColumn;
+     M(Bool, keeper_map_strict_mode, false, "Enforce additional checks during operations on KeeperMap. E.g. throw an exception on an insert for already existing key", 0) \
+     M(UInt64, extract_kvp_max_pairs_per_row, 1000, "Max number pairs that can be produced by extractKeyValuePairs function. Used to safeguard against consuming too much memory.", 0) \
+     M(Timezone, session_timezone, "", "This setting can be removed in the future due to potential caveats. It is experimental and is not suitable for production usage. The default timezone for current session or query. The server default timezone if empty.", 0) \
++    M(Bool, optimize_uniq_to_count, false, "Rewrite uniq and its variants(except uniqUpTo) to count if subquery has distinct or group by clause.", 0) \
+     M(Bool, allow_create_index_without_type, false, "Allow CREATE INDEX query without TYPE. Query will be ignored. Made for SQL compatibility tests.", 0)\
+     // End of COMMON_SETTINGS
+     // Please add settings related to formats into the FORMAT_FACTORY_SETTINGS and move obsolete settings to OBSOLETE_SETTINGS.
+diff --git a/src/Interpreters/InterpreterSelectQuery.cpp b/src/Interpreters/InterpreterSelectQuery.cpp
+index d07a65215445..5193c489afe5 100644
+--- a/src/Interpreters/InterpreterSelectQuery.cpp
++++ b/src/Interpreters/InterpreterSelectQuery.cpp
+@@ -39,6 +39,7 @@
+ #include <Interpreters/QueryLog.h>
+ #include <Interpreters/replaceAliasColumnsInQuery.h>
+ #include <Interpreters/RewriteCountDistinctVisitor.h>
++#include <Interpreters/RewriteUniqToCountVisitor.h>
+ #include <Interpreters/getCustomKeyFilterForParallelReplicas.h>
+ 
+ #include <QueryPipeline/Pipe.h>
+@@ -426,6 +427,12 @@ InterpreterSelectQuery::InterpreterSelectQuery(
+         RewriteCountDistinctFunctionVisitor(data_rewrite_countdistinct).visit(query_ptr);
+     }
+ 
++    if (settings.optimize_uniq_to_count)
++    {
++        RewriteUniqToCountMatcher::Data data_rewrite_uniq_count;
++        RewriteUniqToCountVisitor(data_rewrite_uniq_count).visit(query_ptr);
++    }
++
+     JoinedTables joined_tables(getSubqueryContext(context), getSelectQuery(), options.with_all_cols, options_.is_create_parameterized_view);
+ 
+     bool got_storage_from_query = false;
+diff --git a/src/Interpreters/RewriteUniqToCountVisitor.cpp b/src/Interpreters/RewriteUniqToCountVisitor.cpp
+new file mode 100644
+index 000000000000..7445068207ab
+--- /dev/null
++++ b/src/Interpreters/RewriteUniqToCountVisitor.cpp
+@@ -0,0 +1,163 @@
++#include <Interpreters/RewriteUniqToCountVisitor.h>
++
++#include <AggregateFunctions/AggregateFunctionFactory.h>
++#include <Parsers/ASTExpressionList.h>
++#include <Parsers/ASTFunction.h>
++#include <Parsers/ASTIdentifier.h>
++#include <Parsers/ASTSelectQuery.h>
++#include <Parsers/ASTSelectWithUnionQuery.h>
++#include <Parsers/ASTSubquery.h>
++#include <Parsers/ASTTablesInSelectQuery.h>
++#include <Parsers/parseQuery.h>
++
++
++namespace DB
++{
++
++using Aliases = std::unordered_map<String, ASTPtr>;
++
++namespace
++{
++
++bool matchFnUniq(String func_name)
++{
++    auto name = Poco::toLower(func_name);
++    return name == "uniq" || name == "uniqHLL12" || name == "uniqExact" || name == "uniqTheta" || name == "uniqCombined"
++        || name == "uniqCombined64";
++}
++
++bool expressionEquals(const ASTPtr & lhs, const ASTPtr & rhs, const Aliases & alias)
++{
++    if (lhs->getTreeHash() == rhs->getTreeHash())
++    {
++        return true;
++    }
++    else
++    {
++        auto * lhs_idf = lhs->as<ASTIdentifier>();
++        auto * rhs_idf = rhs->as<ASTIdentifier>();
++        if (lhs_idf && rhs_idf)
++        {
++            /// compound identifiers, such as: <t.name, name>
++            if (lhs_idf->shortName() == rhs_idf->shortName())
++                return true;
++
++            /// translate alias
++            if (alias.find(lhs_idf->shortName()) != alias.end())
++                lhs_idf = alias.find(lhs_idf->shortName())->second->as<ASTIdentifier>();
++
++            if (alias.find(rhs_idf->shortName()) != alias.end())
++                rhs_idf = alias.find(rhs_idf->shortName())->second->as<ASTIdentifier>();
++
++            if (lhs_idf->shortName() == rhs_idf->shortName())
++                return true;
++        }
++    }
++    return false;
++}
++
++bool expressionListEquals(ASTExpressionList * lhs, ASTExpressionList * rhs, const Aliases & alias)
++{
++    if (!lhs || !rhs)
++        return false;
++    if (lhs->children.size() != rhs->children.size())
++        return false;
++    for (size_t i = 0; i < lhs->children.size(); i++)
++    {
++        if (!expressionEquals(lhs->children[i], rhs->children[i], alias))
++            return false;
++    }
++    return true;
++}
++
++/// Test whether lhs contains all expressions in rhs.
++bool expressionListContainsAll(ASTExpressionList * lhs, ASTExpressionList * rhs, const Aliases & alias)
++{
++    if (!lhs || !rhs)
++        return false;
++    if (lhs->children.size() < rhs->children.size())
++        return false;
++    for (const auto & re : rhs->children)
++    {
++        auto predicate = [&re, &alias](ASTPtr & le) { return expressionEquals(le, re, alias); };
++        if (std::find_if(lhs->children.begin(), lhs->children.end(), predicate) == lhs->children.end())
++            return false;
++    }
++    return true;
++}
++
++}
++
++void RewriteUniqToCountMatcher::visit(ASTPtr & ast, Data & /*data*/)
++{
++    auto * selectq = ast->as<ASTSelectQuery>();
++    if (!selectq || !selectq->tables() || selectq->tables()->children.size() != 1)
++        return;
++    auto expr_list = selectq->select();
++    if (!expr_list || expr_list->children.size() != 1)
++        return;
++    auto * func = expr_list->children[0]->as<ASTFunction>();
++    if (!func || !matchFnUniq(func->name))
++        return;
++    if (selectq->tables()->as<ASTTablesInSelectQuery>()->children[0]->as<ASTTablesInSelectQueryElement>()->children.size() != 1)
++        return;
++    auto * table_expr = selectq->tables()
++                            ->as<ASTTablesInSelectQuery>()
++                            ->children[0]
++                            ->as<ASTTablesInSelectQueryElement>()
++                            ->children[0]
++                            ->as<ASTTableExpression>();
++    if (!table_expr || table_expr->children.size() != 1 || !table_expr->subquery)
++        return;
++    auto * subquery = table_expr->subquery->as<ASTSubquery>();
++    if (!subquery)
++        return;
++    auto * sub_selectq = subquery->children[0]
++                             ->as<ASTSelectWithUnionQuery>()->children[0]
++                             ->as<ASTExpressionList>()->children[0]
++                             ->as<ASTSelectQuery>();
++    if (!sub_selectq)
++        return;
++    auto sub_expr_list = sub_selectq->select();
++    if (!sub_expr_list)
++        return;
++
++    /// collect subquery select expressions alias
++    Aliases alias;
++    for (const auto & expr : sub_expr_list->children)
++    {
++        if (!expr->tryGetAlias().empty())
++            alias.insert({expr->tryGetAlias(), expr});
++    }
++
++    /// Whether query matches 'SELECT uniq(x ...) FROM (SELECT DISTINCT x ...)'
++    auto match_subquery_with_distinct = [&]() -> bool
++    {
++        if (!sub_selectq->distinct)
++            return false;
++        /// uniq expression list == subquery group by expression list
++        if (!expressionListEquals(func->children[0]->as<ASTExpressionList>(), sub_expr_list->as<ASTExpressionList>(), alias))
++            return false;
++        return true;
++    };
++
++    /// Whether query matches 'SELECT uniq(x ...) FROM (SELECT x ... GROUP BY x ...)'
++    auto match_subquery_with_group_by = [&]() -> bool
++    {
++        auto group_by = sub_selectq->groupBy();
++        if (!group_by)
++            return false;
++        /// uniq expression list == subquery group by expression list
++        if (!expressionListEquals(func->children[0]->as<ASTExpressionList>(), group_by->as<ASTExpressionList>(), alias))
++            return false;
++        /// subquery select expression list must contain all columns in uniq expression list
++        if (!expressionListContainsAll(sub_expr_list->as<ASTExpressionList>(), func->children[0]->as<ASTExpressionList>(), alias))
++            return false;
++        return true;
++    };
++
++    if (match_subquery_with_distinct() || match_subquery_with_group_by())
++        expr_list->children[0] = makeASTFunction("count");
++}
++
++}
+diff --git a/src/Interpreters/RewriteUniqToCountVisitor.h b/src/Interpreters/RewriteUniqToCountVisitor.h
+new file mode 100644
+index 000000000000..94528ccf2ee3
+--- /dev/null
++++ b/src/Interpreters/RewriteUniqToCountVisitor.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Parsers/IAST.h>
++#include <Interpreters/InDepthNodeVisitor.h>
++#include "Interpreters/TreeRewriter.h"
++
++namespace DB
++{
++
++class ASTFunction;
++
++/** Optimize `uniq` into `count` over subquery.
++ *     Example: 'SELECT uniq(x ...) FROM (SELECT DISTINCT x ...)' to
++ *     Result: 'SELECT count() FROM (SELECT DISTINCT x ...)'
++ *
++ *     Example: 'SELECT uniq(x ...) FROM (SELECT x ... GROUP BY x ...)' to
++ *     Result: 'SELECT count() FROM (SELECT x ... GROUP BY x ...)'
++ *
++ *     Note that we can rewrite all uniq variants except uniqUpTo.
++ */
++class RewriteUniqToCountMatcher
++{
++public:
++    struct Data {};
++    static void visit(ASTPtr & ast, Data &);
++    static bool needChildVisit(const ASTPtr &, const ASTPtr &) { return true; }
++};
++
++using RewriteUniqToCountVisitor = InDepthNodeVisitor<RewriteUniqToCountMatcher, true>;
++}

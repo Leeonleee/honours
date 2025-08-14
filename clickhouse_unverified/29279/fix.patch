@@ -1,0 +1,3323 @@
+diff --git a/programs/server/config.xml b/programs/server/config.xml
+index 37f36aa52155..9a2a6d7729f1 100644
+--- a/programs/server/config.xml
++++ b/programs/server/config.xml
+@@ -650,6 +650,38 @@
+                 </replica>
+             </shard>
+         </test_shard_localhost>
++        <test_cluster_one_shard_three_replicas_localhost>
++            <shard>
++                <internal_replication>false</internal_replication>
++                <replica>
++                    <host>127.0.0.1</host>
++                    <port>9000</port>
++                </replica>
++                <replica>
++                    <host>127.0.0.2</host>
++                    <port>9000</port>
++                </replica>
++                <replica>
++                    <host>127.0.0.3</host>
++                    <port>9000</port>
++                </replica>
++            </shard>
++            <!--shard>
++                <internal_replication>false</internal_replication>
++                <replica>
++                    <host>127.0.0.1</host>
++                    <port>9000</port>
++                </replica>
++                <replica>
++                    <host>127.0.0.2</host>
++                    <port>9000</port>
++                </replica>
++                <replica>
++                    <host>127.0.0.3</host>
++                    <port>9000</port>
++                </replica>
++            </shard-->
++        </test_cluster_one_shard_three_replicas_localhost>
+         <test_cluster_two_shards_localhost>
+              <shard>
+                  <replica>
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5f4ebaaa895a..5e4a16cfda7d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -517,6 +517,8 @@ if (USE_BZIP2)
+     target_include_directories (clickhouse_common_io SYSTEM BEFORE PRIVATE ${BZIP2_INCLUDE_DIR})
+ endif()
+ 
++dbms_target_link_libraries(PUBLIC consistent-hashing)
++
+ include ("${ClickHouse_SOURCE_DIR}/cmake/add_check.cmake")
+ 
+ if (ENABLE_TESTS AND USE_GTEST)
+diff --git a/src/Client/Connection.cpp b/src/Client/Connection.cpp
+index ca10160fa88d..505a6514812b 100644
+--- a/src/Client/Connection.cpp
++++ b/src/Client/Connection.cpp
+@@ -603,6 +603,14 @@ void Connection::sendReadTaskResponse(const String & response)
+     out->next();
+ }
+ 
++
++void Connection::sendMergeTreeReadTaskResponse(const PartitionReadResponse & response)
++{
++    writeVarUInt(Protocol::Client::MergeTreeReadTaskResponse, *out);
++    response.serialize(*out);
++    out->next();
++}
++
+ void Connection::sendPreparedData(ReadBuffer & input, size_t size, const String & name)
+ {
+     /// NOTE 'Throttler' is not used in this method (could use, but it's not important right now).
+@@ -872,6 +880,10 @@ Packet Connection::receivePacket()
+             case Protocol::Server::ReadTaskRequest:
+                 return res;
+ 
++            case Protocol::Server::MergeTreeReadTaskRequest:
++                res.request = receivePartitionReadRequest();
++                return res;
++
+             case Protocol::Server::ProfileEvents:
+                 res.block = receiveProfileEvents();
+                 return res;
+@@ -1023,6 +1035,13 @@ ProfileInfo Connection::receiveProfileInfo() const
+     return profile_info;
+ }
+ 
++PartitionReadRequest Connection::receivePartitionReadRequest() const
++{
++    PartitionReadRequest request;
++    request.deserialize(*in);
++    return request;
++}
++
+ 
+ void Connection::throwUnexpectedPacket(UInt64 packet_type, const char * expected) const
+ {
+diff --git a/src/Client/Connection.h b/src/Client/Connection.h
+index 3b49760ba104..2ea5334bbd39 100644
+--- a/src/Client/Connection.h
++++ b/src/Client/Connection.h
+@@ -16,6 +16,8 @@
+ 
+ #include <Compression/ICompressionCodec.h>
+ 
++#include <Storages/MergeTree/RequestResponse.h>
++
+ #include <atomic>
+ #include <optional>
+ 
+@@ -104,6 +106,8 @@ class Connection : public IServerConnection
+ 
+     void sendData(const Block & block, const String & name/* = "" */, bool scalar/* = false */) override;
+ 
++    void sendMergeTreeReadTaskResponse(const PartitionReadResponse & response) override;
++
+     void sendExternalTablesData(ExternalTablesData & data) override;
+ 
+     bool poll(size_t timeout_microseconds/* = 0 */) override;
+@@ -255,6 +259,7 @@ class Connection : public IServerConnection
+     std::vector<String> receiveMultistringMessage(UInt64 msg_type) const;
+     std::unique_ptr<Exception> receiveException() const;
+     Progress receiveProgress() const;
++    PartitionReadRequest receivePartitionReadRequest() const;
+     ProfileInfo receiveProfileInfo() const;
+ 
+     void initInputBuffers();
+diff --git a/src/Client/HedgedConnections.cpp b/src/Client/HedgedConnections.cpp
+index c73bea53d105..791ac4c1ef18 100644
+--- a/src/Client/HedgedConnections.cpp
++++ b/src/Client/HedgedConnections.cpp
+@@ -132,7 +132,7 @@ void HedgedConnections::sendQuery(
+     const String & query,
+     const String & query_id,
+     UInt64 stage,
+-    const ClientInfo & client_info,
++    ClientInfo & client_info,
+     bool with_pending_data)
+ {
+     std::lock_guard lock(cancel_mutex);
+@@ -171,7 +171,9 @@ void HedgedConnections::sendQuery(
+             modified_settings.group_by_two_level_threshold_bytes = 0;
+         }
+ 
+-        if (offset_states.size() > 1)
++        const bool enable_sample_offset_parallel_processing = settings.max_parallel_replicas > 1 && !settings.allow_experimental_parallel_reading_from_replicas;
++
++        if (offset_states.size() > 1 && enable_sample_offset_parallel_processing)
+         {
+             modified_settings.parallel_replicas_count = offset_states.size();
+             modified_settings.parallel_replica_offset = fd_to_replica_location[replica.packet_receiver->getFileDescriptor()].offset;
+diff --git a/src/Client/HedgedConnections.h b/src/Client/HedgedConnections.h
+index e39d9582cdea..d64f7ea4286e 100644
+--- a/src/Client/HedgedConnections.h
++++ b/src/Client/HedgedConnections.h
+@@ -86,7 +86,7 @@ class HedgedConnections : public IConnections
+         const String & query,
+         const String & query_id,
+         UInt64 stage,
+-        const ClientInfo & client_info,
++        ClientInfo & client_info,
+         bool with_pending_data) override;
+ 
+     void sendReadTaskResponse(const String &) override
+@@ -94,6 +94,11 @@ class HedgedConnections : public IConnections
+         throw Exception("sendReadTaskResponse in not supported with HedgedConnections", ErrorCodes::LOGICAL_ERROR);
+     }
+ 
++    void sendMergeTreeReadTaskResponse(PartitionReadResponse) override
++    {
++        throw Exception("sendMergeTreeReadTaskResponse in not supported with HedgedConnections", ErrorCodes::LOGICAL_ERROR);
++    }
++
+     Packet receivePacket() override;
+ 
+     Packet receivePacketUnlocked(AsyncCallback async_callback, bool is_draining) override;
+@@ -112,6 +117,8 @@ class HedgedConnections : public IConnections
+ 
+     bool hasActiveConnections() const override { return active_connection_count > 0; }
+ 
++    void setReplicaInfo(ReplicaInfo value) override { replica_info = value; }
++
+ private:
+     /// If we don't receive data from replica and there is no progress in query
+     /// execution for receive_data_timeout, we are trying to get new
+@@ -199,6 +206,8 @@ class HedgedConnections : public IConnections
+     bool sent_query = false;
+     bool cancelled = false;
+ 
++    ReplicaInfo replica_info;
++
+     mutable std::mutex cancel_mutex;
+ };
+ 
+diff --git a/src/Client/IConnections.h b/src/Client/IConnections.h
+index 53267cbbb3e3..8dbd58c9598c 100644
+--- a/src/Client/IConnections.h
++++ b/src/Client/IConnections.h
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
++#include <compare>
++
+ #include <Client/Connection.h>
++#include <Storages/MergeTree/RequestResponse.h>
+ 
+ namespace DB
+ {
+@@ -27,10 +30,11 @@ class IConnections : boost::noncopyable
+         const String & query,
+         const String & query_id,
+         UInt64 stage,
+-        const ClientInfo & client_info,
++        ClientInfo & client_info,
+         bool with_pending_data) = 0;
+ 
+     virtual void sendReadTaskResponse(const String &) = 0;
++    virtual void sendMergeTreeReadTaskResponse(PartitionReadResponse response) = 0;
+ 
+     /// Get packet from any replica.
+     virtual Packet receivePacket() = 0;
+@@ -56,6 +60,17 @@ class IConnections : boost::noncopyable
+     /// Get the replica addresses as a string.
+     virtual std::string dumpAddresses() const = 0;
+ 
++
++    struct ReplicaInfo
++    {
++        size_t all_replicas_count{0};
++        size_t number_of_current_replica{0};
++    };
++
++    /// This is needed in max_parallel_replicas case.
++    /// We create a RemoteQueryExecutor for each replica
++    virtual void setReplicaInfo(ReplicaInfo value) = 0;
++
+     /// Returns the number of replicas.
+     virtual size_t size() const = 0;
+ 
+diff --git a/src/Client/IServerConnection.h b/src/Client/IServerConnection.h
+index 9d6b54ef32fa..b7c6ae314e26 100644
+--- a/src/Client/IServerConnection.h
++++ b/src/Client/IServerConnection.h
+@@ -12,6 +12,8 @@
+ #include <IO/ConnectionTimeouts.h>
+ #include <IO/Progress.h>
+ 
++#include <Storages/MergeTree/RequestResponse.h>
++
+ 
+ #include <boost/noncopyable.hpp>
+ 
+@@ -32,10 +34,13 @@ struct Packet
+     Progress progress;
+     ProfileInfo profile_info;
+     std::vector<UUID> part_uuids;
++    PartitionReadRequest request;
++    PartitionReadResponse response;
+ 
+     Packet() : type(Protocol::Server::Hello) {}
+ };
+ 
++
+ /// Struct which represents data we are going to send for external table.
+ struct ExternalTableData
+ {
+@@ -96,6 +101,8 @@ class IServerConnection : boost::noncopyable
+     /// Send all contents of external (temporary) tables.
+     virtual void sendExternalTablesData(ExternalTablesData & data) = 0;
+ 
++    virtual void sendMergeTreeReadTaskResponse(const PartitionReadResponse & response) = 0;
++
+     /// Check, if has data to read.
+     virtual bool poll(size_t timeout_microseconds) = 0;
+ 
+diff --git a/src/Client/LocalConnection.cpp b/src/Client/LocalConnection.cpp
+index 4f476b57c270..9eaa9ce883a1 100644
+--- a/src/Client/LocalConnection.cpp
++++ b/src/Client/LocalConnection.cpp
+@@ -424,6 +424,11 @@ void LocalConnection::sendExternalTablesData(ExternalTablesData &)
+     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Not implemented");
+ }
+ 
++void LocalConnection::sendMergeTreeReadTaskResponse(const PartitionReadResponse &)
++{
++    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Not implemented");
++}
++
+ ServerConnectionPtr LocalConnection::createConnection(const ConnectionParameters &, ContextPtr current_context, bool send_progress)
+ {
+     return std::make_unique<LocalConnection>(current_context, send_progress);
+diff --git a/src/Client/LocalConnection.h b/src/Client/LocalConnection.h
+index 1cc23defa6e1..fbd054506e70 100644
+--- a/src/Client/LocalConnection.h
++++ b/src/Client/LocalConnection.h
+@@ -92,6 +92,8 @@ class LocalConnection : public IServerConnection, WithContext
+ 
+     void sendExternalTablesData(ExternalTablesData &) override;
+ 
++    void sendMergeTreeReadTaskResponse(const PartitionReadResponse & response) override;
++
+     bool poll(size_t timeout_microseconds/* = 0 */) override;
+ 
+     bool hasReadPendingData() const override;
+diff --git a/src/Client/MultiplexedConnections.cpp b/src/Client/MultiplexedConnections.cpp
+index a27f77095556..c3000443a9c6 100644
+--- a/src/Client/MultiplexedConnections.cpp
++++ b/src/Client/MultiplexedConnections.cpp
+@@ -1,9 +1,10 @@
+ #include <Client/MultiplexedConnections.h>
++
++#include <Common/thread_local_rng.h>
++#include <Core/Protocol.h>
+ #include <IO/ConnectionTimeouts.h>
+ #include <IO/Operators.h>
+-#include <Common/thread_local_rng.h>
+-#include "Core/Protocol.h"
+-
++#include <Interpreters/ClientInfo.h>
+ 
+ namespace DB
+ {
+@@ -110,7 +111,7 @@ void MultiplexedConnections::sendQuery(
+     const String & query,
+     const String & query_id,
+     UInt64 stage,
+-    const ClientInfo & client_info,
++    ClientInfo & client_info,
+     bool with_pending_data)
+ {
+     std::lock_guard lock(cancel_mutex);
+@@ -131,16 +132,29 @@ void MultiplexedConnections::sendQuery(
+             modified_settings.group_by_two_level_threshold = 0;
+             modified_settings.group_by_two_level_threshold_bytes = 0;
+         }
++
++        if (settings.allow_experimental_parallel_reading_from_replicas)
++        {
++            client_info.collaborate_with_initiator = true;
++            client_info.count_participating_replicas = replica_info.all_replicas_count;
++            client_info.number_of_current_replica = replica_info.number_of_current_replica;
++        }
+     }
+ 
++    const bool enable_sample_offset_parallel_processing = settings.max_parallel_replicas > 1 && !settings.allow_experimental_parallel_reading_from_replicas;
++
+     size_t num_replicas = replica_states.size();
+     if (num_replicas > 1)
+     {
+-        /// Use multiple replicas for parallel query processing.
+-        modified_settings.parallel_replicas_count = num_replicas;
++        if (enable_sample_offset_parallel_processing)
++            /// Use multiple replicas for parallel query processing.
++            modified_settings.parallel_replicas_count = num_replicas;
++
+         for (size_t i = 0; i < num_replicas; ++i)
+         {
+-            modified_settings.parallel_replica_offset = i;
++            if (enable_sample_offset_parallel_processing)
++                modified_settings.parallel_replica_offset = i;
++
+             replica_states[i].connection->sendQuery(timeouts, query, query_id,
+                 stage, &modified_settings, &client_info, with_pending_data);
+         }
+@@ -179,6 +193,16 @@ void MultiplexedConnections::sendReadTaskResponse(const String & response)
+     current_connection->sendReadTaskResponse(response);
+ }
+ 
++
++void MultiplexedConnections::sendMergeTreeReadTaskResponse(PartitionReadResponse response)
++{
++    std::lock_guard lock(cancel_mutex);
++    if (cancelled)
++        return;
++    current_connection->sendMergeTreeReadTaskResponse(response);
++}
++
++
+ Packet MultiplexedConnections::receivePacket()
+ {
+     std::lock_guard lock(cancel_mutex);
+@@ -234,6 +258,7 @@ Packet MultiplexedConnections::drain()
+ 
+         switch (packet.type)
+         {
++            case Protocol::Server::MergeTreeReadTaskRequest:
+             case Protocol::Server::ReadTaskRequest:
+             case Protocol::Server::PartUUIDs:
+             case Protocol::Server::Data:
+@@ -313,6 +338,7 @@ Packet MultiplexedConnections::receivePacketUnlocked(AsyncCallback async_callbac
+ 
+     switch (packet.type)
+     {
++        case Protocol::Server::MergeTreeReadTaskRequest:
+         case Protocol::Server::ReadTaskRequest:
+         case Protocol::Server::PartUUIDs:
+         case Protocol::Server::Data:
+diff --git a/src/Client/MultiplexedConnections.h b/src/Client/MultiplexedConnections.h
+index 4fb7d496b0c5..e76d54218c71 100644
+--- a/src/Client/MultiplexedConnections.h
++++ b/src/Client/MultiplexedConnections.h
+@@ -38,10 +38,11 @@ class MultiplexedConnections final : public IConnections
+         const String & query,
+         const String & query_id,
+         UInt64 stage,
+-        const ClientInfo & client_info,
++        ClientInfo & client_info,
+         bool with_pending_data) override;
+ 
+     void sendReadTaskResponse(const String &) override;
++    void sendMergeTreeReadTaskResponse(PartitionReadResponse response) override;
+ 
+     Packet receivePacket() override;
+ 
+@@ -62,6 +63,7 @@ class MultiplexedConnections final : public IConnections
+     /// Without locking, because sendCancel() does not change the state of the replicas.
+     bool hasActiveConnections() const override { return active_connection_count > 0; }
+ 
++    void setReplicaInfo(ReplicaInfo value) override { replica_info = value; }
+ private:
+     Packet receivePacketUnlocked(AsyncCallback async_callback, bool is_draining) override;
+ 
+@@ -102,6 +104,8 @@ class MultiplexedConnections final : public IConnections
+     bool sent_query = false;
+     bool cancelled = false;
+ 
++    ReplicaInfo replica_info;
++
+     /// A mutex for the sendCancel function to execute safely
+     /// in separate thread.
+     mutable std::mutex cancel_mutex;
+diff --git a/src/Common/PoolBase.h b/src/Common/PoolBase.h
+index 3f7f340c5d1a..85d4e84abcab 100644
+--- a/src/Common/PoolBase.h
++++ b/src/Common/PoolBase.h
+@@ -163,4 +163,3 @@ class PoolBase : private boost::noncopyable
+     /** Creates a new object to put into the pool. */
+     virtual ObjectPtr allocObject() = 0;
+ };
+-
+diff --git a/src/Core/Protocol.h b/src/Core/Protocol.h
+index fb18e1135a51..08c675eb4219 100644
+--- a/src/Core/Protocol.h
++++ b/src/Core/Protocol.h
+@@ -64,24 +64,26 @@ namespace Protocol
+     {
+         enum Enum
+         {
+-            Hello = 0,                /// Name, version, revision.
+-            Data = 1,                 /// A block of data (compressed or not).
+-            Exception = 2,            /// The exception during query execution.
+-            Progress = 3,             /// Query execution progress: rows read, bytes read.
+-            Pong = 4,                 /// Ping response
+-            EndOfStream = 5,          /// All packets were transmitted
+-            ProfileInfo = 6,          /// Packet with profiling info.
+-            Totals = 7,               /// A block with totals (compressed or not).
+-            Extremes = 8,             /// A block with minimums and maximums (compressed or not).
+-            TablesStatusResponse = 9, /// A response to TablesStatus request.
+-            Log = 10,                 /// System logs of the query execution
+-            TableColumns = 11,        /// Columns' description for default values calculation
+-            PartUUIDs = 12,           /// List of unique parts ids.
+-            ReadTaskRequest = 13,     /// String (UUID) describes a request for which next task is needed
+-                                      /// This is such an inverted logic, where server sends requests
+-                                      /// And client returns back response
+-            ProfileEvents = 14,       /// Packet with profile events from server.
+-            MAX = ProfileEvents,
++            Hello = 0,                      /// Name, version, revision.
++            Data = 1,                       /// A block of data (compressed or not).
++            Exception = 2,                  /// The exception during query execution.
++            Progress = 3,                   /// Query execution progress: rows read, bytes read.
++            Pong = 4,                       /// Ping response
++            EndOfStream = 5,                /// All packets were transmitted
++            ProfileInfo = 6,                /// Packet with profiling info.
++            Totals = 7,                     /// A block with totals (compressed or not).
++            Extremes = 8,                   /// A block with minimums and maximums (compressed or not).
++            TablesStatusResponse = 9,       /// A response to TablesStatus request.
++            Log = 10,                       /// System logs of the query execution
++            TableColumns = 11,              /// Columns' description for default values calculation
++            PartUUIDs = 12,                 /// List of unique parts ids.
++            ReadTaskRequest = 13,           /// String (UUID) describes a request for which next task is needed
++                                            /// This is such an inverted logic, where server sends requests
++                                            /// And client returns back response
++            ProfileEvents = 14,             /// Packet with profile events from server.
++            MergeTreeReadTaskRequest = 15,  /// Request from a MergeTree replica to a coordinator
++            MAX = MergeTreeReadTaskRequest,
++
+         };
+ 
+         /// NOTE: If the type of packet argument would be Enum, the comparison packet >= 0 && packet < 10
+@@ -106,6 +108,7 @@ namespace Protocol
+                 "PartUUIDs",
+                 "ReadTaskRequest",
+                 "ProfileEvents",
++                "MergeTreeReadTaskRequest",
+             };
+             return packet <= MAX
+                 ? data[packet]
+@@ -130,20 +133,20 @@ namespace Protocol
+     {
+         enum Enum
+         {
+-            Hello = 0,               /// Name, version, revision, default DB
+-            Query = 1,               /// Query id, query settings, stage up to which the query must be executed,
+-                                     /// whether the compression must be used,
+-                                     /// query text (without data for INSERTs).
+-            Data = 2,                /// A block of data (compressed or not).
+-            Cancel = 3,              /// Cancel the query execution.
+-            Ping = 4,                /// Check that connection to the server is alive.
+-            TablesStatusRequest = 5, /// Check status of tables on the server.
+-            KeepAlive = 6,           /// Keep the connection alive
+-            Scalar = 7,              /// A block of data (compressed or not).
+-            IgnoredPartUUIDs = 8,    /// List of unique parts ids to exclude from query processing
+-            ReadTaskResponse = 9,     /// TODO:
+-
+-            MAX = ReadTaskResponse,
++            Hello = 0,                      /// Name, version, revision, default DB
++            Query = 1,                      /// Query id, query settings, stage up to which the query must be executed,
++                                            /// whether the compression must be used,
++                                            /// query text (without data for INSERTs).
++            Data = 2,                       /// A block of data (compressed or not).
++            Cancel = 3,                     /// Cancel the query execution.
++            Ping = 4,                       /// Check that connection to the server is alive.
++            TablesStatusRequest = 5,        /// Check status of tables on the server.
++            KeepAlive = 6,                  /// Keep the connection alive
++            Scalar = 7,                     /// A block of data (compressed or not).
++            IgnoredPartUUIDs = 8,           /// List of unique parts ids to exclude from query processing
++            ReadTaskResponse = 9,           /// A filename to read from s3 (used in s3Cluster)
++            MergeTreeReadTaskResponse = 10, /// Coordinator's decision with a modified set of mark ranges allowed to read
++            MAX = MergeTreeReadTaskResponse,
+         };
+ 
+         inline const char * toString(UInt64 packet)
+@@ -159,6 +162,7 @@ namespace Protocol
+                 "Scalar",
+                 "IgnoredPartUUIDs",
+                 "ReadTaskResponse",
++                "MergeTreeReadTaskResponse"
+             };
+             return packet <= MAX
+                 ? data[packet]
+diff --git a/src/Core/ProtocolDefines.h b/src/Core/ProtocolDefines.h
+index ac0fba384b86..36820788b91f 100644
+--- a/src/Core/ProtocolDefines.h
++++ b/src/Core/ProtocolDefines.h
+@@ -31,6 +31,9 @@
+ 
+ #define DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION 1
+ 
++#define DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION 1
++#define DBMS_MIN_REVISION_WITH_PARALLEL_REPLICAS 54453
++
+ /// Minimum revision supporting interserver secret.
+ #define DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET 54441
+ 
+@@ -48,6 +51,7 @@
+ /// NOTE: DBMS_TCP_PROTOCOL_VERSION has nothing common with VERSION_REVISION,
+ /// later is just a number for server version (one number instead of commit SHA)
+ /// for simplicity (sometimes it may be more convenient in some use cases).
+-#define DBMS_TCP_PROTOCOL_VERSION 54452
++
++#define DBMS_TCP_PROTOCOL_VERSION 54453
+ 
+ #define DBMS_MIN_PROTOCOL_VERSION_WITH_INITIAL_QUERY_START_TIME 54449
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 4e0e50cc5218..47b01655c264 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -126,6 +126,8 @@ class IColumn;
+     M(UInt64, parallel_replicas_count, 0, "", 0) \
+     M(UInt64, parallel_replica_offset, 0, "", 0) \
+     \
++    M(Bool, allow_experimental_parallel_reading_from_replicas, false, "If true, ClickHouse will send a SELECT query to all replicas of a table. It will work for any kind on MergeTree table.", 0) \
++    \
+     M(Bool, skip_unavailable_shards, false, "If true, ClickHouse silently skips unavailable shards and nodes unresolvable through DNS. Shard is marked as unavailable when none of the replicas can be reached.", 0) \
+     \
+     M(UInt64, parallel_distributed_insert_select, 0, "Process distributed INSERT SELECT query in the same cluster on local tables on every shard, if 1 SELECT is executed on each shard, if 2 SELECT and INSERT is executed on each shard", 0) \
+diff --git a/src/IO/WriteHelpers.h b/src/IO/WriteHelpers.h
+index 9cdc77df957c..5498e1c90f39 100644
+--- a/src/IO/WriteHelpers.h
++++ b/src/IO/WriteHelpers.h
+@@ -118,6 +118,7 @@ inline void writeStringBinary(const std::string_view & s, WriteBuffer & buf)
+     writeStringBinary(StringRef{s}, buf);
+ }
+ 
++
+ template <typename T>
+ void writeVectorBinary(const std::vector<T> & v, WriteBuffer & buf)
+ {
+diff --git a/src/Interpreters/ClientInfo.cpp b/src/Interpreters/ClientInfo.cpp
+index 79956aaebed7..827e7d274092 100644
+--- a/src/Interpreters/ClientInfo.cpp
++++ b/src/Interpreters/ClientInfo.cpp
+@@ -89,6 +89,13 @@ void ClientInfo::write(WriteBuffer & out, const UInt64 server_protocol_revision)
+             writeBinary(uint8_t(0), out);
+         }
+     }
++
++    if (server_protocol_revision >= DBMS_MIN_REVISION_WITH_PARALLEL_REPLICAS)
++    {
++        writeVarUInt(static_cast<UInt64>(collaborate_with_initiator), out);
++        writeVarUInt(count_participating_replicas, out);
++        writeVarUInt(number_of_current_replica, out);
++    }
+ }
+ 
+ 
+@@ -170,6 +177,15 @@ void ClientInfo::read(ReadBuffer & in, const UInt64 client_protocol_revision)
+             readBinary(client_trace_context.trace_flags, in);
+         }
+     }
++
++    if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_PARALLEL_REPLICAS)
++    {
++        UInt64 value;
++        readVarUInt(value, in);
++        collaborate_with_initiator = static_cast<bool>(value);
++        readVarUInt(count_participating_replicas, in);
++        readVarUInt(number_of_current_replica, in);
++    }
+ }
+ 
+ 
+diff --git a/src/Interpreters/ClientInfo.h b/src/Interpreters/ClientInfo.h
+index d42c34f07e2e..3ce740c64368 100644
+--- a/src/Interpreters/ClientInfo.h
++++ b/src/Interpreters/ClientInfo.h
+@@ -108,6 +108,11 @@ class ClientInfo
+ 
+     bool is_replicated_database_internal = false;
+ 
++    /// For parallel processing on replicas
++    bool collaborate_with_initiator{false};
++    UInt64 count_participating_replicas{0};
++    UInt64 number_of_current_replica{0};
++
+     bool empty() const { return query_kind == QueryKind::NO_QUERY; }
+ 
+     /** Serialization and deserialization.
+diff --git a/src/Interpreters/Cluster.h b/src/Interpreters/Cluster.h
+index ec78abf574c7..a64e17264b11 100644
+--- a/src/Interpreters/Cluster.h
++++ b/src/Interpreters/Cluster.h
+@@ -184,6 +184,8 @@ class Cluster
+         bool isLocal() const { return !local_addresses.empty(); }
+         bool hasRemoteConnections() const { return local_addresses.size() != per_replica_pools.size(); }
+         size_t getLocalNodeCount() const { return local_addresses.size(); }
++        size_t getRemoteNodeCount() const { return per_replica_pools.size() - local_addresses.size(); }
++        size_t getAllNodeCount() const { return per_replica_pools.size(); }
+         bool hasInternalReplication() const { return has_internal_replication; }
+         /// Name of directory for asynchronous write to StorageDistributed if has_internal_replication
+         const std::string & insertPathForInternalReplication(bool prefer_localhost_replica, bool use_compact_format) const;
+diff --git a/src/Interpreters/ClusterProxy/IStreamFactory.h b/src/Interpreters/ClusterProxy/IStreamFactory.h
+index 6360aee2f55b..483ce9dcab90 100644
+--- a/src/Interpreters/ClusterProxy/IStreamFactory.h
++++ b/src/Interpreters/ClusterProxy/IStreamFactory.h
+@@ -37,7 +37,9 @@ class IStreamFactory
+         Block header;
+ 
+         size_t shard_num = 0;
++        size_t num_replicas = 0;
+         ConnectionPoolWithFailoverPtr pool;
++        ConnectionPoolPtrs per_replica_pools;
+ 
+         /// If we connect to replicas lazily.
+         /// (When there is a local replica with big delay).
+diff --git a/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp b/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
+index b644f2936d9e..a47874c475a9 100644
+--- a/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
++++ b/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
+@@ -117,7 +117,9 @@ void SelectStreamFactory::createForShard(
+             .query = modified_query_ast,
+             .header = header,
+             .shard_num = shard_info.shard_num,
++            .num_replicas = shard_info.getAllNodeCount(),
+             .pool = shard_info.pool,
++            .per_replica_pools = shard_info.per_replica_pools,
+             .lazy = lazy,
+             .local_delay = local_delay,
+         });
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 9b2721cd15d4..db1d6a378779 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -2962,7 +2962,7 @@ PartUUIDsPtr Context::getPartUUIDs() const
+ ReadTaskCallback Context::getReadTaskCallback() const
+ {
+     if (!next_task_callback.has_value())
+-        throw Exception(fmt::format("Next task callback is not set for query {}", getInitialQueryId()), ErrorCodes::LOGICAL_ERROR);
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Next task callback is not set for query {}", getInitialQueryId());
+     return next_task_callback.value();
+ }
+ 
+@@ -2972,6 +2972,20 @@ void Context::setReadTaskCallback(ReadTaskCallback && callback)
+     next_task_callback = callback;
+ }
+ 
++
++MergeTreeReadTaskCallback Context::getMergeTreeReadTaskCallback() const
++{
++    if (!merge_tree_read_task_callback.has_value())
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Next task callback for is not set for query {}", getInitialQueryId());
++
++    return merge_tree_read_task_callback.value();
++}
++
++void Context::setMergeTreeReadTaskCallback(MergeTreeReadTaskCallback && callback)
++{
++    merge_tree_read_task_callback = callback;
++}
++
+ PartUUIDsPtr Context::getIgnoredPartUUIDs() const
+ {
+     auto lock = getLock();
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index 5948cc7f7a75..823bc028c157 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -14,6 +14,7 @@
+ #include <Common/RemoteHostFilter.h>
+ #include <Common/isLocalAddress.h>
+ #include <base/types.h>
++#include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
+ 
+ #include "config_core.h"
+ 
+@@ -148,6 +149,8 @@ using InputBlocksReader = std::function<Block(ContextPtr)>;
+ /// Used in distributed task processing
+ using ReadTaskCallback = std::function<String()>;
+ 
++using MergeTreeReadTaskCallback = std::function<std::optional<PartitionReadResponse>(PartitionReadRequest)>;
++
+ /// An empty interface for an arbitrary object that may be attached by a shared pointer
+ /// to query context, when using ClickHouse as a library.
+ struct IHostContext
+@@ -216,8 +219,12 @@ class Context: public std::enable_shared_from_this<Context>
+     Scalars scalars;
+     Scalars local_scalars;
+ 
+-    /// Fields for distributed s3 function
++    /// Used in s3Cluster table function. With this callback, a worker node could ask an initiator
++    /// about next file to read from s3.
+     std::optional<ReadTaskCallback> next_task_callback;
++    /// Used in parallel reading from replicas. A replica tells about its intentions to read
++    /// some ranges from some part and initiator will tell the replica about whether it is accepted or denied.
++    std::optional<MergeTreeReadTaskCallback> merge_tree_read_task_callback;
+ 
+     /// Record entities accessed by current query, and store this information in system.query_log.
+     struct QueryAccessInfo
+@@ -865,6 +872,9 @@ class Context: public std::enable_shared_from_this<Context>
+     ReadTaskCallback getReadTaskCallback() const;
+     void setReadTaskCallback(ReadTaskCallback && callback);
+ 
++    MergeTreeReadTaskCallback getMergeTreeReadTaskCallback() const;
++    void setMergeTreeReadTaskCallback(MergeTreeReadTaskCallback && callback);
++
+     /// Background executors related methods
+     void initializeBackgroundExecutorsIfNeeded();
+ 
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index 67ca6d3d8e0d..eddbbb9138c0 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -74,7 +74,8 @@ ReadFromMergeTree::ReadFromMergeTree(
+     bool sample_factor_column_queried_,
+     std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read_,
+     Poco::Logger * log_,
+-    MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_)
++    MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_,
++    bool enable_parallel_reading)
+     : ISourceStep(DataStream{.header = MergeTreeBaseSelectProcessor::transformHeader(
+         metadata_snapshot_->getSampleBlockForColumns(real_column_names_, data_.getVirtuals(), data_.getStorageID()),
+         getPrewhereInfo(query_info_),
+@@ -107,6 +108,9 @@ ReadFromMergeTree::ReadFromMergeTree(
+         auto type = std::make_shared<DataTypeFloat64>();
+         output_stream->header.insert({type->createColumn(), type, "_sample_factor"});
+     }
++
++    if (enable_parallel_reading)
++        read_task_callback = context->getMergeTreeReadTaskCallback();
+ }
+ 
+ Pipe ReadFromMergeTree::readFromPool(
+@@ -127,6 +131,7 @@ Pipe ReadFromMergeTree::readFromPool(
+     }
+ 
+     const auto & settings = context->getSettingsRef();
++    const auto & client_info = context->getClientInfo();
+     MergeTreeReadPool::BackoffSettings backoff_settings(settings);
+ 
+     auto pool = std::make_shared<MergeTreeReadPool>(
+@@ -147,17 +152,30 @@ Pipe ReadFromMergeTree::readFromPool(
+ 
+     for (size_t i = 0; i < max_streams; ++i)
+     {
++        std::optional<ParallelReadingExtension> extension;
++        if (read_task_callback)
++        {
++            extension = ParallelReadingExtension
++            {
++                .callback = read_task_callback.value(),
++                .count_participating_replicas = client_info.count_participating_replicas,
++                .number_of_current_replica = client_info.number_of_current_replica,
++                .colums_to_read = required_columns
++            };
++        }
++
+         auto source = std::make_shared<MergeTreeThreadSelectProcessor>(
+             i, pool, min_marks_for_concurrent_read, max_block_size,
+             settings.preferred_block_size_bytes, settings.preferred_max_column_in_block_size_bytes,
+             data, metadata_snapshot, use_uncompressed_cache,
+-            prewhere_info, actions_settings, reader_settings, virt_column_names);
++            prewhere_info, actions_settings, reader_settings, virt_column_names, std::move(extension));
+ 
+-        if (i == 0)
+-        {
+-            /// Set the approximate number of rows for the first source only
++        /// Set the approximate number of rows for the first source only
++        /// In case of parallel processing on replicas do not set approximate rows at all.
++        /// Because the value will be identical on every replicas and will be accounted
++        /// multiple times (settings.max_parallel_replicas times more)
++        if (i == 0 && !client_info.collaborate_with_initiator)
+             source->addTotalRowsApprox(total_rows);
+-        }
+ 
+         pipes.emplace_back(std::move(source));
+     }
+@@ -172,10 +190,22 @@ ProcessorPtr ReadFromMergeTree::createSource(
+     bool use_uncompressed_cache,
+     bool has_limit_below_one_block)
+ {
++    const auto & client_info = context->getClientInfo();
++    std::optional<ParallelReadingExtension> extension;
++    if (read_task_callback)
++    {
++        extension = ParallelReadingExtension
++        {
++            .callback = read_task_callback.value(),
++            .count_participating_replicas = client_info.count_participating_replicas,
++            .number_of_current_replica = client_info.number_of_current_replica,
++            .colums_to_read = required_columns
++        };
++    }
+     return std::make_shared<TSource>(
+             data, metadata_snapshot, part.data_part, max_block_size, preferred_block_size_bytes,
+             preferred_max_column_in_block_size_bytes, required_columns, part.ranges, use_uncompressed_cache, prewhere_info,
+-            actions_settings, reader_settings, virt_column_names, part.part_index_in_query, has_limit_below_one_block);
++            actions_settings, reader_settings, virt_column_names, part.part_index_in_query, has_limit_below_one_block, std::move(extension));
+ }
+ 
+ Pipe ReadFromMergeTree::readInOrder(
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.h b/src/Processors/QueryPlan/ReadFromMergeTree.h
+index 46b62467ae03..0bdfa66bcc7a 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.h
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.h
+@@ -97,7 +97,8 @@ class ReadFromMergeTree final : public ISourceStep
+         bool sample_factor_column_queried_,
+         std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read_,
+         Poco::Logger * log_,
+-        MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_
++        MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_,
++        bool enable_parallel_reading
+     );
+ 
+     String getName() const override { return "ReadFromMergeTree"; }
+@@ -184,6 +185,8 @@ class ReadFromMergeTree final : public ISourceStep
+     MergeTreeDataSelectAnalysisResultPtr selectRangesToRead(MergeTreeData::DataPartsVector parts) const;
+     ReadFromMergeTree::AnalysisResult getAnalysisResult() const;
+     MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr;
++
++    std::optional<MergeTreeReadTaskCallback> read_task_callback;
+ };
+ 
+ struct MergeTreeDataSelectAnalysisResult
+diff --git a/src/Processors/QueryPlan/ReadFromRemote.cpp b/src/Processors/QueryPlan/ReadFromRemote.cpp
+index 399e7d018390..8fcec03d746c 100644
+--- a/src/Processors/QueryPlan/ReadFromRemote.cpp
++++ b/src/Processors/QueryPlan/ReadFromRemote.cpp
+@@ -12,6 +12,8 @@
+ #include <Interpreters/InterpreterSelectQuery.h>
+ #include <IO/ConnectionTimeoutsContext.h>
+ #include <Common/checkStackSize.h>
++#include <Client/ConnectionPool.h>
++#include <Client/ConnectionPoolWithFailover.h>
+ 
+ namespace DB
+ {
+@@ -112,7 +114,10 @@ ReadFromRemote::ReadFromRemote(
+ {
+ }
+ 
+-void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard)
++void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard,
++    std::shared_ptr<ParallelReplicasReadingCoordinator> coordinator,
++    std::shared_ptr<ConnectionPoolWithFailover> pool,
++    std::optional<IConnections::ReplicaInfo> replica_info)
+ {
+     bool add_agg_info = stage == QueryProcessingStage::WithMergeableState;
+     bool add_totals = false;
+@@ -125,7 +130,10 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFacto
+     }
+ 
+     auto lazily_create_stream = [
+-            pool = shard.pool, shard_num = shard.shard_num, shard_count = shard_count, query = shard.query, header = shard.header,
++            replica_info = replica_info,
++            pool = pool ? pool : shard.pool,
++            coordinator = coordinator,
++            shard_num = shard.shard_num, shard_count = shard_count, query = shard.query, header = shard.header,
+             context = context, throttler = throttler,
+             main_table = main_table, table_func_ptr = table_func_ptr,
+             scalars = scalars, external_tables = external_tables,
+@@ -161,9 +169,12 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFacto
+                 max_remote_delay = std::max(try_result.staleness, max_remote_delay);
+         }
+ 
+-        if (try_results.empty() || local_delay < max_remote_delay)
++        /// We disable this branch in case of parallel reading from replicas, because createLocalPlan will call
++        /// InterpreterSelectQuery directly and it will be too ugly to pass ParallelReplicasCoordinator or some callback there.
++        if (!context->getClientInfo().collaborate_with_initiator && (try_results.empty() || local_delay < max_remote_delay))
+         {
+             auto plan = createLocalPlan(query, header, context, stage, shard_num, shard_count);
++
+             return QueryPipelineBuilder::getPipe(std::move(*plan->buildQueryPipeline(
+                 QueryPlanOptimizationSettings::fromContext(context),
+                 BuildQueryPipelineSettings::fromContext(context))));
+@@ -180,7 +191,8 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFacto
+             scalars["_shard_num"]
+                 = Block{{DataTypeUInt32().createColumnConst(1, shard_num), std::make_shared<DataTypeUInt32>(), "_shard_num"}};
+             auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
+-                pool, std::move(connections), query_string, header, context, throttler, scalars, external_tables, stage);
++                pool, std::move(connections), query_string, header, context, throttler, scalars, external_tables, stage,
++                RemoteQueryExecutor::Extension{.parallel_reading_coordinator = std::move(coordinator), .replica_info = replica_info});
+ 
+             return createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read);
+         }
+@@ -191,7 +203,10 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFacto
+     addConvertingActions(pipes.back(), output_stream->header);
+ }
+ 
+-void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard)
++void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard,
++    std::shared_ptr<ParallelReplicasReadingCoordinator> coordinator,
++    std::shared_ptr<ConnectionPoolWithFailover> pool,
++    std::optional<IConnections::ReplicaInfo> replica_info)
+ {
+     bool add_agg_info = stage == QueryProcessingStage::WithMergeableState;
+     bool add_totals = false;
+@@ -207,11 +222,20 @@ void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::
+ 
+     scalars["_shard_num"]
+         = Block{{DataTypeUInt32().createColumnConst(1, shard.shard_num), std::make_shared<DataTypeUInt32>(), "_shard_num"}};
+-    auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
+-        shard.pool, query_string, shard.header, context, throttler, scalars, external_tables, stage);
++
++    std::shared_ptr<RemoteQueryExecutor> remote_query_executor;
++
++    remote_query_executor = std::make_shared<RemoteQueryExecutor>(
++            pool ? pool : shard.pool, query_string, shard.header, context, throttler, scalars, external_tables, stage,
++            RemoteQueryExecutor::Extension{.parallel_reading_coordinator = std::move(coordinator), .replica_info = std::move(replica_info)});
++
+     remote_query_executor->setLogger(log);
+ 
+-    remote_query_executor->setPoolMode(PoolMode::GET_MANY);
++    /// In case of parallel reading from replicas we have a connection pool per replica.
++    /// Setting PoolMode will make no sense.
++    if (!pool)
++        remote_query_executor->setPoolMode(PoolMode::GET_MANY);
++
+     if (!table_func_ptr)
+         remote_query_executor->setMainTable(main_table);
+ 
+@@ -223,12 +247,51 @@ void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::
+ void ReadFromRemote::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+ {
+     Pipes pipes;
+-    for (const auto & shard : shards)
++
++    const auto & settings = context->getSettingsRef();
++    const bool enable_sample_offset_parallel_processing = settings.max_parallel_replicas > 1 && !settings.allow_experimental_parallel_reading_from_replicas;
++
++    /// We have to create a pipe for each replica
++    /// FIXME: The second condition is only for tests to work, because hedged connections enabled by default.
++    if (settings.max_parallel_replicas > 1 && !enable_sample_offset_parallel_processing && !context->getSettingsRef().use_hedged_requests)
+     {
+-        if (shard.lazy)
+-            addLazyPipe(pipes, shard);
+-        else
+-            addPipe(pipes, shard);
++        const Settings & current_settings = context->getSettingsRef();
++        auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
++
++        for (const auto & shard : shards)
++        {
++            auto coordinator = std::make_shared<ParallelReplicasReadingCoordinator>();
++
++            for (size_t replica_num = 0; replica_num < shard.num_replicas; ++replica_num)
++            {
++                IConnections::ReplicaInfo replica_info
++                {
++                    .all_replicas_count = shard.num_replicas,
++                    .number_of_current_replica = replica_num
++                };
++
++                auto pool = shard.per_replica_pools[replica_num];
++                auto pool_with_failover =  std::make_shared<ConnectionPoolWithFailover>(
++                    ConnectionPoolPtrs{pool}, current_settings.load_balancing);
++
++                if (shard.lazy)
++                    addLazyPipe(pipes, shard, coordinator, pool_with_failover, replica_info);
++                else
++                    addPipe(pipes, shard, coordinator, pool_with_failover, replica_info);
++            }
++        }
++    }
++    else
++    {
++        for (const auto & shard : shards)
++        {
++            auto coordinator = std::make_shared<ParallelReplicasReadingCoordinator>();
++
++            if (shard.lazy)
++                addLazyPipe(pipes, shard, /*coordinator=*/nullptr, /*pool*/{}, /*replica_info*/std::nullopt);
++            else
++                addPipe(pipes, shard, /*coordinator=*/nullptr, /*pool*/{}, /*replica_info*/std::nullopt);
++        }
+     }
+ 
+     auto pipe = Pipe::unitePipes(std::move(pipes));
+diff --git a/src/Processors/QueryPlan/ReadFromRemote.h b/src/Processors/QueryPlan/ReadFromRemote.h
+index f963164dd3f7..f361be93b5a7 100644
+--- a/src/Processors/QueryPlan/ReadFromRemote.h
++++ b/src/Processors/QueryPlan/ReadFromRemote.h
+@@ -1,9 +1,11 @@
+ #pragma once
+ #include <Processors/QueryPlan/ISourceStep.h>
+ #include <Core/QueryProcessingStage.h>
++#include <Client/IConnections.h>
+ #include <Storages/IStorage_fwd.h>
+ #include <Interpreters/StorageID.h>
+ #include <Interpreters/ClusterProxy/IStreamFactory.h>
++#include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
+ 
+ namespace DB
+ {
+@@ -37,6 +39,12 @@ class ReadFromRemote final : public ISourceStep
+     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+ 
+ private:
++    enum class Mode
++    {
++        PerReplica,
++        PerShard
++    };
++
+     ClusterProxy::IStreamFactory::Shards shards;
+     QueryProcessingStage::Enum stage;
+ 
+@@ -52,8 +60,16 @@ class ReadFromRemote final : public ISourceStep
+     Poco::Logger * log;
+ 
+     UInt32 shard_count;
+-    void addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard);
+-    void addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard);
++    void addLazyPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard,
++        std::shared_ptr<ParallelReplicasReadingCoordinator> coordinator,
++        std::shared_ptr<ConnectionPoolWithFailover> pool,
++        std::optional<IConnections::ReplicaInfo> replica_info);
++    void addPipe(Pipes & pipes, const ClusterProxy::IStreamFactory::Shard & shard,
++        std::shared_ptr<ParallelReplicasReadingCoordinator> coordinator,
++        std::shared_ptr<ConnectionPoolWithFailover> pool,
++        std::optional<IConnections::ReplicaInfo> replica_info);
++
++    void addPipeForReplica();
+ };
+ 
+ }
+diff --git a/src/QueryPipeline/RemoteQueryExecutor.cpp b/src/QueryPipeline/RemoteQueryExecutor.cpp
+index ada16a1f201b..653d9a2bbf8b 100644
+--- a/src/QueryPipeline/RemoteQueryExecutor.cpp
++++ b/src/QueryPipeline/RemoteQueryExecutor.cpp
+@@ -7,6 +7,7 @@
+ #include <Columns/ColumnConst.h>
+ #include <Common/CurrentThread.h>
+ #include "Core/Protocol.h"
++#include "IO/ReadHelpers.h"
+ #include <QueryPipeline/Pipe.h>
+ #include <Processors/Sources/SourceFromSingleChunk.h>
+ #include <Processors/Transforms/LimitsCheckingTransform.h>
+@@ -20,6 +21,7 @@
+ #include <Client/MultiplexedConnections.h>
+ #include <Client/HedgedConnections.h>
+ #include <Storages/MergeTree/MergeTreeDataPartUUID.h>
++#include <IO/ReadBufferFromString.h>
+ 
+ 
+ namespace CurrentMetrics
+@@ -42,21 +44,26 @@ namespace ErrorCodes
+ RemoteQueryExecutor::RemoteQueryExecutor(
+     const String & query_, const Block & header_, ContextPtr context_,
+     const Scalars & scalars_, const Tables & external_tables_,
+-    QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_)
++    QueryProcessingStage::Enum stage_, std::optional<Extension> extension_)
+     : header(header_), query(query_), context(context_), scalars(scalars_)
+-    , external_tables(external_tables_), stage(stage_), task_iterator(task_iterator_)
++    , external_tables(external_tables_), stage(stage_)
++    , task_iterator(extension_ ? extension_->task_iterator : nullptr)
++    , parallel_reading_coordinator(extension_ ? extension_->parallel_reading_coordinator : nullptr)
+ {}
+ 
+ RemoteQueryExecutor::RemoteQueryExecutor(
+     Connection & connection,
+     const String & query_, const Block & header_, ContextPtr context_,
+     ThrottlerPtr throttler, const Scalars & scalars_, const Tables & external_tables_,
+-    QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_)
+-    : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, task_iterator_)
++    QueryProcessingStage::Enum stage_, std::optional<Extension> extension_)
++    : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, extension_)
+ {
+-    create_connections = [this, &connection, throttler]()
++    create_connections = [this, &connection, throttler, extension_]()
+     {
+-        return std::make_shared<MultiplexedConnections>(connection, context->getSettingsRef(), throttler);
++        auto res = std::make_shared<MultiplexedConnections>(connection, context->getSettingsRef(), throttler);
++        if (extension_ && extension_->replica_info)
++            res->setReplicaInfo(*extension_->replica_info);
++        return res;
+     };
+ }
+ 
+@@ -64,12 +71,15 @@ RemoteQueryExecutor::RemoteQueryExecutor(
+     std::shared_ptr<Connection> connection_ptr,
+     const String & query_, const Block & header_, ContextPtr context_,
+     ThrottlerPtr throttler, const Scalars & scalars_, const Tables & external_tables_,
+-    QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_)
+-    : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, task_iterator_)
++    QueryProcessingStage::Enum stage_, std::optional<Extension> extension_)
++    : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, extension_)
+ {
+-    create_connections = [this, connection_ptr, throttler]()
++    create_connections = [this, connection_ptr, throttler, extension_]()
+     {
+-        return std::make_shared<MultiplexedConnections>(connection_ptr, context->getSettingsRef(), throttler);
++        auto res = std::make_shared<MultiplexedConnections>(connection_ptr, context->getSettingsRef(), throttler);
++        if (extension_ && extension_->replica_info)
++            res->setReplicaInfo(*extension_->replica_info);
++        return res;
+     };
+ }
+ 
+@@ -78,12 +88,18 @@ RemoteQueryExecutor::RemoteQueryExecutor(
+     std::vector<IConnectionPool::Entry> && connections_,
+     const String & query_, const Block & header_, ContextPtr context_,
+     const ThrottlerPtr & throttler, const Scalars & scalars_, const Tables & external_tables_,
+-    QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_)
++    QueryProcessingStage::Enum stage_, std::optional<Extension> extension_)
+     : header(header_), query(query_), context(context_)
+-    , scalars(scalars_), external_tables(external_tables_), stage(stage_), task_iterator(task_iterator_), pool(pool_)
++    , scalars(scalars_), external_tables(external_tables_), stage(stage_)
++    , task_iterator(extension_ ? extension_->task_iterator : nullptr)
++    , parallel_reading_coordinator(extension_ ? extension_->parallel_reading_coordinator : nullptr)
++    , pool(pool_)
+ {
+-    create_connections = [this, connections_, throttler]() mutable {
+-        return std::make_shared<MultiplexedConnections>(std::move(connections_), context->getSettingsRef(), throttler);
++    create_connections = [this, connections_, throttler, extension_]() mutable {
++        auto res = std::make_shared<MultiplexedConnections>(std::move(connections_), context->getSettingsRef(), throttler);
++        if (extension_ && extension_->replica_info)
++            res->setReplicaInfo(*extension_->replica_info);
++        return res;
+     };
+ }
+ 
+@@ -91,11 +107,14 @@ RemoteQueryExecutor::RemoteQueryExecutor(
+     const ConnectionPoolWithFailoverPtr & pool_,
+     const String & query_, const Block & header_, ContextPtr context_,
+     const ThrottlerPtr & throttler, const Scalars & scalars_, const Tables & external_tables_,
+-    QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_)
++    QueryProcessingStage::Enum stage_, std::optional<Extension> extension_)
+     : header(header_), query(query_), context(context_)
+-    , scalars(scalars_), external_tables(external_tables_), stage(stage_), task_iterator(task_iterator_), pool(pool_)
++    , scalars(scalars_), external_tables(external_tables_), stage(stage_)
++    , task_iterator(extension_ ? extension_->task_iterator : nullptr)
++    , parallel_reading_coordinator(extension_ ? extension_->parallel_reading_coordinator : nullptr)
++    , pool(pool_)
+ {
+-    create_connections = [this, throttler]()->std::shared_ptr<IConnections>
++    create_connections = [this, throttler, extension_]()->std::shared_ptr<IConnections>
+     {
+         const Settings & current_settings = context->getSettingsRef();
+         auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
+@@ -107,7 +126,10 @@ RemoteQueryExecutor::RemoteQueryExecutor(
+             if (main_table)
+                 table_to_check = std::make_shared<QualifiedTableName>(main_table.getQualifiedName());
+ 
+-            return std::make_shared<HedgedConnections>(pool, context, timeouts, throttler, pool_mode, table_to_check);
++            auto res = std::make_shared<HedgedConnections>(pool, context, timeouts, throttler, pool_mode, table_to_check);
++            if (extension_ && extension_->replica_info)
++                res->setReplicaInfo(*extension_->replica_info);
++            return res;
+         }
+ #endif
+ 
+@@ -122,7 +144,10 @@ RemoteQueryExecutor::RemoteQueryExecutor(
+         else
+             connection_entries = pool->getMany(timeouts, &current_settings, pool_mode);
+ 
+-        return std::make_shared<MultiplexedConnections>(std::move(connection_entries), current_settings, throttler);
++        auto res = std::make_shared<MultiplexedConnections>(std::move(connection_entries), current_settings, throttler);
++        if (extension_ && extension_->replica_info)
++            res->setReplicaInfo(*extension_->replica_info);
++        return res;
+     };
+ }
+ 
+@@ -344,6 +369,9 @@ std::optional<Block> RemoteQueryExecutor::processPacket(Packet packet)
+ {
+     switch (packet.type)
+     {
++        case Protocol::Server::MergeTreeReadTaskRequest:
++            processMergeTreeReadTaskRequest(packet.request);
++            break;
+         case Protocol::Server::ReadTaskRequest:
+             processReadTaskRequest();
+             break;
+@@ -440,6 +468,15 @@ void RemoteQueryExecutor::processReadTaskRequest()
+     connections->sendReadTaskResponse(response);
+ }
+ 
++void RemoteQueryExecutor::processMergeTreeReadTaskRequest(PartitionReadRequest request)
++{
++    if (!parallel_reading_coordinator)
++        throw Exception("Coordinator for parallel reading from replicas is not initialized", ErrorCodes::LOGICAL_ERROR);
++
++    auto response = parallel_reading_coordinator->handleRequest(std::move(request));
++    connections->sendMergeTreeReadTaskResponse(response);
++}
++
+ void RemoteQueryExecutor::finish(std::unique_ptr<ReadContext> * read_context)
+ {
+     /** If one of:
+diff --git a/src/QueryPipeline/RemoteQueryExecutor.h b/src/QueryPipeline/RemoteQueryExecutor.h
+index b7a2509ea978..d5603fd22812 100644
+--- a/src/QueryPipeline/RemoteQueryExecutor.h
++++ b/src/QueryPipeline/RemoteQueryExecutor.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <variant>
++
+ #include <Client/ConnectionPool.h>
+ #include <Client/IConnections.h>
+ #include <Client/ConnectionPoolWithFailover.h>
+@@ -7,7 +9,7 @@
+ #include <Interpreters/Context.h>
+ #include <Interpreters/StorageID.h>
+ #include <Common/TimerDescriptor.h>
+-#include <variant>
++#include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
+ 
+ 
+ namespace DB
+@@ -35,20 +37,33 @@ class RemoteQueryExecutor
+ public:
+     using ReadContext = RemoteQueryExecutorReadContext;
+ 
++    /// We can provide additional logic for RemoteQueryExecutor
++    /// For example for s3Cluster table function we provide an Iterator over tasks to do.
++    /// Nodes involved into the query send request for a new task and we answer them using this object.
++    /// In case of parallel reading from replicas we provide a Coordinator object
++    /// Every replica will tell us about parts and mark ranges it wants to read and coordinator will
++    /// decide whether to deny or to accept that request.
++    struct Extension
++    {
++      std::shared_ptr<TaskIterator> task_iterator{nullptr};
++      std::shared_ptr<ParallelReplicasReadingCoordinator> parallel_reading_coordinator;
++      std::optional<IConnections::ReplicaInfo> replica_info;
++    };
++
+     /// Takes already set connection.
+     /// We don't own connection, thus we have to drain it synchronously.
+     RemoteQueryExecutor(
+         Connection & connection,
+         const String & query_, const Block & header_, ContextPtr context_,
+         ThrottlerPtr throttler_ = nullptr, const Scalars & scalars_ = Scalars(), const Tables & external_tables_ = Tables(),
+-        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::shared_ptr<TaskIterator> task_iterator_ = {});
++        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::optional<Extension> extension_ = std::nullopt);
+ 
+     /// Takes already set connection.
+     RemoteQueryExecutor(
+         std::shared_ptr<Connection> connection,
+         const String & query_, const Block & header_, ContextPtr context_,
+         ThrottlerPtr throttler_ = nullptr, const Scalars & scalars_ = Scalars(), const Tables & external_tables_ = Tables(),
+-        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::shared_ptr<TaskIterator> task_iterator_ = {});
++        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::optional<Extension> extension_ = std::nullopt);
+ 
+     /// Accepts several connections already taken from pool.
+     RemoteQueryExecutor(
+@@ -56,14 +71,14 @@ class RemoteQueryExecutor
+         std::vector<IConnectionPool::Entry> && connections_,
+         const String & query_, const Block & header_, ContextPtr context_,
+         const ThrottlerPtr & throttler = nullptr, const Scalars & scalars_ = Scalars(), const Tables & external_tables_ = Tables(),
+-        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::shared_ptr<TaskIterator> task_iterator_ = {});
++        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::optional<Extension> extension_ = std::nullopt);
+ 
+     /// Takes a pool and gets one or several connections from it.
+     RemoteQueryExecutor(
+         const ConnectionPoolWithFailoverPtr & pool,
+         const String & query_, const Block & header_, ContextPtr context_,
+         const ThrottlerPtr & throttler = nullptr, const Scalars & scalars_ = Scalars(), const Tables & external_tables_ = Tables(),
+-        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::shared_ptr<TaskIterator> task_iterator_ = {});
++        QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete, std::optional<Extension> extension_ = std::nullopt);
+ 
+     ~RemoteQueryExecutor();
+ 
+@@ -115,7 +130,7 @@ class RemoteQueryExecutor
+     RemoteQueryExecutor(
+         const String & query_, const Block & header_, ContextPtr context_,
+         const Scalars & scalars_, const Tables & external_tables_,
+-        QueryProcessingStage::Enum stage_, std::shared_ptr<TaskIterator> task_iterator_);
++        QueryProcessingStage::Enum stage_, std::optional<Extension> extension_);
+ 
+     Block header;
+     Block totals;
+@@ -136,6 +151,13 @@ class RemoteQueryExecutor
+     /// Initiator identifier for distributed task processing
+     std::shared_ptr<TaskIterator> task_iterator;
+ 
++    std::shared_ptr<ParallelReplicasReadingCoordinator> parallel_reading_coordinator;
++
++    /// This is needed only for parallel reading from replicas, because
++    /// we create a RemoteQueryExecutor per replica and have to store additional info
++    /// about the number of the current replica or the count of replicas at all.
++    IConnections::ReplicaInfo replica_info;
++
+     std::function<std::shared_ptr<IConnections>()> create_connections;
+     /// Hold a shared reference to the connection pool so that asynchronous connection draining will
+     /// work safely. Make sure it's the first member so that we don't destruct it too early.
+@@ -203,6 +225,8 @@ class RemoteQueryExecutor
+ 
+     void processReadTaskRequest();
+ 
++    void processMergeTreeReadTaskRequest(PartitionReadRequest request);
++
+     /// Cancell query and restart it with info about duplicated UUIDs
+     /// only for `allow_experimental_query_deduplication`.
+     std::variant<Block, int> restartQueryWithoutDuplicatedUUIDs(std::unique_ptr<ReadContext> * read_context = nullptr);
+diff --git a/src/Server/TCPHandler.cpp b/src/Server/TCPHandler.cpp
+index 32154054cc08..cdf1838c06b4 100644
+--- a/src/Server/TCPHandler.cpp
++++ b/src/Server/TCPHandler.cpp
+@@ -310,10 +310,25 @@ void TCPHandler::runImpl()
+             query_context->setReadTaskCallback([this]() -> String
+             {
+                 std::lock_guard lock(task_callback_mutex);
++
++                if (state.is_cancelled)
++                    return {};
++
+                 sendReadTaskRequestAssumeLocked();
+                 return receiveReadTaskResponseAssumeLocked();
+             });
+ 
++            query_context->setMergeTreeReadTaskCallback([this](PartitionReadRequest request) -> std::optional<PartitionReadResponse>
++            {
++                std::lock_guard lock(task_callback_mutex);
++
++                if (state.is_cancelled)
++                    return std::nullopt;
++
++                sendMergeTreeReadTaskRequstAssumeLocked(std::move(request));
++                return receivePartitionMergeTreeReadTaskResponseAssumeLocked();
++            });
++
+             /// Processing Query
+             state.io = executeQuery(state.query, query_context, false, state.stage);
+ 
+@@ -663,10 +678,13 @@ void TCPHandler::processOrdinaryQueryWithProcessors()
+         Block block;
+         while (executor.pull(block, interactive_delay / 1000))
+         {
+-            std::lock_guard lock(task_callback_mutex);
++            std::unique_lock lock(task_callback_mutex);
+ 
+             if (isQueryCancelled())
+             {
++                /// Several callback like callback for parallel reading could be called from inside the pipeline
++                /// and we have to unlock the mutex from our side to prevent deadlock.
++                lock.unlock();
+                 /// A packet was received requesting to stop execution of the request.
+                 executor.cancel();
+                 break;
+@@ -786,6 +804,15 @@ void TCPHandler::sendReadTaskRequestAssumeLocked()
+     out->next();
+ }
+ 
++
++void TCPHandler::sendMergeTreeReadTaskRequstAssumeLocked(PartitionReadRequest request)
++{
++    writeVarUInt(Protocol::Server::MergeTreeReadTaskRequest, *out);
++    request.serialize(*out);
++    out->next();
++}
++
++
+ void TCPHandler::sendProfileInfo(const ProfileInfo & info)
+ {
+     writeVarUInt(Protocol::Server::ProfileInfo, *out);
+@@ -1297,6 +1324,35 @@ String TCPHandler::receiveReadTaskResponseAssumeLocked()
+ }
+ 
+ 
++std::optional<PartitionReadResponse> TCPHandler::receivePartitionMergeTreeReadTaskResponseAssumeLocked()
++{
++    UInt64 packet_type = 0;
++    readVarUInt(packet_type, *in);
++    if (packet_type != Protocol::Client::MergeTreeReadTaskResponse)
++    {
++        if (packet_type == Protocol::Client::Cancel)
++        {
++            state.is_cancelled = true;
++            /// For testing connection collector.
++            if (sleep_in_receive_cancel.totalMilliseconds())
++            {
++                std::chrono::milliseconds ms(sleep_in_receive_cancel.totalMilliseconds());
++                std::this_thread::sleep_for(ms);
++            }
++            return std::nullopt;
++        }
++        else
++        {
++            throw Exception(fmt::format("Received {} packet after requesting read task",
++                    Protocol::Client::toString(packet_type)), ErrorCodes::UNEXPECTED_PACKET_FROM_CLIENT);
++        }
++    }
++    PartitionReadResponse response;
++    response.deserialize(*in);
++    return response;
++}
++
++
+ void TCPHandler::receiveClusterNameAndSalt()
+ {
+     readStringBinary(cluster, *in);
+@@ -1697,7 +1753,7 @@ bool TCPHandler::isQueryCancelled()
+                 return true;
+ 
+             default:
+-                throw NetException("Unknown packet from client", ErrorCodes::UNKNOWN_PACKET_FROM_CLIENT);
++                throw NetException("Unknown packet from client " + toString(packet_type), ErrorCodes::UNKNOWN_PACKET_FROM_CLIENT);
+         }
+     }
+ 
+diff --git a/src/Server/TCPHandler.h b/src/Server/TCPHandler.h
+index 3cf3346cd720..4a340e328ed5 100644
+--- a/src/Server/TCPHandler.h
++++ b/src/Server/TCPHandler.h
+@@ -15,6 +15,8 @@
+ #include <Interpreters/Context_fwd.h>
+ #include <Formats/NativeReader.h>
+ 
++#include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
++
+ #include "IServer.h"
+ #include "base/types.h"
+ 
+@@ -201,6 +203,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+     void receiveQuery();
+     void receiveIgnoredPartUUIDs();
+     String receiveReadTaskResponseAssumeLocked();
++    std::optional<PartitionReadResponse> receivePartitionMergeTreeReadTaskResponseAssumeLocked();
+     bool receiveData(bool scalar);
+     bool readDataNext();
+     void readData();
+@@ -233,6 +236,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+     void sendEndOfStream();
+     void sendPartUUIDs();
+     void sendReadTaskRequestAssumeLocked();
++    void sendMergeTreeReadTaskRequstAssumeLocked(PartitionReadRequest request);
+     void sendProfileInfo(const ProfileInfo & info);
+     void sendTotals(const Block & totals);
+     void sendExtremes(const Block & extremes);
+diff --git a/src/Storages/IStorage.h b/src/Storages/IStorage.h
+index cf7b075a2047..8432e5c48d16 100644
+--- a/src/Storages/IStorage.h
++++ b/src/Storages/IStorage.h
+@@ -20,6 +20,7 @@
+ 
+ #include <optional>
+ #include <shared_mutex>
++#include <compare>
+ 
+ 
+ namespace DB
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.cpp b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+index 1255bf975e6a..21dbedbb6ac8 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.cpp
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+@@ -546,7 +546,7 @@ String IMergeTreeDataPart::getColumnNameWithMinimumCompressedSize(const StorageM
+         if (!hasColumnFiles(column))
+             continue;
+ 
+-        const auto size = getColumnSize(column_name, *column_type).data_compressed;
++        const auto size = getColumnSize(column_name).data_compressed;
+         if (size < minimum_size)
+         {
+             minimum_size = size;
+@@ -747,7 +747,7 @@ CompressionCodecPtr IMergeTreeDataPart::detectDefaultCompressionCodec() const
+     for (const auto & part_column : columns)
+     {
+         /// It was compressed with default codec and it's not empty
+-        auto column_size = getColumnSize(part_column.name, *part_column.type);
++        auto column_size = getColumnSize(part_column.name);
+         if (column_size.data_compressed != 0 && !storage_columns.hasCompressionCodec(part_column.name))
+         {
+             auto serialization = IDataType::getSerialization(part_column,
+@@ -885,7 +885,7 @@ void IMergeTreeDataPart::loadRowsCount()
+             /// Most trivial types
+             if (column.type->isValueRepresentedByNumber() && !column.type->haveSubtypes())
+             {
+-                auto size = getColumnSize(column.name, *column.type);
++                auto size = getColumnSize(column.name);
+ 
+                 if (size.data_uncompressed == 0)
+                     continue;
+@@ -933,7 +933,7 @@ void IMergeTreeDataPart::loadRowsCount()
+             if (!column_col->isFixedAndContiguous() || column_col->lowCardinality())
+                 continue;
+ 
+-            size_t column_size = getColumnSize(column.name, *column.type).data_uncompressed;
++            size_t column_size = getColumnSize(column.name).data_uncompressed;
+             if (!column_size)
+                 continue;
+ 
+@@ -1490,7 +1490,7 @@ void IMergeTreeDataPart::calculateSecondaryIndicesSizesOnDisk()
+     }
+ }
+ 
+-ColumnSize IMergeTreeDataPart::getColumnSize(const String & column_name, const IDataType & /* type */) const
++ColumnSize IMergeTreeDataPart::getColumnSize(const String & column_name) const
+ {
+     /// For some types of parts columns_size maybe not calculated
+     auto it = columns_sizes.find(column_name);
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.h b/src/Storages/MergeTree/IMergeTreeDataPart.h
+index 1467b0ef03f4..3515da20fa99 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.h
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.h
+@@ -103,7 +103,7 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+ 
+     /// NOTE: Returns zeros if column files are not found in checksums.
+     /// Otherwise return information about column size on disk.
+-    ColumnSize getColumnSize(const String & column_name, const IDataType & /* type */) const;
++    ColumnSize getColumnSize(const String & column_name) const;
+ 
+     /// NOTE: Returns zeros if secondary indexes are not found in checksums.
+     /// Otherwise return information about secondary index size on disk.
+diff --git a/src/Storages/MergeTree/IntersectionsIndexes.h b/src/Storages/MergeTree/IntersectionsIndexes.h
+new file mode 100644
+index 000000000000..68ccbc4a0b11
+--- /dev/null
++++ b/src/Storages/MergeTree/IntersectionsIndexes.h
+@@ -0,0 +1,237 @@
++#pragma once
++
++#include <fmt/format.h>
++#include <Storages/MergeTree/RequestResponse.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++
++/// A boundary of a segment (left or right)
++struct PartToRead
++{
++    PartBlockRange range;
++    struct PartAndProjectionNames
++    {
++        String part;
++        String projection;
++        bool operator<(const PartAndProjectionNames & rhs) const
++        {
++            if (part == rhs.part)
++                return projection < rhs.projection;
++            return part < rhs.part;
++        }
++        bool operator==(const PartAndProjectionNames & rhs) const
++        {
++            return part == rhs.part && projection == rhs.projection;
++        }
++    };
++
++    PartAndProjectionNames name;
++
++    bool operator==(const PartToRead & rhs) const
++    {
++        return range == rhs.range && name == rhs.name;
++    }
++
++    bool operator<(const PartToRead & rhs) const
++    {
++        /// We allow only consecutive non-intersecting ranges
++        const bool intersection =
++            (range.begin <= rhs.range.begin && rhs.range.begin < range.end) ||
++            (rhs.range.begin <= range.begin && range.begin <= rhs.range.end);
++        if (intersection)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Got intersecting parts. First [{}, {}]. Second [{}, {}]",
++                range.begin, range.end, rhs.range.begin, rhs.range.end);
++        return range.begin < rhs.range.begin && range.end <= rhs.range.begin;
++    }
++};
++
++/// MergeTreeDataPart is described as a segment (min block and max block)
++/// During request handling we have to know how many intersection
++/// current part has with already saved parts in our state.
++struct PartSegments
++{
++    enum class IntersectionResult
++    {
++        NO_INTERSECTION,
++        EXACTLY_ONE_INTERSECTION,
++        REJECT
++    };
++
++    void addPart(PartToRead part) { segments.insert(std::move(part)); }
++
++    IntersectionResult getIntersectionResult(PartToRead part)
++    {
++        bool intersected_before = false;
++        for (const auto & segment: segments)
++        {
++            auto are_intersect = [](auto & x, auto & y)
++            {
++                /// <= is important here, because we are working with segments [a, b]
++                if ((x.begin <= y.begin) && (y.begin <= x.end))
++                    return true;
++                if ((y.begin <= x.begin) && (x.begin <= y.end))
++                    return true;
++                return false;
++            };
++
++            if (are_intersect(segment.range, part.range))
++            {
++                /// We have two or possibly more intersections
++                if (intersected_before)
++                    return IntersectionResult::REJECT;
++
++                /// We have intersection with part with different name
++                /// or with different min or max block
++                /// It could happens if we have merged part on one replica
++                /// but not on another.
++                if (segment != part)
++                    return IntersectionResult::REJECT;
++
++                /// We allow only the intersection with the same part as we have
++                intersected_before = true;
++            }
++        }
++
++        return intersected_before ? IntersectionResult::EXACTLY_ONE_INTERSECTION : IntersectionResult::NO_INTERSECTION;
++    }
++
++    using OrderedSegments = std::set<PartToRead>;
++    OrderedSegments segments;
++};
++
++/// This is used only in parallel reading from replicas
++/// This struct is an ordered set of half intervals and it is responsible for
++/// giving an inversion of that intervals (e.g. [a, b) => {[-inf, a), [b, +inf)})
++/// or giving an intersection of two sets of intervals
++/// This is needed, because MarkRange is actually a half-opened interval
++/// and during the query execution we receive some kind of request from every replica
++/// to read some ranges from a specific part.
++/// We have to avoid the situation, where some range is read twice.
++/// This struct helps us to do it using only two operations (intersection and inversion)
++/// over a set of half opened intervals.
++struct HalfIntervals
++{
++    static HalfIntervals initializeWithEntireSpace()
++    {
++        auto left_inf = std::numeric_limits<decltype(MarkRange::begin)>::min();
++        auto right_inf = std::numeric_limits<decltype(MarkRange::end)>::max();
++        return HalfIntervals{{{left_inf, right_inf}}};
++    }
++
++    static HalfIntervals initializeFromMarkRanges(MarkRanges ranges)
++    {
++        OrderedRanges new_intervals;
++        for (const auto & range : ranges)
++            new_intervals.insert(range);
++
++        return HalfIntervals{std::move(new_intervals)};
++    }
++
++    MarkRanges convertToMarkRangesFinal()
++    {
++        MarkRanges result;
++        std::move(intervals.begin(), intervals.end(), std::back_inserter(result));
++        return result;
++    }
++
++    HalfIntervals & intersect(const HalfIntervals & rhs)
++    {
++        /**
++         * first   [   ) [   ) [   ) [  ) [  )
++         * second    [       ) [ ) [   )  [    )
++         */
++        OrderedRanges intersected;
++
++        const auto & first_intervals = intervals;
++        auto first = first_intervals.begin();
++        const auto & second_intervals = rhs.intervals;
++        auto second = second_intervals.begin();
++
++        while (first != first_intervals.end() && second != second_intervals.end())
++        {
++            auto curr_intersection = MarkRange{
++                std::max(second->begin, first->begin),
++                std::min(second->end, first->end)
++            };
++
++            /// Insert only if segments are intersect
++            if (curr_intersection.begin < curr_intersection.end)
++                intersected.insert(std::move(curr_intersection));
++
++            if (first->end <= second->end)
++                ++first;
++            else
++                ++second;
++        }
++
++        std::swap(intersected, intervals);
++
++        return *this;
++    }
++
++    HalfIntervals & negate()
++    {
++        auto left_inf = std::numeric_limits<decltype(MarkRange::begin)>::min();
++        auto right_inf = std::numeric_limits<decltype(MarkRange::end)>::max();
++
++        if (intervals.empty())
++        {
++            intervals.insert(MarkRange{left_inf, right_inf});
++            return *this;
++        }
++
++        OrderedRanges new_ranges;
++
++        /// Possibly add (-inf; begin)
++        if (auto begin = intervals.begin()->begin; begin != left_inf)
++            new_ranges.insert(MarkRange{left_inf, begin});
++
++        auto prev = intervals.begin();
++        for (auto it = std::next(intervals.begin()); it != intervals.end(); ++it)
++        {
++            if (prev->end != it->begin)
++                new_ranges.insert(MarkRange{prev->end, it->begin});
++            prev = it;
++        }
++
++        /// Try to add (end; +inf)
++        if (auto end = intervals.rbegin()->end; end != right_inf)
++            new_ranges.insert(MarkRange{end, right_inf});
++
++        std::swap(new_ranges, intervals);
++
++        return *this;
++    }
++
++    bool operator==(const HalfIntervals & rhs) const
++    {
++        return intervals == rhs.intervals;
++    }
++
++    using OrderedRanges = std::set<MarkRange>;
++    OrderedRanges intervals;
++};
++
++
++[[ maybe_unused ]] static std::ostream & operator<< (std::ostream & out, const HalfIntervals & ranges)
++{
++    for (const auto & range: ranges.intervals)
++        out << fmt::format("({}, {}) ", range.begin, range.end);
++    return out;
++}
++
++/// This is needed for tests where we don't need to modify objects
++[[ maybe_unused ]] static HalfIntervals getIntersection(const HalfIntervals & first, const HalfIntervals & second)
++{
++    auto result = first;
++    result.intersect(second);
++    return result;
++}
++
++}
+diff --git a/src/Storages/MergeTree/MarkRange.cpp b/src/Storages/MergeTree/MarkRange.cpp
+index 7f097cd71065..343c4ecaf22b 100644
+--- a/src/Storages/MergeTree/MarkRange.cpp
++++ b/src/Storages/MergeTree/MarkRange.cpp
+@@ -3,6 +3,31 @@
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++
++bool MarkRange::operator==(const MarkRange & rhs) const
++{
++    return begin == rhs.begin && end == rhs.end;
++}
++
++bool MarkRange::operator<(const MarkRange & rhs) const
++{
++    /// We allow only consecutive non-intersecting ranges
++    /// Here we check whether a beginning of one range lies inside another range
++    /// (ranges are intersect)
++    const bool is_intersection = (begin <= rhs.begin && rhs.begin < end) ||
++        (rhs.begin <= begin && begin < rhs.end);
++
++    if (is_intersection)
++        throw Exception(ErrorCodes::LOGICAL_ERROR,
++        "Intersecting mark ranges are not allowed, it is a bug! First range ({}, {}), second range ({}, {})", begin, end, rhs.begin, rhs.end);
++
++    return begin < rhs.begin && end <= rhs.begin;
++}
++
+ size_t getLastMark(const MarkRanges & ranges)
+ {
+     size_t current_task_last_mark = 0;
+diff --git a/src/Storages/MergeTree/MarkRange.h b/src/Storages/MergeTree/MarkRange.h
+index b46913db30cb..4f32be6ab140 100644
+--- a/src/Storages/MergeTree/MarkRange.h
++++ b/src/Storages/MergeTree/MarkRange.h
+@@ -2,7 +2,9 @@
+ 
+ #include <cstddef>
+ #include <deque>
++#include <set>
+ 
++#include <IO/WriteBuffer.h>
+ 
+ namespace DB
+ {
+@@ -18,6 +20,10 @@ struct MarkRange
+ 
+     MarkRange() = default;
+     MarkRange(const size_t begin_, const size_t end_) : begin{begin_}, end{end_} {}
++
++    bool operator==(const MarkRange & rhs) const;
++
++    bool operator<(const MarkRange & rhs) const;
+ };
+ 
+ using MarkRanges = std::deque<MarkRange>;
+diff --git a/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.cpp b/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.cpp
+index 2f46543b03cc..fbc818a7de95 100644
+--- a/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.cpp
++++ b/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.cpp
+@@ -3,6 +3,7 @@
+ #include <Storages/MergeTree/IMergeTreeDataPart.h>
+ #include <Storages/MergeTree/IMergeTreeReader.h>
+ #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
++#include <Storages/MergeTree/RequestResponse.h>
+ #include <Columns/FilterDescription.h>
+ #include <Common/typeid_cast.h>
+ #include <DataTypes/DataTypeNothing.h>
+@@ -12,6 +13,8 @@
+ #include <Processors/Transforms/AggregatingTransform.h>
+ 
+ 
++#include <city.h>
++
+ namespace DB
+ {
+ 
+@@ -33,7 +36,8 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
+     UInt64 preferred_max_column_in_block_size_bytes_,
+     const MergeTreeReaderSettings & reader_settings_,
+     bool use_uncompressed_cache_,
+-    const Names & virt_column_names_)
++    const Names & virt_column_names_,
++    std::optional<ParallelReadingExtension> extension_)
+     : SourceWithProgress(transformHeader(std::move(header), prewhere_info_, storage_.getPartitionValueType(), virt_column_names_))
+     , storage(storage_)
+     , metadata_snapshot(metadata_snapshot_)
+@@ -45,6 +49,7 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
+     , use_uncompressed_cache(use_uncompressed_cache_)
+     , virt_column_names(virt_column_names_)
+     , partition_value_type(storage.getPartitionValueType())
++    , extension(extension_)
+ {
+     header_without_virtual_columns = getPort().getHeader();
+ 
+@@ -71,6 +76,91 @@ MergeTreeBaseSelectProcessor::MergeTreeBaseSelectProcessor(
+ }
+ 
+ 
++bool MergeTreeBaseSelectProcessor::getNewTask()
++{
++    /// No parallel reading feature
++    if (!extension.has_value())
++    {
++        if (getNewTaskImpl())
++        {
++            finalizeNewTask();
++            return true;
++        }
++        return false;
++    }
++    return getNewTaskParallelReading();
++}
++
++
++bool MergeTreeBaseSelectProcessor::getNewTaskParallelReading()
++{
++    if (getTaskFromBuffer())
++        return true;
++
++    if (no_more_tasks)
++        return getDelayedTasks();
++
++    while (true)
++    {
++        /// The end of execution. No task.
++        if (!getNewTaskImpl())
++        {
++            no_more_tasks = true;
++            return getDelayedTasks();
++        }
++
++        splitCurrentTaskRangesAndFillBuffer();
++
++        if (getTaskFromBuffer())
++            return true;
++    }
++}
++
++
++bool MergeTreeBaseSelectProcessor::getTaskFromBuffer()
++{
++    while (!buffered_ranges.empty())
++    {
++        auto ranges = std::move(buffered_ranges.front());
++        buffered_ranges.pop_front();
++
++        assert(!ranges.empty());
++
++        auto res = performRequestToCoordinator(ranges, /*delayed=*/false);
++
++        if (Status::Accepted == res)
++            return true;
++
++        if (Status::Cancelled == res)
++            break;
++    }
++    return false;
++}
++
++
++bool MergeTreeBaseSelectProcessor::getDelayedTasks()
++{
++    while (!delayed_tasks.empty())
++    {
++        task = std::move(delayed_tasks.front());
++        delayed_tasks.pop_front();
++
++        assert(!task->mark_ranges.empty());
++
++        auto res = performRequestToCoordinator(task->mark_ranges, /*delayed=*/true);
++
++        if (Status::Accepted == res)
++            return true;
++
++        if (Status::Cancelled == res)
++            break;
++    }
++
++    finish();
++    return false;
++}
++
++
+ Chunk MergeTreeBaseSelectProcessor::generate()
+ {
+     while (!isCancelled())
+@@ -479,6 +569,163 @@ std::unique_ptr<MergeTreeBlockSizePredictor> MergeTreeBaseSelectProcessor::getSi
+         data_part, Names(complete_column_names.begin(), complete_column_names.end()), sample_block);
+ }
+ 
++
++MergeTreeBaseSelectProcessor::Status MergeTreeBaseSelectProcessor::performRequestToCoordinator(MarkRanges requested_ranges, bool delayed)
++{
++    String partition_id = task->data_part->info.partition_id;
++    String part_name;
++    String projection_name;
++
++    if (task->data_part->isProjectionPart())
++    {
++        part_name = task->data_part->getParentPart()->name;
++        projection_name  = task->data_part->name;
++    }
++    else
++    {
++        part_name = task->data_part->name;
++        projection_name = "";
++    }
++
++    PartBlockRange block_range
++    {
++        .begin = task->data_part->info.min_block,
++        .end = task->data_part->info.max_block
++    };
++
++    PartitionReadRequest request
++    {
++        .partition_id = std::move(partition_id),
++        .part_name = std::move(part_name),
++        .projection_name = std::move(projection_name),
++        .block_range = std::move(block_range),
++        .mark_ranges = std::move(requested_ranges)
++    };
++
++    /// Constistent hashing won't work with reading in order, because at the end of the execution
++    /// we could possibly seek back
++    if (!delayed && canUseConsistentHashingForParallelReading())
++    {
++        const auto hash = request.getConsistentHash(extension->count_participating_replicas);
++        if (hash != extension->number_of_current_replica)
++        {
++            auto delayed_task = std::make_unique<MergeTreeReadTask>(*task); // Create a copy
++            delayed_task->mark_ranges = std::move(request.mark_ranges);
++            delayed_tasks.emplace_back(std::move(delayed_task));
++            return Status::Denied;
++        }
++    }
++
++    auto optional_response = extension.value().callback(std::move(request));
++
++    if (!optional_response.has_value())
++        return Status::Cancelled;
++
++    auto response = optional_response.value();
++
++    task->mark_ranges = std::move(response.mark_ranges);
++
++    if (response.denied || task->mark_ranges.empty())
++        return Status::Denied;
++
++    finalizeNewTask();
++
++    return Status::Accepted;
++}
++
++
++size_t MergeTreeBaseSelectProcessor::estimateMaxBatchSizeForHugeRanges()
++{
++    /// This is an empirical number and it is so,
++    /// because we have an adaptive granularity by default.
++    const size_t average_granule_size_bytes = 8UL * 1024 * 1024 * 10; // 10 MiB
++
++    /// We want to have one RTT per one gigabyte of data read from disk
++    /// this could be configurable.
++    const size_t max_size_for_one_request = 8UL * 1024 * 1024 * 1024; // 1 GiB
++
++    size_t sum_average_marks_size = 0;
++    /// getColumnSize is not fully implemented for compact parts
++    if (task->data_part->getType() == IMergeTreeDataPart::Type::COMPACT)
++    {
++        sum_average_marks_size = average_granule_size_bytes;
++    }
++    else
++    {
++        for (const auto & name : extension->colums_to_read)
++        {
++            auto size = task->data_part->getColumnSize(name);
++
++            assert(size.marks != 0);
++            sum_average_marks_size += size.data_uncompressed / size.marks;
++        }
++    }
++
++    if (sum_average_marks_size == 0)
++        sum_average_marks_size = average_granule_size_bytes; // 10 MiB
++
++    LOG_TEST(log, "Reading from {} part, average mark size is {}",
++        task->data_part->getTypeName(), sum_average_marks_size);
++
++    return max_size_for_one_request / sum_average_marks_size;
++}
++
++void MergeTreeBaseSelectProcessor::splitCurrentTaskRangesAndFillBuffer()
++{
++    const size_t max_batch_size = estimateMaxBatchSizeForHugeRanges();
++
++    size_t current_batch_size = 0;
++    buffered_ranges.emplace_back();
++
++    for (const auto & range : task->mark_ranges)
++    {
++        auto expand_if_needed = [&]
++        {
++            if (current_batch_size > max_batch_size)
++            {
++                buffered_ranges.emplace_back();
++                current_batch_size = 0;
++            }
++        };
++
++        expand_if_needed();
++
++        if (range.end - range.begin < max_batch_size)
++        {
++            buffered_ranges.back().push_back(range);
++            current_batch_size += range.end - range.begin;
++            continue;
++        }
++
++        auto current_begin = range.begin;
++        auto current_end = range.begin + max_batch_size;
++
++        while (current_end < range.end)
++        {
++            auto current_range = MarkRange{current_begin, current_end};
++            buffered_ranges.back().push_back(current_range);
++            current_batch_size += current_end - current_begin;
++
++            current_begin = current_end;
++            current_end = current_end + max_batch_size;
++
++            expand_if_needed();
++        }
++
++        if (range.end - current_begin > 0)
++        {
++            auto current_range = MarkRange{current_begin, range.end};
++            buffered_ranges.back().push_back(current_range);
++            current_batch_size += range.end - current_begin;
++
++            expand_if_needed();
++        }
++    }
++
++    if (buffered_ranges.back().empty())
++        buffered_ranges.pop_back();
++}
++
+ MergeTreeBaseSelectProcessor::~MergeTreeBaseSelectProcessor() = default;
+ 
+ }
+diff --git a/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.h b/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.h
+index d102e4f07a4e..c462c34aa835 100644
+--- a/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.h
++++ b/src/Storages/MergeTree/MergeTreeBaseSelectProcessor.h
+@@ -3,6 +3,7 @@
+ #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+ #include <Storages/MergeTree/MergeTreeData.h>
+ #include <Storages/SelectQueryInfo.h>
++#include <Storages/MergeTree/RequestResponse.h>
+ 
+ #include <Processors/Sources/SourceWithProgress.h>
+ 
+@@ -15,6 +16,18 @@ class UncompressedCache;
+ class MarkCache;
+ struct PrewhereExprInfo;
+ 
++
++struct ParallelReadingExtension
++{
++    MergeTreeReadTaskCallback callback;
++    size_t count_participating_replicas{0};
++    size_t number_of_current_replica{0};
++    /// This is needed to estimate the number of bytes
++    /// between a pair of marks to perform one request
++    /// over the network for a 1Gb of data.
++    Names colums_to_read;
++};
++
+ /// Base class for MergeTreeThreadSelectProcessor and MergeTreeSelectProcessor
+ class MergeTreeBaseSelectProcessor : public SourceWithProgress
+ {
+@@ -30,7 +43,8 @@ class MergeTreeBaseSelectProcessor : public SourceWithProgress
+         UInt64 preferred_max_column_in_block_size_bytes_,
+         const MergeTreeReaderSettings & reader_settings_,
+         bool use_uncompressed_cache_,
+-        const Names & virt_column_names_ = {});
++        const Names & virt_column_names_ = {},
++        std::optional<ParallelReadingExtension> extension = {});
+ 
+     ~MergeTreeBaseSelectProcessor() override;
+ 
+@@ -43,10 +57,22 @@ class MergeTreeBaseSelectProcessor : public SourceWithProgress
+         const Block & sample_block);
+ 
+ protected:
++
+     Chunk generate() final;
+ 
+-    /// Creates new this->task, and initializes readers.
+-    virtual bool getNewTask() = 0;
++    /// Creates new this->task and return a flag whether it was successful or not
++    virtual bool getNewTaskImpl() = 0;
++    /// Creates new readers for a task it is needed. These methods are separate, because
++    /// in case of parallel reading from replicas the whole task could be denied by a coodinator
++    /// or it could modified somehow.
++    virtual void finalizeNewTask() = 0;
++
++    size_t estimateMaxBatchSizeForHugeRanges();
++
++    virtual bool canUseConsistentHashingForParallelReading() { return false; }
++
++    /// Closes readers and unlock part locks
++    virtual void finish() = 0;
+ 
+     virtual Chunk readFromPart();
+ 
+@@ -82,14 +108,62 @@ class MergeTreeBaseSelectProcessor : public SourceWithProgress
+     /// This header is used for chunks from readFromPart().
+     Block header_without_virtual_columns;
+ 
+-    std::unique_ptr<MergeTreeReadTask> task;
+-
+     std::shared_ptr<UncompressedCache> owned_uncompressed_cache;
+     std::shared_ptr<MarkCache> owned_mark_cache;
+ 
+     using MergeTreeReaderPtr = std::unique_ptr<IMergeTreeReader>;
+     MergeTreeReaderPtr reader;
+     MergeTreeReaderPtr pre_reader;
++
++    MergeTreeReadTaskPtr task;
++
++    std::optional<ParallelReadingExtension> extension;
++    bool no_more_tasks{false};
++    std::deque<MergeTreeReadTaskPtr> delayed_tasks;
++    std::deque<MarkRanges> buffered_ranges;
++
++private:
++    Poco::Logger * log = &Poco::Logger::get("MergeTreeBaseSelectProcessor");
++
++    enum class Status
++    {
++        Accepted,
++        Cancelled,
++        Denied
++    };
++
++    /// Calls getNewTaskImpl() to get new task, then performs a request to a coordinator
++    /// The coordinator may modify the set of ranges to read from a part or could
++    /// deny the whole request. In the latter case it creates new task and retries.
++    /// Then it calls finalizeNewTask() to create readers for a task if it is needed.
++    bool getNewTask();
++    bool getNewTaskParallelReading();
++
++    /// After PK analysis the range of marks could be extremely big
++    /// We divide this range to a set smaller consecutive ranges
++    /// Then, depending on the type of reading (concurrent, in order or in reverse order)
++    /// we can calculate a consistent hash function with the number of buckets equal to
++    /// the number of replicas involved. And after that we can throw away some ranges with
++    /// hash not equals to the number of the current replica.
++    bool getTaskFromBuffer();
++
++    /// But we can't throw that ranges completely, because if we have different sets of parts
++    /// on replicas (have merged part on one, but not on another), then such a situation is possible
++    /// - Coordinator allows to read from a big merged part, but this part is present only on one replica.
++    ///   And that replica calculates consistent hash and throws away some ranges
++    /// - Coordinator denies other replicas to read from another parts (source parts for that big one)
++    /// At the end, the result of the query is wrong, because we didn't read all the data.
++    /// So, we have to remember parts and mark ranges with hash different then current replica number.
++    /// An we have to ask the coordinator about its permission to read from that "delayed" parts.
++    /// It won't work with reading in order or reading in reverse order, because we can possibly seek back.
++    bool getDelayedTasks();
++
++    /// It will form a request a request to coordinator and
++    /// then reinitialize the mark ranges of this->task object
++    Status performRequestToCoordinator(MarkRanges requested_ranges, bool delayed);
++
++    void splitCurrentTaskRangesAndFillBuffer();
++
+ };
+ 
+ }
+diff --git a/src/Storages/MergeTree/MergeTreeBlockReadUtils.cpp b/src/Storages/MergeTree/MergeTreeBlockReadUtils.cpp
+index 88f3052e8330..07d51d257001 100644
+--- a/src/Storages/MergeTree/MergeTreeBlockReadUtils.cpp
++++ b/src/Storages/MergeTree/MergeTreeBlockReadUtils.cpp
+@@ -128,8 +128,6 @@ MergeTreeReadTask::MergeTreeReadTask(
+ {
+ }
+ 
+-MergeTreeReadTask::~MergeTreeReadTask() = default;
+-
+ 
+ MergeTreeBlockSizePredictor::MergeTreeBlockSizePredictor(
+     const MergeTreeData::DataPartPtr & data_part_, const Names & columns, const Block & sample_block)
+@@ -175,8 +173,7 @@ void MergeTreeBlockSizePredictor::initialize(const Block & sample_block, const C
+             ColumnInfo info;
+             info.name = column_name;
+             /// If column isn't fixed and doesn't have checksum, than take first
+-            ColumnSize column_size = data_part->getColumnSize(
+-                column_name, *column_with_type_and_name.type);
++            ColumnSize column_size = data_part->getColumnSize(column_name);
+ 
+             info.bytes_per_row_global = column_size.data_uncompressed
+                 ? column_size.data_uncompressed / number_of_rows_in_part
+diff --git a/src/Storages/MergeTree/MergeTreeBlockReadUtils.h b/src/Storages/MergeTree/MergeTreeBlockReadUtils.h
+index 2dfe6fcf06da..b931a13c027d 100644
+--- a/src/Storages/MergeTree/MergeTreeBlockReadUtils.h
++++ b/src/Storages/MergeTree/MergeTreeBlockReadUtils.h
+@@ -14,7 +14,7 @@ struct MergeTreeReadTask;
+ struct MergeTreeBlockSizePredictor;
+ 
+ using MergeTreeReadTaskPtr = std::unique_ptr<MergeTreeReadTask>;
+-using MergeTreeBlockSizePredictorPtr = std::unique_ptr<MergeTreeBlockSizePredictor>;
++using MergeTreeBlockSizePredictorPtr = std::shared_ptr<MergeTreeBlockSizePredictor>;
+ 
+ 
+ /** If some of the requested columns are not in the part,
+@@ -59,8 +59,6 @@ struct MergeTreeReadTask
+         const Names & ordered_names_, const NameSet & column_name_set_, const NamesAndTypesList & columns_,
+         const NamesAndTypesList & pre_columns_, const bool remove_prewhere_column_, const bool should_reorder_,
+         MergeTreeBlockSizePredictorPtr && size_predictor_);
+-
+-    virtual ~MergeTreeReadTask();
+ };
+ 
+ struct MergeTreeReadTaskColumns
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 3cf7023053fd..e58472e572bf 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -3163,7 +3163,7 @@ void MergeTreeData::addPartContributionToColumnAndSecondaryIndexSizes(const Data
+     for (const auto & column : part->getColumns())
+     {
+         ColumnSize & total_column_size = column_sizes[column.name];
+-        ColumnSize part_column_size = part->getColumnSize(column.name, *column.type);
++        ColumnSize part_column_size = part->getColumnSize(column.name);
+         total_column_size.add(part_column_size);
+     }
+ 
+@@ -3181,7 +3181,7 @@ void MergeTreeData::removePartContributionToColumnAndSecondaryIndexSizes(const D
+     for (const auto & column : part->getColumns())
+     {
+         ColumnSize & total_column_size = column_sizes[column.name];
+-        ColumnSize part_column_size = part->getColumnSize(column.name, *column.type);
++        ColumnSize part_column_size = part->getColumnSize(column.name);
+ 
+         auto log_subtract = [&](size_t & from, size_t value, const char * field)
+         {
+diff --git a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+index 036e7d89c5ae..cdedd37e14ae 100644
+--- a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+@@ -124,7 +124,8 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
+     const UInt64 max_block_size,
+     const unsigned num_streams,
+     QueryProcessingStage::Enum processed_stage,
+-    std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read) const
++    std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read,
++    bool enable_parallel_reading) const
+ {
+     if (query_info.merge_tree_empty_result)
+         return std::make_unique<QueryPlan>();
+@@ -142,7 +143,8 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
+             max_block_size,
+             num_streams,
+             max_block_numbers_to_read,
+-            query_info.merge_tree_select_result_ptr);
++            query_info.merge_tree_select_result_ptr,
++            enable_parallel_reading);
+ 
+         if (plan->isInitialized() && settings.allow_experimental_projection_optimization && settings.force_optimize_projection
+             && !metadata_snapshot->projections.empty())
+@@ -184,7 +186,8 @@ QueryPlanPtr MergeTreeDataSelectExecutor::read(
+             max_block_size,
+             num_streams,
+             max_block_numbers_to_read,
+-            query_info.projection->merge_tree_projection_select_result_ptr);
++            query_info.projection->merge_tree_projection_select_result_ptr,
++            enable_parallel_reading);
+     }
+ 
+     if (projection_plan->isInitialized())
+@@ -1210,7 +1213,8 @@ QueryPlanPtr MergeTreeDataSelectExecutor::readFromParts(
+     const UInt64 max_block_size,
+     const unsigned num_streams,
+     std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read,
+-    MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr) const
++    MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr,
++    bool enable_parallel_reading) const
+ {
+     /// If merge_tree_select_result_ptr != nullptr, we use analyzed result so parts will always be empty.
+     if (merge_tree_select_result_ptr)
+@@ -1243,7 +1247,8 @@ QueryPlanPtr MergeTreeDataSelectExecutor::readFromParts(
+         sample_factor_column_queried,
+         max_block_numbers_to_read,
+         log,
+-        merge_tree_select_result_ptr
++        merge_tree_select_result_ptr,
++        enable_parallel_reading
+     );
+ 
+     QueryPlanPtr plan = std::make_unique<QueryPlan>();
+diff --git a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
+index f19d145fc93c..3dde324ce22d 100644
+--- a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
++++ b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
+@@ -34,7 +34,8 @@ class MergeTreeDataSelectExecutor
+         UInt64 max_block_size,
+         unsigned num_streams,
+         QueryProcessingStage::Enum processed_stage,
+-        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr) const;
++        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr,
++        bool enable_parallel_reading = false) const;
+ 
+     /// The same as read, but with specified set of parts.
+     QueryPlanPtr readFromParts(
+@@ -47,7 +48,8 @@ class MergeTreeDataSelectExecutor
+         UInt64 max_block_size,
+         unsigned num_streams,
+         std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr,
+-        MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr = nullptr) const;
++        MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr = nullptr,
++        bool enable_parallel_reading = false) const;
+ 
+     /// Get an estimation for the number of marks we are going to read.
+     /// Reads nothing. Secondary indexes are not used.
+diff --git a/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.cpp b/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.cpp
+index 48a9d62d8726..961106af51b2 100644
+--- a/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.cpp
++++ b/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.cpp
+@@ -8,14 +8,11 @@ namespace ErrorCodes
+     extern const int MEMORY_LIMIT_EXCEEDED;
+ }
+ 
+-bool MergeTreeInOrderSelectProcessor::getNewTask()
++bool MergeTreeInOrderSelectProcessor::getNewTaskImpl()
+ try
+ {
+     if (all_mark_ranges.empty())
+-    {
+-        finish();
+         return false;
+-    }
+ 
+     if (!reader)
+         initializeReaders();
+diff --git a/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.h b/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.h
+index ecf648b02916..467292d88bb7 100644
+--- a/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.h
++++ b/src/Storages/MergeTree/MergeTreeInOrderSelectProcessor.h
+@@ -12,7 +12,7 @@ class MergeTreeInOrderSelectProcessor final : public MergeTreeSelectProcessor
+ {
+ public:
+     template <typename... Args>
+-    MergeTreeInOrderSelectProcessor(Args &&... args)
++    explicit MergeTreeInOrderSelectProcessor(Args &&... args)
+         : MergeTreeSelectProcessor{std::forward<Args>(args)...}
+     {
+         LOG_DEBUG(log, "Reading {} ranges in order from part {}, approx. {} rows starting from {}",
+@@ -23,7 +23,8 @@ class MergeTreeInOrderSelectProcessor final : public MergeTreeSelectProcessor
+     String getName() const override { return "MergeTreeInOrder"; }
+ 
+ private:
+-    bool getNewTask() override;
++    bool getNewTaskImpl() override;
++    void finalizeNewTask() override {}
+ 
+     Poco::Logger * log = &Poco::Logger::get("MergeTreeInOrderSelectProcessor");
+ };
+diff --git a/src/Storages/MergeTree/MergeTreeRangeReader.cpp b/src/Storages/MergeTree/MergeTreeRangeReader.cpp
+index 124f13b14a8d..8481cee0f86f 100644
+--- a/src/Storages/MergeTree/MergeTreeRangeReader.cpp
++++ b/src/Storages/MergeTree/MergeTreeRangeReader.cpp
+@@ -14,6 +14,7 @@ namespace DB
+ namespace ErrorCodes
+ {
+     extern const int LOGICAL_ERROR;
++    extern const int BAD_ARGUMENTS;
+ }
+ 
+ 
+@@ -185,7 +186,7 @@ MergeTreeRangeReader::Stream::Stream(
+ void MergeTreeRangeReader::Stream::checkNotFinished() const
+ {
+     if (isFinished())
+-        throw Exception("Cannot read out of marks range.", ErrorCodes::LOGICAL_ERROR);
++        throw Exception("Cannot read out of marks range.", ErrorCodes::BAD_ARGUMENTS);
+ }
+ 
+ void MergeTreeRangeReader::Stream::checkEnoughSpaceInCurrentGranule(size_t num_rows) const
+@@ -290,7 +291,7 @@ void MergeTreeRangeReader::ReadResult::adjustLastGranule()
+     size_t num_rows_to_subtract = total_rows_per_granule - num_read_rows;
+ 
+     if (rows_per_granule.empty())
+-        throw Exception("Can't adjust last granule because no granules were added.", ErrorCodes::LOGICAL_ERROR);
++        throw Exception("Can't adjust last granule because no granules were added", ErrorCodes::LOGICAL_ERROR);
+ 
+     if (num_rows_to_subtract > rows_per_granule.back())
+         throw Exception(ErrorCodes::LOGICAL_ERROR,
+diff --git a/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.cpp b/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.cpp
+index 16ce9823ebbf..6c4059d64d0a 100644
+--- a/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.cpp
++++ b/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.cpp
+@@ -8,14 +8,11 @@ namespace ErrorCodes
+     extern const int MEMORY_LIMIT_EXCEEDED;
+ }
+ 
+-bool MergeTreeReverseSelectProcessor::getNewTask()
++bool MergeTreeReverseSelectProcessor::getNewTaskImpl()
+ try
+ {
+     if (chunks.empty() && all_mark_ranges.empty())
+-    {
+-        finish();
+         return false;
+-    }
+ 
+     /// We have some blocks to return in buffer.
+     /// Return true to continue reading, but actually don't create a task.
+diff --git a/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.h b/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.h
+index 18ab51c03a02..395f5d5cd2aa 100644
+--- a/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.h
++++ b/src/Storages/MergeTree/MergeTreeReverseSelectProcessor.h
+@@ -13,7 +13,7 @@ class MergeTreeReverseSelectProcessor final : public MergeTreeSelectProcessor
+ {
+ public:
+     template <typename... Args>
+-    MergeTreeReverseSelectProcessor(Args &&... args)
++    explicit MergeTreeReverseSelectProcessor(Args &&... args)
+         : MergeTreeSelectProcessor{std::forward<Args>(args)...}
+     {
+         LOG_DEBUG(log, "Reading {} ranges in reverse order from part {}, approx. {} rows starting from {}",
+@@ -24,7 +24,9 @@ class MergeTreeReverseSelectProcessor final : public MergeTreeSelectProcessor
+     String getName() const override { return "MergeTreeReverse"; }
+ 
+ private:
+-    bool getNewTask() override;
++    bool getNewTaskImpl() override;
++    void finalizeNewTask() override {}
++
+     Chunk readFromPart() override;
+ 
+     Chunks chunks;
+diff --git a/src/Storages/MergeTree/MergeTreeSelectProcessor.cpp b/src/Storages/MergeTree/MergeTreeSelectProcessor.cpp
+index 203ce7a57d28..2d4d3617cee9 100644
+--- a/src/Storages/MergeTree/MergeTreeSelectProcessor.cpp
++++ b/src/Storages/MergeTree/MergeTreeSelectProcessor.cpp
+@@ -22,12 +22,13 @@ MergeTreeSelectProcessor::MergeTreeSelectProcessor(
+     const MergeTreeReaderSettings & reader_settings_,
+     const Names & virt_column_names_,
+     size_t part_index_in_query_,
+-    bool has_limit_below_one_block_)
++    bool has_limit_below_one_block_,
++    std::optional<ParallelReadingExtension> extension_)
+     : MergeTreeBaseSelectProcessor{
+         metadata_snapshot_->getSampleBlockForColumns(required_columns_, storage_.getVirtuals(), storage_.getStorageID()),
+         storage_, metadata_snapshot_, prewhere_info_, std::move(actions_settings), max_block_size_rows_,
+         preferred_block_size_bytes_, preferred_max_column_in_block_size_bytes_,
+-        reader_settings_, use_uncompressed_cache_, virt_column_names_},
++        reader_settings_, use_uncompressed_cache_, virt_column_names_, extension_},
+     required_columns{std::move(required_columns_)},
+     data_part{owned_data_part_},
+     sample_block(metadata_snapshot_->getSampleBlock()),
+@@ -36,7 +37,11 @@ MergeTreeSelectProcessor::MergeTreeSelectProcessor(
+     has_limit_below_one_block(has_limit_below_one_block_),
+     total_rows(data_part->index_granularity.getRowsCountInRanges(all_mark_ranges))
+ {
+-    addTotalRowsApprox(total_rows);
++    /// Actually it means that parallel reading from replicas enabled
++    /// and we have to collaborate with initiator.
++    /// In this case we won't set approximate rows, because it will be accounted multiple times
++    if (!extension_.has_value())
++        addTotalRowsApprox(total_rows);
+     ordered_names = header_without_virtual_columns.getNames();
+ }
+ 
+@@ -64,6 +69,7 @@ void MergeTreeSelectProcessor::initializeReaders()
+ 
+ }
+ 
++
+ void MergeTreeSelectProcessor::finish()
+ {
+     /** Close the files (before destroying the object).
+diff --git a/src/Storages/MergeTree/MergeTreeSelectProcessor.h b/src/Storages/MergeTree/MergeTreeSelectProcessor.h
+index f9b19f9f692f..2ecdc3b59a8f 100644
+--- a/src/Storages/MergeTree/MergeTreeSelectProcessor.h
++++ b/src/Storages/MergeTree/MergeTreeSelectProcessor.h
+@@ -31,17 +31,16 @@ class MergeTreeSelectProcessor : public MergeTreeBaseSelectProcessor
+         const MergeTreeReaderSettings & reader_settings,
+         const Names & virt_column_names = {},
+         size_t part_index_in_query_ = 0,
+-        bool has_limit_below_one_block_ = false);
++        bool has_limit_below_one_block_ = false,
++        std::optional<ParallelReadingExtension> extension_ = {});
+ 
+     ~MergeTreeSelectProcessor() override;
+ 
+-    /// Closes readers and unlock part locks
+-    void finish();
+-
+ protected:
+     /// Defer initialization from constructor, because it may be heavy
+-    /// and it's better to do it lazily in `getNewTask`, which is executing in parallel.
++    /// and it's better to do it lazily in `getNewTaskImpl`, which is executing in parallel.
+     void initializeReaders();
++    void finish() override final;
+ 
+     /// Used by Task
+     Names required_columns;
+diff --git a/src/Storages/MergeTree/MergeTreeSequentialSource.cpp b/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
+index df8d6a7c127b..687458ee681a 100644
+--- a/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
++++ b/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
+@@ -36,6 +36,8 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
+                 data_part->getMarksCount(), data_part->name, data_part->rows_count);
+     }
+ 
++    /// Note, that we don't check setting collaborate_with_coordinator presence, because this source
++    /// is only used in background merges.
+     addTotalRowsApprox(data_part->rows_count);
+ 
+     /// Add columns because we don't want to read empty blocks
+diff --git a/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.cpp b/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.cpp
+index 6a8ef860c874..6a44da06f1f6 100644
+--- a/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.cpp
++++ b/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.cpp
+@@ -7,6 +7,10 @@
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
+ 
+ MergeTreeThreadSelectProcessor::MergeTreeThreadSelectProcessor(
+     const size_t thread_,
+@@ -21,12 +25,13 @@ MergeTreeThreadSelectProcessor::MergeTreeThreadSelectProcessor(
+     const PrewhereInfoPtr & prewhere_info_,
+     ExpressionActionsSettings actions_settings,
+     const MergeTreeReaderSettings & reader_settings_,
+-    const Names & virt_column_names_)
++    const Names & virt_column_names_,
++    std::optional<ParallelReadingExtension> extension_)
+     :
+     MergeTreeBaseSelectProcessor{
+         pool_->getHeader(), storage_, metadata_snapshot_, prewhere_info_, std::move(actions_settings), max_block_size_rows_,
+         preferred_block_size_bytes_, preferred_max_column_in_block_size_bytes_,
+-        reader_settings_, use_uncompressed_cache_, virt_column_names_},
++        reader_settings_, use_uncompressed_cache_, virt_column_names_, extension_},
+     thread{thread_},
+     pool{pool_}
+ {
+@@ -39,28 +44,61 @@ MergeTreeThreadSelectProcessor::MergeTreeThreadSelectProcessor(
+         min_marks_to_read = (min_marks_to_read_ * fixed_index_granularity + max_block_size_rows - 1)
+             / max_block_size_rows * max_block_size_rows / fixed_index_granularity;
+     }
++    else if (extension.has_value())
++    {
++        /// Parallel reading from replicas is enabled.
++        /// We try to estimate the average number of bytes in a granule
++        /// to make one request over the network per one gigabyte of data
++        /// Actually we will ask MergeTreeReadPool to provide us heavier tasks to read
++        /// because the most part of each task will be postponed
++        /// (due to using consistent hash for better cache affinity)
++        const size_t amount_of_read_bytes_per_one_request = 1024 * 1024 * 1024; // 1GiB
++        /// In case of reading from compact parts (for which we can't estimate the average size of marks)
++        /// we will use this value
++        const size_t empirical_size_of_mark = 1024 * 1024 * 10; // 10 MiB
++
++        if (extension->colums_to_read.empty())
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "A set of column to read is empty. It is a bug");
++
++        size_t sum_average_marks_size = 0;
++        auto column_sizes = storage.getColumnSizes();
++        for (const auto & name : extension->colums_to_read)
++        {
++            auto it = column_sizes.find(name);
++            if (it == column_sizes.end())
++                continue;
++            auto size = it->second;
++
++            if (size.data_compressed == 0 || size.data_uncompressed == 0 || size.marks == 0)
++                continue;
++
++            sum_average_marks_size += size.data_uncompressed / size.marks;
++        }
++
++        if (sum_average_marks_size == 0)
++            sum_average_marks_size = empirical_size_of_mark * extension->colums_to_read.size();
++
++        min_marks_to_read = extension->count_participating_replicas * amount_of_read_bytes_per_one_request / sum_average_marks_size;
++    }
+     else
++    {
+         min_marks_to_read = min_marks_to_read_;
++    }
++
+ 
+     ordered_names = getPort().getHeader().getNames();
+ }
+ 
+ /// Requests read task from MergeTreeReadPool and signals whether it got one
+-bool MergeTreeThreadSelectProcessor::getNewTask()
++bool MergeTreeThreadSelectProcessor::getNewTaskImpl()
+ {
+     task = pool->getTask(min_marks_to_read, thread, ordered_names);
++    return static_cast<bool>(task);
++}
+ 
+-    if (!task)
+-    {
+-        /** Close the files (before destroying the object).
+-          * When many sources are created, but simultaneously reading only a few of them,
+-          * buffers don't waste memory.
+-          */
+-        reader.reset();
+-        pre_reader.reset();
+-        return false;
+-    }
+ 
++void MergeTreeThreadSelectProcessor::finalizeNewTask()
++{
+     const std::string part_name = task->data_part->isProjectionPart() ? task->data_part->getParentPart()->name : task->data_part->name;
+ 
+     /// Allows pool to reduce number of threads in case of too slow reads.
+@@ -99,8 +137,13 @@ bool MergeTreeThreadSelectProcessor::getNewTask()
+     }
+ 
+     last_readed_part_name = part_name;
++}
+ 
+-    return true;
++
++void MergeTreeThreadSelectProcessor::finish()
++{
++    reader.reset();
++    pre_reader.reset();
+ }
+ 
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.h b/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.h
+index d17b15c36356..110c4fa34e65 100644
+--- a/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.h
++++ b/src/Storages/MergeTree/MergeTreeThreadSelectProcessor.h
+@@ -11,7 +11,7 @@ class MergeTreeReadPool;
+ /** Used in conjunction with MergeTreeReadPool, asking it for more work to do and performing whatever reads it is asked
+   * to perform.
+   */
+-class MergeTreeThreadSelectProcessor : public MergeTreeBaseSelectProcessor
++class MergeTreeThreadSelectProcessor final : public MergeTreeBaseSelectProcessor
+ {
+ public:
+     MergeTreeThreadSelectProcessor(
+@@ -27,8 +27,8 @@ class MergeTreeThreadSelectProcessor : public MergeTreeBaseSelectProcessor
+         const PrewhereInfoPtr & prewhere_info_,
+         ExpressionActionsSettings actions_settings,
+         const MergeTreeReaderSettings & reader_settings_,
+-
+-        const Names & virt_column_names_);
++        const Names & virt_column_names_,
++        std::optional<ParallelReadingExtension> extension_);
+ 
+     String getName() const override { return "MergeTreeThread"; }
+ 
+@@ -36,7 +36,13 @@ class MergeTreeThreadSelectProcessor : public MergeTreeBaseSelectProcessor
+ 
+ protected:
+     /// Requests read task from MergeTreeReadPool and signals whether it got one
+-    bool getNewTask() override;
++    bool getNewTaskImpl() override;
++
++    void finalizeNewTask() override;
++
++    void finish() override;
++
++    bool canUseConsistentHashingForParallelReading() override { return true; }
+ 
+ private:
+     /// "thread" index (there are N threads and each thread is assigned index in interval [0..N-1])
+diff --git a/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp
+new file mode 100644
+index 000000000000..80f438a46dbc
+--- /dev/null
++++ b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp
+@@ -0,0 +1,143 @@
++#include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
++
++#include <algorithm>
++#include <vector>
++#include <compare>
++#include <numeric>
++#include <unordered_map>
++#include <map>
++#include <iostream>
++#include <set>
++#include <cassert>
++
++
++#include <base/logger_useful.h>
++#include <base/types.h>
++#include <base/scope_guard.h>
++#include <Common/Stopwatch.h>
++#include "IO/WriteBufferFromString.h"
++#include <Storages/MergeTree/MarkRange.h>
++#include <Storages/MergeTree/IntersectionsIndexes.h>
++
++namespace DB
++{
++
++class ParallelReplicasReadingCoordinator::Impl
++{
++public:
++    using PartitionReadRequestPtr = std::unique_ptr<PartitionReadRequest>;
++    using PartToMarkRanges = std::map<PartToRead::PartAndProjectionNames, HalfIntervals>;
++
++    struct PartitionReading
++    {
++        PartSegments part_ranges;
++        PartToMarkRanges mark_ranges_in_part;
++    };
++
++    using PartitionToBlockRanges = std::map<String, PartitionReading>;
++    PartitionToBlockRanges partitions;
++
++    std::mutex mutex;
++
++    PartitionReadResponse handleRequest(PartitionReadRequest request);
++};
++
++
++PartitionReadResponse ParallelReplicasReadingCoordinator::Impl::handleRequest(PartitionReadRequest request)
++{
++    AtomicStopwatch watch;
++    std::lock_guard lock(mutex);
++
++    auto partition_it = partitions.find(request.partition_id);
++
++    SCOPE_EXIT({
++        LOG_TRACE(&Poco::Logger::get("ParallelReplicasReadingCoordinator"), "Time for handling request: {}ns", watch.elapsed());
++    });
++
++    PartToRead::PartAndProjectionNames part_and_projection
++    {
++        .part = request.part_name,
++        .projection = request.projection_name
++    };
++
++    /// We are the first who wants to process parts in partition
++    if (partition_it == partitions.end())
++    {
++        PartitionReading partition_reading;
++
++        PartToRead part_to_read;
++        part_to_read.range = request.block_range;
++        part_to_read.name = part_and_projection;
++
++        partition_reading.part_ranges.addPart(std::move(part_to_read));
++
++        /// As this query is first in partition, we will accept all ranges from it.
++        /// We need just to update our state.
++        auto request_ranges = HalfIntervals::initializeFromMarkRanges(request.mark_ranges);
++        auto mark_ranges_index = HalfIntervals::initializeWithEntireSpace();
++        mark_ranges_index.intersect(request_ranges.negate());
++
++        partition_reading.mark_ranges_in_part.insert({part_and_projection, std::move(mark_ranges_index)});
++        partitions.insert({request.partition_id, std::move(partition_reading)});
++
++        return {.denied = false, .mark_ranges = std::move(request.mark_ranges)};
++    }
++
++    auto & partition_reading = partition_it->second;
++
++    PartToRead part_to_read;
++    part_to_read.range = request.block_range;
++    part_to_read.name = part_and_projection;
++
++    auto part_intersection_res = partition_reading.part_ranges.getIntersectionResult(part_to_read);
++
++    switch (part_intersection_res)
++    {
++        case PartSegments::IntersectionResult::REJECT:
++        {
++            return {.denied = true, .mark_ranges = {}};
++        }
++        case PartSegments::IntersectionResult::EXACTLY_ONE_INTERSECTION:
++        {
++            auto marks_it = partition_reading.mark_ranges_in_part.find(part_and_projection);
++
++            auto & intervals_to_do = marks_it->second;
++            auto result = HalfIntervals::initializeFromMarkRanges(request.mark_ranges);
++            result.intersect(intervals_to_do);
++
++            /// Update intervals_to_do
++            intervals_to_do.intersect(HalfIntervals::initializeFromMarkRanges(std::move(request.mark_ranges)).negate());
++
++            auto result_ranges = result.convertToMarkRangesFinal();
++            const bool denied = result_ranges.empty();
++            return {.denied = denied, .mark_ranges = std::move(result_ranges)};
++        }
++        case PartSegments::IntersectionResult::NO_INTERSECTION:
++        {
++            partition_reading.part_ranges.addPart(std::move(part_to_read));
++
++            auto mark_ranges_index = HalfIntervals::initializeWithEntireSpace().intersect(
++            HalfIntervals::initializeFromMarkRanges(request.mark_ranges).negate()
++            );
++            partition_reading.mark_ranges_in_part.insert({part_and_projection, std::move(mark_ranges_index)});
++
++            return {.denied = false, .mark_ranges = std::move(request.mark_ranges)};
++        }
++    }
++
++    __builtin_unreachable();
++}
++
++PartitionReadResponse ParallelReplicasReadingCoordinator::handleRequest(PartitionReadRequest request)
++{
++    return pimpl->handleRequest(std::move(request));
++}
++
++ParallelReplicasReadingCoordinator::ParallelReplicasReadingCoordinator()
++{
++    pimpl = std::make_unique<ParallelReplicasReadingCoordinator::Impl>();
++}
++
++ParallelReplicasReadingCoordinator::~ParallelReplicasReadingCoordinator() = default;
++
++}
+diff --git a/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.h b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.h
+new file mode 100644
+index 000000000000..af74e0fae49b
+--- /dev/null
++++ b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <memory>
++#include <Storages/MergeTree/RequestResponse.h>
++
++namespace DB
++{
++
++class ParallelReplicasReadingCoordinator
++{
++public:
++    ParallelReplicasReadingCoordinator();
++    ~ParallelReplicasReadingCoordinator();
++    PartitionReadResponse handleRequest(PartitionReadRequest request);
++private:
++    class Impl;
++    std::unique_ptr<Impl> pimpl;
++};
++
++}
+diff --git a/src/Storages/MergeTree/RequestResponse.cpp b/src/Storages/MergeTree/RequestResponse.cpp
+new file mode 100644
+index 000000000000..a266540b99ad
+--- /dev/null
++++ b/src/Storages/MergeTree/RequestResponse.cpp
+@@ -0,0 +1,141 @@
++#include <Storages/MergeTree/RequestResponse.h>
++
++#include <Core/ProtocolDefines.h>
++#include <Common/SipHash.h>
++#include <IO/WriteHelpers.h>
++#include <IO/ReadHelpers.h>
++
++#include <consistent_hashing.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int UNKNOWN_PROTOCOL;
++}
++
++static void readMarkRangesBinary(MarkRanges & ranges, ReadBuffer & buf, size_t MAX_RANGES_SIZE = DEFAULT_MAX_STRING_SIZE)
++{
++    size_t size = 0;
++    readVarUInt(size, buf);
++
++    if (size > MAX_RANGES_SIZE)
++        throw Poco::Exception("Too large ranges size.");
++
++    ranges.resize(size);
++    for (size_t i = 0; i < size; ++i)
++    {
++        readBinary(ranges[i].begin, buf);
++        readBinary(ranges[i].end, buf);
++    }
++}
++
++
++static void writeMarkRangesBinary(const MarkRanges & ranges, WriteBuffer & buf)
++{
++    writeVarUInt(ranges.size(), buf);
++
++    for (const auto & [begin, end] : ranges)
++    {
++        writeBinary(begin, buf);
++        writeBinary(end, buf);
++    }
++}
++
++
++void PartitionReadRequest::serialize(WriteBuffer & out) const
++{
++    /// Must be the first
++    writeVarUInt(DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION, out);
++
++    writeStringBinary(partition_id, out);
++    writeStringBinary(part_name, out);
++    writeStringBinary(projection_name, out);
++
++    writeVarInt(block_range.begin, out);
++    writeVarInt(block_range.end, out);
++
++    writeMarkRangesBinary(mark_ranges, out);
++}
++
++
++void PartitionReadRequest::describe(WriteBuffer & out) const
++{
++    String result;
++    result += fmt::format("partition_id: {} 
+", partition_id);
++    result += fmt::format("part_name: {} 
+", part_name);
++    result += fmt::format("projection_name: {} 
+", projection_name);
++    result += fmt::format("block_range: ({}, {}) 
+", block_range.begin, block_range.end);
++    result += "mark_ranges: ";
++    for (const auto & range : mark_ranges)
++        result += fmt::format("({}, {}) ", range.begin, range.end);
++    result += '
+';
++    out.write(result.c_str(), result.size());
++}
++
++void PartitionReadRequest::deserialize(ReadBuffer & in)
++{
++    UInt64 version;
++    readVarUInt(version, in);
++    if (version != DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION)
++        throw Exception(ErrorCodes::UNKNOWN_PROTOCOL, "Protocol versions for parallel reading \
++            from replicas differ. Got: {}, supported version: {}",
++            version, DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION);
++
++    readStringBinary(partition_id, in);
++    readStringBinary(part_name, in);
++    readStringBinary(projection_name, in);
++
++    readVarInt(block_range.begin, in);
++    readVarInt(block_range.end, in);
++
++    readMarkRangesBinary(mark_ranges, in);
++}
++
++UInt64 PartitionReadRequest::getConsistentHash(size_t buckets) const
++{
++    auto hash = SipHash();
++    hash.update(partition_id);
++    hash.update(part_name);
++    hash.update(projection_name);
++
++    hash.update(block_range.begin);
++    hash.update(block_range.end);
++
++    for (const auto & range : mark_ranges)
++    {
++        hash.update(range.begin);
++        hash.update(range.end);
++    }
++
++    return ConsistentHashing(hash.get64(), buckets);
++}
++
++
++void PartitionReadResponse::serialize(WriteBuffer & out) const
++{
++    /// Must be the first
++    writeVarUInt(DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION, out);
++
++    writeVarUInt(static_cast<UInt64>(denied), out);
++    writeMarkRangesBinary(mark_ranges, out);
++}
++
++
++void PartitionReadResponse::deserialize(ReadBuffer & in)
++{
++    UInt64 version;
++    readVarUInt(version, in);
++    if (version != DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION)
++        throw Exception(ErrorCodes::UNKNOWN_PROTOCOL, "Protocol versions for parallel reading \
++            from replicas differ. Got: {}, supported version: {}",
++            version, DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION);
++
++    UInt64 value;
++    readVarUInt(value, in);
++    denied = static_cast<bool>(value);
++    readMarkRangesBinary(mark_ranges, in);
++}
++
++}
+diff --git a/src/Storages/MergeTree/RequestResponse.h b/src/Storages/MergeTree/RequestResponse.h
+new file mode 100644
+index 000000000000..85c8f7181af2
+--- /dev/null
++++ b/src/Storages/MergeTree/RequestResponse.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <functional>
++#include <optional>
++
++#include <base/types.h>
++
++#include <IO/WriteBuffer.h>
++#include <IO/ReadBuffer.h>
++
++#include <Storages/MergeTree/MarkRange.h>
++
++
++namespace DB
++{
++
++/// Represents a segment [left; right]
++struct PartBlockRange
++{
++    Int64 begin;
++    Int64 end;
++
++    bool operator==(const PartBlockRange & rhs) const
++    {
++        return begin == rhs.begin && end == rhs.end;
++    }
++};
++
++struct PartitionReadRequest
++{
++    String partition_id;
++    String part_name;
++    String projection_name;
++    PartBlockRange block_range;
++    MarkRanges mark_ranges;
++
++    void serialize(WriteBuffer & out) const;
++    void describe(WriteBuffer & out) const;
++    void deserialize(ReadBuffer & in);
++
++    UInt64 getConsistentHash(size_t buckets) const;
++};
++
++struct PartitionReadResponse
++{
++    bool denied{false};
++    MarkRanges mark_ranges{};
++
++    void serialize(WriteBuffer & out) const;
++    void deserialize(ReadBuffer & in);
++};
++
++
++using MergeTreeReadTaskCallback = std::function<std::optional<PartitionReadResponse>(PartitionReadRequest)>;
++
++
++}
+diff --git a/src/Storages/StorageDistributed.cpp b/src/Storages/StorageDistributed.cpp
+index a45afd847e6a..e033d319fc8c 100644
+--- a/src/Storages/StorageDistributed.cpp
++++ b/src/Storages/StorageDistributed.cpp
+@@ -110,6 +110,7 @@ namespace ErrorCodes
+     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+     extern const int INCORRECT_NUMBER_OF_COLUMNS;
+     extern const int INFINITE_LOOP;
++    extern const int ILLEGAL_FINAL;
+     extern const int TYPE_MISMATCH;
+     extern const int TOO_MANY_ROWS;
+     extern const int UNABLE_TO_SKIP_UNUSED_SHARDS;
+@@ -273,7 +274,7 @@ size_t getClusterQueriedNodes(const Settings & settings, const ClusterPtr & clus
+ {
+     size_t num_local_shards = cluster->getLocalShardCount();
+     size_t num_remote_shards = cluster->getRemoteShardCount();
+-    return (num_remote_shards * settings.max_parallel_replicas) + num_local_shards;
++    return (num_remote_shards + num_local_shards) * settings.max_parallel_replicas;
+ }
+ 
+ }
+@@ -590,6 +591,10 @@ void StorageDistributed::read(
+     const size_t /*max_block_size*/,
+     const unsigned /*num_streams*/)
+ {
++    const auto * select_query = query_info.query->as<ASTSelectQuery>();
++    if (select_query->final() && local_context->getSettingsRef().allow_experimental_parallel_reading_from_replicas)
++        throw Exception(ErrorCodes::ILLEGAL_FINAL, "Final modifier is not allowed together with parallel reading from replicas feature");
++
+     const auto & modified_query_ast = rewriteSelectQuery(
+         query_info.query, remote_database, remote_table, remote_table_function_ptr);
+ 
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 8a3d786532ea..470a406dbe4d 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -191,7 +191,14 @@ void StorageMergeTree::read(
+     size_t max_block_size,
+     unsigned num_streams)
+ {
+-    if (auto plan = reader.read(column_names, metadata_snapshot, query_info, local_context, max_block_size, num_streams, processed_stage))
++    /// If true, then we will ask initiator if we can read chosen ranges
++    bool enable_parallel_reading = local_context->getClientInfo().collaborate_with_initiator;
++
++    if (enable_parallel_reading)
++        LOG_TRACE(log, "Parallel reading from replicas enabled {}", enable_parallel_reading);
++
++    if (auto plan = reader.read(
++        column_names, metadata_snapshot, query_info, local_context, max_block_size, num_streams, processed_stage, nullptr, enable_parallel_reading))
+         query_plan = std::move(*plan);
+ }
+ 
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 852e2b10e6cb..132d69344a12 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -48,8 +48,10 @@
+ #include <Parsers/ASTSetQuery.h>
+ 
+ #include <Processors/QueryPlan/QueryPlan.h>
++#include <Processors/Sources/RemoteSource.h>
+ #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+ #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
++#include <Processors/QueryPlan/ReadFromPreparedSource.h>
+ 
+ #include <IO/ReadBufferFromString.h>
+ #include <IO/Operators.h>
+@@ -61,6 +63,8 @@
+ #include <Interpreters/Context.h>
+ #include <Interpreters/DDLTask.h>
+ #include <Interpreters/InterserverCredentials.h>
++#include <Interpreters/SelectQueryOptions.h>
++#include <Interpreters/InterpreterSelectQuery.h>
+ 
+ #include <Poco/DirectoryIterator.h>
+ 
+@@ -4227,6 +4231,9 @@ void StorageReplicatedMergeTree::read(
+     const size_t max_block_size,
+     const unsigned num_streams)
+ {
++    /// If true, then we will ask initiator if we can read chosen ranges
++    const bool enable_parallel_reading = local_context->getClientInfo().collaborate_with_initiator;
++
+     /** The `select_sequential_consistency` setting has two meanings:
+     * 1. To throw an exception if on a replica there are not all parts which have been written down on quorum of remaining replicas.
+     * 2. Do not read parts that have not yet been written to the quorum of the replicas.
+@@ -4236,13 +4243,18 @@ void StorageReplicatedMergeTree::read(
+     {
+         auto max_added_blocks = std::make_shared<ReplicatedMergeTreeQuorumAddedParts::PartitionIdToMaxBlock>(getMaxAddedBlocks());
+         if (auto plan = reader.read(
+-                column_names, metadata_snapshot, query_info, local_context, max_block_size, num_streams, processed_stage, std::move(max_added_blocks)))
++                column_names, metadata_snapshot, query_info, local_context,
++                max_block_size, num_streams, processed_stage, std::move(max_added_blocks), enable_parallel_reading))
+             query_plan = std::move(*plan);
+         return;
+     }
+ 
+-    if (auto plan = reader.read(column_names, metadata_snapshot, query_info, local_context, max_block_size, num_streams, processed_stage))
++    if (auto plan = reader.read(
++        column_names, metadata_snapshot, query_info, local_context,
++        max_block_size, num_streams, processed_stage, nullptr, enable_parallel_reading))
++    {
+         query_plan = std::move(*plan);
++    }
+ }
+ 
+ Pipe StorageReplicatedMergeTree::read(
+diff --git a/src/Storages/StorageS3Cluster.cpp b/src/Storages/StorageS3Cluster.cpp
+index f49fd35044d6..659071b392d6 100644
+--- a/src/Storages/StorageS3Cluster.cpp
++++ b/src/Storages/StorageS3Cluster.cpp
+@@ -126,7 +126,7 @@ Pipe StorageS3Cluster::read(
+                 scalars,
+                 Tables(),
+                 processed_stage,
+-                callback);
++                RemoteQueryExecutor::Extension{.task_iterator = callback});
+ 
+             pipes.emplace_back(std::make_shared<RemoteSource>(remote_query_executor, add_agg_info, false));
+         }
+diff --git a/src/Storages/System/StorageSystemPartsColumns.cpp b/src/Storages/System/StorageSystemPartsColumns.cpp
+index 33ec5c457f66..8dbd73628cac 100644
+--- a/src/Storages/System/StorageSystemPartsColumns.cpp
++++ b/src/Storages/System/StorageSystemPartsColumns.cpp
+@@ -206,7 +206,7 @@ void StorageSystemPartsColumns::processNextStorage(
+                     columns[res_index++]->insertDefault();
+             }
+ 
+-            ColumnSize column_size = part->getColumnSize(column.name, *column.type);
++            ColumnSize column_size = part->getColumnSize(column.name);
+             if (columns_mask[src_index++])
+                 columns[res_index++]->insert(column_size.data_compressed + column_size.marks);
+             if (columns_mask[src_index++])
+diff --git a/src/Storages/System/StorageSystemProjectionPartsColumns.cpp b/src/Storages/System/StorageSystemProjectionPartsColumns.cpp
+index bdbe9a468463..f6490177014c 100644
+--- a/src/Storages/System/StorageSystemProjectionPartsColumns.cpp
++++ b/src/Storages/System/StorageSystemProjectionPartsColumns.cpp
+@@ -237,7 +237,7 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
+                     columns[res_index++]->insertDefault();
+             }
+ 
+-            ColumnSize column_size = part->getColumnSize(column.name, *column.type);
++            ColumnSize column_size = part->getColumnSize(column.name);
+             if (columns_mask[src_index++])
+                 columns[res_index++]->insert(column_size.data_compressed + column_size.marks);
+             if (columns_mask[src_index++])

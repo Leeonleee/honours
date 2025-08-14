@@ -1,0 +1,664 @@
+diff --git a/src/Access/Common/AccessType.h b/src/Access/Common/AccessType.h
+index a7827ee7c595..57fa75dc67b0 100644
+--- a/src/Access/Common/AccessType.h
++++ b/src/Access/Common/AccessType.h
+@@ -104,6 +104,8 @@ enum class AccessType
+     M(DROP_NAMED_COLLECTION, "", NAMED_COLLECTION, NAMED_COLLECTION_CONTROL) /* allows to execute DROP NAMED COLLECTION */\
+     M(DROP, "", GROUP, ALL) /* allows to execute {DROP|DETACH} */\
+     \
++    M(UNDROP_TABLE, "", TABLE, ALL) /* allows to execute {UNDROP} TABLE */\
++    \
+     M(TRUNCATE, "TRUNCATE TABLE", TABLE, ALL) \
+     M(OPTIMIZE, "OPTIMIZE TABLE", TABLE, ALL) \
+     M(BACKUP, "", TABLE, ALL) /* allows to backup tables */\
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 9fa2ba0d32fa..acc20c85165f 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -720,6 +720,7 @@ class IColumn;
+     M(UInt64, insert_keeper_fault_injection_seed, 0, "0 - random seed, otherwise the setting value", 0) \
+     M(Bool, force_aggregation_in_order, false, "Force use of aggregation in order on remote nodes during distributed aggregation. PLEASE, NEVER CHANGE THIS SETTING VALUE MANUALLY!", IMPORTANT) \
+     M(UInt64, http_max_request_param_data_size, 10_MiB, "Limit on size of request data used as a query parameter in predefined HTTP requests.", 0) \
++    M(Bool, allow_experimental_undrop_table_query, false, "Allow to use undrop query to restore dropped table in a limited time", 0) \
+     // End of COMMON_SETTINGS
+     // Please add settings related to formats into the FORMAT_FACTORY_SETTINGS and move obsolete settings to OBSOLETE_SETTINGS.
+ 
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index 7e20b6f6535b..e5320dc6ff47 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -110,6 +110,16 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String &
+     return table;
+ }
+ 
++void DatabaseAtomic::undropTable(ContextPtr /* context_ */, const String & table_name, const StoragePtr & table, const String & relative_table_path)
++{
++    std::lock_guard lock(mutex);
++    String table_metadata_path = getObjectMetadataPath(table_name);
++    String table_metadata_path_drop = DatabaseCatalog::instance().getPathForDroppedMetadata(table->getStorageID());
++    renameNoReplace(table_metadata_path_drop, table_metadata_path);
++    DatabaseOrdinary::attachTableUnlocked(table_name, table);
++    table_name_to_path.emplace(std::make_pair(table_name, relative_table_path));
++}
++
+ void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_name, bool sync)
+ {
+     auto table = tryGetTable(table_name, local_context);
+diff --git a/src/Databases/DatabaseAtomic.h b/src/Databases/DatabaseAtomic.h
+index cb275812098b..b8ff719989be 100644
+--- a/src/Databases/DatabaseAtomic.h
++++ b/src/Databases/DatabaseAtomic.h
+@@ -41,6 +41,8 @@ class DatabaseAtomic : public DatabaseOrdinary
+     void attachTable(ContextPtr context, const String & name, const StoragePtr & table, const String & relative_table_path) override;
+     StoragePtr detachTable(ContextPtr context, const String & name) override;
+ 
++    void undropTable(ContextPtr context, const String & table_name, const StoragePtr & table, const String & relative_table_path) override;
++
+     String getTableDataPath(const String & table_name) const override;
+     String getTableDataPath(const ASTCreateQuery & query) const override;
+ 
+diff --git a/src/Databases/IDatabase.h b/src/Databases/IDatabase.h
+index b8880c4c4cc8..4dbf78cb5c4b 100644
+--- a/src/Databases/IDatabase.h
++++ b/src/Databases/IDatabase.h
+@@ -216,6 +216,11 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "There is no DETACH TABLE query for Database{}", getEngineName());
+     }
+ 
++    virtual void undropTable(ContextPtr /* context */, const String & /*name*/, const StoragePtr & /*table*/, [[maybe_unused]] const String & relative_table_path = {}) /// NOLINT
++    {
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "There is no UNDROP TABLE query for Database{}", getEngineName());
++    }
++
+     /// Forget about the table without deleting it's data, but rename metadata file to prevent reloading it
+     /// with next restart. The database may not support this method.
+     virtual void detachTablePermanently(ContextPtr /*context*/, const String & /*name*/)
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index bbfbd4defdc0..b9ef5e88a2ad 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -402,6 +402,7 @@ class Context: public std::enable_shared_from_this<Context>
+     /// Temporary data for query execution accounting.
+     TemporaryDataOnDiskScopePtr temp_data_on_disk;
+ 
++    bool in_ddl_guard = false;
+ public:
+     /// Some counters for current query execution.
+     /// Most of them are workarounds and should be removed in the future.
+@@ -1014,6 +1015,9 @@ class Context: public std::enable_shared_from_this<Context>
+     bool isInternalQuery() const { return is_internal_query; }
+     void setInternalQuery(bool internal) { is_internal_query = internal; }
+ 
++    bool isInDDLGuard() const { return in_ddl_guard; }
++    void setInDDLGuard(bool ddl_guard) { in_ddl_guard = ddl_guard; }
++
+     ActionLocksManagerPtr getActionLocksManager() const;
+ 
+     enum class ApplicationType
+diff --git a/src/Interpreters/DatabaseCatalog.cpp b/src/Interpreters/DatabaseCatalog.cpp
+index b11a973c7b79..436bf244e4e2 100644
+--- a/src/Interpreters/DatabaseCatalog.cpp
++++ b/src/Interpreters/DatabaseCatalog.cpp
+@@ -1,6 +1,8 @@
+ #include <Interpreters/DatabaseCatalog.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/loadMetadata.h>
++#include <Interpreters/executeQuery.h>
++#include <Interpreters/InterpreterCreateQuery.h>
+ #include <Storages/IStorage.h>
+ #include <Databases/IDatabase.h>
+ #include <Databases/DatabaseMemory.h>
+@@ -51,6 +53,7 @@ namespace ErrorCodes
+     extern const int DATABASE_ACCESS_DENIED;
+     extern const int LOGICAL_ERROR;
+     extern const int HAVE_DEPENDENT_OBJECTS;
++    extern const int FS_METADATA_ERROR;
+ }
+ 
+ TemporaryTableHolder::TemporaryTableHolder(ContextPtr context_, const TemporaryTableHolder::Creator & creator, const ASTPtr & query)
+@@ -869,6 +872,13 @@ String DatabaseCatalog::getPathForDroppedMetadata(const StorageID & table_id) co
+            toString(table_id.uuid) + ".sql";
+ }
+ 
++String DatabaseCatalog::getPathForMetadata(const StorageID & table_id) const
++{
++    return getContext()->getPath() + "metadata/" +
++           escapeForFileName(table_id.getDatabaseName()) + "/" +
++           escapeForFileName(table_id.getTableName()) + ".sql";
++}
++
+ void DatabaseCatalog::enqueueDroppedTableCleanup(StorageID table_id, StoragePtr table, String dropped_metadata_path, bool ignore_delay)
+ {
+     assert(table_id.hasUUID());
+@@ -936,6 +946,97 @@ void DatabaseCatalog::enqueueDroppedTableCleanup(StorageID table_id, StoragePtr
+         (*drop_task)->schedule();
+ }
+ 
++void DatabaseCatalog::dequeueDroppedTableCleanup(StorageID table_id)
++{
++    String latest_metadata_dropped_path;
++    TableMarkedAsDropped dropped_table;
++    {
++        std::lock_guard lock(tables_marked_dropped_mutex);
++        time_t latest_drop_time = std::numeric_limits<time_t>::min();
++        auto it_dropped_table = tables_marked_dropped.end();
++        for (auto it = tables_marked_dropped.begin(); it != tables_marked_dropped.end(); ++it)
++        {
++            auto storage_ptr = it->table;
++            if (it->table_id.uuid == table_id.uuid)
++            {
++                it_dropped_table = it;
++                dropped_table = *it;
++                break;
++            }
++            /// If table uuid exists, only find tables with equal uuid.
++            if (table_id.uuid != UUIDHelpers::Nil)
++                continue;
++            if (it->table_id.database_name == table_id.database_name &&
++                it->table_id.table_name == table_id.table_name &&
++                it->drop_time >= latest_drop_time)
++            {
++                latest_drop_time = it->drop_time;
++                it_dropped_table = it;
++                dropped_table = *it;
++            }
++        }
++        if (it_dropped_table == tables_marked_dropped.end())
++            throw Exception(ErrorCodes::UNKNOWN_TABLE,
++                "The drop task of table {} is in progress, has been dropped or the database engine doesn't support it",
++                table_id.getNameForLogs());
++        latest_metadata_dropped_path = it_dropped_table->metadata_path;
++        String table_metadata_path = getPathForMetadata(it_dropped_table->table_id);
++
++        /// a table is successfully marked undropped,
++        /// if and only if its metadata file was moved to a database.
++        /// This maybe throw exception.
++        renameNoReplace(latest_metadata_dropped_path, table_metadata_path);
++
++        tables_marked_dropped.erase(it_dropped_table);
++        [[maybe_unused]] auto removed = tables_marked_dropped_ids.erase(dropped_table.table_id.uuid);
++        assert(removed);
++        CurrentMetrics::sub(CurrentMetrics::TablesToDropQueueSize, 1);
++    }
++
++    LOG_INFO(log, "Trying Undrop table {} from {}", dropped_table.table_id.getNameForLogs(), latest_metadata_dropped_path);
++
++    try
++    {
++        auto wait_dropped_table_not_in_use = [&]()
++        {
++            while (true)
++            {
++                {
++                    std::lock_guard lock(tables_marked_dropped_mutex);
++                    if (dropped_table.table.unique())
++                        return;
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            }
++        };
++        wait_dropped_table_not_in_use();
++
++        auto ast_attach = std::make_shared<ASTCreateQuery>();
++        ast_attach->attach = true;
++        ast_attach->setDatabase(dropped_table.table_id.database_name);
++        ast_attach->setTable(dropped_table.table_id.table_name);
++
++        auto query_context = Context::createCopy(getContext());
++        /// Attach table needs to acquire ddl guard, that has already been acquired in undrop table,
++        /// and cannot be acquired in the attach table again.
++        query_context->setInDDLGuard(true);
++        InterpreterCreateQuery interpreter(ast_attach, query_context);
++        interpreter.setForceAttach(true);
++        interpreter.setForceRestoreData(true);
++        interpreter.execute();
++
++        LOG_INFO(log, "Table {} was successfully Undropped.", dropped_table.table_id.getNameForLogs());
++    }
++    catch (...)
++    {
++        throw Exception(
++            ErrorCodes::FS_METADATA_ERROR,
++            "Cannot undrop table {} from {}",
++            dropped_table.table_id.getNameForLogs(),
++            latest_metadata_dropped_path);
++    }
++}
++
+ void DatabaseCatalog::dropTableDataTask()
+ {
+     /// Background task that removes data of tables which were marked as dropped by Atomic databases.
+@@ -948,7 +1049,8 @@ void DatabaseCatalog::dropTableDataTask()
+     try
+     {
+         std::lock_guard lock(tables_marked_dropped_mutex);
+-        assert(!tables_marked_dropped.empty());
++        if (tables_marked_dropped.empty())
++            return;
+         time_t current_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+         time_t min_drop_time = std::numeric_limits<time_t>::max();
+         size_t tables_in_use_count = 0;
+diff --git a/src/Interpreters/DatabaseCatalog.h b/src/Interpreters/DatabaseCatalog.h
+index 88645ff72afc..51e9fbdb9360 100644
+--- a/src/Interpreters/DatabaseCatalog.h
++++ b/src/Interpreters/DatabaseCatalog.h
+@@ -215,7 +215,9 @@ class DatabaseCatalog : boost::noncopyable, WithMutableContext
+     DatabaseAndTable tryGetByUUID(const UUID & uuid) const;
+ 
+     String getPathForDroppedMetadata(const StorageID & table_id) const;
++    String getPathForMetadata(const StorageID & table_id) const;
+     void enqueueDroppedTableCleanup(StorageID table_id, StoragePtr table, String dropped_metadata_path, bool ignore_delay = false);
++    void dequeueDroppedTableCleanup(StorageID table_id);
+ 
+     void waitTableFinallyDropped(const UUID & uuid);
+ 
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index 7a4d65a4d57b..0ba8b0cd40b6 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -1107,7 +1107,8 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+ 
+         /// For short syntax of ATTACH query we have to lock table name here, before reading metadata
+         /// and hold it until table is attached
+-        ddl_guard = DatabaseCatalog::instance().getDDLGuard(database_name, create.getTable());
++        if (!getContext()->isInDDLGuard())
++            ddl_guard = DatabaseCatalog::instance().getDDLGuard(database_name, create.getTable());
+ 
+         bool if_not_exists = create.if_not_exists;
+ 
+@@ -1312,7 +1313,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
+         return true;
+     }
+ 
+-    if (!ddl_guard)
++    if (!ddl_guard && !getContext()->isInDDLGuard())
+         ddl_guard = DatabaseCatalog::instance().getDDLGuard(create.getDatabase(), create.getTable());
+ 
+     String data_path;
+diff --git a/src/Interpreters/InterpreterFactory.cpp b/src/Interpreters/InterpreterFactory.cpp
+index 502de459156a..91291090e022 100644
+--- a/src/Interpreters/InterpreterFactory.cpp
++++ b/src/Interpreters/InterpreterFactory.cpp
+@@ -8,6 +8,7 @@
+ #include <Parsers/ASTDropFunctionQuery.h>
+ #include <Parsers/ASTDropIndexQuery.h>
+ #include <Parsers/ASTDropQuery.h>
++#include <Parsers/ASTUndropQuery.h>
+ #include <Parsers/ASTExplainQuery.h>
+ #include <Parsers/ASTInsertQuery.h>
+ #include <Parsers/ASTSelectIntersectExceptQuery.h>
+@@ -60,6 +61,7 @@
+ #include <Interpreters/InterpreterDropFunctionQuery.h>
+ #include <Interpreters/InterpreterDropIndexQuery.h>
+ #include <Interpreters/InterpreterDropQuery.h>
++#include <Interpreters/InterpreterUndropQuery.h>
+ #include <Interpreters/InterpreterExistsQuery.h>
+ #include <Interpreters/InterpreterExplainQuery.h>
+ #include <Interpreters/InterpreterExternalDDLQuery.h>
+@@ -161,6 +163,10 @@ std::unique_ptr<IInterpreter> InterpreterFactory::get(ASTPtr & query, ContextMut
+     {
+         return std::make_unique<InterpreterDropQuery>(query, context);
+     }
++    else if (query->as<ASTUndropQuery>())
++    {
++        return std::make_unique<InterpreterUndropQuery>(query, context);
++    }
+     else if (query->as<ASTRenameQuery>())
+     {
+         return std::make_unique<InterpreterRenameQuery>(query, context);
+diff --git a/src/Interpreters/InterpreterUndropQuery.cpp b/src/Interpreters/InterpreterUndropQuery.cpp
+new file mode 100644
+index 000000000000..c4c214e75ca5
+--- /dev/null
++++ b/src/Interpreters/InterpreterUndropQuery.cpp
+@@ -0,0 +1,78 @@
++#include <Interpreters/Context.h>
++#include <Interpreters/executeDDLQueryOnCluster.h>
++#include <Interpreters/InterpreterUndropQuery.h>
++#include <Access/Common/AccessRightsElement.h>
++#include <Parsers/ASTUndropQuery.h>
++
++#include "config.h"
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++    extern const int TABLE_ALREADY_EXISTS;
++    extern const int SUPPORT_IS_DISABLED;
++}
++
++InterpreterUndropQuery::InterpreterUndropQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_) : WithMutableContext(context_), query_ptr(query_ptr_)
++{
++}
++
++
++BlockIO InterpreterUndropQuery::execute()
++{
++    if (!getContext()->getSettingsRef().allow_experimental_undrop_table_query)
++        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
++                        "Undrop table is experimental. "
++                        "Set `allow_experimental_undrop_table_query` setting to enable it");
++
++    getContext()->checkAccess(AccessType::UNDROP_TABLE);
++    auto & undrop = query_ptr->as<ASTUndropQuery &>();
++    if (!undrop.cluster.empty() && !maybeRemoveOnCluster(query_ptr, getContext()))
++    {
++        DDLQueryOnClusterParams params;
++        params.access_to_check = getRequiredAccessForDDLOnCluster();
++        return executeDDLQueryOnCluster(query_ptr, getContext(), params);
++    }
++
++    if (undrop.table)
++        return executeToTable(undrop);
++    else
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Nothing to undrop, both names are empty");
++}
++
++BlockIO InterpreterUndropQuery::executeToTable(ASTUndropQuery & query)
++{
++    auto table_id = StorageID(query);
++
++    auto context = getContext();
++    if (table_id.database_name.empty())
++    {
++        table_id.database_name = context->getCurrentDatabase();
++        query.setDatabase(table_id.database_name);
++    }
++
++    auto guard = DatabaseCatalog::instance().getDDLGuard(table_id.database_name, table_id.table_name);
++
++    auto database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
++    if (database->isTableExist(table_id.table_name, getContext()))
++        throw Exception(
++            ErrorCodes::TABLE_ALREADY_EXISTS, "Cannot Undrop table, {} already exists", table_id);
++
++    database->checkMetadataFilenameAvailability(table_id.table_name);
++
++    DatabaseCatalog::instance().dequeueDroppedTableCleanup(table_id);
++    return {};
++}
++
++AccessRightsElements InterpreterUndropQuery::getRequiredAccessForDDLOnCluster() const
++{
++    AccessRightsElements required_access;
++    const auto & undrop = query_ptr->as<const ASTUndropQuery &>();
++
++    required_access.emplace_back(AccessType::UNDROP_TABLE, undrop.getDatabase(), undrop.getTable());
++    return required_access;
++}
++}
+diff --git a/src/Interpreters/InterpreterUndropQuery.h b/src/Interpreters/InterpreterUndropQuery.h
+new file mode 100644
+index 000000000000..a47617fd17f6
+--- /dev/null
++++ b/src/Interpreters/InterpreterUndropQuery.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <Databases/IDatabase.h>
++#include <Interpreters/IInterpreter.h>
++#include <Parsers/ASTUndropQuery.h>
++
++namespace DB
++{
++
++class Context;
++using DatabaseAndTable = std::pair<DatabasePtr, StoragePtr>;
++class AccessRightsElements;
++
++
++class InterpreterUndropQuery : public IInterpreter, WithMutableContext
++{
++public:
++    InterpreterUndropQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_);
++
++    /// Undrop table.
++    BlockIO execute() override;
++
++private:
++    AccessRightsElements getRequiredAccessForDDLOnCluster() const;
++    ASTPtr query_ptr;
++
++    BlockIO executeToTable(ASTUndropQuery & query);
++};
++}
+diff --git a/src/Parsers/ASTUndropQuery.cpp b/src/Parsers/ASTUndropQuery.cpp
+new file mode 100644
+index 000000000000..0b8a18b12c95
+--- /dev/null
++++ b/src/Parsers/ASTUndropQuery.cpp
+@@ -0,0 +1,42 @@
++#include <Parsers/ASTUndropQuery.h>
++#include <Common/quoteString.h>
++#include <IO/Operators.h>
++
++
++namespace DB
++{
++
++String ASTUndropQuery::getID(char delim) const
++{
++    return "UndropQuery" + (delim + getDatabase()) + delim + getTable();
++}
++
++ASTPtr ASTUndropQuery::clone() const
++{
++    auto res = std::make_shared<ASTUndropQuery>(*this);
++    cloneOutputOptions(*res);
++    cloneTableOptions(*res);
++    return res;
++}
++
++void ASTUndropQuery::formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const
++{
++    settings.ostr << (settings.hilite ? hilite_keyword : "");
++    settings.ostr << "UNDROP ";
++    settings.ostr << "TABLE ";
++    settings.ostr << (settings.hilite ? hilite_none : "");
++
++    assert (table);
++    if (!database)
++        settings.ostr << backQuoteIfNeed(getTable());
++    else
++        settings.ostr << backQuoteIfNeed(getDatabase()) + "." << backQuoteIfNeed(getTable());
++
++    if (uuid != UUIDHelpers::Nil)
++        settings.ostr << (settings.hilite ? hilite_keyword : "") << " UUID " << (settings.hilite ? hilite_none : "")
++            << quoteString(toString(uuid));
++
++    formatOnCluster(settings);
++}
++
++}
+diff --git a/src/Parsers/ASTUndropQuery.h b/src/Parsers/ASTUndropQuery.h
+new file mode 100644
+index 000000000000..7aac4c86c5b3
+--- /dev/null
++++ b/src/Parsers/ASTUndropQuery.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Parsers/ASTQueryWithTableAndOutput.h>
++#include <Parsers/ASTQueryWithOnCluster.h>
++
++
++namespace DB
++{
++
++/** UNDROP query
++  */
++class ASTUndropQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
++{
++public:
++    /** Get the text that identifies this element. */
++    String getID(char) const override;
++    ASTPtr clone() const override;
++
++    ASTPtr getRewrittenASTWithoutOnCluster(const WithoutOnClusterASTRewriteParams & params) const override
++    {
++        return removeOnCluster<ASTUndropQuery>(clone(), params.default_database);
++    }
++
++    QueryKind getQueryKind() const override { return QueryKind::Undrop; }
++
++protected:
++    void formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override;
++};
++
++}
+diff --git a/src/Parsers/IAST.h b/src/Parsers/IAST.h
+index 5928506aa5b7..606a822eceeb 100644
+--- a/src/Parsers/IAST.h
++++ b/src/Parsers/IAST.h
+@@ -268,6 +268,7 @@ class IAST : public std::enable_shared_from_this<IAST>, public TypePromotion<IAS
+         Delete,
+         Create,
+         Drop,
++        Undrop,
+         Rename,
+         Optimize,
+         Check,
+diff --git a/src/Parsers/ParserQueryWithOutput.cpp b/src/Parsers/ParserQueryWithOutput.cpp
+index 7024d8cbe11a..d6cf9109be05 100644
+--- a/src/Parsers/ParserQueryWithOutput.cpp
++++ b/src/Parsers/ParserQueryWithOutput.cpp
+@@ -6,6 +6,7 @@
+ #include <Parsers/ParserCreateQuery.h>
+ #include <Parsers/ParserDescribeTableQuery.h>
+ #include <Parsers/ParserDropQuery.h>
++#include <Parsers/ParserUndropQuery.h>
+ #include <Parsers/ParserExplainQuery.h>
+ #include <Parsers/ParserKillQueryQuery.h>
+ #include <Parsers/ParserOptimizeQuery.h>
+@@ -44,6 +45,7 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
+     ParserAlterQuery alter_p;
+     ParserRenameQuery rename_p;
+     ParserDropQuery drop_p;
++    ParserUndropQuery undrop_p;
+     ParserCheckQuery check_p;
+     ParserOptimizeQuery optimize_p;
+     ParserKillQueryQuery kill_query_p;
+@@ -71,6 +73,7 @@ bool ParserQueryWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
+         || alter_p.parse(pos, query, expected)
+         || rename_p.parse(pos, query, expected)
+         || drop_p.parse(pos, query, expected)
++        || undrop_p.parse(pos, query, expected)
+         || check_p.parse(pos, query, expected)
+         || kill_query_p.parse(pos, query, expected)
+         || optimize_p.parse(pos, query, expected)
+diff --git a/src/Parsers/ParserUndropQuery.cpp b/src/Parsers/ParserUndropQuery.cpp
+new file mode 100644
+index 000000000000..3784ab0f3539
+--- /dev/null
++++ b/src/Parsers/ParserUndropQuery.cpp
+@@ -0,0 +1,81 @@
++#include <Parsers/ASTUndropQuery.h>
++
++#include <Parsers/CommonParsers.h>
++#include <Parsers/ParserUndropQuery.h>
++#include "Parsers/ASTLiteral.h"
++
++
++namespace DB
++{
++
++namespace
++{
++
++bool parseUndropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected)
++{
++    ParserKeyword s_table("TABLE");
++    ParserToken s_dot(TokenType::Dot);
++    ParserIdentifier name_p(true);
++
++    ASTPtr database;
++    ASTPtr table;
++    String cluster_str;
++    /// We can specify the table's uuid for exact undrop.
++    /// because the same name of a table can be created and deleted multiple times,
++    /// and can generate multiple different uuids.
++    UUID uuid = UUIDHelpers::Nil;
++
++    if (!s_table.ignore(pos, expected))
++        return false;
++    if (!name_p.parse(pos, table, expected))
++        return false;
++    if (s_dot.ignore(pos, expected))
++    {
++        database = table;
++        if (!name_p.parse(pos, table, expected))
++            return false;
++    }
++    if (ParserKeyword("UUID").ignore(pos, expected))
++    {
++        ParserStringLiteral uuid_p;
++        ASTPtr ast_uuid;
++        if (!uuid_p.parse(pos, ast_uuid, expected))
++            return false;
++        uuid = parseFromString<UUID>(ast_uuid->as<ASTLiteral>()->value.get<String>());
++    }
++    if (ParserKeyword{"ON"}.ignore(pos, expected))
++    {
++        if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
++            return false;
++    }
++    auto query = std::make_shared<ASTUndropQuery>();
++    node = query;
++
++    query->database = database;
++    query->table = table;
++    query->uuid = uuid;
++
++    if (database)
++        query->children.push_back(database);
++
++    assert (table);
++    query->children.push_back(table);
++
++    query->cluster = cluster_str;
++
++    return true;
++}
++
++}
++
++bool ParserUndropQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
++{
++    ParserKeyword s_undrop("UNDROP");
++
++    if (s_undrop.ignore(pos, expected))
++        return parseUndropQuery(pos, node, expected);
++    else
++        return false;
++}
++
++}
+diff --git a/src/Parsers/ParserUndropQuery.h b/src/Parsers/ParserUndropQuery.h
+new file mode 100644
+index 000000000000..4b2896003960
+--- /dev/null
++++ b/src/Parsers/ParserUndropQuery.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <Parsers/IParserBase.h>
++#include <Parsers/ExpressionElementParsers.h>
++
++
++namespace DB
++{
++
++/** Query like this:
++  * UNDROP TABLE [db.]name [UUID uuid]
++  */
++class ParserUndropQuery : public IParserBase
++{
++protected:
++    const char * getName() const  override{ return "UNDROP query"; }
++    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
++};
++
++}

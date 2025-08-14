@@ -1,0 +1,1067 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index 476725c5627c..621c40c31bf7 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -1488,6 +1488,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+         /// We load temporary database first, because projections need it.
+         database_catalog.initializeAndLoadTemporaryDatabase();
+         loadMetadataSystem(global_context);
++        maybeConvertOrdinaryDatabaseToAtomic(global_context, DatabaseCatalog::instance().getSystemDatabase());
+         /// After attaching system databases we can initialize system log.
+         global_context->initializeSystemLogs();
+         global_context->setSystemZooKeeperLogAfterInitializationIfNeeded();
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index a446c1a77689..f1f7bc7f2ab1 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -445,7 +445,6 @@ static constexpr UInt64 operator""_GiB(unsigned long long value)
+     M(Seconds, wait_for_window_view_fire_signal_timeout, 10, "Timeout for waiting for window view fire signal in event time processing", 0) \
+     M(UInt64, min_free_disk_space_for_temporary_data, 0, "The minimum disk space to keep while writing temporary data used in external sorting and aggregation.", 0) \
+     \
+-    M(DefaultDatabaseEngine, default_database_engine, DefaultDatabaseEngine::Atomic, "Default database engine.", 0) \
+     M(DefaultTableEngine, default_table_engine, DefaultTableEngine::None, "Default table engine used when ENGINE is not set in CREATE statement.",0) \
+     M(Bool, show_table_uuid_in_table_create_query_if_not_nil, false, "For tables in databases with Engine=Atomic show UUID of the table in its CREATE query.", 0) \
+     M(Bool, database_atomic_wait_for_drop_and_detach_synchronously, false, "When executing DROP or DETACH TABLE in Atomic database, wait for table data to be finally dropped or detached.", 0) \
+@@ -640,6 +639,7 @@ static constexpr UInt64 operator""_GiB(unsigned long long value)
+     MAKE_OBSOLETE(M, UInt64, background_schedule_pool_size, 128) \
+     MAKE_OBSOLETE(M, UInt64, background_message_broker_schedule_pool_size, 16) \
+     MAKE_OBSOLETE(M, UInt64, background_distributed_schedule_pool_size, 16) \
++    MAKE_OBSOLETE(M, DefaultDatabaseEngine, default_database_engine, DefaultDatabaseEngine::Atomic) \
+     /** The section above is for obsolete settings. Do not add anything there. */
+ 
+ 
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index a4fa1fa267b8..be53512a608b 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -109,13 +109,13 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String &
+     return table;
+ }
+ 
+-void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_name, bool no_delay)
++void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_name, bool sync)
+ {
+     auto table = tryGetTable(table_name, local_context);
+     /// Remove the inner table (if any) to avoid deadlock
+     /// (due to attempt to execute DROP from the worker thread)
+     if (table)
+-        table->dropInnerTableIfAny(no_delay, local_context);
++        table->dropInnerTableIfAny(sync, local_context);
+     else
+         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist",
+                         backQuote(database_name), backQuote(table_name));
+@@ -145,7 +145,7 @@ void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_na
+ 
+     /// Notify DatabaseCatalog that table was dropped. It will remove table data in background.
+     /// Cleanup is performed outside of database to allow easily DROP DATABASE without waiting for cleanup to complete.
+-    DatabaseCatalog::instance().enqueueDroppedTableCleanup(table->getStorageID(), table, table_metadata_path_drop, no_delay);
++    DatabaseCatalog::instance().enqueueDroppedTableCleanup(table->getStorageID(), table, table_metadata_path_drop, sync);
+ }
+ 
+ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_name, IDatabase & to_database,
+diff --git a/src/Databases/DatabaseAtomic.h b/src/Databases/DatabaseAtomic.h
+index b748e53244dd..cba9593a6019 100644
+--- a/src/Databases/DatabaseAtomic.h
++++ b/src/Databases/DatabaseAtomic.h
+@@ -35,7 +35,7 @@ class DatabaseAtomic : public DatabaseOrdinary
+             bool exchange,
+             bool dictionary) override;
+ 
+-    void dropTable(ContextPtr context, const String & table_name, bool no_delay) override;
++    void dropTable(ContextPtr context, const String & table_name, bool sync) override;
+ 
+     void attachTable(ContextPtr context, const String & name, const StoragePtr & table, const String & relative_table_path) override;
+     StoragePtr detachTable(ContextPtr context, const String & name) override;
+diff --git a/src/Databases/DatabaseFactory.cpp b/src/Databases/DatabaseFactory.cpp
+index 5c7c1dedf9b7..af82d3820634 100644
+--- a/src/Databases/DatabaseFactory.cpp
++++ b/src/Databases/DatabaseFactory.cpp
+@@ -62,36 +62,19 @@ namespace ErrorCodes
+ 
+ DatabasePtr DatabaseFactory::get(const ASTCreateQuery & create, const String & metadata_path, ContextPtr context)
+ {
+-    bool created = false;
++    /// Creates store/xxx/ for Atomic
++    fs::create_directories(fs::path(metadata_path).parent_path());
+ 
+-    try
+-    {
+-        /// Creates store/xxx/ for Atomic
+-        fs::create_directories(fs::path(metadata_path).parent_path());
+-
+-        /// Before 20.7 it's possible that .sql metadata file does not exist for some old database.
+-        /// In this case Ordinary database is created on server startup if the corresponding metadata directory exists.
+-        /// So we should remove metadata directory if database creation failed.
+-        /// TODO remove this code
+-        created = fs::create_directory(metadata_path);
+-
+-        DatabasePtr impl = getImpl(create, metadata_path, context);
++    DatabasePtr impl = getImpl(create, metadata_path, context);
+ 
+-        if (impl && context->hasQueryContext() && context->getSettingsRef().log_queries)
+-            context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Database, impl->getEngineName());
++    if (impl && context->hasQueryContext() && context->getSettingsRef().log_queries)
++        context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Database, impl->getEngineName());
+ 
+-        // Attach database metadata
+-        if (impl && create.comment)
+-            impl->setDatabaseComment(create.comment->as<ASTLiteral>()->value.safeGet<String>());
++    /// Attach database metadata
++    if (impl && create.comment)
++        impl->setDatabaseComment(create.comment->as<ASTLiteral>()->value.safeGet<String>());
+ 
+-        return impl;
+-    }
+-    catch (...)
+-    {
+-        if (created && fs::exists(metadata_path))
+-            fs::remove_all(metadata_path);
+-        throw;
+-    }
++    return impl;
+ }
+ 
+ template <typename ValueType>
+@@ -139,8 +122,14 @@ DatabasePtr DatabaseFactory::getImpl(const ASTCreateQuery & create, const String
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Database engine `{}` cannot have table overrides", engine_name);
+ 
+     if (engine_name == "Ordinary")
++    {
++        if (!create.attach && !context->getSettingsRef().allow_deprecated_database_ordinary)
++            throw Exception(ErrorCodes::UNKNOWN_DATABASE_ENGINE,
++                            "Ordinary database engine is deprecated (see also allow_deprecated_database_ordinary setting)");
+         return std::make_shared<DatabaseOrdinary>(database_name, metadata_path, context);
+-    else if (engine_name == "Atomic")
++    }
++
++    if (engine_name == "Atomic")
+         return std::make_shared<DatabaseAtomic>(database_name, metadata_path, uuid, context);
+     else if (engine_name == "Memory")
+         return std::make_shared<DatabaseMemory>(database_name, context);
+diff --git a/src/Databases/DatabaseLazy.cpp b/src/Databases/DatabaseLazy.cpp
+index b024c73d5783..84e1a1326699 100644
+--- a/src/Databases/DatabaseLazy.cpp
++++ b/src/Databases/DatabaseLazy.cpp
+@@ -77,10 +77,10 @@ void DatabaseLazy::createTable(
+ void DatabaseLazy::dropTable(
+     ContextPtr local_context,
+     const String & table_name,
+-    bool no_delay)
++    bool sync)
+ {
+     SCOPE_EXIT_MEMORY_SAFE({ clearExpiredTables(); });
+-    DatabaseOnDisk::dropTable(local_context, table_name, no_delay);
++    DatabaseOnDisk::dropTable(local_context, table_name, sync);
+ }
+ 
+ void DatabaseLazy::renameTable(
+diff --git a/src/Databases/DatabaseLazy.h b/src/Databases/DatabaseLazy.h
+index 3a7d7b14be1d..8d4799945fb8 100644
+--- a/src/Databases/DatabaseLazy.h
++++ b/src/Databases/DatabaseLazy.h
+@@ -37,7 +37,7 @@ class DatabaseLazy final : public DatabaseOnDisk
+     void dropTable(
+         ContextPtr context,
+         const String & table_name,
+-        bool no_delay) override;
++        bool sync) override;
+ 
+     void renameTable(
+         ContextPtr context,
+diff --git a/src/Databases/DatabaseMemory.cpp b/src/Databases/DatabaseMemory.cpp
+index 6df5b70c8277..664bb015925d 100644
+--- a/src/Databases/DatabaseMemory.cpp
++++ b/src/Databases/DatabaseMemory.cpp
+@@ -52,7 +52,7 @@ void DatabaseMemory::createTable(
+ void DatabaseMemory::dropTable(
+     ContextPtr /*context*/,
+     const String & table_name,
+-    bool /*no_delay*/)
++    bool /*sync*/)
+ {
+     std::unique_lock lock{mutex};
+     auto table = detachTableUnlocked(table_name, lock);
+diff --git a/src/Databases/DatabaseMemory.h b/src/Databases/DatabaseMemory.h
+index b854d9be1f34..6b22b5a4ec21 100644
+--- a/src/Databases/DatabaseMemory.h
++++ b/src/Databases/DatabaseMemory.h
+@@ -32,7 +32,7 @@ class DatabaseMemory final : public DatabaseWithOwnTablesBase
+     void dropTable(
+         ContextPtr context,
+         const String & table_name,
+-        bool no_delay) override;
++        bool sync) override;
+ 
+     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr context, bool throw_on_error) const override;
+     ASTPtr getCreateDatabaseQuery() const override;
+diff --git a/src/Databases/DatabaseOnDisk.cpp b/src/Databases/DatabaseOnDisk.cpp
+index 64bc9a4a0946..1895cb12a0e9 100644
+--- a/src/Databases/DatabaseOnDisk.cpp
++++ b/src/Databases/DatabaseOnDisk.cpp
+@@ -281,7 +281,7 @@ void DatabaseOnDisk::detachTablePermanently(ContextPtr query_context, const Stri
+     }
+ }
+ 
+-void DatabaseOnDisk::dropTable(ContextPtr local_context, const String & table_name, bool /*no_delay*/)
++void DatabaseOnDisk::dropTable(ContextPtr local_context, const String & table_name, bool /*sync*/)
+ {
+     String table_metadata_path = getObjectMetadataPath(table_name);
+     String table_metadata_path_drop = table_metadata_path + drop_suffix;
+diff --git a/src/Databases/DatabaseOnDisk.h b/src/Databases/DatabaseOnDisk.h
+index a118c8da6782..462b602a8b81 100644
+--- a/src/Databases/DatabaseOnDisk.h
++++ b/src/Databases/DatabaseOnDisk.h
+@@ -43,7 +43,7 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+     void dropTable(
+         ContextPtr context,
+         const String & table_name,
+-        bool no_delay) override;
++        bool sync) override;
+ 
+     void renameTable(
+         ContextPtr context,
+diff --git a/src/Databases/DatabaseReplicated.cpp b/src/Databases/DatabaseReplicated.cpp
+index 5c701c8d90c8..7067746cf716 100644
+--- a/src/Databases/DatabaseReplicated.cpp
++++ b/src/Databases/DatabaseReplicated.cpp
+@@ -608,6 +608,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
+         /// and make possible creation of new table with the same UUID.
+         String query = fmt::format("CREATE DATABASE IF NOT EXISTS {} ENGINE=Ordinary", backQuoteIfNeed(to_db_name));
+         auto query_context = Context::createCopy(getContext());
++        query_context->setSetting("allow_deprecated_database_ordinary", 1);
+         executeQuery(query, query_context, true);
+ 
+         /// But we want to avoid discarding UUID of ReplicatedMergeTree tables, because it will not work
+@@ -811,7 +812,7 @@ void DatabaseReplicated::shutdown()
+ }
+ 
+ 
+-void DatabaseReplicated::dropTable(ContextPtr local_context, const String & table_name, bool no_delay)
++void DatabaseReplicated::dropTable(ContextPtr local_context, const String & table_name, bool sync)
+ {
+     auto txn = local_context->getZooKeeperMetadataTransaction();
+     assert(!ddl_worker->isCurrentlyActive() || txn || startsWith(table_name, ".inner_id."));
+@@ -820,7 +821,7 @@ void DatabaseReplicated::dropTable(ContextPtr local_context, const String & tabl
+         String metadata_zk_path = zookeeper_path + "/metadata/" + escapeForFileName(table_name);
+         txn->addOp(zkutil::makeRemoveRequest(metadata_zk_path, -1));
+     }
+-    DatabaseAtomic::dropTable(local_context, table_name, no_delay);
++    DatabaseAtomic::dropTable(local_context, table_name, sync);
+ }
+ 
+ void DatabaseReplicated::renameTable(ContextPtr local_context, const String & table_name, IDatabase & to_database,
+diff --git a/src/Databases/DatabaseReplicated.h b/src/Databases/DatabaseReplicated.h
+index 45a9d12981c9..3aa2aa378b7e 100644
+--- a/src/Databases/DatabaseReplicated.h
++++ b/src/Databases/DatabaseReplicated.h
+@@ -30,7 +30,7 @@ class DatabaseReplicated : public DatabaseAtomic
+     String getEngineName() const override { return "Replicated"; }
+ 
+     /// If current query is initial, then the following methods add metadata updating ZooKeeper operations to current ZooKeeperMetadataTransaction.
+-    void dropTable(ContextPtr, const String & table_name, bool no_delay) override;
++    void dropTable(ContextPtr, const String & table_name, bool sync) override;
+     void renameTable(ContextPtr context, const String & table_name, IDatabase & to_database,
+                      const String & to_table_name, bool exchange, bool dictionary) override;
+     void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
+diff --git a/src/Databases/IDatabase.h b/src/Databases/IDatabase.h
+index a81df0a389af..1a0ffa7bcf0a 100644
+--- a/src/Databases/IDatabase.h
++++ b/src/Databases/IDatabase.h
+@@ -198,7 +198,7 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+     virtual void dropTable( /// NOLINT
+         ContextPtr /*context*/,
+         const String & /*name*/,
+-        [[maybe_unused]] bool no_delay = false)
++        [[maybe_unused]] bool sync = false)
+     {
+         throw Exception("There is no DROP TABLE query for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+diff --git a/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp b/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
+index 13f55eab9e2f..a81e07f01732 100644
+--- a/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
++++ b/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
+@@ -80,10 +80,10 @@ void DatabaseMaterializedMySQL::createTable(ContextPtr context_, const String &
+     DatabaseAtomic::createTable(context_, name, table, query);
+ }
+ 
+-void DatabaseMaterializedMySQL::dropTable(ContextPtr context_, const String & name, bool no_delay)
++void DatabaseMaterializedMySQL::dropTable(ContextPtr context_, const String & name, bool sync)
+ {
+     checkIsInternalQuery(context_, "DROP TABLE");
+-    DatabaseAtomic::dropTable(context_, name, no_delay);
++    DatabaseAtomic::dropTable(context_, name, sync);
+ }
+ 
+ void DatabaseMaterializedMySQL::attachTable(ContextPtr context_, const String & name, const StoragePtr & table, const String & relative_table_path)
+diff --git a/src/Databases/MySQL/DatabaseMaterializedMySQL.h b/src/Databases/MySQL/DatabaseMaterializedMySQL.h
+index 32686784f2a1..a6810f29d87c 100644
+--- a/src/Databases/MySQL/DatabaseMaterializedMySQL.h
++++ b/src/Databases/MySQL/DatabaseMaterializedMySQL.h
+@@ -52,7 +52,7 @@ class DatabaseMaterializedMySQL : public DatabaseAtomic
+ 
+     void createTable(ContextPtr context_, const String & name, const StoragePtr & table, const ASTPtr & query) override;
+ 
+-    void dropTable(ContextPtr context_, const String & name, bool no_delay) override;
++    void dropTable(ContextPtr context_, const String & name, bool sync) override;
+ 
+     void attachTable(ContextPtr context_, const String & name, const StoragePtr & table, const String & relative_table_path) override;
+ 
+diff --git a/src/Databases/MySQL/DatabaseMySQL.cpp b/src/Databases/MySQL/DatabaseMySQL.cpp
+index 58be682bd736..95098ba9cbd8 100644
+--- a/src/Databases/MySQL/DatabaseMySQL.cpp
++++ b/src/Databases/MySQL/DatabaseMySQL.cpp
+@@ -447,7 +447,7 @@ void DatabaseMySQL::detachTablePermanently(ContextPtr, const String & table_name
+     table_iter->second.second->is_dropped = true;
+ }
+ 
+-void DatabaseMySQL::dropTable(ContextPtr local_context, const String & table_name, bool /*no_delay*/)
++void DatabaseMySQL::dropTable(ContextPtr local_context, const String & table_name, bool /*sync*/)
+ {
+     detachTablePermanently(local_context, table_name);
+ }
+diff --git a/src/Databases/MySQL/DatabaseMySQL.h b/src/Databases/MySQL/DatabaseMySQL.h
+index 1ee090ecd524..6a5105e2dba6 100644
+--- a/src/Databases/MySQL/DatabaseMySQL.h
++++ b/src/Databases/MySQL/DatabaseMySQL.h
+@@ -82,7 +82,7 @@ class DatabaseMySQL final : public IDatabase, WithContext
+ 
+     void detachTablePermanently(ContextPtr context, const String & table_name) override;
+ 
+-    void dropTable(ContextPtr context, const String & table_name, bool no_delay) override;
++    void dropTable(ContextPtr context, const String & table_name, bool sync) override;
+ 
+     void attachTable(ContextPtr context, const String & table_name, const StoragePtr & storage, const String & relative_table_path) override;
+ 
+diff --git a/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.cpp b/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.cpp
+index db184342a97a..10b109630c73 100644
+--- a/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.cpp
++++ b/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.cpp
+@@ -390,10 +390,10 @@ void DatabaseMaterializedPostgreSQL::stopReplication()
+ }
+ 
+ 
+-void DatabaseMaterializedPostgreSQL::dropTable(ContextPtr local_context, const String & table_name, bool no_delay)
++void DatabaseMaterializedPostgreSQL::dropTable(ContextPtr local_context, const String & table_name, bool sync)
+ {
+     /// Modify context into nested_context and pass query to Atomic database.
+-    DatabaseAtomic::dropTable(StorageMaterializedPostgreSQL::makeNestedTableContext(local_context), table_name, no_delay);
++    DatabaseAtomic::dropTable(StorageMaterializedPostgreSQL::makeNestedTableContext(local_context), table_name, sync);
+ }
+ 
+ 
+diff --git a/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.h b/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.h
+index 08420f4ba5ee..ac2bcedca608 100644
+--- a/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.h
++++ b/src/Databases/PostgreSQL/DatabaseMaterializedPostgreSQL.h
+@@ -55,7 +55,7 @@ class DatabaseMaterializedPostgreSQL : public DatabaseAtomic
+ 
+     StoragePtr detachTable(ContextPtr context, const String & table_name) override;
+ 
+-    void dropTable(ContextPtr local_context, const String & name, bool no_delay) override;
++    void dropTable(ContextPtr local_context, const String & name, bool sync) override;
+ 
+     void drop(ContextPtr local_context) override;
+ 
+diff --git a/src/Databases/PostgreSQL/DatabasePostgreSQL.cpp b/src/Databases/PostgreSQL/DatabasePostgreSQL.cpp
+index 1bcc203beb92..fed4d1ee64d7 100644
+--- a/src/Databases/PostgreSQL/DatabasePostgreSQL.cpp
++++ b/src/Databases/PostgreSQL/DatabasePostgreSQL.cpp
+@@ -264,7 +264,7 @@ void DatabasePostgreSQL::createTable(ContextPtr local_context, const String & ta
+ }
+ 
+ 
+-void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* no_delay */)
++void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* sync */)
+ {
+     std::lock_guard<std::mutex> lock{mutex};
+ 
+diff --git a/src/Databases/PostgreSQL/DatabasePostgreSQL.h b/src/Databases/PostgreSQL/DatabasePostgreSQL.h
+index 3397dcc80766..3d5e7bd444e8 100644
+--- a/src/Databases/PostgreSQL/DatabasePostgreSQL.h
++++ b/src/Databases/PostgreSQL/DatabasePostgreSQL.h
+@@ -53,7 +53,7 @@ class DatabasePostgreSQL final : public IDatabase, WithContext
+     StoragePtr tryGetTable(const String & name, ContextPtr context) const override;
+ 
+     void createTable(ContextPtr, const String & table_name, const StoragePtr & storage, const ASTPtr & create_query) override;
+-    void dropTable(ContextPtr, const String & table_name, bool no_delay) override;
++    void dropTable(ContextPtr, const String & table_name, bool sync) override;
+ 
+     void attachTable(ContextPtr context, const String & table_name, const StoragePtr & storage, const String & relative_table_path) override;
+     StoragePtr detachTable(ContextPtr context, const String & table_name) override;
+diff --git a/src/Interpreters/AsynchronousInsertQueue.h b/src/Interpreters/AsynchronousInsertQueue.h
+index db3cb3049fd4..8a4e8dad8dd1 100644
+--- a/src/Interpreters/AsynchronousInsertQueue.h
++++ b/src/Interpreters/AsynchronousInsertQueue.h
+@@ -1,7 +1,6 @@
+ #pragma once
+ 
+ #include <Parsers/IAST_fwd.h>
+-#include <Common/RWLock.h>
+ #include <Common/ThreadPool.h>
+ #include <Core/Settings.h>
+ #include <Poco/Logger.h>
+diff --git a/src/Interpreters/HashJoin.h b/src/Interpreters/HashJoin.h
+index b2a7aedaa5af..17d09b25ea16 100644
+--- a/src/Interpreters/HashJoin.h
++++ b/src/Interpreters/HashJoin.h
+@@ -16,7 +16,7 @@
+ #include <Common/ColumnsHashing.h>
+ #include <Common/HashTable/HashMap.h>
+ #include <Common/HashTable/FixedHashMap.h>
+-#include <Common/RWLock.h>
++#include <Storages/TableLockHolder.h>
+ 
+ #include <Columns/ColumnString.h>
+ #include <Columns/ColumnFixedString.h>
+@@ -339,7 +339,7 @@ class HashJoin : public IJoin
+ 
+     /// We keep correspondence between used_flags and hash table internal buffer.
+     /// Hash table cannot be modified during HashJoin lifetime and must be protected with lock.
+-    void setLock(RWLockImpl::LockHolder rwlock_holder)
++    void setLock(TableLockHolder rwlock_holder)
+     {
+         storage_join_lock = rwlock_holder;
+     }
+@@ -394,7 +394,7 @@ class HashJoin : public IJoin
+ 
+     /// Should be set via setLock to protect hash table from modification from StorageJoin
+     /// If set HashJoin instance is not available for modification (addJoinedBlock)
+-    RWLockImpl::LockHolder storage_join_lock = nullptr;
++    TableLockHolder storage_join_lock = nullptr;
+ 
+     void dataMapInit(MapsVariant &);
+ 
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index 75d00fcb8a75..20d88c91709b 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -150,10 +150,9 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
+         /// When attaching old-style database during server startup, we must always use Ordinary engine
+         if (create.attach)
+             throw Exception("Database engine must be specified for ATTACH DATABASE query", ErrorCodes::UNKNOWN_DATABASE_ENGINE);
+-        bool old_style_database = getContext()->getSettingsRef().default_database_engine.value == DefaultDatabaseEngine::Ordinary;
+         auto engine = std::make_shared<ASTFunction>();
+         auto storage = std::make_shared<ASTStorage>();
+-        engine->name = old_style_database ? "Ordinary" : "Atomic";
++        engine->name = "Atomic";
+         engine->no_empty_args = true;
+         storage->set(storage->engine, engine);
+         create.set(create.storage, storage);
+@@ -196,8 +195,7 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
+ 
+         if (create_from_user)
+         {
+-            const auto & default_engine = getContext()->getSettingsRef().default_database_engine.value;
+-            if (create.uuid == UUIDHelpers::Nil && default_engine == DefaultDatabaseEngine::Atomic)
++            if (create.uuid == UUIDHelpers::Nil)
+                 create.uuid = UUIDHelpers::generateV4();    /// Will enable Atomic engine for nested database
+         }
+         else if (attach_from_user && create.uuid == UUIDHelpers::Nil)
+diff --git a/src/Interpreters/InterpreterDropQuery.cpp b/src/Interpreters/InterpreterDropQuery.cpp
+index 41b65e73efa2..ac731ec6f4b6 100644
+--- a/src/Interpreters/InterpreterDropQuery.cpp
++++ b/src/Interpreters/InterpreterDropQuery.cpp
+@@ -62,7 +62,7 @@ BlockIO InterpreterDropQuery::execute()
+     }
+ 
+     if (getContext()->getSettingsRef().database_atomic_wait_for_drop_and_detach_synchronously)
+-        drop.no_delay = true;
++        drop.sync = true;
+ 
+     if (drop.table)
+         return executeToTable(drop);
+@@ -89,7 +89,7 @@ BlockIO InterpreterDropQuery::executeToTable(ASTDropQuery & query)
+     DatabasePtr database;
+     UUID table_to_wait_on = UUIDHelpers::Nil;
+     auto res = executeToTableImpl(getContext(), query, database, table_to_wait_on);
+-    if (query.no_delay)
++    if (query.sync)
+         waitForTableToBeActuallyDroppedOrDetached(query, database, table_to_wait_on);
+     return res;
+ }
+@@ -244,7 +244,7 @@ BlockIO InterpreterDropQuery::executeToTableImpl(ContextPtr context_, ASTDropQue
+ 
+             DatabaseCatalog::instance().tryRemoveLoadingDependencies(table_id, getContext()->getSettingsRef().check_table_dependencies,
+                                                                      is_drop_or_detach_database);
+-            database->dropTable(context_, table_id.table_name, query.no_delay);
++            database->dropTable(context_, table_id.table_name, query.sync);
+         }
+ 
+         db = database;
+@@ -300,7 +300,7 @@ BlockIO InterpreterDropQuery::executeToDatabase(const ASTDropQuery & query)
+     }
+     catch (...)
+     {
+-        if (query.no_delay)
++        if (query.sync)
+         {
+             for (const auto & table_uuid : tables_to_wait)
+                 waitForTableToBeActuallyDroppedOrDetached(query, database, table_uuid);
+@@ -308,7 +308,7 @@ BlockIO InterpreterDropQuery::executeToDatabase(const ASTDropQuery & query)
+         throw;
+     }
+ 
+-    if (query.no_delay)
++    if (query.sync)
+     {
+         for (const auto & table_uuid : tables_to_wait)
+             waitForTableToBeActuallyDroppedOrDetached(query, database, table_uuid);
+@@ -345,7 +345,7 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query,
+                 query_for_table.kind = query.kind;
+                 query_for_table.if_exists = true;
+                 query_for_table.setDatabase(database_name);
+-                query_for_table.no_delay = query.no_delay;
++                query_for_table.sync = query.sync;
+ 
+                 /// Flush should not be done if shouldBeEmptyOnDetach() == false,
+                 /// since in this case getTablesIterator() may do some additional work,
+@@ -368,7 +368,7 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query,
+                 }
+             }
+ 
+-            if (!drop && query.no_delay)
++            if (!drop && query.sync)
+             {
+                 /// Avoid "some tables are still in use" when sync mode is enabled
+                 for (const auto & table_uuid : uuids_to_wait)
+@@ -428,7 +428,7 @@ void InterpreterDropQuery::extendQueryLogElemImpl(QueryLogElement & elem, const
+     elem.query_kind = "Drop";
+ }
+ 
+-void InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind kind, ContextPtr global_context, ContextPtr current_context, const StorageID & target_table_id, bool no_delay)
++void InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind kind, ContextPtr global_context, ContextPtr current_context, const StorageID & target_table_id, bool sync)
+ {
+     if (DatabaseCatalog::instance().tryGetTable(target_table_id, current_context))
+     {
+@@ -437,7 +437,7 @@ void InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind kind, ContextPtr
+         drop_query->setDatabase(target_table_id.database_name);
+         drop_query->setTable(target_table_id.table_name);
+         drop_query->kind = kind;
+-        drop_query->no_delay = no_delay;
++        drop_query->sync = sync;
+         drop_query->if_exists = true;
+         ASTPtr ast_drop_query = drop_query;
+         /// FIXME We have to use global context to execute DROP query for inner table
+diff --git a/src/Interpreters/InterpreterDropQuery.h b/src/Interpreters/InterpreterDropQuery.h
+index 1a38abcdff9a..2b65039954be 100644
+--- a/src/Interpreters/InterpreterDropQuery.h
++++ b/src/Interpreters/InterpreterDropQuery.h
+@@ -26,7 +26,7 @@ class InterpreterDropQuery : public IInterpreter, WithMutableContext
+ 
+     void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr &, ContextPtr) const override;
+ 
+-    static void executeDropQuery(ASTDropQuery::Kind kind, ContextPtr global_context, ContextPtr current_context, const StorageID & target_table_id, bool no_delay);
++    static void executeDropQuery(ASTDropQuery::Kind kind, ContextPtr global_context, ContextPtr current_context, const StorageID & target_table_id, bool sync);
+ 
+ private:
+     AccessRightsElements getRequiredAccessForDDLOnCluster() const;
+diff --git a/src/Interpreters/loadMetadata.cpp b/src/Interpreters/loadMetadata.cpp
+index de920eaddbfe..15d4f7929f87 100644
+--- a/src/Interpreters/loadMetadata.cpp
++++ b/src/Interpreters/loadMetadata.cpp
+@@ -9,6 +9,7 @@
+ #include <Interpreters/InterpreterCreateQuery.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/loadMetadata.h>
++#include <Interpreters/executeQuery.h>
+ 
+ #include <Databases/DatabaseOrdinary.h>
+ #include <Databases/TablesLoader.h>
+@@ -18,7 +19,6 @@
+ #include <Common/escapeForFileName.h>
+ 
+ #include <Common/typeid_cast.h>
+-#include <Common/StringUtils/StringUtils.h>
+ #include <filesystem>
+ #include <Common/logger_useful.h>
+ 
+@@ -27,6 +27,12 @@ namespace fs = std::filesystem;
+ namespace DB
+ {
+ 
++namespace ErrorCodes
++{
++    extern const int NOT_IMPLEMENTED;
++    extern const int LOGICAL_ERROR;
++}
++
+ static void executeCreateQuery(
+     const String & query,
+     ContextMutablePtr context,
+@@ -71,12 +77,6 @@ static void loadDatabase(
+         ReadBufferFromFile in(database_metadata_file, 1024);
+         readStringUntilEOF(database_attach_query, in);
+     }
+-    else if (fs::exists(fs::path(database_path)))
+-    {
+-        /// TODO Remove this code (it's required for compatibility with versions older than 20.7)
+-        /// Database exists, but .sql file is absent. It's old-style Ordinary database (e.g. system or default)
+-        database_attach_query = "ATTACH DATABASE " + backQuoteIfNeed(database) + " ENGINE = Ordinary";
+-    }
+     else
+     {
+         /// It's first server run and we need create default and system databases.
+@@ -95,6 +95,15 @@ static void loadDatabase(
+     }
+ }
+ 
++static void checkUnsupportedVersion(ContextMutablePtr context, const String & database_name)
++{
++    /// Produce better exception message
++    String metadata_path = context->getPath() + "metadata/" + database_name;
++    if (fs::exists(fs::path(metadata_path)))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data directory for {} database exists, but metadata file does not. "
++                                                     "Probably you are trying to upgrade from version older than 20.7. "
++                                                     "If so, you should upgrade through intermediate version.", database_name);
++}
+ 
+ void loadMetadata(ContextMutablePtr context, const String & default_database_name)
+ {
+@@ -118,43 +127,33 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
+         if (it->is_symlink())
+             continue;
+ 
++        if (it->is_directory())
++            continue;
++
+         const auto current_file = it->path().filename().string();
+-        if (!it->is_directory())
++
++        /// TODO: DETACH DATABASE PERMANENTLY ?
++        if (fs::path(current_file).extension() == ".sql")
+         {
+-            /// TODO: DETACH DATABASE PERMANENTLY ?
+-            if (fs::path(current_file).extension() == ".sql")
++            String db_name = fs::path(current_file).stem();
++            if (!isSystemOrInformationSchema(db_name))
++                databases.emplace(unescapeForFileName(db_name), fs::path(path) / db_name);
++        }
++
++        /// Temporary fails may be left from previous server runs.
++        if (fs::path(current_file).extension() == ".tmp")
++        {
++            LOG_WARNING(log, "Removing temporary file {}", it->path().string());
++            try
+             {
+-                String db_name = fs::path(current_file).stem();
+-                if (!isSystemOrInformationSchema(db_name))
+-                    databases.emplace(unescapeForFileName(db_name), fs::path(path) / db_name);
++                fs::remove(it->path());
+             }
+-
+-            /// Temporary fails may be left from previous server runs.
+-            if (fs::path(current_file).extension() == ".tmp")
++            catch (...)
+             {
+-                LOG_WARNING(log, "Removing temporary file {}", it->path().string());
+-                try
+-                {
+-                    fs::remove(it->path());
+-                }
+-                catch (...)
+-                {
+-                    /// It does not prevent server to startup.
+-                    tryLogCurrentException(log);
+-                }
++                /// It does not prevent server to startup.
++                tryLogCurrentException(log);
+             }
+-
+-            continue;
+         }
+-
+-        /// For '.svn', '.gitignore' directory and similar.
+-        if (current_file.at(0) == '.')
+-            continue;
+-
+-        if (isSystemOrInformationSchema(current_file))
+-            continue;
+-
+-        databases.emplace(unescapeForFileName(current_file), it->path().string());
+     }
+ 
+     /// clickhouse-local creates DatabaseMemory as default database by itself
+@@ -162,7 +161,10 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
+     bool create_default_db_if_not_exists = !default_database_name.empty();
+     bool metadata_dir_for_default_db_already_exists = databases.contains(default_database_name);
+     if (create_default_db_if_not_exists && !metadata_dir_for_default_db_already_exists)
++    {
++        checkUnsupportedVersion(context, default_database_name);
+         databases.emplace(default_database_name, std::filesystem::path(path) / escapeForFileName(default_database_name));
++    }
+ 
+     TablesLoader::Databases loaded_databases;
+     for (const auto & [name, db_path] : databases)
+@@ -192,13 +194,14 @@ static void loadSystemDatabaseImpl(ContextMutablePtr context, const String & dat
+ {
+     String path = context->getPath() + "metadata/" + database_name;
+     String metadata_file = path + ".sql";
+-    if (fs::exists(fs::path(path)) || fs::exists(fs::path(metadata_file)))
++    if (fs::exists(fs::path(metadata_file)))
+     {
+         /// 'has_force_restore_data_flag' is true, to not fail on loading query_log table, if it is corrupted.
+         loadDatabase(context, database_name, path, true);
+     }
+     else
+     {
++        checkUnsupportedVersion(context, database_name);
+         /// Initialize system database manually
+         String database_create_query = "CREATE DATABASE ";
+         database_create_query += database_name;
+@@ -208,6 +211,122 @@ static void loadSystemDatabaseImpl(ContextMutablePtr context, const String & dat
+     }
+ }
+ 
++static void convertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database)
++{
++    /// It's kind of C++ script that creates temporary database with Atomic engine,
++    /// moves all tables to it, drops old database and then renames new one to old name.
++
++    Poco::Logger * log = &Poco::Logger::get("loadMetadata");
++
++    String name = database->getDatabaseName();
++
++    String tmp_name = fmt::format(".tmp_convert.{}.{}", name, thread_local_rng());
++
++    String name_quoted = backQuoteIfNeed(name);
++    String tmp_name_quoted = backQuoteIfNeed(tmp_name);
++
++    LOG_INFO(log, "Will convert database {} from Ordinary to Atomic", name_quoted);
++
++    String create_database_query = fmt::format("CREATE DATABASE IF NOT EXISTS {}", tmp_name_quoted);
++    auto res = executeQuery(create_database_query, context, true);
++    executeTrivialBlockIO(res, context);
++    res = {};
++    auto tmp_database = DatabaseCatalog::instance().getDatabase(tmp_name);
++    assert(tmp_database->getEngineName() == "Atomic");
++
++    size_t num_tables = 0;
++    for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
++    {
++        ++num_tables;
++        auto id = iterator->table()->getStorageID();
++        id.database_name = tmp_name;
++        iterator->table()->checkTableCanBeRenamed(id);
++    }
++
++    LOG_INFO(log, "Will move {} tables to {}", num_tables, tmp_name_quoted);
++
++    for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
++    {
++        auto id = iterator->table()->getStorageID();
++        String qualified_quoted_name = id.getFullTableName();
++        id.database_name = tmp_name;
++        String tmp_qualified_quoted_name = id.getFullTableName();
++
++        String move_table_query = fmt::format("RENAME TABLE {} TO {}", qualified_quoted_name, tmp_qualified_quoted_name);
++        res = executeQuery(move_table_query, context, true);
++        executeTrivialBlockIO(res, context);
++        res = {};
++    }
++
++    LOG_INFO(log, "Moved all tables from {} to {}", name_quoted, tmp_name_quoted);
++
++    if (!database->empty())
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Database {} is not empty after moving tables", name_quoted);
++
++    String drop_query = fmt::format("DROP DATABASE {}", name_quoted);
++    res = executeQuery(drop_query, context, true);
++    executeTrivialBlockIO(res, context);
++    res = {};
++
++    String rename_query = fmt::format("RENAME DATABASE {} TO {}", tmp_name_quoted, name_quoted);
++    res = executeQuery(rename_query, context, true);
++    executeTrivialBlockIO(res, context);
++
++    LOG_INFO(log, "Finished database engine conversion of {}", name_quoted);
++}
++
++void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database)
++{
++    if (database->getEngineName() != "Ordinary")
++        return;
++
++    if (context->getSettingsRef().allow_deprecated_database_ordinary)
++        return;
++
++    try
++    {
++        /// It's not quite correct to run DDL queries while database is not started up.
++        startupSystemTables();
++
++        auto local_context = Context::createCopy(context);
++        local_context->setSetting("check_table_dependencies", false);
++        convertOrdinaryDatabaseToAtomic(local_context, database);
++
++        auto new_database = DatabaseCatalog::instance().getDatabase(DatabaseCatalog::SYSTEM_DATABASE);
++        UUID db_uuid = new_database->getUUID();
++        std::vector<UUID> tables_uuids;
++        for (auto iterator = new_database->getTablesIterator(context); iterator->isValid(); iterator->next())
++            tables_uuids.push_back(iterator->uuid());
++
++        /// Reload database just in case (and update logger name)
++        String detach_query = fmt::format("DETACH DATABASE {}", backQuoteIfNeed(DatabaseCatalog::SYSTEM_DATABASE));
++        auto res = executeQuery(detach_query, context, true);
++        executeTrivialBlockIO(res, context);
++        res = {};
++
++        /// Unlock UUID mapping, because it will be locked again on database reload.
++        /// It's safe to do during metadata loading, because cleanup task is not started yet.
++        DatabaseCatalog::instance().removeUUIDMappingFinally(db_uuid);
++        for (const auto & uuid : tables_uuids)
++            DatabaseCatalog::instance().removeUUIDMappingFinally(uuid);
++
++        loadSystemDatabaseImpl(context, DatabaseCatalog::SYSTEM_DATABASE, "Atomic");
++        TablesLoader::Databases databases =
++        {
++            {DatabaseCatalog::SYSTEM_DATABASE, DatabaseCatalog::instance().getSystemDatabase()},
++        };
++        TablesLoader loader{context, databases, /* force_restore */ true, /* force_attach */ true};
++        loader.loadTables();
++
++        /// Will startup tables usual way
++    }
++    catch (Exception & e)
++    {
++        e.addMessage("While trying to convert {} to Atomic", database->getDatabaseName());
++        throw;
++    }
++}
++
+ 
+ void startupSystemTables()
+ {
+diff --git a/src/Interpreters/loadMetadata.h b/src/Interpreters/loadMetadata.h
+index e918b5f530c7..8dc332defc53 100644
+--- a/src/Interpreters/loadMetadata.h
++++ b/src/Interpreters/loadMetadata.h
+@@ -19,4 +19,8 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
+ /// so we startup system tables after all databases are loaded.
+ void startupSystemTables();
+ 
++/// Converts database with Ordinary engine to Atomic. Does nothing if database is not Ordinary.
++/// Can be called only during server startup when there are no queries from users.
++void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database);
++
+ }
+diff --git a/src/Parsers/ASTDropQuery.cpp b/src/Parsers/ASTDropQuery.cpp
+index 9e815ee75deb..11c1dd4c47a5 100644
+--- a/src/Parsers/ASTDropQuery.cpp
++++ b/src/Parsers/ASTDropQuery.cpp
+@@ -72,8 +72,8 @@ void ASTDropQuery::formatQueryImpl(const FormatSettings & settings, FormatState
+     if (permanently)
+         settings.ostr << " PERMANENTLY";
+ 
+-    if (no_delay)
+-        settings.ostr << (settings.hilite ? hilite_keyword : "") << " NO DELAY" << (settings.hilite ? hilite_none : "");
++    if (sync)
++        settings.ostr << (settings.hilite ? hilite_keyword : "") << " SYNC" << (settings.hilite ? hilite_none : "");
+ }
+ 
+ }
+diff --git a/src/Parsers/ASTDropQuery.h b/src/Parsers/ASTDropQuery.h
+index ef2b609fbac1..b4c96353a09b 100644
+--- a/src/Parsers/ASTDropQuery.h
++++ b/src/Parsers/ASTDropQuery.h
+@@ -31,7 +31,7 @@ class ASTDropQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnClu
+     /// Same as above
+     bool is_view{false};
+ 
+-    bool no_delay{false};
++    bool sync{false};
+ 
+     // We detach the object permanently, so it will not be reattached back during server restart.
+     bool permanently{false};
+diff --git a/src/Parsers/ParserDropQuery.cpp b/src/Parsers/ParserDropQuery.cpp
+index e7263aa47f55..f40a39e6b2ff 100644
+--- a/src/Parsers/ParserDropQuery.cpp
++++ b/src/Parsers/ParserDropQuery.cpp
+@@ -31,7 +31,7 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
+     bool temporary = false;
+     bool is_dictionary = false;
+     bool is_view = false;
+-    bool no_delay = false;
++    bool sync = false;
+     bool permanently = false;
+ 
+     if (s_database.ignore(pos, expected))
+@@ -83,7 +83,7 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
+ 
+     /// actually for TRUNCATE NO DELAY / SYNC means nothing
+     if (s_no_delay.ignore(pos, expected) || s_sync.ignore(pos, expected))
+-        no_delay = true;
++        sync = true;
+ 
+     auto query = std::make_shared<ASTDropQuery>();
+     node = query;
+@@ -93,7 +93,7 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, cons
+     query->temporary = temporary;
+     query->is_dictionary = is_dictionary;
+     query->is_view = is_view;
+-    query->no_delay = no_delay;
++    query->sync = sync;
+     query->permanently = permanently;
+     query->database = database;
+     query->table = table;
+diff --git a/src/Storages/IStorage.h b/src/Storages/IStorage.h
+index a655da4473b4..6dd329db02bb 100644
+--- a/src/Storages/IStorage.h
++++ b/src/Storages/IStorage.h
+@@ -396,7 +396,7 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+       */
+     virtual void drop() {}
+ 
+-    virtual void dropInnerTableIfAny(bool /* no_delay */, ContextPtr /* context */) {}
++    virtual void dropInnerTableIfAny(bool /* sync */, ContextPtr /* context */) {}
+ 
+     /** Clear the table data and leave it empty.
+       * Must be called under exclusive lock (lockExclusively).
+diff --git a/src/Storages/MergeTree/registerStorageMergeTree.cpp b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+index 73b9b364f7ff..e52a0fed6742 100644
+--- a/src/Storages/MergeTree/registerStorageMergeTree.cpp
++++ b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+@@ -304,12 +304,22 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+                             arg_idx, e.message(), getMergeTreeVerboseHelp(is_extended_storage_def));
+         }
+     }
++    else if (!args.attach && !args.getLocalContext()->getSettingsRef().allow_deprecated_syntax_for_merge_tree)
++    {
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "This syntax for *MergeTree engine is deprecated. "
++                                                   "Use extended storage definition syntax with ORDER BY/PRIMARY KEY clause."
++                                                   "See also allow_deprecated_syntax_for_merge_tree setting.");
++    }
+ 
+     /// For Replicated.
+     String zookeeper_path;
+     String replica_name;
+     StorageReplicatedMergeTree::RenamingRestrictions renaming_restrictions = StorageReplicatedMergeTree::RenamingRestrictions::ALLOW_ANY;
+ 
++    bool is_on_cluster = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
++    bool is_replicated_database = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY &&
++        DatabaseCatalog::instance().getDatabase(args.table_id.database_name)->getEngineName() == "Replicated";
++
+     if (replicated)
+     {
+         bool has_arguments = arg_num + 2 <= arg_cnt;
+@@ -372,17 +382,11 @@ static StoragePtr create(const StorageFactory::Arguments & args)
+             throw Exception("Expected two string literal arguments: zookeeper_path and replica_name", ErrorCodes::BAD_ARGUMENTS);
+ 
+         /// Allow implicit {uuid} macros only for zookeeper_path in ON CLUSTER queries
+-        bool is_on_cluster = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
+-        bool is_replicated_database = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY &&
+-                                      DatabaseCatalog::instance().getDatabase(args.table_id.database_name)->getEngineName() == "Replicated";
+         bool allow_uuid_macro = is_on_cluster || is_replicated_database || args.query.attach;
+ 
+         /// Unfold {database} and {table} macro on table creation, so table can be renamed.
+         if (!args.attach)
+         {
+-            if (is_replicated_database && !is_extended_storage_def)
+-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Old syntax is not allowed for ReplicatedMergeTree tables in Replicated databases");
+-
+             Macros::MacroExpansionInfo info;
+             /// NOTE: it's not recursive
+             info.expand_special_macros_only = true;
+diff --git a/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.cpp b/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.cpp
+index 190ffabe2c11..cc80d567d1da 100644
+--- a/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.cpp
++++ b/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.cpp
+@@ -240,7 +240,7 @@ void StorageMaterializedPostgreSQL::shutdown()
+ }
+ 
+ 
+-void StorageMaterializedPostgreSQL::dropInnerTableIfAny(bool no_delay, ContextPtr local_context)
++void StorageMaterializedPostgreSQL::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+ {
+     /// If it is a table with database engine MaterializedPostgreSQL - return, because delition of
+     /// internal tables is managed there.
+@@ -252,7 +252,7 @@ void StorageMaterializedPostgreSQL::dropInnerTableIfAny(bool no_delay, ContextPt
+ 
+     auto nested_table = tryGetNested() != nullptr;
+     if (nested_table)
+-        InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, getNestedStorageID(), no_delay);
++        InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, getNestedStorageID(), sync);
+ }
+ 
+ 
+diff --git a/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.h b/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.h
+index bb3836a88530..f1eea33d4b0b 100644
+--- a/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.h
++++ b/src/Storages/PostgreSQL/StorageMaterializedPostgreSQL.h
+@@ -84,7 +84,7 @@ class StorageMaterializedPostgreSQL final : public IStorage, WithContext
+     void shutdown() override;
+ 
+     /// Used only for single MaterializedPostgreSQL storage.
+-    void dropInnerTableIfAny(bool no_delay, ContextPtr local_context) override;
++    void dropInnerTableIfAny(bool sync, ContextPtr local_context) override;
+ 
+     NamesAndTypesList getVirtuals() const override;
+ 
+diff --git a/src/Storages/StorageMaterializedView.cpp b/src/Storages/StorageMaterializedView.cpp
+index d0685c263f84..2ece0af33599 100644
+--- a/src/Storages/StorageMaterializedView.cpp
++++ b/src/Storages/StorageMaterializedView.cpp
+@@ -215,10 +215,10 @@ void StorageMaterializedView::drop()
+     dropInnerTableIfAny(true, getContext());
+ }
+ 
+-void StorageMaterializedView::dropInnerTableIfAny(bool no_delay, ContextPtr local_context)
++void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+ {
+     if (has_inner_table && tryGetTargetTable())
+-        InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, target_table_id, no_delay);
++        InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, target_table_id, sync);
+ }
+ 
+ void StorageMaterializedView::truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr local_context, TableExclusiveLockHolder &)
+diff --git a/src/Storages/StorageMaterializedView.h b/src/Storages/StorageMaterializedView.h
+index 8aec0313ecbd..0adf394876c3 100644
+--- a/src/Storages/StorageMaterializedView.h
++++ b/src/Storages/StorageMaterializedView.h
+@@ -42,7 +42,7 @@ class StorageMaterializedView final : public IStorage, WithMutableContext
+     SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context) override;
+ 
+     void drop() override;
+-    void dropInnerTableIfAny(bool no_delay, ContextPtr local_context) override;
++    void dropInnerTableIfAny(bool sync, ContextPtr local_context) override;
+ 
+     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
+ 
+diff --git a/src/Storages/WindowView/StorageWindowView.cpp b/src/Storages/WindowView/StorageWindowView.cpp
+index cfb198690740..d9780eb84462 100644
+--- a/src/Storages/WindowView/StorageWindowView.cpp
++++ b/src/Storages/WindowView/StorageWindowView.cpp
+@@ -1606,7 +1606,7 @@ void StorageWindowView::drop()
+     dropInnerTableIfAny(true, getContext());
+ }
+ 
+-void StorageWindowView::dropInnerTableIfAny(bool no_delay, ContextPtr local_context)
++void StorageWindowView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+ {
+     if (!std::exchange(has_inner_table, false))
+         return;
+@@ -1614,10 +1614,10 @@ void StorageWindowView::dropInnerTableIfAny(bool no_delay, ContextPtr local_cont
+     try
+     {
+         InterpreterDropQuery::executeDropQuery(
+-            ASTDropQuery::Kind::Drop, getContext(), local_context, inner_table_id, no_delay);
++            ASTDropQuery::Kind::Drop, getContext(), local_context, inner_table_id, sync);
+ 
+         if (has_inner_target_table)
+-            InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, target_table_id, no_delay);
++            InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, target_table_id, sync);
+     }
+     catch (...)
+     {
+diff --git a/src/Storages/WindowView/StorageWindowView.h b/src/Storages/WindowView/StorageWindowView.h
+index 86cc80ee8eaf..96c034b95907 100644
+--- a/src/Storages/WindowView/StorageWindowView.h
++++ b/src/Storages/WindowView/StorageWindowView.h
+@@ -120,7 +120,7 @@ class StorageWindowView final : public IStorage, WithContext
+ 
+     void checkTableCanBeDropped() const override;
+ 
+-    void dropInnerTableIfAny(bool no_delay, ContextPtr context) override;
++    void dropInnerTableIfAny(bool sync, ContextPtr context) override;
+ 
+     void drop() override;
+ 

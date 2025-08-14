@@ -1,0 +1,730 @@
+diff --git a/docs/en/operations/server-configuration-parameters/settings.md b/docs/en/operations/server-configuration-parameters/settings.md
+index d3a50969a392..1714251ac929 100644
+--- a/docs/en/operations/server-configuration-parameters/settings.md
++++ b/docs/en/operations/server-configuration-parameters/settings.md
+@@ -197,7 +197,7 @@ Default value: `480` (8 minute).
+ 
+ Parameter of a task that cleans up garbage from `store/` directory.
+ If some subdirectory is not used by clickhouse-server and this directory was not modified for last
+-`database_catalog_unused_dir_hide_timeout_sec` seconds, the task will "hide" this directory by 
++`database_catalog_unused_dir_hide_timeout_sec` seconds, the task will "hide" this directory by
+ removing all access rights. It also works for directories that clickhouse-server does not
+ expect to see inside `store/`. Zero means "immediately".
+ 
+@@ -206,10 +206,10 @@ Default value: `3600` (1 hour).
+ ## database_catalog_unused_dir_rm_timeout_sec {#database_catalog_unused_dir_rm_timeout_sec}
+ 
+ Parameter of a task that cleans up garbage from `store/` directory.
+-If some subdirectory is not used by clickhouse-server and it was previousely "hidden" 
+-(see [database_catalog_unused_dir_hide_timeout_sec](../../operations/server-configuration-parameters/settings.md#database_catalog_unused_dir_hide_timeout_sec)) 
++If some subdirectory is not used by clickhouse-server and it was previousely "hidden"
++(see [database_catalog_unused_dir_hide_timeout_sec](../../operations/server-configuration-parameters/settings.md#database_catalog_unused_dir_hide_timeout_sec))
+ and this directory was not modified for last
+-`database_catalog_unused_dir_rm_timeout_sec` seconds, the task will remove this directory. 
++`database_catalog_unused_dir_rm_timeout_sec` seconds, the task will remove this directory.
+ It also works for directories that clickhouse-server does not
+ expect to see inside `store/`. Zero means "never".
+ 
+@@ -731,6 +731,16 @@ On hosts with low RAM and swap, you possibly need setting `max_server_memory_usa
+ 
+ -   [max_server_memory_usage](#max_server_memory_usage)
+ 
++## concurrent_threads_soft_limit {#concurrent_threads_soft_limit}
++The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get one thread to run.
++
++Possible values:
++-   Positive integer.
++-   0 — No limit.
++-   -1 — The parameter is initialized by number of logical cores multiplies by 3. Which is a good heuristic for CPU-bound tasks.
++
++Default value: `0`.
++
+ ## max_concurrent_queries {#max-concurrent-queries}
+ 
+ The maximum number of simultaneously processed queries.
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index 621c40c31bf7..9effc23e1076 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -29,6 +29,7 @@
+ #include <Common/ClickHouseRevision.h>
+ #include <Common/DNSResolver.h>
+ #include <Common/CurrentMetrics.h>
++#include <Common/ConcurrencyControl.h>
+ #include <Common/Macros.h>
+ #include <Common/ShellCommand.h>
+ #include <Common/StringUtils/StringUtils.h>
+@@ -1124,6 +1125,23 @@ int Server::main(const std::vector<std::string> & /*args*/)
+             if (config->has("max_partition_size_to_drop"))
+                 global_context->setMaxPartitionSizeToDrop(config->getUInt64("max_partition_size_to_drop"));
+ 
++            if (config->has("concurrent_threads_soft_limit"))
++            {
++                auto concurrent_threads_soft_limit = config->getInt("concurrent_threads_soft_limit", 0);
++                if (concurrent_threads_soft_limit == -1)
++                {
++                    // Based on tests concurrent_threads_soft_limit has an optimal value when it's about 3 times of logical CPU cores
++                    constexpr size_t thread_factor = 3;
++                    concurrent_threads_soft_limit = std::thread::hardware_concurrency() * thread_factor;
++                }
++                if (concurrent_threads_soft_limit)
++                    ConcurrencyControl::instance().setMaxConcurrency(concurrent_threads_soft_limit);
++                else
++                    ConcurrencyControl::instance().setMaxConcurrency(ConcurrencyControl::Unlimited);
++            }
++            else
++                ConcurrencyControl::instance().setMaxConcurrency(ConcurrencyControl::Unlimited);
++
+             if (config->has("max_concurrent_queries"))
+                 global_context->getProcessList().setMaxSize(config->getInt("max_concurrent_queries", 0));
+ 
+diff --git a/programs/server/config.xml b/programs/server/config.xml
+index 40e561c18806..849302303974 100644
+--- a/programs/server/config.xml
++++ b/programs/server/config.xml
+@@ -269,6 +269,13 @@
+     <http_server_default_response><![CDATA[<html ng-app="SMI2"><head><base href="http://ui.tabix.io/"></head><body><div ui-view="" class="content-ui"></div><script src="http://loader.tabix.io/master.js"></script></body></html>]]></http_server_default_response>
+     -->
+ 
++    <!-- Maximum number of query processing threads to run all queries.
++         Note that This is not a hard limit. In case if the limit is reached the query will still get one thread to run.
++         For value equals to -1 this parameter is initialized by number of logical cores multiplies by 3.
++         Which is a good heuristic for CPU-bound tasks.
++    -->
++    <concurrent_threads_soft_limit>0</concurrent_threads_soft_limit>
++
+     <!-- Maximum number of concurrent queries. -->
+     <max_concurrent_queries>100</max_concurrent_queries>
+ 
+@@ -604,7 +611,7 @@
+              if this setting is true the user B will see all rows, and if this setting is false the user B will see no rows.
+              By default this setting is false for compatibility with earlier access configurations. -->
+         <users_without_row_policies_can_read_rows>false</users_without_row_policies_can_read_rows>
+-        
++
+         <!-- By default, for backward compatibility ON CLUSTER queries ignore CLUSTER grant,
+              however you can change this behaviour by setting this to true -->
+         <on_cluster_queries_require_cluster_grant>false</on_cluster_queries_require_cluster_grant>
+diff --git a/src/Common/ConcurrencyControl.h b/src/Common/ConcurrencyControl.h
+new file mode 100644
+index 000000000000..6f37bb45c849
+--- /dev/null
++++ b/src/Common/ConcurrencyControl.h
+@@ -0,0 +1,266 @@
++#pragma once
++
++#include <base/types.h>
++#include <boost/core/noncopyable.hpp>
++#include <mutex>
++#include <memory>
++#include <list>
++#include <condition_variable>
++
++#include <Common/Exception.h>
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int LOGICAL_ERROR;
++}
++}
++
++/*
++ * Controls how many threads can be allocated for a query (or another activity).
++ * There is a limited amount of slots for threads. It can be set with `setMaxConcurrency(limit)`.
++ *
++ * Lifecycle of a slot: free -> granted -> acquired -> free.
++ * free: slot is available to be allocated by any query.
++ * granted: slot is allocated by specific query, but not yet acquired by any thread.
++ * acquired: slot is allocated by specific query and acquired by a thread.
++ *
++ * USAGE:
++ *   1. Create an allocation for a query:
++ *      `auto slots = ConcurrencyControl::instance().allocate(min, max);`
++ *      It will allocate at least `min` and at most `max` slots.
++ *      Note that `min` slots are granted immediately, but other `max - min` may be granted later.
++ *   2. For every thread a slot has to be acquired from that allocation:
++ *      `while (auto slot = slots->tryAcquire()) createYourThread([slot = std::move(slot)] { ... });`
++ *      This snippet can be used at query startup and for upscaling later.
++ * (both functions are non-blocking)
++ *
++ * Released slots are distributed between waiting allocations in a round-robin manner to provide fairness.
++ * Oversubscription is possible: total amount of allocated slots can exceed `setMaxConcurrency(limit)`
++ * because `min` amount of slots is allocated for each query unconditionally.
++ */
++class ConcurrencyControl : boost::noncopyable
++{
++public:
++    struct Allocation;
++    using AllocationPtr = std::shared_ptr<Allocation>;
++    using SlotCount = UInt64;
++    using Waiters = std::list<Allocation *>;
++
++    static constexpr SlotCount Unlimited = std::numeric_limits<SlotCount>::max();
++
++    // Scoped guard for acquired slot, see Allocation::tryAcquire()
++    struct Slot : boost::noncopyable
++    {
++        ~Slot()
++        {
++            allocation->release();
++        }
++
++    private:
++        friend struct Allocation; // for ctor
++
++        explicit Slot(AllocationPtr && allocation_)
++            : allocation(std::move(allocation_))
++        {}
++
++        AllocationPtr allocation;
++    };
++
++    // FIXME: have to be unique_ptr, but ThreadFromGlobalPool does not support move semantics yet
++    using SlotPtr = std::shared_ptr<Slot>;
++
++    // Manages group of slots for a single query, see ConcurrencyControl::allocate(min, max)
++    struct Allocation : std::enable_shared_from_this<Allocation>, boost::noncopyable
++    {
++        ~Allocation()
++        {
++            // We have to lock parent's mutex to avoid race with grant()
++            // NOTE: shortcut can be added, but it requires Allocation::mutex lock even to check if shortcut is possible
++            parent.free(this);
++        }
++
++        // Take one already granted slot if available. Lock-free iff there is no granted slot.
++        [[nodiscard]] SlotPtr tryAcquire()
++        {
++            SlotCount value = granted.load();
++            while (value)
++            {
++                if (granted.compare_exchange_strong(value, value - 1))
++                {
++                    std::unique_lock lock{mutex};
++                    return SlotPtr(new Slot(shared_from_this())); // can't use std::make_shared due to private ctor
++                }
++            }
++            return {}; // avoid unnecessary locking
++        }
++
++        SlotCount grantedCount() const
++        {
++            return granted;
++        }
++
++    private:
++        friend struct Slot; // for release()
++        friend class ConcurrencyControl; // for grant(), free() and ctor
++
++        Allocation(ConcurrencyControl & parent_, SlotCount limit_, SlotCount granted_, Waiters::iterator waiter_ = {})
++            : parent(parent_)
++            , limit(limit_)
++            , allocated(granted_)
++            , granted(granted_)
++            , waiter(waiter_)
++        {
++            if (allocated < limit)
++                *waiter = this;
++        }
++
++        auto cancel()
++        {
++            std::unique_lock lock{mutex};
++            return std::pair{allocated - released,
++                allocated < limit ?
++                    std::optional<Waiters::iterator>(waiter) :
++                    std::optional<Waiters::iterator>()};
++        }
++
++        // Grant single slot to allocation, returns true iff more slot(s) are required
++        bool grant()
++        {
++            std::unique_lock lock{mutex};
++            granted++;
++            allocated++;
++            return allocated < limit;
++        }
++
++        // Release one slot and grant it to other allocation if required
++        void release()
++        {
++            parent.release(1);
++            std::unique_lock lock{mutex};
++            released++;
++            if (released > allocated)
++                abort();
++        }
++
++        ConcurrencyControl & parent;
++        const SlotCount limit;
++
++        std::mutex mutex; // the following values must be accessed under this mutex
++        SlotCount allocated; // allocated total (including already `released`)
++        SlotCount released = 0;
++
++        std::atomic<SlotCount> granted; // allocated, but not yet acquired
++
++        const Waiters::iterator waiter; // iterator to itself in Waiters list; valid iff allocated < limit
++    };
++
++public:
++    ConcurrencyControl()
++        : cur_waiter(waiters.end())
++    {}
++
++    // WARNING: all Allocation objects MUST be destructed before ConcurrencyControl
++    // NOTE: Recommended way to achieve this is to use `instance()` and do graceful shutdown of queries
++    ~ConcurrencyControl()
++    {
++        if (!waiters.empty())
++            abort();
++    }
++
++    // Allocate at least `min` and at most `max` slots.
++    // If not all `max` slots were successfully allocated, a subscription for later allocation is created
++    // Use `Allocation::tryAcquire()` to acquire allocated slot, before running a thread.
++    [[nodiscard]] AllocationPtr allocate(SlotCount min, SlotCount max)
++    {
++        if (min > max)
++            throw DB::Exception("ConcurrencyControl: invalid allocation requirements", DB::ErrorCodes::LOGICAL_ERROR);
++
++        std::unique_lock lock{mutex};
++
++        // Acquire as much slots as we can, but not lower than `min`
++        SlotCount granted = std::max(min, std::min(max, available(lock)));
++        cur_concurrency += granted;
++
++        // Create allocation and start waiting if more slots are required
++        if (granted < max)
++            return AllocationPtr(new Allocation(*this, max, granted,
++                waiters.insert(cur_waiter, nullptr /* pointer is set by Allocation ctor */)));
++        else
++            return AllocationPtr(new Allocation(*this, max, granted));
++    }
++
++    void setMaxConcurrency(SlotCount value)
++    {
++        std::unique_lock lock{mutex};
++        max_concurrency = std::max<SlotCount>(1, value); // never allow max_concurrency to be zero
++        schedule(lock);
++    }
++
++    static ConcurrencyControl & instance()
++    {
++        static ConcurrencyControl result;
++        return result;
++    }
++
++private:
++    friend struct Allocation; // for free() and release()
++
++    void free(Allocation * allocation)
++    {
++        // Allocation is allowed to be canceled even if there are:
++        //  - `amount`: granted slots (acquired slots are not possible, because Slot holds AllocationPtr)
++        //  - `waiter`: active waiting for more slots to be allocated
++        // Thus Allocation destruction may require the following lock, to avoid race conditions
++        std::unique_lock lock{mutex};
++        auto [amount, waiter] = allocation->cancel();
++
++        cur_concurrency -= amount;
++        if (waiter)
++        {
++            if (cur_waiter == *waiter)
++                cur_waiter = waiters.erase(*waiter);
++            else
++                waiters.erase(*waiter);
++        }
++        schedule(lock);
++    }
++
++    void release(SlotCount amount)
++    {
++        std::unique_lock lock{mutex};
++        cur_concurrency -= amount;
++        schedule(lock);
++    }
++
++    // Round-robin scheduling of available slots among waiting allocations
++    void schedule(std::unique_lock<std::mutex> &)
++    {
++        while (cur_concurrency < max_concurrency && !waiters.empty())
++        {
++            cur_concurrency++;
++            if (cur_waiter == waiters.end())
++                cur_waiter = waiters.begin();
++            Allocation * allocation = *cur_waiter;
++            if (allocation->grant())
++                ++cur_waiter;
++            else
++                cur_waiter = waiters.erase(cur_waiter); // last required slot has just been granted -- stop waiting
++        }
++    }
++
++    SlotCount available(std::unique_lock<std::mutex> &)
++    {
++        if (cur_concurrency < max_concurrency)
++            return max_concurrency - cur_concurrency;
++        else
++            return 0;
++    }
++
++    std::mutex mutex;
++    Waiters waiters;
++    Waiters::iterator cur_waiter; // round-robin pointer
++    SlotCount max_concurrency = Unlimited;
++    SlotCount cur_concurrency = 0;
++};
+diff --git a/src/Processors/Executors/ExecutorTasks.cpp b/src/Processors/Executors/ExecutorTasks.cpp
+index 824b4e962d2c..d5c2bfe73992 100644
+--- a/src/Processors/Executors/ExecutorTasks.cpp
++++ b/src/Processors/Executors/ExecutorTasks.cpp
+@@ -32,7 +32,7 @@ void ExecutorTasks::tryWakeUpAnyOtherThreadWithTasks(ExecutionThreadContext & se
+ {
+     if (!task_queue.empty() && !threads_queue.empty() && !finished)
+     {
+-        size_t next_thread = self.thread_number + 1 == num_threads ? 0 : (self.thread_number + 1);
++        size_t next_thread = self.thread_number + 1 >= use_threads ? 0 : (self.thread_number + 1);
+         auto thread_to_wake = task_queue.getAnyThreadWithTasks(next_thread);
+ 
+         if (threads_queue.has(thread_to_wake))
+@@ -40,6 +40,9 @@ void ExecutorTasks::tryWakeUpAnyOtherThreadWithTasks(ExecutionThreadContext & se
+         else
+             thread_to_wake = threads_queue.popAny();
+ 
++        if (thread_to_wake >= use_threads)
++            throw Exception("Non-empty queue without allocated thread", ErrorCodes::LOGICAL_ERROR);
++
+         lock.unlock();
+         executor_contexts[thread_to_wake]->wakeUp();
+     }
+@@ -50,6 +53,7 @@ void ExecutorTasks::tryGetTask(ExecutionThreadContext & context)
+     {
+         std::unique_lock lock(mutex);
+ 
++        /// Try get async task assigned to this thread or any other task from queue.
+         if (auto * async_task = context.tryPopAsyncTask())
+         {
+             context.setTask(async_task);
+@@ -58,13 +62,18 @@ void ExecutorTasks::tryGetTask(ExecutionThreadContext & context)
+         else if (!task_queue.empty())
+             context.setTask(task_queue.pop(context.thread_number));
+ 
++        /// Task found.
+         if (context.hasTask())
+         {
++            /// We have to wake up at least one thread if there are pending tasks.
++            /// That thread will wake up other threads during its `tryGetTask()` call if any.
+             tryWakeUpAnyOtherThreadWithTasks(context, lock);
+             return;
+         }
+ 
+-        if (threads_queue.size() + 1 == num_threads && async_task_queue.empty() && num_waiting_async_tasks == 0)
++        /// This thread has no tasks to do and is going to wait.
++        /// Finish execution if this was the last active thread.
++        if (threads_queue.size() + 1 == use_threads && async_task_queue.empty() && num_waiting_async_tasks == 0)
+         {
+             lock.unlock();
+             finish();
+@@ -88,6 +97,7 @@ void ExecutorTasks::tryGetTask(ExecutionThreadContext & context)
+         }
+     #endif
+ 
++        /// Enqueue thread into stack of waiting threads.
+         threads_queue.push(context.thread_number);
+     }
+ 
+@@ -124,13 +134,15 @@ void ExecutorTasks::pushTasks(Queue & queue, Queue & async_queue, ExecutionThrea
+             queue.pop();
+         }
+ 
++        /// Wake up at least one thread that will wake up other threads if required
+         tryWakeUpAnyOtherThreadWithTasks(context, lock);
+     }
+ }
+ 
+-void ExecutorTasks::init(size_t num_threads_, bool profile_processors, bool trace_processors, ReadProgressCallback * callback)
++void ExecutorTasks::init(size_t num_threads_, size_t use_threads_, bool profile_processors, bool trace_processors, ReadProgressCallback * callback)
+ {
+     num_threads = num_threads_;
++    use_threads = use_threads_;
+     threads_queue.init(num_threads);
+     task_queue.init(num_threads);
+ 
+@@ -154,11 +166,21 @@ void ExecutorTasks::fill(Queue & queue)
+         queue.pop();
+ 
+         ++next_thread;
+-        if (next_thread >= num_threads)
++
++        /// It is important to keep queues empty for threads that are not started yet.
++        /// Otherwise that thread can be selected by `tryWakeUpAnyOtherThreadWithTasks()`, leading to deadlock.
++        if (next_thread >= use_threads)
+             next_thread = 0;
+     }
+ }
+ 
++void ExecutorTasks::upscale(size_t use_threads_)
++{
++    std::lock_guard lock(mutex);
++    if (use_threads < use_threads_)
++        use_threads = use_threads_;
++}
++
+ void ExecutorTasks::processAsyncTasks()
+ {
+ #if defined(OS_LINUX)
+diff --git a/src/Processors/Executors/ExecutorTasks.h b/src/Processors/Executors/ExecutorTasks.h
+index 668470e7b11d..d35f8de94d15 100644
+--- a/src/Processors/Executors/ExecutorTasks.h
++++ b/src/Processors/Executors/ExecutorTasks.h
+@@ -32,8 +32,12 @@ class ExecutorTasks
+     /// For single thread, will wait for async tasks only when task_queue is empty.
+     PollingQueue async_task_queue;
+ 
++    /// Maximum amount of threads. Constant after initialization, based on `max_threads` setting.
+     size_t num_threads = 0;
+ 
++    /// Started thread count (allocated by `ConcurrencyControl`). Can increase during execution up to `num_threads`.
++    size_t use_threads = 0;
++
+     /// This is the total number of waited async tasks which are not executed yet.
+     /// sum(executor_contexts[i].async_tasks.size())
+     size_t num_waiting_async_tasks = 0;
+@@ -54,8 +58,9 @@ class ExecutorTasks
+     void tryGetTask(ExecutionThreadContext & context);
+     void pushTasks(Queue & queue, Queue & async_queue, ExecutionThreadContext & context);
+ 
+-    void init(size_t num_threads_, bool profile_processors, bool trace_processors, ReadProgressCallback * callback);
++    void init(size_t num_threads_, size_t use_threads_, bool profile_processors, bool trace_processors, ReadProgressCallback * callback);
+     void fill(Queue & queue);
++    void upscale(size_t use_threads_);
+ 
+     void processAsyncTasks();
+ 
+diff --git a/src/Processors/Executors/PipelineExecutor.cpp b/src/Processors/Executors/PipelineExecutor.cpp
+index 68225d73ff1e..ae20d97604bf 100644
+--- a/src/Processors/Executors/PipelineExecutor.cpp
++++ b/src/Processors/Executors/PipelineExecutor.cpp
+@@ -1,4 +1,3 @@
+-#include <queue>
+ #include <IO/WriteBufferFromString.h>
+ #include <Common/CurrentThread.h>
+ #include <Common/setThreadName.h>
+@@ -114,6 +113,11 @@ bool PipelineExecutor::executeStep(std::atomic_bool * yield_flag)
+     {
+         initializeExecution(1);
+ 
++        // Acquire slot until we are done
++        single_thread_slot = slots->tryAcquire();
++        if (!single_thread_slot)
++            abort(); // Unable to allocate slot for the first thread, but we just allocated at least one slot
++
+         if (yield_flag && *yield_flag)
+             return true;
+     }
+@@ -128,6 +132,7 @@ bool PipelineExecutor::executeStep(std::atomic_bool * yield_flag)
+         if (node->exception)
+             std::rethrow_exception(node->exception);
+ 
++    single_thread_slot.reset();
+     finalizeExecution();
+ 
+     return false;
+@@ -205,7 +210,6 @@ void PipelineExecutor::executeStepImpl(size_t thread_num, std::atomic_bool * yie
+     Stopwatch total_time_watch;
+ #endif
+ 
+-    // auto & node = tasks.getNode(thread_num);
+     auto & context = tasks.getThreadContext(thread_num);
+     bool yield = false;
+ 
+@@ -251,6 +255,9 @@ void PipelineExecutor::executeStepImpl(size_t thread_num, std::atomic_bool * yie
+             context.processing_time_ns += processing_time_watch.elapsed();
+ #endif
+ 
++            /// Upscale if possible.
++            spawnThreads();
++
+             /// We have executed single processor. Check if we need to yield execution.
+             if (yield_flag && *yield_flag)
+                 yield = true;
+@@ -267,70 +274,98 @@ void PipelineExecutor::initializeExecution(size_t num_threads)
+ {
+     is_execution_initialized = true;
+ 
++    /// Allocate CPU slots from concurrency control
++    constexpr size_t min_threads = 1;
++    slots = ConcurrencyControl::instance().allocate(min_threads, num_threads);
++    size_t use_threads = slots->grantedCount();
++
+     Queue queue;
+     graph->initializeExecution(queue);
+ 
+-    tasks.init(num_threads, profile_processors, trace_processors, read_progress_callback.get());
++    tasks.init(num_threads, use_threads, profile_processors, trace_processors, read_progress_callback.get());
+     tasks.fill(queue);
++
++    std::unique_lock lock{threads_mutex};
++    threads.reserve(num_threads);
++}
++
++void PipelineExecutor::spawnThreads()
++{
++    while (auto slot = slots->tryAcquire())
++    {
++        std::unique_lock lock{threads_mutex};
++        size_t thread_num = threads.size();
++
++        /// Count of threads in use should be updated for proper finish() condition.
++        /// NOTE: this will not decrease `use_threads` below initially granted count
++        tasks.upscale(thread_num + 1);
++
++        /// Start new thread
++        threads.emplace_back([this, thread_num, thread_group = CurrentThread::getGroup(), slot = std::move(slot)]
++        {
++            /// ThreadStatus thread_status;
++
++            setThreadName("QueryPipelineEx");
++
++            if (thread_group)
++                CurrentThread::attachTo(thread_group);
++
++            try
++            {
++                executeSingleThread(thread_num);
++            }
++            catch (...)
++            {
++                /// In case of exception from executor itself, stop other threads.
++                finish();
++                tasks.getThreadContext(thread_num).setException(std::current_exception());
++            }
++        });
++    }
++}
++
++void PipelineExecutor::joinThreads()
++{
++    for (size_t thread_num = 0; ; thread_num++)
++    {
++        std::unique_lock lock{threads_mutex};
++        if (thread_num >= threads.size())
++            break;
++        if (threads[thread_num].joinable())
++        {
++            auto & thread = threads[thread_num];
++            lock.unlock(); // to avoid deadlock if thread we are going to join starts spawning threads
++            thread.join();
++        }
++    }
++    // NOTE: No races: all concurrent spawnThreads() calls are done from `threads`, but they're already joined.
+ }
+ 
+ void PipelineExecutor::executeImpl(size_t num_threads)
+ {
+     initializeExecution(num_threads);
+ 
+-    using ThreadsData = std::vector<ThreadFromGlobalPool>;
+-    ThreadsData threads;
+-    threads.reserve(num_threads);
+-
+     bool finished_flag = false;
+ 
+     SCOPE_EXIT_SAFE(
+         if (!finished_flag)
+         {
+             finish();
+-
+-            for (auto & thread : threads)
+-                if (thread.joinable())
+-                    thread.join();
++            joinThreads();
+         }
+     );
+ 
+     if (num_threads > 1)
+     {
+-        auto thread_group = CurrentThread::getGroup();
+-
+-        for (size_t i = 0; i < num_threads; ++i)
+-        {
+-            threads.emplace_back([this, thread_group, thread_num = i]
+-            {
+-                /// ThreadStatus thread_status;
+-
+-                setThreadName("QueryPipelineEx");
+-
+-                if (thread_group)
+-                    CurrentThread::attachTo(thread_group);
+-
+-                try
+-                {
+-                    executeSingleThread(thread_num);
+-                }
+-                catch (...)
+-                {
+-                    /// In case of exception from executor itself, stop other threads.
+-                    finish();
+-                    tasks.getThreadContext(thread_num).setException(std::current_exception());
+-                }
+-            });
+-        }
+-
++        spawnThreads(); // start at least one thread
+         tasks.processAsyncTasks();
+-
+-        for (auto & thread : threads)
+-            if (thread.joinable())
+-                thread.join();
++        joinThreads();
+     }
+     else
++    {
++        auto slot = slots->tryAcquire();
+         executeSingleThread(0);
++    }
+ 
+     finished_flag = true;
+ }
+diff --git a/src/Processors/Executors/PipelineExecutor.h b/src/Processors/Executors/PipelineExecutor.h
+index c4d11ef688d9..cea64d309faa 100644
+--- a/src/Processors/Executors/PipelineExecutor.h
++++ b/src/Processors/Executors/PipelineExecutor.h
+@@ -4,9 +4,10 @@
+ #include <Processors/Executors/ExecutorTasks.h>
+ #include <Common/EventCounter.h>
+ #include <Common/logger_useful.h>
++#include <Common/ThreadPool.h>
++#include <Common/ConcurrencyControl.h>
+ 
+ #include <queue>
+-#include <stack>
+ #include <mutex>
+ 
+ namespace DB
+@@ -59,7 +60,12 @@ class PipelineExecutor
+     ExecutingGraphPtr graph;
+ 
+     ExecutorTasks tasks;
+-    using Stack = std::stack<UInt64>;
++
++    // Concurrency control related
++    ConcurrencyControl::AllocationPtr slots;
++    ConcurrencyControl::SlotPtr single_thread_slot; // slot for single-thread mode to work using executeStep()
++    std::mutex threads_mutex;
++    std::vector<ThreadFromGlobalPool> threads;
+ 
+     /// Flag that checks that initializeExecution was called.
+     bool is_execution_initialized = false;
+@@ -81,6 +87,8 @@ class PipelineExecutor
+ 
+     void initializeExecution(size_t num_threads); /// Initialize executor contexts and task_queue.
+     void finalizeExecution(); /// Check all processors are finished.
++    void spawnThreads();
++    void joinThreads();
+ 
+     /// Methods connected to execution.
+     void executeImpl(size_t num_threads);

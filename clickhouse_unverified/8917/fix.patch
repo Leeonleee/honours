@@ -1,0 +1,438 @@
+diff --git a/dbms/src/Storages/Kafka/KafkaBlockInputStream.cpp b/dbms/src/Storages/Kafka/KafkaBlockInputStream.cpp
+index b19dd4bb911e..ec708422d467 100644
+--- a/dbms/src/Storages/Kafka/KafkaBlockInputStream.cpp
++++ b/dbms/src/Storages/Kafka/KafkaBlockInputStream.cpp
+@@ -52,16 +52,21 @@ void KafkaBlockInputStream::readPrefixImpl()
+     if (!buffer)
+         return;
+ 
+-    buffer->subscribe(storage.getTopics());
++    buffer->subscribe();
+ 
+     broken = true;
+ }
+ 
+ Block KafkaBlockInputStream::readImpl()
+ {
+-    if (!buffer)
++    if (!buffer || finished)
+         return Block();
+ 
++    finished = true;
++    // now it's one-time usage InputStream
++    // one block of the needed size (or with desired flush timeout) is formed in one internal iteration
++    // otherwise external iteration will reuse that and logic will became even more fuzzy
++
+     MutableColumns result_columns  = non_virtual_header.cloneEmptyColumns();
+     MutableColumns virtual_columns = virtual_header.cloneEmptyColumns();
+ 
+@@ -126,6 +131,8 @@ Block KafkaBlockInputStream::readImpl()
+ 
+         auto new_rows = read_kafka_message();
+ 
++        buffer->storeLastReadMessageOffset();
++
+         auto _topic         = buffer->currentTopic();
+         auto _key           = buffer->currentKey();
+         auto _offset        = buffer->currentOffset();
+@@ -151,11 +158,18 @@ Block KafkaBlockInputStream::readImpl()
+ 
+         total_rows = total_rows + new_rows;
+         buffer->allowNext();
+-        if (!new_rows || total_rows >= max_block_size || !checkTimeLimit())
++
++        if (buffer->hasMorePolledMessages())
++        {
++            continue;
++        }
++        if (total_rows >= max_block_size || !checkTimeLimit())
++        {
+             break;
++        }
+     }
+ 
+-    if (total_rows == 0)
++    if (buffer->rebalanceHappened() || total_rows == 0)
+         return Block();
+ 
+     /// MATERIALIZED columns can be added here, but I think
+diff --git a/dbms/src/Storages/Kafka/KafkaBlockInputStream.h b/dbms/src/Storages/Kafka/KafkaBlockInputStream.h
+index 5ab2df15ecd1..1c853a4d486b 100644
+--- a/dbms/src/Storages/Kafka/KafkaBlockInputStream.h
++++ b/dbms/src/Storages/Kafka/KafkaBlockInputStream.h
+@@ -33,7 +33,8 @@ class KafkaBlockInputStream : public IBlockInputStream
+     UInt64 max_block_size;
+ 
+     ConsumerBufferPtr buffer;
+-    bool broken = true, claimed = false, commit_in_suffix;
++    bool broken = true, finished = false, claimed = false, commit_in_suffix;
++
+     const Block non_virtual_header, virtual_header;
+ };
+ 
+diff --git a/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.cpp b/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.cpp
+index 44b8a119240f..10f5fd0b47af 100644
+--- a/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.cpp
++++ b/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.cpp
+@@ -3,11 +3,14 @@
+ #include <common/logger_useful.h>
+ 
+ #include <cppkafka/cppkafka.h>
++#include <boost/algorithm/string/join.hpp>
+ 
+ namespace DB
+ {
+ 
+ using namespace std::chrono_literals;
++const auto MAX_TIME_TO_WAIT_FOR_ASSIGNMENT_MS = 15000;
++
+ 
+ ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
+     ConsumerPtr consumer_,
+@@ -15,7 +18,8 @@ ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
+     size_t max_batch_size,
+     size_t poll_timeout_,
+     bool intermediate_commit_,
+-    const std::atomic<bool> & stopped_)
++    const std::atomic<bool> & stopped_,
++    const Names & _topics)
+     : ReadBuffer(nullptr, 0)
+     , consumer(consumer_)
+     , log(log_)
+@@ -24,7 +28,51 @@ ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
+     , intermediate_commit(intermediate_commit_)
+     , stopped(stopped_)
+     , current(messages.begin())
++    , topics(_topics)
+ {
++    // called (synchroniously, during poll) when we enter the consumer group
++    consumer->set_assignment_callback([this](const cppkafka::TopicPartitionList& topic_partitions)
++    {
++        LOG_TRACE(log, "Topics/partitions assigned: " << topic_partitions);
++        assignment = topic_partitions;
++    });
++
++    // called (synchroniously, during poll) when we leave the consumer group
++    consumer->set_revocation_callback([this](const cppkafka::TopicPartitionList& topic_partitions)
++    {
++        // Rebalance is happening now, and now we have a chance to finish the work
++        // with topics/partitions we were working with before rebalance
++        LOG_TRACE(log, "Rebalance initiated. Revoking partitions: " << topic_partitions);
++
++        // we can not flush data to target from that point (it is pulled, not pushed)
++        // so the best we can now it to
++        // 1) repeat last commit in sync mode (async could be still in queue, we need to be sure is is properly committed before rebalance)
++        // 2) stop / brake the current reading:
++        //     * clean buffered non-commited messages
++        //     * set flag / flush
++
++        messages.clear();
++        current = messages.begin();
++        BufferBase::set(nullptr, 0, 0);
++
++        rebalance_happened = true;
++        assignment.clear();
++
++        // for now we use slower (but reliable) sync commit in main loop, so no need to repeat
++        // try
++        // {
++        //     consumer->commit();
++        // }
++        // catch (cppkafka::HandleException & e)
++        // {
++        //     LOG_WARNING(log, "Commit error: " << e.what());
++        // }
++    });
++
++    consumer->set_rebalance_error_callback([this](cppkafka::Error err)
++    {
++        LOG_ERROR(log, "Rebalance error: " << err);
++    });
+ }
+ 
+ ReadBufferFromKafkaConsumer::~ReadBufferFromKafkaConsumer()
+@@ -32,7 +80,7 @@ ReadBufferFromKafkaConsumer::~ReadBufferFromKafkaConsumer()
+     /// NOTE: see https://github.com/edenhill/librdkafka/issues/2077
+     consumer->unsubscribe();
+     consumer->unassign();
+-    while (consumer->get_consumer_queue().next_event(1s));
++    while (consumer->get_consumer_queue().next_event(100ms));
+ }
+ 
+ void ReadBufferFromKafkaConsumer::commit()
+@@ -72,55 +120,60 @@ void ReadBufferFromKafkaConsumer::commit()
+ 
+     PrintOffsets("Polled offset", consumer->get_offsets_position(consumer->get_assignment()));
+ 
+-    consumer->async_commit();
++    if (hasMorePolledMessages())
++    {
++        LOG_WARNING(log,"Logical error. Non all polled messages were processed.");
++    }
++
++    if (offsets_stored > 0)
++    {
++        // if we will do async commit here (which is faster)
++        // we may need to repeat commit in sync mode in revocation callback,
++        // but it seems like existing API doesn't allow us to to that
++        // in a controlled manner (i.e. we don't know the offsets to commit then)
++        consumer->commit();
++    }
++    else
++    {
++        LOG_TRACE(log,"Nothing to commit.");
++    }
+ 
+     PrintOffsets("Committed offset", consumer->get_offsets_committed(consumer->get_assignment()));
++    offsets_stored = 0;
+ 
+     stalled = false;
+ }
+ 
+-void ReadBufferFromKafkaConsumer::subscribe(const Names & topics)
++void ReadBufferFromKafkaConsumer::subscribe()
+ {
+-    {
+-        String message = "Already subscribed to topics:";
+-        for (const auto & topic : consumer->get_subscription())
+-            message += " " + topic;
+-        LOG_TRACE(log, message);
+-    }
++    LOG_TRACE(log,"Already subscribed to topics: [ "
++                    << boost::algorithm::join(consumer->get_subscription(), ", ")
++                    << " ]");
+ 
+-    {
+-        String message = "Already assigned to topics:";
+-        for (const auto & toppar : consumer->get_assignment())
+-            message += " " + toppar.get_topic();
+-        LOG_TRACE(log, message);
+-    }
++    LOG_TRACE(log, "Already assigned to : " << assignment);
++
++    size_t max_retries = 5;
+ 
+-    // While we wait for an assignment after subscribtion, we'll poll zero messages anyway.
+-    // If we're doing a manual select then it's better to get something after a wait, then immediate nothing.
+-    // But due to the nature of async pause/resume/subscribe we can't guarantee any persistent state:
+-    // see https://github.com/edenhill/librdkafka/issues/2455
+     while (consumer->get_subscription().empty())
+     {
+-        stalled = false;
+-
++        --max_retries;
+         try
+         {
+             consumer->subscribe(topics);
+-            if (nextImpl())
+-                break;
+-
+             // FIXME: if we failed to receive "subscribe" response while polling and destroy consumer now, then we may hang up.
+             //        see https://github.com/edenhill/librdkafka/issues/2077
+         }
+         catch (cppkafka::HandleException & e)
+         {
+-            if (e.get_error() == RD_KAFKA_RESP_ERR__TIMED_OUT)
++            if (max_retries > 0 && e.get_error() == RD_KAFKA_RESP_ERR__TIMED_OUT)
+                 continue;
+             throw;
+         }
+     }
+ 
+     stalled = false;
++    rebalance_happened = false;
++    offsets_stored = 0;
+ }
+ 
+ void ReadBufferFromKafkaConsumer::unsubscribe()
+@@ -134,13 +187,33 @@ void ReadBufferFromKafkaConsumer::unsubscribe()
+     consumer->unsubscribe();
+ }
+ 
++
++bool ReadBufferFromKafkaConsumer::hasMorePolledMessages() const
++{
++    return (!stalled) && (current != messages.end());
++}
++
++
++void ReadBufferFromKafkaConsumer::resetToLastCommitted(const char * msg)
++{
++    if (assignment.empty())
++    {
++        LOG_TRACE(log, "Not assignned. Can't reset to last committed position.");
++        return;
++    }
++    auto committed_offset = consumer->get_offsets_committed(consumer->get_assignment());
++    consumer->assign(committed_offset);
++    LOG_TRACE(log, msg << "Returned to committed position: " << committed_offset);
++
++}
++
+ /// Do commit messages implicitly after we processed the previous batch.
+ bool ReadBufferFromKafkaConsumer::nextImpl()
+ {
+     /// NOTE: ReadBuffer was implemented with an immutable underlying contents in mind.
+     ///       If we failed to poll any message once - don't try again.
+     ///       Otherwise, the |poll_timeout| expectations get flawn.
+-    if (stalled || stopped || !allowed)
++    if (stalled || stopped || !allowed || rebalance_happened)
+         return false;
+ 
+     if (current == messages.end())
+@@ -148,18 +221,60 @@ bool ReadBufferFromKafkaConsumer::nextImpl()
+         if (intermediate_commit)
+             commit();
+ 
+-        /// Don't drop old messages immediately, since we may need them for virtual columns.
+-        auto new_messages = consumer->poll_batch(batch_size, std::chrono::milliseconds(poll_timeout));
+-        if (new_messages.empty())
++        size_t waited_for_assignment = 0;
++        while (1)
+         {
+-            LOG_TRACE(log, "Stalled");
+-            stalled = true;
+-            return false;
+-        }
+-        messages = std::move(new_messages);
+-        current = messages.begin();
++            /// Don't drop old messages immediately, since we may need them for virtual columns.
++            auto new_messages = consumer->poll_batch(batch_size, std::chrono::milliseconds(poll_timeout));
+ 
+-        LOG_TRACE(log, "Polled batch of " << messages.size() << " messages");
++            if (rebalance_happened)
++            {
++                if (!new_messages.empty())
++                {
++                    // we have polled something just after rebalance.
++                    // we will not use current batch, so we need to return to last commited position
++                    // otherwise we will continue polling from that position
++                    resetToLastCommitted("Rewind last poll after rebalance.");
++                }
++
++                offsets_stored = 0;
++                return false;
++            }
++
++            if (new_messages.empty())
++            {
++                // While we wait for an assignment after subscription, we'll poll zero messages anyway.
++                // If we're doing a manual select then it's better to get something after a wait, then immediate nothing.
++                if (assignment.empty())
++                {
++                    waited_for_assignment += poll_timeout; // slightly innaccurate, but rough calculation is ok.
++                    if (waited_for_assignment < MAX_TIME_TO_WAIT_FOR_ASSIGNMENT_MS)
++                    {
++                        continue;
++                    }
++                    else
++                    {
++                        LOG_TRACE(log, "Can't get assignment");
++                        stalled = true;
++                        return false;
++                    }
++
++                }
++                else
++                {
++                    LOG_TRACE(log, "Stalled");
++                    stalled = true;
++                    return false;
++                }
++            }
++            else
++            {
++                messages = std::move(new_messages);
++                current = messages.begin();
++                LOG_TRACE(log, "Polled batch of " << messages.size() << " messages. Offset position: " << consumer->get_offsets_position(consumer->get_assignment()));
++                break;
++            }
++        }
+     }
+ 
+     if (auto err = current->get_error())
+@@ -176,12 +291,18 @@ bool ReadBufferFromKafkaConsumer::nextImpl()
+     BufferBase::set(new_position, current->get_payload().get_size(), 0);
+     allowed = false;
+ 
+-    /// Since we can poll more messages than we already processed - commit only processed messages.
+-    consumer->store_offset(*current);
+-
+     ++current;
+ 
+     return true;
+ }
+ 
++void ReadBufferFromKafkaConsumer::storeLastReadMessageOffset()
++{
++    if (!stalled && !rebalance_happened)
++    {
++        consumer->store_offset(*(current - 1));
++        ++offsets_stored;
++    }
++}
++
+ }
+diff --git a/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.h b/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.h
+index d1ea961cef2b..700a69cf49bc 100644
+--- a/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.h
++++ b/dbms/src/Storages/Kafka/ReadBufferFromKafkaConsumer.h
+@@ -25,16 +25,24 @@ class ReadBufferFromKafkaConsumer : public ReadBuffer
+         size_t max_batch_size,
+         size_t poll_timeout_,
+         bool intermediate_commit_,
+-        const std::atomic<bool> & stopped_);
++        const std::atomic<bool> & stopped_,
++        const Names & _topics
++    );
+     ~ReadBufferFromKafkaConsumer() override;
+ 
+     void allowNext() { allowed = true; } // Allow to read next message.
+     void commit(); // Commit all processed messages.
+-    void subscribe(const Names & topics); // Subscribe internal consumer to topics.
++    void subscribe(); // Subscribe internal consumer to topics.
+     void unsubscribe(); // Unsubscribe internal consumer in case of failure.
+ 
+     auto pollTimeout() const { return poll_timeout; }
+ 
++    bool hasMorePolledMessages() const;
++    auto rebalanceHappened() const { return rebalance_happened; }
++
++    void storeLastReadMessageOffset();
++    void resetToLastCommitted(const char * msg);
++
+     // Return values for the message that's being read.
+     String currentTopic() const { return current[-1].get_topic(); }
+     String currentKey() const { return current[-1].get_key(); }
+@@ -49,6 +57,7 @@ class ReadBufferFromKafkaConsumer : public ReadBuffer
+     Poco::Logger * log;
+     const size_t batch_size = 1;
+     const size_t poll_timeout = 0;
++    size_t offsets_stored = 0;
+     bool stalled = false;
+     bool intermediate_commit = true;
+     bool allowed = true;
+@@ -58,6 +67,10 @@ class ReadBufferFromKafkaConsumer : public ReadBuffer
+     Messages messages;
+     Messages::const_iterator current;
+ 
++    bool rebalance_happened = false;
++    cppkafka::TopicPartitionList assignment;
++    const Names topics;
++
+     bool nextImpl() override;
+ };
+ 
+diff --git a/dbms/src/Storages/Kafka/StorageKafka.cpp b/dbms/src/Storages/Kafka/StorageKafka.cpp
+index 1980637f4b6d..6b0bab72bb01 100644
+--- a/dbms/src/Storages/Kafka/StorageKafka.cpp
++++ b/dbms/src/Storages/Kafka/StorageKafka.cpp
+@@ -272,7 +272,7 @@ ConsumerBufferPtr StorageKafka::createReadBuffer()
+     size_t poll_timeout = settings.stream_poll_timeout_ms.totalMilliseconds();
+ 
+     /// NOTE: we pass |stream_cancelled| by reference here, so the buffers should not outlive the storage.
+-    return std::make_shared<ReadBufferFromKafkaConsumer>(consumer, log, batch_size, poll_timeout, intermediate_commit, stream_cancelled);
++    return std::make_shared<ReadBufferFromKafkaConsumer>(consumer, log, batch_size, poll_timeout, intermediate_commit, stream_cancelled, getTopics());
+ }
+ 
+ 

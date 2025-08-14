@@ -1,0 +1,665 @@
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index f9cc7a4197b3..17a91a1fff97 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -217,6 +217,9 @@ void DatabaseAtomic::renameTable(const Context & context, const String & table_n
+     if (is_dictionary && !inside_database)
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot move dictionary to other database");
+ 
++    if (!exchange)
++        other_db.checkMetadataFilenameAvailabilityUnlocked(to_table_name, inside_database ? db_lock : other_db_lock);
++
+     StoragePtr table = getTableUnlocked(table_name, db_lock);
+     table->checkTableCanBeRenamed();
+     assert_can_move_mat_view(table);
+diff --git a/src/Databases/DatabaseLazy.cpp b/src/Databases/DatabaseLazy.cpp
+index 0119f17f8431..f297bf2c82f2 100644
+--- a/src/Databases/DatabaseLazy.cpp
++++ b/src/Databases/DatabaseLazy.cpp
+@@ -42,6 +42,14 @@ void DatabaseLazy::loadStoredObjects(
+     iterateMetadataFiles(context, [this](const String & file_name)
+     {
+         const std::string table_name = file_name.substr(0, file_name.size() - 4);
++
++        auto detached_permanently_flag = Poco::File(getMetadataPath() + "/" + file_name + detached_suffix);
++        if (detached_permanently_flag.exists())
++        {
++            LOG_DEBUG(log, "Skipping permanently detached table {}.", backQuote(table_name));
++            return;
++        }
++
+         attachTable(table_name, nullptr, {});
+     });
+ }
+diff --git a/src/Databases/DatabaseOnDisk.cpp b/src/Databases/DatabaseOnDisk.cpp
+index 4f172f0f8deb..2a8276ec6dbf 100644
+--- a/src/Databases/DatabaseOnDisk.cpp
++++ b/src/Databases/DatabaseOnDisk.cpp
+@@ -164,20 +164,38 @@ void DatabaseOnDisk::createTable(
+     /// But there is protection from it - see using DDLGuard in InterpreterCreateQuery.
+ 
+     if (isDictionaryExist(table_name))
+-        throw Exception("Dictionary " + backQuote(getDatabaseName()) + "." + backQuote(table_name) + " already exists.",
+-            ErrorCodes::DICTIONARY_ALREADY_EXISTS);
++        throw Exception(ErrorCodes::DICTIONARY_ALREADY_EXISTS, "Dictionary {}.{} already exists", backQuote(getDatabaseName()), backQuote(table_name));
+ 
+     if (isTableExist(table_name, global_context))
+-        throw Exception("Table " + backQuote(getDatabaseName()) + "." + backQuote(table_name) + " already exists.", ErrorCodes::TABLE_ALREADY_EXISTS);
++        throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists", backQuote(getDatabaseName()), backQuote(table_name));
++
++    String table_metadata_path = getObjectMetadataPath(table_name);
+ 
+     if (create.attach_short_syntax)
+     {
+         /// Metadata already exists, table was detached
+         attachTable(table_name, table, getTableDataPath(create));
++        removeDetachedPermanentlyFlag(table_name, table_metadata_path);
+         return;
+     }
+ 
+-    String table_metadata_path = getObjectMetadataPath(table_name);
++    if (!create.attach)
++        checkMetadataFilenameAvailability(table_name);
++
++    if (create.attach && Poco::File(table_metadata_path).exists())
++    {
++        ASTPtr ast_detached = parseQueryFromMetadata(log, context, table_metadata_path);
++        auto & create_detached = ast_detached->as<ASTCreateQuery &>();
++
++        // either both should be Nil, either values should be equal
++        if (create.uuid != create_detached.uuid)
++            throw Exception(
++                    ErrorCodes::TABLE_ALREADY_EXISTS,
++                    "Table {}.{} already exist (detached permanently). To attach it back "
++                    "you need to use short ATTACH syntax or a full statement with the same UUID",
++                    backQuote(getDatabaseName()), backQuote(table_name));
++    }
++
+     String table_metadata_tmp_path = table_metadata_path + create_suffix;
+     String statement;
+ 
+@@ -194,6 +212,26 @@ void DatabaseOnDisk::createTable(
+     }
+ 
+     commitCreateTable(create, table, table_metadata_tmp_path, table_metadata_path);
++
++    removeDetachedPermanentlyFlag(table_name, table_metadata_path);
++}
++
++/// If the table was detached permanently we will have a flag file with
++/// .sql.detached extension, is not needed anymore since we attached the table back
++void DatabaseOnDisk::removeDetachedPermanentlyFlag(const String & table_name, const String & table_metadata_path) const
++{
++    try
++    {
++        auto detached_permanently_flag = Poco::File(table_metadata_path + detached_suffix);
++
++        if (detached_permanently_flag.exists())
++            detached_permanently_flag.remove();
++    }
++    catch (Exception & e)
++    {
++        e.addMessage("while trying to remove permanenty detached flag. Table {}.{} may still be marked as permanently detached, and will not be reattached during server restart.", backQuote(getDatabaseName()), backQuote(table_name));
++        throw;
++    }
+ }
+ 
+ void DatabaseOnDisk::commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
+@@ -215,6 +253,22 @@ void DatabaseOnDisk::commitCreateTable(const ASTCreateQuery & query, const Stora
+     }
+ }
+ 
++void DatabaseOnDisk::detachTablePermanently(const String & table_name)
++{
++    auto table = detachTable(table_name);
++
++    Poco::File detached_permanently_flag(getObjectMetadataPath(table_name) + detached_suffix);
++    try
++    {
++        detached_permanently_flag.createFile();
++    }
++    catch (Exception & e)
++    {
++        e.addMessage("while trying to set permanenty detached flag. Table {}.{} may be reattached during server restart.", backQuote(getDatabaseName()), backQuote(table_name));
++        throw;
++    }
++}
++
+ void DatabaseOnDisk::dropTable(const Context & context, const String & table_name, bool /*no_delay*/)
+ {
+     String table_metadata_path = getObjectMetadataPath(table_name);
+@@ -253,6 +307,27 @@ void DatabaseOnDisk::dropTable(const Context & context, const String & table_nam
+     Poco::File(table_metadata_path_drop).remove();
+ }
+ 
++void DatabaseOnDisk::checkMetadataFilenameAvailability(const String & to_table_name) const
++{
++    std::unique_lock lock(mutex);
++    checkMetadataFilenameAvailabilityUnlocked(to_table_name, lock);
++}
++
++void DatabaseOnDisk::checkMetadataFilenameAvailabilityUnlocked(const String & to_table_name, std::unique_lock<std::mutex> &) const
++{
++    String table_metadata_path = getObjectMetadataPath(to_table_name);
++
++    if (Poco::File(table_metadata_path).exists())
++    {
++        auto detached_permanently_flag = Poco::File(table_metadata_path + detached_suffix);
++
++        if (detached_permanently_flag.exists())
++            throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists (detached permanently)", backQuote(database_name), backQuote(to_table_name));
++        else
++            throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists (detached)", backQuote(database_name), backQuote(to_table_name));
++    }
++}
++
+ void DatabaseOnDisk::renameTable(
+         const Context & context,
+         const String & table_name,
+@@ -299,6 +374,9 @@ void DatabaseOnDisk::renameTable(
+         if (from_atomic_to_ordinary)
+             create.uuid = UUIDHelpers::Nil;
+ 
++        if (auto * target_db = dynamic_cast<DatabaseOnDisk *>(&to_database))
++            target_db->checkMetadataFilenameAvailability(to_table_name);
++
+         /// Notify the table that it is renamed. It will move data to new path (if it stores data on disk) and update StorageID
+         table->rename(to_database.getTableDataPath(create), StorageID(create));
+     }
+@@ -328,6 +406,8 @@ void DatabaseOnDisk::renameTable(
+     }
+ }
+ 
++
++/// It returns create table statement (even if table is detached)
+ ASTPtr DatabaseOnDisk::getCreateTableQueryImpl(const String & table_name, const Context &, bool throw_on_error) const
+ {
+     ASTPtr ast;
+@@ -430,8 +510,11 @@ void DatabaseOnDisk::iterateMetadataFiles(const Context & context, const Iterati
+         if (endsWith(dir_it.name(), ".sql.bak"))
+             continue;
+ 
+-        static const char * tmp_drop_ext = ".sql.tmp_drop";
+-        if (endsWith(dir_it.name(), tmp_drop_ext))
++        /// Permanently detached table flag
++        if (endsWith(dir_it.name(), ".sql.detached"))
++            continue;
++
++        if (endsWith(dir_it.name(), ".sql.tmp_drop"))
+         {
+             /// There are files that we tried to delete previously
+             metadata_files.emplace(dir_it.name(), false);
+diff --git a/src/Databases/DatabaseOnDisk.h b/src/Databases/DatabaseOnDisk.h
+index 586491d4d29d..fff2a259911b 100644
+--- a/src/Databases/DatabaseOnDisk.h
++++ b/src/Databases/DatabaseOnDisk.h
+@@ -39,6 +39,8 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+         const StoragePtr & table,
+         const ASTPtr & query) override;
+ 
++    void detachTablePermanently(const String & table_name) override;
++
+     void dropTable(
+         const Context & context,
+         const String & table_name,
+@@ -67,9 +69,14 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+ 
+     static ASTPtr parseQueryFromMetadata(Poco::Logger * log, const Context & context, const String & metadata_file_path, bool throw_on_error = true, bool remove_empty = false);
+ 
++    /// will throw when the table we want to attach already exists (in active / detached / detached permanently form)
++    void checkMetadataFilenameAvailability(const String & to_table_name) const;
++    void checkMetadataFilenameAvailabilityUnlocked(const String & to_table_name, std::unique_lock<std::mutex> &) const;
++
+ protected:
+     static constexpr const char * create_suffix = ".tmp";
+     static constexpr const char * drop_suffix = ".tmp_drop";
++    static constexpr const char * detached_suffix = ".detached";
+ 
+     using IteratingFunction = std::function<void(const String &)>;
+ 
+@@ -87,6 +94,9 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+ 
+     const String metadata_path;
+     const String data_path;
++
++private:
++    void removeDetachedPermanentlyFlag(const String & table_name, const String & table_metadata_path) const;
+ };
+ 
+ }
+diff --git a/src/Databases/DatabaseOrdinary.cpp b/src/Databases/DatabaseOrdinary.cpp
+index 24e2bdcd6b29..58b4ad72a1b8 100644
+--- a/src/Databases/DatabaseOrdinary.cpp
++++ b/src/Databases/DatabaseOrdinary.cpp
+@@ -135,6 +135,19 @@ void DatabaseOrdinary::loadStoredObjects(Context & context, bool has_force_resto
+             {
+                 auto * create_query = ast->as<ASTCreateQuery>();
+                 create_query->database = database_name;
++
++                auto detached_permanently_flag = Poco::File(full_path.string() + detached_suffix);
++                if (detached_permanently_flag.exists())
++                {
++                    /// FIXME: even if we don't load the table we can still mark the uuid of it as taken.
++                    /// if (create_query->uuid != UUIDHelpers::Nil)
++                    ///     DatabaseCatalog::instance().addUUIDMapping(create_query->uuid);
++
++                    const std::string table_name = file_name.substr(0, file_name.size() - 4);
++                    LOG_DEBUG(log, "Skipping permanently detached table {}.", backQuote(table_name));
++                    return;
++                }
++
+                 std::lock_guard lock{file_names_mutex};
+                 file_names[file_name] = ast;
+                 total_dictionaries += create_query->is_dictionary;
+diff --git a/src/Databases/DatabasesCommon.cpp b/src/Databases/DatabasesCommon.cpp
+index 29262318138b..2d3d206162bd 100644
+--- a/src/Databases/DatabasesCommon.cpp
++++ b/src/Databases/DatabasesCommon.cpp
+@@ -72,7 +72,7 @@ StoragePtr DatabaseWithOwnTablesBase::detachTableUnlocked(const String & table_n
+ 
+     auto it = tables.find(table_name);
+     if (it == tables.end())
+-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist.",
++        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist",
+                         backQuote(database_name), backQuote(table_name));
+     res = it->second;
+     tables.erase(it);
+@@ -157,7 +157,7 @@ StoragePtr DatabaseWithOwnTablesBase::getTableUnlocked(const String & table_name
+     auto it = tables.find(table_name);
+     if (it != tables.end())
+         return it->second;
+-    throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist.",
++    throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist",
+                     backQuote(database_name), backQuote(table_name));
+ }
+ 
+diff --git a/src/Databases/IDatabase.h b/src/Databases/IDatabase.h
+index 9a0eb8d99695..fc821fcab30f 100644
+--- a/src/Databases/IDatabase.h
++++ b/src/Databases/IDatabase.h
+@@ -221,6 +221,8 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+     }
+ 
+     /// Add a table to the database, but do not add it to the metadata. The database may not support this method.
++    ///
++    /// Note: ATTACH TABLE statement actually uses createTable method.
+     virtual void attachTable(const String & /*name*/, const StoragePtr & /*table*/, [[maybe_unused]] const String & relative_table_path = {})
+     {
+         throw Exception("There is no ATTACH TABLE query for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
+@@ -245,6 +247,13 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+         throw Exception("There is no DETACH DICTIONARY query for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
++    /// Forget about the table without deleting it's data, but rename metadata file to prevent reloading it
++    /// with next restart. The database may not support this method.
++    virtual void detachTablePermanently(const String & /*name*/)
++    {
++        throw Exception("There is no DETACH TABLE PERMANENTLY query for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
++    }
++
+     /// Rename the table and possibly move the table to another database.
+     virtual void renameTable(
+         const Context & /*context*/,
+diff --git a/src/Databases/MySQL/DatabaseConnectionMySQL.cpp b/src/Databases/MySQL/DatabaseConnectionMySQL.cpp
+index 454830557393..35b016f255b9 100644
+--- a/src/Databases/MySQL/DatabaseConnectionMySQL.cpp
++++ b/src/Databases/MySQL/DatabaseConnectionMySQL.cpp
+@@ -395,7 +395,7 @@ void DatabaseConnectionMySQL::loadStoredObjects(Context &, bool, bool /*force_at
+     }
+ }
+ 
+-void DatabaseConnectionMySQL::dropTable(const Context &, const String & table_name, bool /*no_delay*/)
++void DatabaseConnectionMySQL::detachTablePermanently(const String & table_name)
+ {
+     std::lock_guard<std::mutex> lock{mutex};
+ 
+@@ -429,6 +429,11 @@ void DatabaseConnectionMySQL::dropTable(const Context &, const String & table_na
+     table_iter->second.second->is_dropped = true;
+ }
+ 
++void DatabaseConnectionMySQL::dropTable(const Context &, const String & table_name, bool /*no_delay*/)
++{
++    detachTablePermanently(table_name);
++}
++
+ DatabaseConnectionMySQL::~DatabaseConnectionMySQL()
+ {
+     try
+diff --git a/src/Databases/MySQL/DatabaseConnectionMySQL.h b/src/Databases/MySQL/DatabaseConnectionMySQL.h
+index d8694e71db23..3e305fcb20df 100644
+--- a/src/Databases/MySQL/DatabaseConnectionMySQL.h
++++ b/src/Databases/MySQL/DatabaseConnectionMySQL.h
+@@ -72,6 +72,8 @@ class DatabaseConnectionMySQL final : public IDatabase
+ 
+     StoragePtr detachTable(const String & table_name) override;
+ 
++    void detachTablePermanently(const String & table_name) override;
++
+     void dropTable(const Context &, const String & table_name, bool no_delay) override;
+ 
+     void attachTable(const String & table_name, const StoragePtr & storage, const String & relative_table_path) override;
+diff --git a/src/Interpreters/DatabaseCatalog.cpp b/src/Interpreters/DatabaseCatalog.cpp
+index 813918314c6d..e9caaab4ef93 100644
+--- a/src/Interpreters/DatabaseCatalog.cpp
++++ b/src/Interpreters/DatabaseCatalog.cpp
+@@ -211,7 +211,7 @@ DatabaseAndTable DatabaseCatalog::getTableImpl(
+     if (!table_id)
+     {
+         if (exception)
+-            exception->emplace("Cannot find table: StorageID is empty", ErrorCodes::UNKNOWN_TABLE);
++            exception->emplace(ErrorCodes::UNKNOWN_TABLE, "Cannot find table: StorageID is empty");
+         return {};
+     }
+ 
+@@ -223,7 +223,7 @@ DatabaseAndTable DatabaseCatalog::getTableImpl(
+         {
+             assert(!db_and_table.first && !db_and_table.second);
+             if (exception)
+-                exception->emplace("Table " + table_id.getNameForLogs() + " doesn't exist.", ErrorCodes::UNKNOWN_TABLE);
++                exception->emplace(ErrorCodes::UNKNOWN_TABLE, "Table {} doesn't exist", table_id.getNameForLogs());
+             return {};
+         }
+ 
+@@ -244,7 +244,7 @@ DatabaseAndTable DatabaseCatalog::getTableImpl(
+         /// If table_id has no UUID, then the name of database was specified by user and table_id was not resolved through context.
+         /// Do not allow access to TEMPORARY_DATABASE because it contains all temporary tables of all contexts and users.
+         if (exception)
+-            exception->emplace("Direct access to `" + String(TEMPORARY_DATABASE) + "` database is not allowed.", ErrorCodes::DATABASE_ACCESS_DENIED);
++            exception->emplace(ErrorCodes::DATABASE_ACCESS_DENIED, "Direct access to `{}` database is not allowed", String(TEMPORARY_DATABASE));
+         return {};
+     }
+ 
+@@ -255,8 +255,7 @@ DatabaseAndTable DatabaseCatalog::getTableImpl(
+         if (databases.end() == it)
+         {
+             if (exception)
+-                exception->emplace("Database " + backQuoteIfNeed(table_id.getDatabaseName()) + " doesn't exist",
+-                                   ErrorCodes::UNKNOWN_DATABASE);
++                exception->emplace(ErrorCodes::UNKNOWN_DATABASE, "Database {} doesn't exist", backQuoteIfNeed(table_id.getDatabaseName()));
+             return {};
+         }
+         database = it->second;
+@@ -264,7 +263,7 @@ DatabaseAndTable DatabaseCatalog::getTableImpl(
+ 
+     auto table = database->tryGetTable(table_id.table_name, context);
+     if (!table && exception)
+-            exception->emplace("Table " + table_id.getNameForLogs() + " doesn't exist.", ErrorCodes::UNKNOWN_TABLE);
++            exception->emplace(ErrorCodes::UNKNOWN_TABLE, "Table {} doesn't exist", table_id.getNameForLogs());
+     if (!table)
+         database = nullptr;
+ 
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index a7edd8dd5cd6..4b2166741a99 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -734,7 +734,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+         auto database = DatabaseCatalog::instance().getDatabase(database_name);
+         bool if_not_exists = create.if_not_exists;
+ 
+-        // Table SQL definition is available even if the table is detached
++        // Table SQL definition is available even if the table is detached (even permanently)
+         auto query = database->getCreateTableQuery(create.table, context);
+         create = query->as<ASTCreateQuery &>(); // Copy the saved create query, but use ATTACH instead of CREATE
+         if (create.is_dictionary)
+diff --git a/src/Interpreters/InterpreterDropQuery.cpp b/src/Interpreters/InterpreterDropQuery.cpp
+index 00039297244d..47bafdbdcb4f 100644
+--- a/src/Interpreters/InterpreterDropQuery.cpp
++++ b/src/Interpreters/InterpreterDropQuery.cpp
+@@ -30,6 +30,7 @@ namespace ErrorCodes
+     extern const int SYNTAX_ERROR;
+     extern const int UNKNOWN_TABLE;
+     extern const int UNKNOWN_DICTIONARY;
++    extern const int NOT_IMPLEMENTED;
+ }
+ 
+ 
+@@ -55,6 +56,8 @@ BlockIO InterpreterDropQuery::execute()
+     {
+         if (!drop.is_dictionary)
+             return executeToTable(drop);
++        else if (drop.permanently && drop.kind == ASTDropQuery::Kind::Detach)
++            throw Exception("DETACH PERMANENTLY is not implemented for dictionaries", ErrorCodes::NOT_IMPLEMENTED);
+         else
+             return executeToDictionary(drop.database, drop.table, drop.kind, drop.if_exists, drop.temporary, drop.no_ddl_lock);
+     }
+@@ -128,8 +131,18 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ASTDropQuery & query, Dat
+             TableExclusiveLockHolder table_lock;
+             if (database->getUUID() == UUIDHelpers::Nil)
+                 table_lock = table->lockExclusively(context.getCurrentQueryId(), context.getSettingsRef().lock_acquire_timeout);
+-            /// Drop table from memory, don't touch data and metadata
+-            database->detachTable(table_id.table_name);
++
++            if (query.permanently)
++            {
++                /// Drop table from memory, don't touch data, metadata file renamed and will be skipped during server restart
++                database->detachTablePermanently(table_id.table_name);
++            }
++            else
++            {
++                /// Drop table from memory, don't touch data and metadata
++                database->detachTable(table_id.table_name);
++            }
++
+         }
+         else if (query.kind == ASTDropQuery::Kind::Truncate)
+         {
+@@ -286,6 +299,9 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query,
+             bool drop = query.kind == ASTDropQuery::Kind::Drop;
+             context.checkAccess(AccessType::DROP_DATABASE, database_name);
+ 
++            if (query.kind == ASTDropQuery::Kind::Detach && query.permanently)
++                throw Exception("DETACH PERMANENTLY is not implemented for databases", ErrorCodes::NOT_IMPLEMENTED);
++
+ #if USE_MYSQL
+             if (database->getEngineName() == "MaterializeMySQL")
+                 stopDatabaseSynchronization(database);
+diff --git a/src/Interpreters/loadMetadata.cpp b/src/Interpreters/loadMetadata.cpp
+index bb476999f8c9..71d3c7e6e5b9 100644
+--- a/src/Interpreters/loadMetadata.cpp
++++ b/src/Interpreters/loadMetadata.cpp
+@@ -108,6 +108,7 @@ void loadMetadata(Context & context, const String & default_database_name)
+ 
+         if (!it->isDirectory())
+         {
++            /// TODO: DETACH DATABASE PERMANENTLY ?
+             if (endsWith(it.name(), ".sql"))
+             {
+                 String db_name = it.name().substr(0, it.name().size() - 4);
+diff --git a/src/Parsers/ASTDropQuery.cpp b/src/Parsers/ASTDropQuery.cpp
+index b09b588ca6eb..6ea6c81c3be8 100644
+--- a/src/Parsers/ASTDropQuery.cpp
++++ b/src/Parsers/ASTDropQuery.cpp
+@@ -67,6 +67,9 @@ void ASTDropQuery::formatQueryImpl(const FormatSettings & settings, FormatState
+ 
+     formatOnCluster(settings);
+ 
++    if (permanently)
++        settings.ostr << " PERMANENTLY";
++
+     if (no_delay)
+         settings.ostr << (settings.hilite ? hilite_keyword : "") << " NO DELAY" << (settings.hilite ? hilite_none : "");
+ }
+diff --git a/src/Parsers/ASTDropQuery.h b/src/Parsers/ASTDropQuery.h
+index 5096975c219f..b612618aaec2 100644
+--- a/src/Parsers/ASTDropQuery.h
++++ b/src/Parsers/ASTDropQuery.h
+@@ -33,6 +33,9 @@ class ASTDropQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnClu
+ 
+     bool no_delay{false};
+ 
++    // We detach the object permanently, so it will not be reattached back during server restart.
++    bool permanently{false};
++
+     /** Get the text that identifies this element. */
+     String getID(char) const override;
+     ASTPtr clone() const override;
+diff --git a/src/Parsers/ParserDropQuery.cpp b/src/Parsers/ParserDropQuery.cpp
+index e09642e7b84b..5400f33fbd93 100644
+--- a/src/Parsers/ParserDropQuery.cpp
++++ b/src/Parsers/ParserDropQuery.cpp
+@@ -11,7 +11,7 @@ namespace DB
+ namespace
+ {
+ 
+-bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool optional_table_keyword = false)
++bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, const ASTDropQuery::Kind kind)
+ {
+     ParserKeyword s_temporary("TEMPORARY");
+     ParserKeyword s_table("TABLE");
+@@ -21,6 +21,7 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+     ParserToken s_dot(TokenType::Dot);
+     ParserKeyword s_if_exists("IF EXISTS");
+     ParserIdentifier name_p;
++    ParserKeyword s_permanently("PERMANENTLY");
+     ParserKeyword s_no_delay("NO DELAY");
+     ParserKeyword s_sync("SYNC");
+ 
+@@ -32,6 +33,7 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+     bool is_dictionary = false;
+     bool is_view = false;
+     bool no_delay = false;
++    bool permanently = false;
+ 
+     if (s_database.ignore(pos, expected))
+     {
+@@ -40,15 +42,6 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+ 
+         if (!name_p.parse(pos, database, expected))
+             return false;
+-
+-        if (ParserKeyword{"ON"}.ignore(pos, expected))
+-        {
+-            if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
+-                return false;
+-        }
+-
+-        if (s_no_delay.ignore(pos, expected) || s_sync.ignore(pos, expected))
+-            no_delay = true;
+     }
+     else
+     {
+@@ -59,7 +52,8 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+         else if (s_temporary.ignore(pos, expected))
+             temporary = true;
+ 
+-        if (!is_view && !is_dictionary && (!s_table.ignore(pos, expected) && !optional_table_keyword))
++        /// for TRUNCATE queries TABLE keyword is assumed as default and can be skipped
++        if (!is_view && !is_dictionary && (!s_table.ignore(pos, expected) && kind != ASTDropQuery::Kind::Truncate))
+         {
+             return false;
+         }
+@@ -76,26 +70,32 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+             if (!name_p.parse(pos, table, expected))
+                 return false;
+         }
++    }
+ 
+-        if (ParserKeyword{"ON"}.ignore(pos, expected))
+-        {
+-            if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
+-                return false;
+-        }
+-
+-        if (s_no_delay.ignore(pos, expected) || s_sync.ignore(pos, expected))
+-            no_delay = true;
++    /// common for tables / dictionaries / databases
++    if (ParserKeyword{"ON"}.ignore(pos, expected))
++    {
++        if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
++            return false;
+     }
+ 
++    if (kind == ASTDropQuery::Kind::Detach && s_permanently.ignore(pos, expected))
++        permanently = true;
++
++    /// actually for TRUNCATE NO DELAY / SYNC means nothing
++    if (s_no_delay.ignore(pos, expected) || s_sync.ignore(pos, expected))
++        no_delay = true;
++
+     auto query = std::make_shared<ASTDropQuery>();
+     node = query;
+ 
+-    query->kind = ASTDropQuery::Kind::Drop;
++    query->kind = kind;
+     query->if_exists = if_exists;
+     query->temporary = temporary;
+     query->is_dictionary = is_dictionary;
+     query->is_view = is_view;
+     query->no_delay = no_delay;
++    query->permanently = permanently;
+ 
+     tryGetIdentifierNameInto(database, query->database);
+     tryGetIdentifierNameInto(table, query->table);
+@@ -105,28 +105,6 @@ bool parseDropQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected, bool
+     return true;
+ }
+ 
+-bool parseDetachQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected)
+-{
+-    if (parseDropQuery(pos, node, expected))
+-    {
+-        auto * drop_query = node->as<ASTDropQuery>();
+-        drop_query->kind = ASTDropQuery::Kind::Detach;
+-        return true;
+-    }
+-    return false;
+-}
+-
+-bool parseTruncateQuery(IParser::Pos & pos, ASTPtr & node, Expected & expected)
+-{
+-    if (parseDropQuery(pos, node, expected, true))
+-    {
+-        auto * drop_query = node->as<ASTDropQuery>();
+-        drop_query->kind = ASTDropQuery::Kind::Truncate;
+-        return true;
+-    }
+-    return false;
+-}
+-
+ }
+ 
+ bool ParserDropQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+@@ -136,11 +114,11 @@ bool ParserDropQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+     ParserKeyword s_truncate("TRUNCATE");
+ 
+     if (s_drop.ignore(pos, expected))
+-        return parseDropQuery(pos, node, expected);
++        return parseDropQuery(pos, node, expected, ASTDropQuery::Kind::Drop);
+     else if (s_detach.ignore(pos, expected))
+-        return parseDetachQuery(pos, node, expected);
++        return parseDropQuery(pos, node, expected, ASTDropQuery::Kind::Detach);
+     else if (s_truncate.ignore(pos, expected))
+-        return parseTruncateQuery(pos, node, expected);
++        return parseDropQuery(pos, node, expected, ASTDropQuery::Kind::Truncate);
+     else
+         return false;
+ }
+diff --git a/src/Parsers/ParserDropQuery.h b/src/Parsers/ParserDropQuery.h
+index 069b9c34ddd9..39ff5b7c4fd9 100644
+--- a/src/Parsers/ParserDropQuery.h
++++ b/src/Parsers/ParserDropQuery.h
+@@ -8,7 +8,7 @@ namespace DB
+ {
+ 
+ /** Query like this:
+-  * DROP|DETACH|TRUNCATE TABLE [IF EXISTS] [db.]name
++  * DROP|DETACH|TRUNCATE TABLE [IF EXISTS] [db.]name [PERMANENTLY]
+   *
+   * Or:
+   * DROP DATABASE [IF EXISTS] db
+diff --git a/src/Storages/StorageDictionary.cpp b/src/Storages/StorageDictionary.cpp
+index 4896ace4e7ae..32fe7b4c0264 100644
+--- a/src/Storages/StorageDictionary.cpp
++++ b/src/Storages/StorageDictionary.cpp
+@@ -121,9 +121,9 @@ StorageDictionary::StorageDictionary(
+ void StorageDictionary::checkTableCanBeDropped() const
+ {
+     if (location == Location::SameDatabaseAndNameAsDictionary)
+-        throw Exception("Cannot detach dictionary " + backQuote(dictionary_name) + " as table, use DETACH DICTIONARY query", ErrorCodes::CANNOT_DETACH_DICTIONARY_AS_TABLE);
++        throw Exception("Cannot drop/detach dictionary " + backQuote(dictionary_name) + " as table, use DROP DICTIONARY or DETACH DICTIONARY query instead", ErrorCodes::CANNOT_DETACH_DICTIONARY_AS_TABLE);
+     if (location == Location::DictionaryDatabase)
+-        throw Exception("Cannot detach table " + getStorageID().getFullTableName() + " from a database with DICTIONARY engine", ErrorCodes::CANNOT_DETACH_DICTIONARY_AS_TABLE);
++        throw Exception("Cannot drop/detach table " + getStorageID().getFullTableName() + " from a database with DICTIONARY engine", ErrorCodes::CANNOT_DETACH_DICTIONARY_AS_TABLE);
+ }
+ 
+ void StorageDictionary::checkTableCanBeDetached() const

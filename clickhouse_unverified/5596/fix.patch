@@ -1,0 +1,886 @@
+diff --git a/dbms/src/IO/HTTPCommon.cpp b/dbms/src/IO/HTTPCommon.cpp
+index ca5b5ab700ba..0a7c7e7af66b 100644
+--- a/dbms/src/IO/HTTPCommon.cpp
++++ b/dbms/src/IO/HTTPCommon.cpp
+@@ -45,7 +45,7 @@ namespace ErrorCodes
+ 
+ namespace
+ {
+-void setTimeouts(Poco::Net::HTTPClientSession & session, const ConnectionTimeouts & timeouts)
++    void setTimeouts(Poco::Net::HTTPClientSession & session, const ConnectionTimeouts & timeouts)
+     {
+ #if defined(POCO_CLICKHOUSE_PATCH) || POCO_VERSION >= 0x02000000
+         session.setTimeout(timeouts.connection_timeout, timeouts.send_timeout, timeouts.receive_timeout);
+@@ -216,20 +216,25 @@ PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const Connecti
+ std::istream * receiveResponse(
+     Poco::Net::HTTPClientSession & session, const Poco::Net::HTTPRequest & request, Poco::Net::HTTPResponse & response)
+ {
+-    auto istr = &session.receiveResponse(response);
++    auto & istr = session.receiveResponse(response);
++    assertResponseIsOk(request, response, istr);
++    return &istr;
++}
++
++void assertResponseIsOk(const Poco::Net::HTTPRequest & request, Poco::Net::HTTPResponse & response, std::istream & istr)
++{
+     auto status = response.getStatus();
+ 
+     if (status != Poco::Net::HTTPResponse::HTTP_OK)
+     {
+         std::stringstream error_message;
+         error_message << "Received error from remote server " << request.getURI() << ". HTTP status code: " << status << " "
+-                      << response.getReason() << ", body: " << istr->rdbuf();
++                      << response.getReason() << ", body: " << istr.rdbuf();
+ 
+         throw Exception(error_message.str(),
+             status == HTTP_TOO_MANY_REQUESTS ? ErrorCodes::RECEIVED_ERROR_TOO_MANY_REQUESTS
+                                              : ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER);
+     }
+-    return istr;
+ }
+ 
+ }
+diff --git a/dbms/src/IO/HTTPCommon.h b/dbms/src/IO/HTTPCommon.h
+index 6dc669c248e0..412429e59d19 100644
+--- a/dbms/src/IO/HTTPCommon.h
++++ b/dbms/src/IO/HTTPCommon.h
+@@ -57,4 +57,6 @@ PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const Connecti
+   */
+ std::istream * receiveResponse(
+     Poco::Net::HTTPClientSession & session, const Poco::Net::HTTPRequest & request, Poco::Net::HTTPResponse & response);
++void assertResponseIsOk(const Poco::Net::HTTPRequest & request, Poco::Net::HTTPResponse & response, std::istream & istr);
++
+ }
+diff --git a/dbms/src/IO/ReadBufferFromS3.cpp b/dbms/src/IO/ReadBufferFromS3.cpp
+new file mode 100644
+index 000000000000..ae09f0fb1898
+--- /dev/null
++++ b/dbms/src/IO/ReadBufferFromS3.cpp
+@@ -0,0 +1,70 @@
++#include <IO/ReadBufferFromS3.h>
++
++#include <IO/ReadBufferFromIStream.h>
++
++#include <common/logger_useful.h>
++
++
++namespace DB
++{
++
++const int DEFAULT_S3_MAX_FOLLOW_GET_REDIRECT = 2;
++
++ReadBufferFromS3::ReadBufferFromS3(Poco::URI uri_,
++    const ConnectionTimeouts & timeouts,
++    const Poco::Net::HTTPBasicCredentials & credentials,
++    size_t buffer_size_)
++    : ReadBuffer(nullptr, 0)
++    , uri {uri_}
++    , method {Poco::Net::HTTPRequest::HTTP_GET}
++    , session {makeHTTPSession(uri_, timeouts)}
++{
++    Poco::Net::HTTPResponse response;
++    std::unique_ptr<Poco::Net::HTTPRequest> request;
++
++    for (int i = 0; i < DEFAULT_S3_MAX_FOLLOW_GET_REDIRECT; ++i)
++    {
++        // With empty path poco will send "POST  HTTP/1.1" its bug.
++        if (uri.getPath().empty())
++            uri.setPath("/");
++
++        request = std::make_unique<Poco::Net::HTTPRequest>(method, uri.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
++        request->setHost(uri.getHost()); // use original, not resolved host name in header
++
++        if (!credentials.getUsername().empty())
++            credentials.authenticate(*request);
++
++        LOG_TRACE((&Logger::get("ReadBufferFromS3")), "Sending request to " << uri.toString());
++
++        session->sendRequest(*request);
++
++        istr = &session->receiveResponse(response);
++
++        // Handle 307 Temporary Redirect in order to allow request redirection
++        // See https://docs.aws.amazon.com/AmazonS3/latest/dev/Redirects.html
++        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT)
++            break;
++
++        auto location_iterator = response.find("Location");
++        if (location_iterator == response.end())
++            break;
++
++        uri = location_iterator->second;
++        session = makeHTTPSession(uri, timeouts);
++    }
++
++    assertResponseIsOk(*request, response, *istr);
++    impl = std::make_unique<ReadBufferFromIStream>(*istr, buffer_size_);
++}
++
++
++bool ReadBufferFromS3::nextImpl()
++{
++    if (!impl->next())
++        return false;
++    internal_buffer = impl->buffer();
++    working_buffer = internal_buffer;
++    return true;
++}
++
++}
+diff --git a/dbms/src/IO/ReadBufferFromS3.h b/dbms/src/IO/ReadBufferFromS3.h
+new file mode 100644
+index 000000000000..ffc0c5c0ab1f
+--- /dev/null
++++ b/dbms/src/IO/ReadBufferFromS3.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <memory>
++
++#include <IO/ConnectionTimeouts.h>
++#include <IO/HTTPCommon.h>
++#include <IO/ReadBuffer.h>
++#include <Poco/Net/HTTPBasicCredentials.h>
++#include <Poco/URI.h>
++
++
++namespace DB
++{
++/** Perform S3 HTTP GET request and provide response to read.
++  */
++class ReadBufferFromS3 : public ReadBuffer
++{
++protected:
++    Poco::URI uri;
++    std::string method;
++
++    HTTPSessionPtr session;
++    std::istream * istr; /// owned by session
++    std::unique_ptr<ReadBuffer> impl;
++
++public:
++    explicit ReadBufferFromS3(Poco::URI uri_,
++        const ConnectionTimeouts & timeouts = {},
++        const Poco::Net::HTTPBasicCredentials & credentials = {},
++        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE);
++
++    bool nextImpl() override;
++};
++
++}
+diff --git a/dbms/src/IO/WriteBufferFromS3.cpp b/dbms/src/IO/WriteBufferFromS3.cpp
+new file mode 100644
+index 000000000000..1ef6f3b19a06
+--- /dev/null
++++ b/dbms/src/IO/WriteBufferFromS3.cpp
+@@ -0,0 +1,286 @@
++#include <IO/WriteBufferFromS3.h>
++
++#include <IO/WriteHelpers.h>
++
++#include <Poco/DOM/AutoPtr.h>
++#include <Poco/DOM/DOMParser.h>
++#include <Poco/DOM/Document.h>
++#include <Poco/DOM/NodeList.h>
++#include <Poco/SAX/InputSource.h>
++
++#include <common/logger_useful.h>
++
++
++namespace DB
++{
++
++const int DEFAULT_S3_MAX_FOLLOW_PUT_REDIRECT = 2;
++const int S3_WARN_MAX_PARTS = 10000;
++
++
++namespace ErrorCodes
++{
++    extern const int INCORRECT_DATA;
++}
++
++
++WriteBufferFromS3::WriteBufferFromS3(
++    const Poco::URI & uri_,
++    size_t minimum_upload_part_size_,
++    const ConnectionTimeouts & timeouts_,
++    const Poco::Net::HTTPBasicCredentials & credentials, size_t buffer_size_
++)
++    : BufferWithOwnMemory<WriteBuffer>(buffer_size_, nullptr, 0)
++    , uri {uri_}
++    , minimum_upload_part_size {minimum_upload_part_size_}
++    , timeouts {timeouts_}
++    , auth_request {Poco::Net::HTTPRequest::HTTP_PUT, uri.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1}
++    , temporary_buffer {std::make_unique<WriteBufferFromString>(buffer_string)}
++    , last_part_size {0}
++{
++    if (!credentials.getUsername().empty())
++        credentials.authenticate(auth_request);
++
++    initiate();
++}
++
++
++void WriteBufferFromS3::nextImpl()
++{
++    if (!offset())
++        return;
++
++    temporary_buffer->write(working_buffer.begin(), offset());
++
++    last_part_size += offset();
++
++    if (last_part_size > minimum_upload_part_size)
++    {
++        temporary_buffer->finish();
++        writePart(buffer_string);
++        last_part_size = 0;
++        temporary_buffer = std::make_unique<WriteBufferFromString>(buffer_string);
++    }
++}
++
++
++void WriteBufferFromS3::finalize()
++{
++    temporary_buffer->finish();
++    if (!buffer_string.empty())
++    {
++        writePart(buffer_string);
++    }
++
++    complete();
++}
++
++
++WriteBufferFromS3::~WriteBufferFromS3()
++{
++    try
++    {
++        next();
++    }
++    catch (...)
++    {
++        tryLogCurrentException(__PRETTY_FUNCTION__);
++    }
++}
++
++
++void WriteBufferFromS3::initiate()
++{
++    // See https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadInitiate.html
++    Poco::Net::HTTPResponse response;
++    std::unique_ptr<Poco::Net::HTTPRequest> request_ptr;
++    HTTPSessionPtr session;
++    std::istream * istr = nullptr; /// owned by session
++    Poco::URI initiate_uri = uri;
++    initiate_uri.setRawQuery("uploads");
++    for (auto & param: uri.getQueryParameters())
++    {
++        initiate_uri.addQueryParameter(param.first, param.second);
++    }
++
++    for (int i = 0; i < DEFAULT_S3_MAX_FOLLOW_PUT_REDIRECT; ++i)
++    {
++        session = makeHTTPSession(initiate_uri, timeouts);
++        request_ptr = std::make_unique<Poco::Net::HTTPRequest>(Poco::Net::HTTPRequest::HTTP_POST, initiate_uri.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
++        request_ptr->setHost(initiate_uri.getHost()); // use original, not resolved host name in header
++
++        if (auth_request.hasCredentials())
++        {
++            Poco::Net::HTTPBasicCredentials credentials(auth_request);
++            credentials.authenticate(*request_ptr);
++        }
++
++        request_ptr->setContentLength(0);
++
++        LOG_TRACE((&Logger::get("WriteBufferFromS3")), "Sending request to " << initiate_uri.toString());
++
++        session->sendRequest(*request_ptr);
++
++        istr = &session->receiveResponse(response);
++
++        // Handle 307 Temporary Redirect in order to allow request redirection
++        // See https://docs.aws.amazon.com/AmazonS3/latest/dev/Redirects.html
++        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT)
++            break;
++
++        auto location_iterator = response.find("Location");
++        if (location_iterator == response.end())
++            break;
++
++        initiate_uri = location_iterator->second;
++    }
++    assertResponseIsOk(*request_ptr, response, *istr);
++
++    Poco::XML::InputSource src(*istr);
++    Poco::XML::DOMParser parser;
++    Poco::AutoPtr<Poco::XML::Document> document = parser.parse(&src);
++    Poco::AutoPtr<Poco::XML::NodeList> nodes = document->getElementsByTagName("UploadId");
++    if (nodes->length() != 1)
++    {
++        throw Exception("Incorrect XML in response, no upload id", ErrorCodes::INCORRECT_DATA);
++    }
++    upload_id = nodes->item(0)->innerText();
++    if (upload_id.empty())
++    {
++        throw Exception("Incorrect XML in response, empty upload id", ErrorCodes::INCORRECT_DATA);
++    }
++}
++
++
++void WriteBufferFromS3::writePart(const String & data)
++{
++    // See https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadUploadPart.html
++    Poco::Net::HTTPResponse response;
++    std::unique_ptr<Poco::Net::HTTPRequest> request_ptr;
++    HTTPSessionPtr session;
++    std::istream * istr = nullptr; /// owned by session
++    Poco::URI part_uri = uri;
++    part_uri.addQueryParameter("partNumber", std::to_string(part_tags.size() + 1));
++    part_uri.addQueryParameter("uploadId", upload_id);
++
++    if (part_tags.size() == S3_WARN_MAX_PARTS)
++    {
++        // Don't throw exception here by ourselves but leave the decision to take by S3 server.
++        LOG_WARNING(&Logger::get("WriteBufferFromS3"), "Maximum part number in S3 protocol has reached (too much parts). Server may not accept this whole upload.");
++    }
++
++    for (int i = 0; i < DEFAULT_S3_MAX_FOLLOW_PUT_REDIRECT; ++i)
++    {
++        session = makeHTTPSession(part_uri, timeouts);
++        request_ptr = std::make_unique<Poco::Net::HTTPRequest>(Poco::Net::HTTPRequest::HTTP_PUT, part_uri.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
++        request_ptr->setHost(part_uri.getHost()); // use original, not resolved host name in header
++
++        if (auth_request.hasCredentials())
++        {
++            Poco::Net::HTTPBasicCredentials credentials(auth_request);
++            credentials.authenticate(*request_ptr);
++        }
++
++        request_ptr->setExpectContinue(true);
++
++        request_ptr->setContentLength(data.size());
++
++        LOG_TRACE((&Logger::get("WriteBufferFromS3")), "Sending request to " << part_uri.toString());
++
++        std::ostream & ostr = session->sendRequest(*request_ptr);
++        if (session->peekResponse(response))
++        {
++            // Received 100-continue.
++            ostr << data;
++        }
++
++        istr = &session->receiveResponse(response);
++
++        // Handle 307 Temporary Redirect in order to allow request redirection
++        // See https://docs.aws.amazon.com/AmazonS3/latest/dev/Redirects.html
++        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT)
++            break;
++
++        auto location_iterator = response.find("Location");
++        if (location_iterator == response.end())
++            break;
++
++        part_uri = location_iterator->second;
++    }
++    assertResponseIsOk(*request_ptr, response, *istr);
++
++    auto etag_iterator = response.find("ETag");
++    if (etag_iterator == response.end())
++    {
++        throw Exception("Incorrect response, no ETag", ErrorCodes::INCORRECT_DATA);
++    }
++    part_tags.push_back(etag_iterator->second);
++}
++
++
++void WriteBufferFromS3::complete()
++{
++    // See https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadComplete.html
++    Poco::Net::HTTPResponse response;
++    std::unique_ptr<Poco::Net::HTTPRequest> request_ptr;
++    HTTPSessionPtr session;
++    std::istream * istr = nullptr; /// owned by session
++    Poco::URI complete_uri = uri;
++    complete_uri.addQueryParameter("uploadId", upload_id);
++
++    String data;
++    WriteBufferFromString buffer(data);
++    writeString("<CompleteMultipartUpload>", buffer);
++    for (size_t i = 0; i < part_tags.size(); ++i)
++    {
++        writeString("<Part><PartNumber>", buffer);
++        writeIntText(i + 1, buffer);
++        writeString("</PartNumber><ETag>", buffer);
++        writeString(part_tags[i], buffer);
++        writeString("</ETag></Part>", buffer);
++    }
++    writeString("</CompleteMultipartUpload>", buffer);
++    buffer.finish();
++
++    for (int i = 0; i < DEFAULT_S3_MAX_FOLLOW_PUT_REDIRECT; ++i)
++    {
++        session = makeHTTPSession(complete_uri, timeouts);
++        request_ptr = std::make_unique<Poco::Net::HTTPRequest>(Poco::Net::HTTPRequest::HTTP_POST, complete_uri.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
++        request_ptr->setHost(complete_uri.getHost()); // use original, not resolved host name in header
++
++        if (auth_request.hasCredentials())
++        {
++            Poco::Net::HTTPBasicCredentials credentials(auth_request);
++            credentials.authenticate(*request_ptr);
++        }
++
++        request_ptr->setExpectContinue(true);
++
++        request_ptr->setContentLength(data.size());
++
++        LOG_TRACE((&Logger::get("WriteBufferFromS3")), "Sending request to " << complete_uri.toString());
++
++        std::ostream & ostr = session->sendRequest(*request_ptr);
++        if (session->peekResponse(response))
++        {
++            // Received 100-continue.
++            ostr << data;
++        }
++
++        istr = &session->receiveResponse(response);
++
++        // Handle 307 Temporary Redirect in order to allow request redirection
++        // See https://docs.aws.amazon.com/AmazonS3/latest/dev/Redirects.html
++        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT)
++            break;
++
++        auto location_iterator = response.find("Location");
++        if (location_iterator == response.end())
++            break;
++
++        complete_uri = location_iterator->second;
++    }
++    assertResponseIsOk(*request_ptr, response, *istr);
++}
++
++}
+diff --git a/dbms/src/IO/WriteBufferFromS3.h b/dbms/src/IO/WriteBufferFromS3.h
+new file mode 100644
+index 000000000000..0eb689e468fc
+--- /dev/null
++++ b/dbms/src/IO/WriteBufferFromS3.h
+@@ -0,0 +1,62 @@
++#pragma once
++
++#include <functional>
++#include <memory>
++#include <vector>
++#include <Core/Types.h>
++#include <IO/ConnectionTimeouts.h>
++#include <IO/HTTPCommon.h>
++#include <IO/BufferWithOwnMemory.h>
++#include <IO/ReadBuffer.h>
++#include <IO/ReadBufferFromIStream.h>
++#include <IO/WriteBuffer.h>
++#include <IO/WriteBufferFromString.h>
++#include <Poco/Net/HTTPBasicCredentials.h>
++#include <Poco/Net/HTTPClientSession.h>
++#include <Poco/Net/HTTPRequest.h>
++#include <Poco/Net/HTTPResponse.h>
++#include <Poco/URI.h>
++#include <Poco/Version.h>
++#include <Common/DNSResolver.h>
++#include <Common/config.h>
++#include <common/logger_useful.h>
++
++
++namespace DB
++{
++/* Perform S3 HTTP PUT request.
++ */
++class WriteBufferFromS3 : public BufferWithOwnMemory<WriteBuffer>
++{
++private:
++    Poco::URI uri;
++    size_t minimum_upload_part_size;
++    ConnectionTimeouts timeouts;
++    Poco::Net::HTTPRequest auth_request;
++    String buffer_string;
++    std::unique_ptr<WriteBufferFromString> temporary_buffer;
++    size_t last_part_size;
++    String upload_id;
++    std::vector<String> part_tags;
++
++public:
++    explicit WriteBufferFromS3(const Poco::URI & uri,
++        size_t minimum_upload_part_size_,
++        const ConnectionTimeouts & timeouts = {},
++        const Poco::Net::HTTPBasicCredentials & credentials = {},
++        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE);
++
++    void nextImpl() override;
++
++    /// Receives response from the server after sending all data.
++    void finalize();
++
++    ~WriteBufferFromS3() override;
++
++private:
++    void initiate();
++    void writePart(const String & data);
++    void complete();
++};
++
++}
+diff --git a/dbms/src/Storages/StorageS3.cpp b/dbms/src/Storages/StorageS3.cpp
+new file mode 100644
+index 000000000000..59b2ef589a9f
+--- /dev/null
++++ b/dbms/src/Storages/StorageS3.cpp
+@@ -0,0 +1,177 @@
++#include <Storages/StorageFactory.h>
++#include <Storages/StorageS3.h>
++
++#include <Interpreters/Context.h>
++#include <Interpreters/evaluateConstantExpression.h>
++#include <Parsers/ASTLiteral.h>
++
++#include <IO/ReadBufferFromS3.h>
++#include <IO/WriteBufferFromS3.h>
++
++#include <Formats/FormatFactory.h>
++
++#include <DataStreams/IBlockOutputStream.h>
++#include <DataStreams/IBlockInputStream.h>
++#include <DataStreams/AddingDefaultsBlockInputStream.h>
++
++#include <Poco/Net/HTTPRequest.h>
++
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++}
++
++namespace
++{
++    class StorageS3BlockInputStream : public IBlockInputStream
++    {
++    public:
++        StorageS3BlockInputStream(const Poco::URI & uri,
++            const String & format,
++            const String & name_,
++            const Block & sample_block,
++            const Context & context,
++            UInt64 max_block_size,
++            const ConnectionTimeouts & timeouts)
++            : name(name_)
++        {
++            read_buf = std::make_unique<ReadBufferFromS3>(uri, timeouts);
++
++            reader = FormatFactory::instance().getInput(format, *read_buf, sample_block, context, max_block_size);
++        }
++
++        String getName() const override
++        {
++            return name;
++        }
++
++        Block readImpl() override
++        {
++            return reader->read();
++        }
++
++        Block getHeader() const override
++        {
++            return reader->getHeader();
++        }
++
++        void readPrefixImpl() override
++        {
++            reader->readPrefix();
++        }
++
++        void readSuffixImpl() override
++        {
++            reader->readSuffix();
++        }
++
++    private:
++        String name;
++        std::unique_ptr<ReadBufferFromS3> read_buf;
++        BlockInputStreamPtr reader;
++    };
++
++    class StorageS3BlockOutputStream : public IBlockOutputStream
++    {
++    public:
++        StorageS3BlockOutputStream(const Poco::URI & uri,
++            const String & format,
++            const Block & sample_block_,
++            const Context & context,
++            const ConnectionTimeouts & timeouts)
++            : sample_block(sample_block_)
++        {
++            auto minimum_upload_part_size = context.getConfigRef().getUInt64("s3_minimum_upload_part_size", 512'000'000);
++            write_buf = std::make_unique<WriteBufferFromS3>(uri, minimum_upload_part_size, timeouts);
++            writer = FormatFactory::instance().getOutput(format, *write_buf, sample_block, context);
++        }
++
++        Block getHeader() const override
++        {
++            return sample_block;
++        }
++
++        void write(const Block & block) override
++        {
++            writer->write(block);
++        }
++
++        void writePrefix() override
++        {
++            writer->writePrefix();
++        }
++
++        void writeSuffix() override
++        {
++            writer->writeSuffix();
++            writer->flush();
++            write_buf->finalize();
++        }
++
++    private:
++        Block sample_block;
++        std::unique_ptr<WriteBufferFromS3> write_buf;
++        BlockOutputStreamPtr writer;
++    };
++}
++
++
++BlockInputStreams StorageS3::read(const Names & column_names,
++    const SelectQueryInfo & /*query_info*/,
++    const Context & context,
++    QueryProcessingStage::Enum /*processed_stage*/,
++    size_t max_block_size,
++    unsigned /*num_streams*/)
++{
++    BlockInputStreamPtr block_input = std::make_shared<StorageS3BlockInputStream>(uri,
++        format_name,
++        getName(),
++        getHeaderBlock(column_names),
++        context,
++        max_block_size,
++        ConnectionTimeouts::getHTTPTimeouts(context));
++
++    auto column_defaults = getColumns().getDefaults();
++    if (column_defaults.empty())
++        return {block_input};
++    return {std::make_shared<AddingDefaultsBlockInputStream>(block_input, column_defaults, context)};
++}
++
++void StorageS3::rename(const String & /*new_path_to_db*/, const String & new_database_name, const String & new_table_name, TableStructureWriteLockHolder &)
++{
++    table_name = new_table_name;
++    database_name = new_database_name;
++}
++
++BlockOutputStreamPtr StorageS3::write(const ASTPtr & /*query*/, const Context & /*context*/)
++{
++    return std::make_shared<StorageS3BlockOutputStream>(
++        uri, format_name, getSampleBlock(), context_global, ConnectionTimeouts::getHTTPTimeouts(context_global));
++}
++
++void registerStorageS3(StorageFactory & factory)
++{
++    factory.registerStorage("S3", [](const StorageFactory::Arguments & args)
++    {
++        ASTs & engine_args = args.engine_args;
++
++        if (!(engine_args.size() == 1 || engine_args.size() == 2))
++            throw Exception(
++                "Storage S3 requires exactly 2 arguments: url and name of used format.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++        engine_args[0] = evaluateConstantExpressionOrIdentifierAsLiteral(engine_args[0], args.local_context);
++
++        String url = engine_args[0]->as<ASTLiteral &>().value.safeGet<String>();
++        Poco::URI uri(url);
++
++        engine_args[1] = evaluateConstantExpressionOrIdentifierAsLiteral(engine_args[1], args.local_context);
++
++        String format_name = engine_args[1]->as<ASTLiteral &>().value.safeGet<String>();
++
++        return StorageS3::create(uri, args.database_name, args.table_name, format_name, args.columns, args.context);
++    });
++}
++}
+diff --git a/dbms/src/Storages/StorageS3.h b/dbms/src/Storages/StorageS3.h
+new file mode 100644
+index 000000000000..ad073aaa14cb
+--- /dev/null
++++ b/dbms/src/Storages/StorageS3.h
+@@ -0,0 +1,71 @@
++#pragma once
++
++#include <Storages/IStorage.h>
++#include <Poco/URI.h>
++#include <common/logger_useful.h>
++#include <ext/shared_ptr_helper.h>
++
++namespace DB
++{
++/**
++ * This class represents table engine for external S3 urls.
++ * It sends HTTP GET to server when select is called and
++ * HTTP PUT when insert is called.
++ */
++class StorageS3 : public ext::shared_ptr_helper<StorageS3>, public IStorage
++{
++public:
++    StorageS3(const Poco::URI & uri_,
++        const std::string & database_name_,
++        const std::string & table_name_,
++        const String & format_name_,
++        const ColumnsDescription & columns_,
++        Context & context_
++    )
++        : IStorage(columns_)
++        , uri(uri_)
++        , context_global(context_)
++        , format_name(format_name_)
++        , database_name(database_name_)
++        , table_name(table_name_)
++    {
++        setColumns(columns_);
++    }
++
++    String getName() const override
++    {
++        return "S3";
++    }
++
++    Block getHeaderBlock(const Names & /*column_names*/) const
++    {
++        return getSampleBlock();
++    }
++
++    String getTableName() const override
++    {
++        return table_name;
++    }
++
++    BlockInputStreams read(const Names & column_names,
++        const SelectQueryInfo & query_info,
++        const Context & context,
++        QueryProcessingStage::Enum processed_stage,
++        size_t max_block_size,
++        unsigned num_streams) override;
++
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
++
++    void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name, TableStructureWriteLockHolder &) override;
++
++protected:
++    Poco::URI uri;
++    const Context & context_global;
++
++private:
++    String format_name;
++    String database_name;
++    String table_name;
++};
++
++}
+diff --git a/dbms/src/Storages/registerStorages.cpp b/dbms/src/Storages/registerStorages.cpp
+index c21156ea44db..4c29884dfcfc 100644
+--- a/dbms/src/Storages/registerStorages.cpp
++++ b/dbms/src/Storages/registerStorages.cpp
+@@ -19,6 +19,7 @@ void registerStorageDistributed(StorageFactory & factory);
+ void registerStorageMemory(StorageFactory & factory);
+ void registerStorageFile(StorageFactory & factory);
+ void registerStorageURL(StorageFactory & factory);
++void registerStorageS3(StorageFactory & factory);
+ void registerStorageDictionary(StorageFactory & factory);
+ void registerStorageSet(StorageFactory & factory);
+ void registerStorageJoin(StorageFactory & factory);
+@@ -60,6 +61,7 @@ void registerStorages()
+     registerStorageMemory(factory);
+     registerStorageFile(factory);
+     registerStorageURL(factory);
++    registerStorageS3(factory);
+     registerStorageDictionary(factory);
+     registerStorageSet(factory);
+     registerStorageJoin(factory);
+diff --git a/dbms/src/TableFunctions/TableFunctionS3.cpp b/dbms/src/TableFunctions/TableFunctionS3.cpp
+new file mode 100644
+index 000000000000..38ca0830e5b8
+--- /dev/null
++++ b/dbms/src/TableFunctions/TableFunctionS3.cpp
+@@ -0,0 +1,19 @@
++#include <Storages/StorageS3.h>
++#include <TableFunctions/TableFunctionFactory.h>
++#include <TableFunctions/TableFunctionS3.h>
++#include <Poco/URI.h>
++
++namespace DB
++{
++StoragePtr TableFunctionS3::getStorage(
++    const String & source, const String & format, const ColumnsDescription & columns, Context & global_context, const std::string & table_name) const
++{
++    Poco::URI uri(source);
++    return StorageS3::create(uri, getDatabaseName(), table_name, format, columns, global_context);
++}
++
++void registerTableFunctionS3(TableFunctionFactory & factory)
++{
++    factory.registerFunction<TableFunctionS3>();
++}
++}
+diff --git a/dbms/src/TableFunctions/TableFunctionS3.h b/dbms/src/TableFunctions/TableFunctionS3.h
+new file mode 100644
+index 000000000000..a4966be13c79
+--- /dev/null
++++ b/dbms/src/TableFunctions/TableFunctionS3.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <TableFunctions/ITableFunctionFileLike.h>
++#include <Interpreters/Context.h>
++#include <Core/Block.h>
++
++
++namespace DB
++{
++/* s3(source, format, structure) - creates a temporary storage for a file in S3
++ */
++class TableFunctionS3 : public ITableFunctionFileLike
++{
++public:
++    static constexpr auto name = "s3";
++    std::string getName() const override
++    {
++        return name;
++    }
++
++private:
++    StoragePtr getStorage(
++        const String & source, const String & format, const ColumnsDescription & columns, Context & global_context, const std::string & table_name) const override;
++};
++}
+diff --git a/dbms/src/TableFunctions/registerTableFunctions.cpp b/dbms/src/TableFunctions/registerTableFunctions.cpp
+index 61d0ec23f7d7..aad5eebe9353 100644
+--- a/dbms/src/TableFunctions/registerTableFunctions.cpp
++++ b/dbms/src/TableFunctions/registerTableFunctions.cpp
+@@ -11,6 +11,7 @@ void registerTableFunctionMerge(TableFunctionFactory & factory);
+ void registerTableFunctionRemote(TableFunctionFactory & factory);
+ void registerTableFunctionNumbers(TableFunctionFactory & factory);
+ void registerTableFunctionFile(TableFunctionFactory & factory);
++void registerTableFunctionS3(TableFunctionFactory & factory);
+ void registerTableFunctionURL(TableFunctionFactory & factory);
+ void registerTableFunctionValues(TableFunctionFactory & factory);
+ 
+@@ -37,6 +38,7 @@ void registerTableFunctions()
+     registerTableFunctionRemote(factory);
+     registerTableFunctionNumbers(factory);
+     registerTableFunctionFile(factory);
++    registerTableFunctionS3(factory);
+     registerTableFunctionURL(factory);
+     registerTableFunctionValues(factory);
+ 

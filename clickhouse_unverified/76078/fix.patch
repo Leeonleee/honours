@@ -1,0 +1,3385 @@
+diff --git a/src/Analyzer/HashUtils.h b/src/Analyzer/HashUtils.h
+index 39ace3903415..f58ada303293 100644
+--- a/src/Analyzer/HashUtils.h
++++ b/src/Analyzer/HashUtils.h
+@@ -54,6 +54,11 @@ using QueryTreeNodeConstRawPtrWithHashSet = std::unordered_set<QueryTreeNodeCons
+ template <typename Value>
+ using QueryTreeNodePtrWithHashMap = std::unordered_map<QueryTreeNodePtrWithHash, Value>;
+ 
++class ColumnNode;
++using ColumnNodePtr = std::shared_ptr<ColumnNode>;
++using ColumnNodePtrWithHash = QueryTreeNodeWithHash<ColumnNodePtr>;
++using ColumnNodePtrWithHashSet = std::unordered_set<ColumnNodePtrWithHash>;
++
+ }
+ 
+ template <typename T, bool compare_aliases, bool compare_types>
+diff --git a/src/Analyzer/IQueryTreeNode.h b/src/Analyzer/IQueryTreeNode.h
+index 372c9eaec403..32af021b95f3 100644
+--- a/src/Analyzer/IQueryTreeNode.h
++++ b/src/Analyzer/IQueryTreeNode.h
+@@ -47,7 +47,7 @@ enum class QueryTreeNodeType : uint8_t
+     ARRAY_JOIN,
+     CROSS_JOIN,
+     JOIN,
+-    UNION
++    UNION,
+ };
+ 
+ /// Convert query tree node type to string
+@@ -91,12 +91,12 @@ class IQueryTreeNode : public TypePromotion<IQueryTreeNode>
+       */
+     virtual DataTypePtr getResultType() const
+     {
+-        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Method getResultType is not supported for {} query node", getNodeTypeName());
++        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Method getResultType is not supported for {} query tree node", getNodeTypeName());
+     }
+ 
+     virtual void convertToNullable()
+     {
+-        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Method convertToNullable is not supported for {} query node", getNodeTypeName());
++        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Method convertToNullable is not supported for {} query tree node", getNodeTypeName());
+     }
+ 
+     struct CompareOptions
+diff --git a/src/Analyzer/Passes/RemoveUnusedProjectionColumnsPass.cpp b/src/Analyzer/Passes/RemoveUnusedProjectionColumnsPass.cpp
+index 182ba1a0d2be..c9b60f0d4722 100644
+--- a/src/Analyzer/Passes/RemoveUnusedProjectionColumnsPass.cpp
++++ b/src/Analyzer/Passes/RemoveUnusedProjectionColumnsPass.cpp
+@@ -2,12 +2,13 @@
+ 
+ #include <Functions/FunctionFactory.h>
+ 
+-#include <Analyzer/InDepthQueryTreeVisitor.h>
++#include <Analyzer/AggregationUtils.h>
++#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/FunctionNode.h>
++#include <Analyzer/InDepthQueryTreeVisitor.h>
+ #include <Analyzer/QueryNode.h>
+-#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/SortNode.h>
+-#include <Analyzer/AggregationUtils.h>
++#include <Analyzer/UnionNode.h>
+ #include <Analyzer/Utils.h>
+ 
+ namespace DB
+@@ -48,6 +49,29 @@ class CollectUsedColumnsVisitor : public InDepthQueryTreeVisitorWithContext<Coll
+             return;
+         }
+ 
++        if (node_type == QueryTreeNodeType::FUNCTION)
++        {
++            auto & function_node = node->as<FunctionNode &>();
++
++            if (function_node.getFunctionName() != "exists")
++                return;
++
++            const auto & subquery_argument = function_node.getArguments().getNodes().front();
++            auto * query_node = subquery_argument->as<QueryNode>();
++            auto * union_node = subquery_argument->as<UnionNode>();
++
++            const auto & correlated_columns = query_node != nullptr ? query_node->getCorrelatedColumns() : union_node->getCorrelatedColumns();
++            for (const auto & correlated_column : correlated_columns)
++            {
++                auto * column_node = correlated_column->as<ColumnNode>();
++                auto column_source_node = column_node->getColumnSource();
++                auto column_source_node_type = column_source_node->getNodeType();
++                if (column_source_node_type == QueryTreeNodeType::QUERY || column_source_node_type == QueryTreeNodeType::UNION)
++                    query_or_union_node_to_used_columns[column_source_node].insert(column_node->getColumnName());
++            }
++            return;
++        }
++
+         if (node_type != QueryTreeNodeType::COLUMN)
+             return;
+ 
+@@ -56,10 +80,15 @@ class CollectUsedColumnsVisitor : public InDepthQueryTreeVisitorWithContext<Coll
+             return;
+ 
+         auto column_source_node = column_node.getColumnSource();
+-        auto column_source_node_type = column_source_node->getNodeType();
+ 
+-        if (column_source_node_type == QueryTreeNodeType::QUERY || column_source_node_type == QueryTreeNodeType::UNION)
+-            query_or_union_node_to_used_columns[column_source_node].insert(column_node.getColumnName());
++        auto it = query_or_union_node_to_used_columns.find(column_source_node);
++        /// If the source node is not found in the map then:
++        /// 1. Tt's either not a Query or Union node.
++        /// 2. It's a correlated column and it comes from the outer scope.
++        if (it != query_or_union_node_to_used_columns.end())
++        {
++            it->second.insert(column_node.getColumnName());
++        }
+     }
+ 
+     void reset()
+diff --git a/src/Analyzer/QueryNode.cpp b/src/Analyzer/QueryNode.cpp
+index 779a141281d7..8b1cdd2bfc07 100644
+--- a/src/Analyzer/QueryNode.cpp
++++ b/src/Analyzer/QueryNode.cpp
+@@ -22,6 +22,7 @@
+ #include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Parsers/ASTSetQuery.h>
+ 
++#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/InterpolateNode.h>
+ #include <Analyzer/UnionNode.h>
+ #include <Analyzer/Utils.h>
+@@ -46,6 +47,7 @@ QueryNode::QueryNode(ContextMutablePtr context_, SettingsChanges settings_change
+     children[window_child_index] = std::make_shared<ListNode>();
+     children[order_by_child_index] = std::make_shared<ListNode>();
+     children[limit_by_child_index] = std::make_shared<ListNode>();
++    children[correlated_columns_list_index] = std::make_shared<ListNode>();
+ }
+ 
+ QueryNode::QueryNode(ContextMutablePtr context_)
+@@ -108,6 +110,31 @@ void QueryNode::removeUnusedProjectionColumns(const std::unordered_set<size_t> &
+     }
+ }
+ 
++ColumnNodePtrWithHashSet QueryNode::getCorrelatedColumnsSet() const
++{
++    ColumnNodePtrWithHashSet result;
++
++    const auto & correlated_columns = getCorrelatedColumns().getNodes();
++    result.reserve(correlated_columns.size());
++
++    for (const auto & column : correlated_columns)
++    {
++        result.insert(std::static_pointer_cast<ColumnNode>(column));
++    }
++    return result;
++}
++
++void QueryNode::addCorrelatedColumn(ColumnNodePtr correlated_column)
++{
++    auto & correlated_columns = getCorrelatedColumns().getNodes();
++    for (const auto & column : correlated_columns)
++    {
++        if (column->isEqual(*correlated_column))
++            return;
++    }
++    correlated_columns.push_back(correlated_column);
++}
++
+ void QueryNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, size_t indent) const
+ {
+     buffer << std::string(indent, ' ') << "QUERY id: " << format_state.getNodeId(this);
+@@ -153,6 +180,12 @@ void QueryNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, s
+     if (!cte_name.empty())
+         buffer << ", cte_name: " << cte_name;
+ 
++    if (isCorrelated())
++    {
++        buffer << ", is_correlated: 1
+" << std::string(indent + 2, ' ') << "CORRELATED COLUMNS
+";
++        getCorrelatedColumns().dumpTreeImpl(buffer, format_state, indent + 4);
++    }
++
+     if (hasWith())
+     {
+         buffer << '
+' << std::string(indent + 2, ' ') << "WITH
+";
+diff --git a/src/Analyzer/QueryNode.h b/src/Analyzer/QueryNode.h
+index 2ec1b96477c6..1bf10fe082e5 100644
+--- a/src/Analyzer/QueryNode.h
++++ b/src/Analyzer/QueryNode.h
+@@ -5,6 +5,7 @@
+ #include <Core/NamesAndTypes.h>
+ #include <Core/Field.h>
+ 
++#include <Analyzer/HashUtils.h>
+ #include <Analyzer/IQueryTreeNode.h>
+ #include <Analyzer/ListNode.h>
+ #include <Analyzer/TableExpressionModifiers.h>
+@@ -59,6 +60,9 @@ namespace DB
+ class QueryNode;
+ using QueryNodePtr = std::shared_ptr<QueryNode>;
+ 
++class ColumnNode;
++using ColumnNodePtr = std::shared_ptr<ColumnNode>;
++
+ class QueryNode final : public IQueryTreeNode
+ {
+ public:
+@@ -619,6 +623,30 @@ class QueryNode final : public IQueryTreeNode
+     /// Remove unused projection columns
+     void removeUnusedProjectionColumns(const std::unordered_set<size_t> & used_projection_columns_indexes);
+ 
++    bool isCorrelated() const
++    {
++        return !children[correlated_columns_list_index]->as<ListNode>()->getNodes().empty();
++    }
++
++    QueryTreeNodePtr & getCorrelatedColumnsNode()
++    {
++        return children[correlated_columns_list_index];
++    }
++
++    ListNode & getCorrelatedColumns()
++    {
++        return children[correlated_columns_list_index]->as<ListNode &>();
++    }
++
++    const ListNode & getCorrelatedColumns() const
++    {
++        return children[correlated_columns_list_index]->as<ListNode &>();
++    }
++
++    ColumnNodePtrWithHashSet getCorrelatedColumnsSet() const;
++
++    void addCorrelatedColumn(ColumnNodePtr correlated_column);
++
+     QueryTreeNodeType getNodeType() const override
+     {
+         return QueryTreeNodeType::QUERY;
+@@ -675,7 +703,8 @@ class QueryNode final : public IQueryTreeNode
+     static constexpr size_t limit_by_child_index = 13;
+     static constexpr size_t limit_child_index = 14;
+     static constexpr size_t offset_child_index = 15;
+-    static constexpr size_t children_size = offset_child_index + 1;
++    static constexpr size_t correlated_columns_list_index = 16;
++    static constexpr size_t children_size = correlated_columns_list_index + 1;
+ };
+ 
+ }
+diff --git a/src/Analyzer/QueryTreePassManager.cpp b/src/Analyzer/QueryTreePassManager.cpp
+index 0005aa6c8bc3..2f24c6c2f60c 100644
+--- a/src/Analyzer/QueryTreePassManager.cpp
++++ b/src/Analyzer/QueryTreePassManager.cpp
+@@ -107,6 +107,9 @@ class ValidationChecker : public InDepthQueryTreeVisitor<ValidationChecker>
+         if (isNameOfInFunction(function->getFunctionName()))
+             return;
+ 
++        if (function->getFunctionName() == "exists")
++            return;
++
+         const auto & expected_argument_types = function->getArgumentTypes();
+         size_t expected_argument_types_size = expected_argument_types.size();
+         auto actual_argument_columns = function->getArgumentColumns();
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.cpp b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+index 2712129b1c92..f601cd494046 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.cpp
++++ b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+@@ -18,6 +18,7 @@
+ #include <Functions/IFunctionAdaptors.h>
+ #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
+ #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
++#include <Functions/exists.h>
+ #include <Functions/grouping.h>
+ 
+ #include <TableFunctions/TableFunctionFactory.h>
+@@ -113,6 +114,7 @@ namespace Setting
+     extern const SettingsBool allow_suspicious_types_in_order_by;
+     extern const SettingsBool allow_not_comparable_types_in_order_by;
+     extern const SettingsBool use_concurrency_control;
++    extern const SettingsBool allow_experimental_correlated_subqueries;
+     extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+@@ -1377,12 +1379,14 @@ IdentifierResolveResult QueryAnalyzer::tryResolveIdentifierInParentScopes(const
+     {
+         auto current = nodes_to_process.back();
+         nodes_to_process.pop_back();
+-        if (auto * current_column = current->as<ColumnNode>())
++        if (ColumnNodePtr current_column = std::dynamic_pointer_cast<ColumnNode>(current))
+         {
+-            if (isDependentColumn(&scope, current_column->getColumnSource()))
++            auto is_correlated_column = checkCorrelatedColumn(&scope, current_column);
++            if (is_correlated_column && !scope.context->getSettingsRef()[Setting::allow_experimental_correlated_subqueries])
+             {
+                 throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+-                    "Resolved identifier '{}' in parent scope to expression '{}' with correlated column '{}'. In scope {}",
++                    "Resolved identifier '{}' in parent scope to expression '{}' with correlated column '{}'"
++                    " (Enable 'allow_experimental_correlated_subqueries' setting to allow correlated subqueries execution). In scope {}",
+                     identifier_lookup.identifier.getFullName(),
+                     resolved_identifier->formatASTForErrorMessage(),
+                     current_column->getColumnName(),
+@@ -2845,27 +2849,6 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
+         }
+     }
+ 
+-    if (is_special_function_exists)
+-    {
+-        checkFunctionNodeHasEmptyNullsAction(*function_node_ptr);
+-        /// Rewrite EXISTS (subquery) into 1 IN (SELECT 1 FROM (subquery) LIMIT 1).
+-        auto & exists_subquery_argument = function_node_ptr->getArguments().getNodes().at(0);
+-
+-        auto constant_data_type = std::make_shared<DataTypeUInt64>();
+-
+-        auto in_subquery = std::make_shared<QueryNode>(Context::createCopy(scope.context));
+-        in_subquery->setIsSubquery(true);
+-        in_subquery->getProjection().getNodes().push_back(std::make_shared<ConstantNode>(1UL, constant_data_type));
+-        in_subquery->getJoinTree() = exists_subquery_argument;
+-        in_subquery->getLimit() = std::make_shared<ConstantNode>(1UL, constant_data_type);
+-
+-        function_node_ptr = std::make_shared<FunctionNode>("in");
+-        function_node_ptr->getArguments().getNodes() = {std::make_shared<ConstantNode>(1UL, constant_data_type), in_subquery};
+-        node = function_node_ptr;
+-        function_name = "in";
+-        is_special_function_in = true;
+-    }
+-
+     if (is_special_function_if && !function_node_ptr->getArguments().getNodes().empty())
+     {
+         checkFunctionNodeHasEmptyNullsAction(*function_node_ptr);
+@@ -2922,12 +2905,61 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
+     }
+ 
+     /// Resolve function arguments
+-    bool allow_table_expressions = is_special_function_in;
++    bool allow_table_expressions = is_special_function_in || is_special_function_exists;
+     auto arguments_projection_names = resolveExpressionNodeList(function_node_ptr->getArgumentsNode(),
+         scope,
+         true /*allow_lambda_expression*/,
+         allow_table_expressions /*allow_table_expression*/);
+ 
++    if (is_special_function_exists)
++    {
++        checkFunctionNodeHasEmptyNullsAction(*function_node_ptr);
++        /// Rewrite EXISTS (subquery) into 1 IN (SELECT 1 FROM (subquery) LIMIT 1).
++        auto & exists_subquery_argument = function_node_ptr->getArguments().getNodes().at(0);
++        bool correlated_exists_subquery = exists_subquery_argument->getNodeType() == QueryTreeNodeType::QUERY
++            ? exists_subquery_argument->as<QueryNode>()->isCorrelated()
++            : exists_subquery_argument->as<UnionNode>()->isCorrelated();
++        if (!correlated_exists_subquery)
++        {
++            auto constant_data_type = std::make_shared<DataTypeUInt64>();
++
++            auto in_subquery = std::make_shared<QueryNode>(Context::createCopy(scope.context));
++            in_subquery->setIsSubquery(true);
++            in_subquery->getProjection().getNodes().push_back(std::make_shared<ConstantNode>(1UL, constant_data_type));
++            in_subquery->getJoinTree() = exists_subquery_argument;
++            in_subquery->getLimit() = std::make_shared<ConstantNode>(1UL, constant_data_type);
++
++            function_node_ptr = std::make_shared<FunctionNode>("in");
++            function_node_ptr->getArguments().getNodes() = {
++                std::make_shared<ConstantNode>(1UL, constant_data_type),
++                std::move(in_subquery)
++            };
++
++            /// Resolve modified arguments
++            arguments_projection_names = resolveExpressionNodeList(function_node_ptr->getArgumentsNode(),
++                scope,
++                true /*allow_lambda_expression*/,
++                true /*allow_table_expression*/);
++
++            node = function_node_ptr;
++            function_name = "in";
++            is_special_function_in = true;
++        }
++        else
++        {
++            /// Subquery is correlated and EXISTS can not be replaced by IN function.
++            /// EXISTS function will be replated by JOIN during query planning.
++            auto function_exists = std::make_shared<FunctionExists>();
++            function_node_ptr->resolveAsFunction(
++                std::make_shared<FunctionToFunctionBaseAdaptor>(
++                    function_exists, DataTypes{}, function_exists->getReturnTypeImpl({})
++                )
++            );
++
++            return { calculateFunctionProjectionName(node, parameters_projection_names, arguments_projection_names) };
++        }
++    }
++
+     /// Mask arguments if needed
+     if (!scope.context->getSettingsRef()[Setting::format_display_secrets_in_show_and_select])
+     {
+@@ -2978,6 +3010,10 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
+             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Function '{}' expects 2 arguments", function_name);
+ 
+         auto & in_second_argument = function_in_arguments_nodes[1];
++        if (isCorrelatedQueryOrUnionNode(function_in_arguments_nodes[0]) || isCorrelatedQueryOrUnionNode(function_in_arguments_nodes[1]))
++            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++                "Correlated subqueries are not supported as IN function arguments yet, but found in expression: {}",
++                node->formatASTForErrorMessage());
+         auto * table_node = in_second_argument->as<TableNode>();
+         auto * table_function_node = in_second_argument->as<TableFunctionNode>();
+ 
+@@ -5140,6 +5176,16 @@ void QueryAnalyzer::resolveJoin(QueryTreeNodePtr & join_node, IdentifierResolveS
+     resolveQueryJoinTreeNode(join_node_typed.getRightTableExpression(), scope, expressions_visitor);
+     validateJoinTableExpressionWithoutAlias(join_node, join_node_typed.getRightTableExpression(), scope);
+ 
++    if (isCorrelatedQueryOrUnionNode(join_node_typed.getLeftTableExpression()))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++            "Correlated subqueries are not supported in JOINs yet, but found in expression: {}",
++            join_node_typed.getLeftTableExpression()->formatASTForErrorMessage());
++
++    if (isCorrelatedQueryOrUnionNode(join_node_typed.getRightTableExpression()))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++            "Correlated subqueries are not supported in JOINs yet, but found in expression: {}",
++            join_node_typed.getRightTableExpression()->formatASTForErrorMessage());
++
+     if (!join_node_typed.getLeftTableExpression()->hasAlias() && !join_node_typed.getRightTableExpression()->hasAlias())
+         checkDuplicateTableNamesOrAliasForPasteJoin(join_node_typed, scope);
+ 
+diff --git a/src/Analyzer/TableNode.cpp b/src/Analyzer/TableNode.cpp
+index bc8f57ef8e93..7b4a96ff0cbe 100644
+--- a/src/Analyzer/TableNode.cpp
++++ b/src/Analyzer/TableNode.cpp
+@@ -85,7 +85,10 @@ void TableNode::updateTreeHashImpl(HashState & state, CompareOptions) const
+     }
+     else
+     {
+-        auto full_name = storage_id.getFullNameNotQuoted();
++        // In case of cross-replication we don't know what database is used for the table.
++        // `storage_id.hasDatabase()` can return false only on the initiator node.
++        // Each shard will use the default database (in the case of cross-replication shards may have different defaults).
++        auto full_name = storage_id.hasDatabase() ? storage_id.getFullNameNotQuoted() : storage_id.getTableName();
+         state.update(full_name.size());
+         state.update(full_name);
+     }
+diff --git a/src/Analyzer/UnionNode.cpp b/src/Analyzer/UnionNode.cpp
+index 1d29aed0a610..af9febed0fb2 100644
+--- a/src/Analyzer/UnionNode.cpp
++++ b/src/Analyzer/UnionNode.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include <Interpreters/Context.h>
+ 
++#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/QueryNode.h>
+ #include <Analyzer/Utils.h>
+ 
+@@ -49,6 +50,7 @@ UnionNode::UnionNode(ContextMutablePtr context_, SelectUnionMode union_mode_)
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "UNION mode {} must be normalized", toString(union_mode));
+ 
+     children[queries_child_index] = std::make_shared<ListNode>();
++    children[correlated_columns_list_index] = std::make_shared<ListNode>();
+ }
+ 
+ bool UnionNode::isResolved() const
+@@ -130,6 +132,17 @@ void UnionNode::removeUnusedProjectionColumns(const std::unordered_set<size_t> &
+     }
+ }
+ 
++void UnionNode::addCorrelatedColumn(ColumnNodePtr correlated_column)
++{
++    auto & correlated_columns = getCorrelatedColumns().getNodes();
++    for (const auto & column : correlated_columns)
++    {
++        if (column->isEqual(*correlated_column))
++            return;
++    }
++    correlated_columns.push_back(correlated_column);
++}
++
+ void UnionNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, size_t indent) const
+ {
+     buffer << std::string(indent, ' ') << "UNION id: " << format_state.getNodeId(this);
+@@ -154,6 +167,12 @@ void UnionNode::dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, s
+ 
+     buffer << ", union_mode: " << toString(union_mode);
+ 
++    if (isCorrelated())
++    {
++        buffer << ", is_correlated: 1
+" << std::string(indent + 2, ' ') << "CORRELATED COLUMNS
+";
++        getCorrelatedColumns().dumpTreeImpl(buffer, format_state, indent + 4);
++    }
++
+     buffer << '
+' << std::string(indent + 2, ' ') << "QUERIES
+";
+     getQueriesNode()->dumpTreeImpl(buffer, format_state, indent + 4);
+ }
+diff --git a/src/Analyzer/UnionNode.h b/src/Analyzer/UnionNode.h
+index 09018156e2d1..657103663ffc 100644
+--- a/src/Analyzer/UnionNode.h
++++ b/src/Analyzer/UnionNode.h
+@@ -35,6 +35,9 @@ namespace DB
+ class UnionNode;
+ using UnionNodePtr = std::shared_ptr<UnionNode>;
+ 
++class ColumnNode;
++using ColumnNodePtr = std::shared_ptr<ColumnNode>;
++
+ class UnionNode final : public IQueryTreeNode
+ {
+ public:
+@@ -170,6 +173,28 @@ class UnionNode final : public IQueryTreeNode
+     /// Remove unused projection columns
+     void removeUnusedProjectionColumns(const std::unordered_set<size_t> & used_projection_columns_indexes);
+ 
++    bool isCorrelated() const
++    {
++        return !children[correlated_columns_list_index]->as<ListNode>()->getNodes().empty();
++    }
++
++    QueryTreeNodePtr & getCorrelatedColumnsNode()
++    {
++        return children[correlated_columns_list_index];
++    }
++
++    ListNode & getCorrelatedColumns()
++    {
++        return children[correlated_columns_list_index]->as<ListNode &>();
++    }
++
++    const ListNode & getCorrelatedColumns() const
++    {
++        return children[correlated_columns_list_index]->as<ListNode &>();
++    }
++
++    void addCorrelatedColumn(ColumnNodePtr correlated_column);
++
+     QueryTreeNodeType getNodeType() const override
+     {
+         return QueryTreeNodeType::UNION;
+@@ -196,7 +221,8 @@ class UnionNode final : public IQueryTreeNode
+     SelectUnionMode union_mode;
+ 
+     static constexpr size_t queries_child_index = 0;
+-    static constexpr size_t children_size = queries_child_index + 1;
++    static constexpr size_t correlated_columns_list_index = 1;
++    static constexpr size_t children_size = correlated_columns_list_index + 1;
+ };
+ 
+ }
+diff --git a/src/Analyzer/Utils.cpp b/src/Analyzer/Utils.cpp
+index 22bde64e2747..fc1ab8d7a5a8 100644
+--- a/src/Analyzer/Utils.cpp
++++ b/src/Analyzer/Utils.cpp
+@@ -46,6 +46,7 @@
+ #include <Analyzer/TableFunctionNode.h>
+ #include <Analyzer/TableNode.h>
+ #include <Analyzer/UnionNode.h>
++
+ #include <Analyzer/Resolve/IdentifierResolveScope.h>
+ 
+ #include <ranges>
+@@ -241,8 +242,21 @@ bool isQueryOrUnionNode(const QueryTreeNodePtr & node)
+     return isQueryOrUnionNode(node.get());
+ }
+ 
+-bool isDependentColumn(IdentifierResolveScope * scope_to_check, const QueryTreeNodePtr & column_source)
++bool isCorrelatedQueryOrUnionNode(const QueryTreeNodePtr & node)
+ {
++    auto * query_node = node->as<QueryNode>();
++    auto * union_node = node->as<UnionNode>();
++
++    return (query_node != nullptr && query_node->isCorrelated()) || (union_node != nullptr && union_node->isCorrelated());
++}
++
++bool checkCorrelatedColumn(
++    IdentifierResolveScope * scope_to_check,
++    const ColumnNodePtr & column
++)
++{
++    auto column_source = column->getColumnSource();
++
+     /// The case of lambda argument. Example:
+     /// arrayMap(X -> X + Y, [0])
+     ///
+@@ -251,15 +265,27 @@ bool isDependentColumn(IdentifierResolveScope * scope_to_check, const QueryTreeN
+     if (column_source->getNodeType() == QueryTreeNodeType::LAMBDA)
+         return false;
+ 
++    bool is_correlated = false;
++
+     while (scope_to_check != nullptr)
+     {
+         if (scope_to_check->registered_table_expression_nodes.contains(column_source))
+-            return false;
++            break;
++
+         if (isQueryOrUnionNode(scope_to_check->scope_node))
+-            return true;
++        {
++            is_correlated = true;
++            if (auto * query_node = scope_to_check->scope_node->as<QueryNode>())
++                query_node->addCorrelatedColumn(column);
++            else if (auto * union_node = scope_to_check->scope_node->as<UnionNode>())
++                union_node->addCorrelatedColumn(column);
++        }
+         scope_to_check = scope_to_check->parent_scope;
+     }
+-    return true;
++    if (!scope_to_check)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot find the original scope of the column");
++
++    return is_correlated;
+ }
+ 
+ DataTypePtr getExpressionNodeResultTypeOrNull(const QueryTreeNodePtr & query_tree_node)
+diff --git a/src/Analyzer/Utils.h b/src/Analyzer/Utils.h
+index e1e6da1d36f7..4b07a21483c0 100644
+--- a/src/Analyzer/Utils.h
++++ b/src/Analyzer/Utils.h
+@@ -15,6 +15,9 @@ namespace DB
+ {
+ 
+ class FunctionNode;
++class ColumnNode;
++using ColumnNodePtr = std::shared_ptr<ColumnNode>;
++
+ struct IdentifierResolveScope;
+ 
+ struct NameAndTypePair;
+@@ -59,10 +62,18 @@ bool isQueryOrUnionNode(const IQueryTreeNode * node);
+ /// Returns true, if node has type QUERY or UNION
+ bool isQueryOrUnionNode(const QueryTreeNodePtr & node);
+ 
+-/* Returns true, if column source is not registered in scopes that appear
++/// Returns true, if node has type QUERY or UNION and uses any columns from outer scope
++bool isCorrelatedQueryOrUnionNode(const QueryTreeNodePtr & node);
++
++/* Checks, if column source is not registered in scopes that appear
+  * before nearest query scope.
++ * If column appears to be correlated in the scope than it be registered
++ * in corresponding QueryNode or UnionNode.
+  */
+-bool isDependentColumn(IdentifierResolveScope * scope_to_check, const QueryTreeNodePtr & column_source);
++bool checkCorrelatedColumn(
++    IdentifierResolveScope * scope_to_check,
++    const ColumnNodePtr & column
++);
+ 
+ DataTypePtr getExpressionNodeResultTypeOrNull(const QueryTreeNodePtr & query_tree_node);
+ 
+diff --git a/src/Core/Settings.cpp b/src/Core/Settings.cpp
+index c84812dadeb1..e816216c3663 100644
+--- a/src/Core/Settings.cpp
++++ b/src/Core/Settings.cpp
+@@ -5066,6 +5066,10 @@ Connect timeout in seconds. Now supported only for MySQL
+     DECLARE(UInt64, external_storage_rw_timeout_sec, DBMS_DEFAULT_RECEIVE_TIMEOUT_SEC, R"(
+ Read/write timeout in seconds. Now supported only for MySQL
+ )", 0)  \
++    \
++    DECLARE(Bool, allow_experimental_correlated_subqueries, false, R"(
++Allow to execute correlated subqueries.
++)", EXPERIMENTAL) \
+     \
+     DECLARE(SetOperationMode, union_default_mode, SetOperationMode::Unspecified, R"(
+ Sets a mode for combining `SELECT` query results. The setting is only used when shared with [UNION](../../sql-reference/statements/select/union.md) without explicitly specifying the `UNION ALL` or `UNION DISTINCT`.
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index f851a553299f..ec223cea5006 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -80,6 +80,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+             {"query_plan_convert_join_to_in", false, false, "New setting"},
+             {"enable_hdfs_pread", true, true, "New setting."},
+             {"low_priority_query_wait_time_ms", 1000, 1000, "New setting."},
++            {"allow_experimental_correlated_subqueries", false, false, "Added new setting to allow correlated subqueries execution."},
+             {"serialize_query_plan", false, false, "NewSetting"},
+             {"allow_experimental_shared_set_join", 0, 1, "A setting for ClickHouse Cloud to enable SharedSet and SharedJoin"},
+             {"allow_special_bool_values_inside_variant", true, false, "Don't allow special bool values during Variant type parsing"},
+diff --git a/src/Databases/enableAllExperimentalSettings.cpp b/src/Databases/enableAllExperimentalSettings.cpp
+index c6883a83c097..b95fc3cf52ae 100644
+--- a/src/Databases/enableAllExperimentalSettings.cpp
++++ b/src/Databases/enableAllExperimentalSettings.cpp
+@@ -30,6 +30,7 @@ void enableAllExperimentalSettings(ContextMutablePtr context)
+     context->setSetting("allow_experimental_map_type", 1);
+     context->setSetting("allow_experimental_bigint_types", 1);
+     context->setSetting("allow_experimental_bfloat16_type", 1);
++    context->setSetting("allow_experimental_correlated_subqueries", 1);
+     context->setSetting("allow_deprecated_error_prone_window_functions", 1);
+ 
+     context->setSetting("allow_suspicious_low_cardinality_types", 1);
+diff --git a/src/Functions/exists.h b/src/Functions/exists.h
+new file mode 100644
+index 000000000000..4c6ba43f3e81
+--- /dev/null
++++ b/src/Functions/exists.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <Common/Exception.h>
++#include <DataTypes/DataTypesNumber.h>
++#include <Functions/IFunction.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++
++extern const int LOGICAL_ERROR;
++
++}
++
++/// This is a helper function for EXISTS expression.
++/// It's not supposed to be ever executed, because it's argument is a subquery
++/// and the whole EXISTS expression is either rewritten to '1 IN (SELECT 1 FROM <subquery>)'
++/// if subquery is not correlated or it's replaced with JOINs during decorrelation.
++class FunctionExists : public IFunction
++{
++public:
++    String getName() const override { return "exists"; }
++
++    ColumnPtr executeImpl(const ColumnsWithTypeAndName & /*arguments*/, const DataTypePtr & /*result_type*/, size_t  /*input_rows_count*/) const override
++    {
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Function 'exists' is not supposed to be executed");
++    }
++
++    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo &) const override
++    {
++        return false;
++    }
++
++    DataTypePtr getReturnTypeImpl(const DataTypes &) const override
++    {
++        return std::make_shared<DataTypeUInt8>();
++    }
++
++    size_t getNumberOfArguments() const override
++    {
++        return 1;
++    }
++};
++
++}
+diff --git a/src/Interpreters/ActionsDAG.cpp b/src/Interpreters/ActionsDAG.cpp
+index 6b3b3efaeed5..d5b63a9bb0e0 100644
+--- a/src/Interpreters/ActionsDAG.cpp
++++ b/src/Interpreters/ActionsDAG.cpp
+@@ -455,6 +455,17 @@ const ActionsDAG::Node & ActionsDAG::addFunctionImpl(
+     return addNode(std::move(node));
+ }
+ 
++const ActionsDAG::Node & ActionsDAG::addPlaceholder(std::string name, DataTypePtr type)
++{
++    Node node;
++    node.type = ActionType::PLACEHOLDER;
++    node.result_type = std::move(type);
++    node.result_name = std::move(name);
++    node.column = node.result_type->createColumn();
++
++    return addNode(std::move(node));
++}
++
+ const ActionsDAG::Node & ActionsDAG::findInOutputs(const std::string & name) const
+ {
+     if (const auto * node = tryFindInOutputs(name))
+@@ -853,6 +864,11 @@ static ColumnWithTypeAndName executeActionForPartialResult(const ActionsDAG::Nod
+         {
+             break;
+         }
++
++        case ActionsDAG::ActionType::PLACEHOLDER:
++        {
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to execute PLACEHOLDER action");
++        }
+     }
+ 
+     return res_column;
+@@ -961,6 +977,16 @@ ColumnsWithTypeAndName ActionsDAG::evaluatePartialResult(
+ 
+                     stack.pop();
+ 
++                    if (node->type == ActionsDAG::ActionType::PLACEHOLDER)
++                    {
++                        /// Maybe move to executeActionForPartialResult
++                        node_to_column[node] = ColumnWithTypeAndName(
++                            node->column->cloneResized(input_rows_count),
++                            node->result_type,
++                            node->result_name);
++                        continue;
++                    }
++
+                     ColumnsWithTypeAndName arguments(node->children.size());
+                     bool has_all_arguments = true;
+                     for (size_t i = 0; i < arguments.size(); ++i)
+@@ -1436,6 +1462,10 @@ std::string ActionsDAG::dumpDAG() const
+             case ActionsDAG::ActionType::INPUT:
+                 out << "INPUT ";
+                 break;
++
++            case ActionsDAG::ActionType::PLACEHOLDER:
++                out << "PLACEHOLDER ";
++                break;
+         }
+ 
+         out << "(";
+@@ -1468,7 +1498,16 @@ std::string ActionsDAG::dumpDAG() const
+     return out.str();
+ }
+ 
+-bool ActionsDAG::hasArrayJoin() const
++bool ActionsDAG::hasCorrelatedColumns() const noexcept
++{
++    for (const auto & node : nodes)
++        if (node.type == ActionType::PLACEHOLDER)
++            return true;
++
++    return false;
++}
++
++bool ActionsDAG::hasArrayJoin() const noexcept
+ {
+     for (const auto & node : nodes)
+         if (node.type == ActionType::ARRAY_JOIN)
+@@ -1486,7 +1525,7 @@ bool ActionsDAG::hasStatefulFunctions() const
+     return false;
+ }
+ 
+-bool ActionsDAG::trivial() const
++bool ActionsDAG::trivial() const noexcept
+ {
+     for (const auto & node : nodes)
+         if (node.type == ActionType::FUNCTION || node.type == ActionType::ARRAY_JOIN)
+@@ -1511,6 +1550,19 @@ bool ActionsDAG::hasNonDeterministic() const
+     return false;
+ }
+ 
++void ActionsDAG::decorrelate() noexcept
++{
++    for (auto & node : nodes)
++    {
++        if (node.type == ActionType::PLACEHOLDER)
++        {
++            node.type = ActionType::INPUT;
++            node.column = nullptr;
++            inputs.emplace_back(&node);
++        }
++    }
++}
++
+ void ActionsDAG::addMaterializingOutputActions(bool materialize_sparse)
+ {
+     for (auto & output_node : outputs)
+@@ -3125,6 +3177,12 @@ std::optional<ActionsDAG> ActionsDAG::buildFilterActionsDAG(
+                     all_const);
+                 break;
+             }
++            case ActionsDAG::ActionType::PLACEHOLDER:
++            {
++                /// TODO: check if it's correct
++                result_node = &result_dag.addPlaceholder(node->result_name, node->result_type);
++                break;
++            }
+         }
+ 
+         node_to_result_node.emplace(node, result_node);
+diff --git a/src/Interpreters/ActionsDAG.h b/src/Interpreters/ActionsDAG.h
+index b86d632ef9c5..b561bbf46ebe 100644
+--- a/src/Interpreters/ActionsDAG.h
++++ b/src/Interpreters/ActionsDAG.h
+@@ -63,6 +63,8 @@ class ActionsDAG
+         /// Function arrayJoin. Specially separated because it changes the number of rows.
+         ARRAY_JOIN,
+         FUNCTION,
++        /// Placeholder node for correlated column
++        PLACEHOLDER,
+     };
+ 
+     struct Node;
+@@ -154,6 +156,7 @@ class ActionsDAG
+         NodeRawConstPtrs children,
+         std::string result_name);
+     const Node & addCast(const Node & node_to_cast, const DataTypePtr & cast_type, std::string result_name);
++    const Node & addPlaceholder(std::string name, DataTypePtr type);
+ 
+     /// Find first column by name in output nodes. This search is linear.
+     const Node & findInOutputs(const std::string & name) const;
+@@ -256,9 +259,10 @@ class ActionsDAG
+         const std::unordered_map<const Node *, const Node *> & new_inputs,
+         const NodeRawConstPtrs & required_outputs);
+ 
+-    bool hasArrayJoin() const;
++    bool hasCorrelatedColumns() const noexcept;
++    bool hasArrayJoin() const noexcept;
+     bool hasStatefulFunctions() const;
+-    bool trivial() const; /// If actions has no functions or array join.
++    bool trivial() const noexcept; /// If actions has no functions or array join.
+     void assertDeterministic() const; /// Throw if not isDeterministic.
+     bool hasNonDeterministic() const;
+ 
+@@ -286,6 +290,9 @@ class ActionsDAG
+         size_t input_rows_count,
+         bool throw_on_error);
+ 
++    /// Replace all PLACEHOLDER nodes with INPUT nodes
++    void decorrelate() noexcept;
++
+     /// For apply materialize() function for every output.
+     /// Also add aliases so the result names remain unchanged.
+     void addMaterializingOutputActions(bool materialize_sparse);
+diff --git a/src/Interpreters/ExpressionActions.cpp b/src/Interpreters/ExpressionActions.cpp
+index cec9749d244d..905c0694c392 100644
+--- a/src/Interpreters/ExpressionActions.cpp
++++ b/src/Interpreters/ExpressionActions.cpp
+@@ -514,6 +514,11 @@ std::string ExpressionActions::Action::toString() const
+         case ActionsDAG::ActionType::INPUT:
+             out << "INPUT " << arguments.front();
+             break;
++
++        case ActionsDAG::ActionType::PLACEHOLDER:
++            out << "PLACEHOLDER " << node->result_name;
++            break;
++
+     }
+ 
+     out << " -> " << node->result_name
+@@ -731,6 +736,11 @@ static void executeAction(const ExpressionActions::Action & action, ExecutionCon
+ 
+             break;
+         }
++
++        case ActionsDAG::ActionType::PLACEHOLDER:
++        {
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to execute PLACEHOLDER action");
++        }
+     }
+ }
+ 
+diff --git a/src/Interpreters/evaluateConstantExpression.cpp b/src/Interpreters/evaluateConstantExpression.cpp
+index 5e56a4be2727..792f7f29038f 100644
+--- a/src/Interpreters/evaluateConstantExpression.cpp
++++ b/src/Interpreters/evaluateConstantExpression.cpp
+@@ -120,7 +120,13 @@ std::optional<EvaluateConstantExpressionResult> evaluateConstantExpressionImpl(c
+         collectSourceColumns(expression, planner_context, false /*keep_alias_columns*/);
+         collectSets(expression, *planner_context);
+ 
+-        auto actions = buildActionsDAGFromExpressionNode(expression, {}, planner_context);
++        ColumnNodePtrWithHashSet empty_correlated_columns_set;
++        auto [actions, correlated_subtrees] = buildActionsDAGFromExpressionNode(
++            expression,
++            /*input_columns=*/{},
++            planner_context,
++            empty_correlated_columns_set);
++        correlated_subtrees.assertEmpty("in constant expression without query context");
+ 
+         if (actions.getOutputs().size() != 1)
+         {
+diff --git a/src/Planner/CollectTableExpressionData.cpp b/src/Planner/CollectTableExpressionData.cpp
+index e0150ed5ee86..72cf8f6f8332 100644
+--- a/src/Planner/CollectTableExpressionData.cpp
++++ b/src/Planner/CollectTableExpressionData.cpp
+@@ -2,16 +2,19 @@
+ 
+ #include <Storages/IStorage.h>
+ 
+-#include <Analyzer/Utils.h>
+-#include <Analyzer/InDepthQueryTreeVisitor.h>
+ #include <Analyzer/ColumnNode.h>
++#include <Analyzer/FunctionNode.h>
++#include <Analyzer/InDepthQueryTreeVisitor.h>
++#include <Analyzer/ListNode.h>
+ #include <Analyzer/QueryNode.h>
+-#include <Analyzer/TableNode.h>
+ #include <Analyzer/TableFunctionNode.h>
+-#include <Analyzer/ListNode.h>
+-#include <Analyzer/FunctionNode.h>
++#include <Analyzer/TableNode.h>
++#include <Analyzer/UnionNode.h>
++#include <Analyzer/Utils.h>
+ 
+ #include <Planner/PlannerActionsVisitor.h>
++#include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ 
+ 
+ namespace DB
+@@ -44,6 +47,19 @@ class CollectSourceColumnsVisitor : public InDepthQueryTreeVisitorWithContext<Co
+             return;
+         }
+ 
++        if (isExistsFunction(node))
++        {
++            auto * function_node = node->as<FunctionNode>();
++            const auto & subquery_argument = function_node->getArguments().getNodes().front();
++            auto * query_node = subquery_argument->as<QueryNode>();
++            auto * union_node = subquery_argument->as<UnionNode>();
++            chassert(query_node != nullptr || union_node != nullptr);
++
++            auto & correlated_columns = query_node ? query_node->getCorrelatedColumnsNode() : union_node->getCorrelatedColumnsNode();
++            visit(correlated_columns);
++            return;
++        }
++
+         auto * column_node = node->as<ColumnNode>();
+         if (!column_node)
+             return;
+@@ -103,11 +119,15 @@ class CollectSourceColumnsVisitor : public InDepthQueryTreeVisitorWithContext<Co
+                 auto column_identifier = planner_context->getGlobalPlannerContext()->createColumnIdentifier(node);
+ 
+                 ActionsDAG alias_column_actions_dag;
+-                PlannerActionsVisitor actions_visitor(planner_context, false);
+-                auto outputs = actions_visitor.visit(alias_column_actions_dag, column_node->getExpression());
++                ColumnNodePtrWithHashSet empty_correlated_columns_set;
++                PlannerActionsVisitor actions_visitor(planner_context, empty_correlated_columns_set, false);
++                auto [outputs, correlated_subtrees] = actions_visitor.visit(alias_column_actions_dag, column_node->getExpression());
+                 if (outputs.size() != 1)
+                     throw Exception(ErrorCodes::LOGICAL_ERROR,
+                         "Expected single output in actions dag for alias column {}. Actual {}", column_node->dumpTree(), outputs.size());
++                if (correlated_subtrees.notEmpty())
++                    throw Exception(ErrorCodes::LOGICAL_ERROR,
++                        "Correlated subquery in alias column expression {}. Actual {}", column_node->dumpTree(), outputs.size());
+ 
+                 auto & alias_node = outputs[0];
+                 const auto & column_name = column_node->getColumnName();
+@@ -180,6 +200,11 @@ class CollectSourceColumnsVisitor : public InDepthQueryTreeVisitorWithContext<Co
+         return node->as<FunctionNode>() && node->as<FunctionNode>()->getFunctionName() == "indexHint";
+     }
+ 
++    static bool isExistsFunction(const QueryTreeNodePtr & node)
++    {
++        return node->as<FunctionNode>() && node->as<FunctionNode>()->getFunctionName() == "exists";
++    }
++
+     static bool isColumnSourceMergeTree(const ColumnNode & node)
+     {
+         const auto * source_table = node.getColumnSource()->as<TableNode>();
+@@ -381,13 +406,18 @@ void collectTableExpressionData(QueryTreeNodePtr & query_node, PlannerContextPtr
+         ActionsDAG prewhere_actions_dag;
+ 
+         QueryTreeNodePtr query_tree_node = query_node_typed.getPrewhere();
++        auto correlated_columns_set = query_node_typed.getCorrelatedColumnsSet();
+ 
+-        PlannerActionsVisitor visitor(planner_context, false /*use_column_identifier_as_action_node_name*/);
+-        auto expression_nodes = visitor.visit(prewhere_actions_dag, query_tree_node);
++        PlannerActionsVisitor visitor(planner_context, /*correlated_columns_set_=*/correlated_columns_set, false /*use_column_identifier_as_action_node_name*/);
++        auto [expression_nodes, correlated_subtrees] = visitor.visit(prewhere_actions_dag, query_tree_node);
+         if (expression_nodes.size() != 1)
+             throw Exception(ErrorCodes::ILLEGAL_PREWHERE,
+                 "Invalid PREWHERE. Expected single boolean expression. In query {}",
+                 query_node->formatASTForErrorMessage());
++        if (correlated_subtrees.notEmpty())
++            throw Exception(ErrorCodes::ILLEGAL_PREWHERE,
++                "Correlated subqueries are not allowed in PREWHERE expression. In query {}",
++                query_node->formatASTForErrorMessage());
+ 
+         prewhere_actions_dag.getOutputs().push_back(expression_nodes.back());
+ 
+diff --git a/src/Planner/Planner.cpp b/src/Planner/Planner.cpp
+index 298f14220af6..3354eb53e337 100644
+--- a/src/Planner/Planner.cpp
++++ b/src/Planner/Planner.cpp
+@@ -69,20 +69,22 @@
+ #include <Analyzer/AggregationUtils.h>
+ #include <Analyzer/WindowFunctionsUtils.h>
+ 
++#include <Planner/CollectColumnIdentifiers.h>
++#include <Planner/CollectSets.h>
++#include <Planner/CollectTableExpressionData.h>
+ #include <Planner/findQueryForParallelReplicas.h>
+-#include <Planner/Utils.h>
+-#include <Planner/PlannerContext.h>
+ #include <Planner/PlannerActionsVisitor.h>
+-#include <Planner/PlannerJoins.h>
+ #include <Planner/PlannerAggregation.h>
+-#include <Planner/PlannerSorting.h>
+-#include <Planner/PlannerWindowFunctions.h>
+-#include <Planner/CollectSets.h>
+-#include <Planner/CollectTableExpressionData.h>
+-#include <Planner/PlannerJoinTree.h>
++#include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ #include <Planner/PlannerExpressionAnalysis.h>
+-#include <Planner/CollectColumnIdentifiers.h>
++#include <Planner/PlannerJoins.h>
++#include <Planner/PlannerJoinTree.h>
+ #include <Planner/PlannerQueryProcessingInfo.h>
++#include <Planner/PlannerSorting.h>
++#include <Planner/PlannerWindowFunctions.h>
++#include <Planner/Utils.h>
++
+ 
+ namespace ProfileEvents
+ {
+@@ -398,11 +400,19 @@ void addExpressionStep(QueryPlan & query_plan,
+     query_plan.addStep(std::move(expression_step));
+ }
+ 
+-void addFilterStep(QueryPlan & query_plan,
++void addFilterStep(
++    const PlannerContextPtr & planner_context,
++    QueryPlan & query_plan,
+     FilterAnalysisResult & filter_analysis_result,
++    const SelectQueryOptions & select_query_options,
+     const std::string & step_description,
+     UsefulSets & useful_sets)
+ {
++    for (const auto & correlated_subquery : filter_analysis_result.correlated_subtrees.subqueries)
++    {
++        buildQueryPlanForCorrelatedSubquery(planner_context, query_plan, correlated_subquery, select_query_options);
++    }
++
+     auto actions = std::move(filter_analysis_result.filter_actions->dag);
+     if (filter_analysis_result.filter_actions->project_input)
+         actions.appendInputsForUnusedColumns(query_plan.getCurrentHeader());
+@@ -798,14 +808,17 @@ void addWithFillStepIfNeeded(QueryPlan & query_plan,
+             {
+                 auto & interpolate_node_typed = interpolate_node->as<InterpolateNode &>();
+ 
+-                PlannerActionsVisitor planner_actions_visitor(planner_context);
+-                auto expression_to_interpolate_expression_nodes = planner_actions_visitor.visit(interpolate_actions_dag,
++                ColumnNodePtrWithHashSet empty_correlated_columns_set;
++                PlannerActionsVisitor planner_actions_visitor(planner_context, empty_correlated_columns_set);
++                auto [expression_to_interpolate_expression_nodes, expression_to_interpolate_correlated_subtrees] = planner_actions_visitor.visit(interpolate_actions_dag,
+                     interpolate_node_typed.getExpression());
++                expression_to_interpolate_correlated_subtrees.assertEmpty("in expression to interpolate");
+                 if (expression_to_interpolate_expression_nodes.size() != 1)
+                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expression to interpolate expected to have single action node");
+ 
+-                auto interpolate_expression_nodes = planner_actions_visitor.visit(interpolate_actions_dag,
++                auto [interpolate_expression_nodes, interpolate_correlated_subtrees] = planner_actions_visitor.visit(interpolate_actions_dag,
+                     interpolate_node_typed.getInterpolateExpression());
++                interpolate_correlated_subtrees.assertEmpty("in interpolate expression");
+                 if (interpolate_expression_nodes.size() != 1)
+                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Interpolate expression expected to have single action node");
+ 
+@@ -1364,23 +1377,7 @@ void Planner::buildPlanForUnionNode()
+     }
+ 
+     Block union_common_header = buildCommonHeaderForUnion(query_plans_headers, union_mode);
+-
+-    for (size_t i = 0; i < queries_size; ++i)
+-    {
+-        auto & query_node_plan = query_plans[i];
+-        if (blocksHaveEqualStructure(query_node_plan->getCurrentHeader(), union_common_header))
+-            continue;
+-
+-        auto actions_dag = ActionsDAG::makeConvertingActions(
+-            query_node_plan->getCurrentHeader().getColumnsWithTypeAndName(),
+-            union_common_header.getColumnsWithTypeAndName(),
+-            ActionsDAG::MatchColumnsMode::Position);
+-        auto converting_step = std::make_unique<ExpressionStep>(query_node_plan->getCurrentHeader(), std::move(actions_dag));
+-        converting_step->setStepDescription("Conversion before UNION");
+-        query_node_plan->addStep(std::move(converting_step));
+-
+-        query_plans_headers[i] = query_node_plan->getCurrentHeader();
+-    }
++    addConvertingToCommonHeaderActionsIfNeeded(query_plans, union_common_header, query_plans_headers);
+ 
+     const auto & query_context = planner_context->getQueryContext();
+     const auto & settings = query_context->getSettingsRef();
+@@ -1619,7 +1616,7 @@ void Planner::buildPlanForQueryNode()
+     if (query_processing_info.isFirstStage())
+     {
+         if (expression_analysis_result.hasWhere())
+-            addFilterStep(query_plan, expression_analysis_result.getWhere(), "WHERE", useful_sets);
++            addFilterStep(planner_context, query_plan, expression_analysis_result.getWhere(), select_query_options, "WHERE", useful_sets);
+ 
+         if (expression_analysis_result.hasAggregation())
+         {
+@@ -1709,7 +1706,7 @@ void Planner::buildPlanForQueryNode()
+             addCubeOrRollupStepIfNeeded(query_plan, aggregation_analysis_result, query_analysis_result, planner_context, select_query_info, query_node);
+ 
+             if (!having_executed && expression_analysis_result.hasHaving())
+-                addFilterStep(query_plan, expression_analysis_result.getHaving(), "HAVING", useful_sets);
++                addFilterStep(planner_context, query_plan, expression_analysis_result.getHaving(), select_query_options, "HAVING", useful_sets);
+         }
+ 
+         if (query_processing_info.isFromAggregationState())
+@@ -1730,7 +1727,7 @@ void Planner::buildPlanForQueryNode()
+             }
+ 
+             if (expression_analysis_result.hasQualify())
+-                addFilterStep(query_plan, expression_analysis_result.getQualify(), "QUALIFY", useful_sets);
++                addFilterStep(planner_context, query_plan, expression_analysis_result.getQualify(), select_query_options, "QUALIFY", useful_sets);
+ 
+             auto & projection_analysis_result = expression_analysis_result.getProjection();
+             addExpressionStep(query_plan, projection_analysis_result.projection_actions, "Projection", useful_sets);
+diff --git a/src/Planner/PlannerActionsVisitor.cpp b/src/Planner/PlannerActionsVisitor.cpp
+index 780e1d9bd08b..28b3cd477aac 100644
+--- a/src/Planner/PlannerActionsVisitor.cpp
++++ b/src/Planner/PlannerActionsVisitor.cpp
+@@ -1,15 +1,19 @@
++#include <utility>
++#include <ranges>
+ #include <Planner/PlannerActionsVisitor.h>
+ 
+ #include <AggregateFunctions/WindowFunction.h>
+-#include <Analyzer/Utils.h>
+-#include <Analyzer/SetUtils.h>
++
++#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/ConstantNode.h>
+ #include <Analyzer/FunctionNode.h>
+-#include <Analyzer/ColumnNode.h>
+ #include <Analyzer/LambdaNode.h>
++#include <Analyzer/QueryNode.h>
++#include <Analyzer/SetUtils.h>
+ #include <Analyzer/SortNode.h>
++#include <Analyzer/UnionNode.h>
++#include <Analyzer/Utils.h>
+ #include <Analyzer/WindowNode.h>
+-#include <Analyzer/QueryNode.h>
+ 
+ #include <DataTypes/FieldToDataType.h>
+ #include <DataTypes/DataTypeSet.h>
+@@ -30,10 +34,12 @@
+ #include <Interpreters/Set.h>
+ 
+ #include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ #include <Planner/TableExpressionData.h>
+ #include <Planner/Utils.h>
+ 
+ #include <Core/Settings.h>
++#include <fmt/format.h>
+ 
+ 
+ namespace DB
+@@ -187,6 +193,20 @@ class ActionNodeNameHelper
+                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __actionName is internal nad should not be used directly");
+                     break;
+                 }
++                else if (function_node.getFunctionName() == "exists")
++                {
++                    const auto & arguments = function_node.getArguments().getNodes();
++                    chassert(arguments.size() == 1);
++
++                    const auto & exists_argument = arguments.front();
++                    chassert(exists_argument != nullptr);
++
++                    const auto & table_alias = exists_argument->getAlias();
++                    chassert(!table_alias.empty());
++
++                    result = fmt::format("exists({})", table_alias);
++                    break;
++                }
+ 
+                 if (planner_context.getQueryContext()->getSettingsRef()[Setting::enable_named_columns_in_function_tuple])
+                 {
+@@ -441,6 +461,12 @@ class ActionsScopeNode
+             node_name_to_node[node.result_name] = &node;
+     }
+ 
++    ActionsScopeNode(const ActionsScopeNode &) = delete;
++    ActionsScopeNode(ActionsScopeNode &&) = default;
++
++    ActionsScopeNode & operator=(const ActionsScopeNode &) = delete;
++    ActionsScopeNode & operator=(ActionsScopeNode &&) = delete;
++
+     const QueryTreeNodePtr & getScopeNode() const
+     {
+         return scope_node;
+@@ -493,6 +519,18 @@ class ActionsScopeNode
+         return node;
+     }
+ 
++    const ActionsDAG::Node * addPlaceholderColumnIfNecessary(const std::string & node_name, const DataTypePtr & column_type)
++    {
++        auto it = node_name_to_node.find(node_name);
++        if (it != node_name_to_node.end())
++            return it->second;
++
++        const auto * node = &actions_dag.addPlaceholder(node_name, column_type);
++        node_name_to_node[node->result_name] = node;
++
++        return node;
++    }
++
+     const ActionsDAG::Node * addInputConstantColumnIfNecessary(const std::string & node_name, const ColumnWithTypeAndName & column)
+     {
+         auto it = node_name_to_node.find(node_name);
+@@ -560,11 +598,13 @@ class ActionsScopeNode
+ class PlannerActionsVisitorImpl
+ {
+ public:
+-    PlannerActionsVisitorImpl(ActionsDAG & actions_dag,
++    PlannerActionsVisitorImpl(
++        ActionsDAG & actions_dag,
+         const PlannerContextPtr & planner_context_,
++        const ColumnNodePtrWithHashSet & correlated_columns_set_,
+         bool use_column_identifier_as_action_node_name_);
+ 
+-    ActionsDAG::NodeRawConstPtrs visit(QueryTreeNodePtr expression_node);
++    std::pair<ActionsDAG::NodeRawConstPtrs, CorrelatedSubtrees> visit(QueryTreeNodePtr expression_node);
+ 
+ private:
+ 
+@@ -607,6 +647,8 @@ class PlannerActionsVisitorImpl
+ 
+     NodeNameAndNodeMinLevel visitColumn(const QueryTreeNodePtr & node);
+ 
++    NodeNameAndNodeMinLevel visitCorrelatedColumn(const ColumnNodePtr & node);
++
+     NodeNameAndNodeMinLevel visitConstant(const QueryTreeNodePtr & node, const std::string & override_column_name = {});
+ 
+     NodeNameAndNodeMinLevel visitLambda(const QueryTreeNodePtr & node);
+@@ -615,26 +657,34 @@ class PlannerActionsVisitorImpl
+ 
+     NodeNameAndNodeMinLevel visitIndexHintFunction(const QueryTreeNodePtr & node);
+ 
++    NodeNameAndNodeMinLevel visitExistsFunction(const QueryTreeNodePtr & node);
++
+     NodeNameAndNodeMinLevel visitFunction(const QueryTreeNodePtr & node);
+ 
+     std::vector<ActionsScopeNode> actions_stack;
+     std::unordered_map<QueryTreeNodePtr, std::string> node_to_node_name;
++    CorrelatedSubtrees correlated_subtrees;
+     const PlannerContextPtr planner_context;
++    const ColumnNodePtrWithHashSet & correlated_columns_set;
+     ActionNodeNameHelper action_node_name_helper;
+     bool use_column_identifier_as_action_node_name;
+ };
+ 
+-PlannerActionsVisitorImpl::PlannerActionsVisitorImpl(ActionsDAG & actions_dag,
++PlannerActionsVisitorImpl::PlannerActionsVisitorImpl(
++    ActionsDAG & actions_dag,
+     const PlannerContextPtr & planner_context_,
+-    bool use_column_identifier_as_action_node_name_)
++    const ColumnNodePtrWithHashSet & correlated_columns_set_,
++    bool use_column_identifier_as_action_node_name_
++)
+     : planner_context(planner_context_)
++    , correlated_columns_set(correlated_columns_set_)
+     , action_node_name_helper(node_to_node_name, *planner_context, use_column_identifier_as_action_node_name_)
+     , use_column_identifier_as_action_node_name(use_column_identifier_as_action_node_name_)
+ {
+     actions_stack.emplace_back(actions_dag, nullptr);
+ }
+ 
+-ActionsDAG::NodeRawConstPtrs PlannerActionsVisitorImpl::visit(QueryTreeNodePtr expression_node)
++std::pair<ActionsDAG::NodeRawConstPtrs, CorrelatedSubtrees> PlannerActionsVisitorImpl::visit(QueryTreeNodePtr expression_node)
+ {
+     ActionsDAG::NodeRawConstPtrs result;
+ 
+@@ -652,7 +702,7 @@ ActionsDAG::NodeRawConstPtrs PlannerActionsVisitorImpl::visit(QueryTreeNodePtr e
+         result.push_back(actions_stack.front().getNodeOrThrow(node_name));
+     }
+ 
+-    return result;
++    return std::make_pair(result, correlated_subtrees);
+ }
+ 
+ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitImpl(QueryTreeNodePtr node)
+@@ -673,8 +723,13 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+ 
+ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitColumn(const QueryTreeNodePtr & node)
+ {
+-    auto column_node_name = action_node_name_helper.calculateActionNodeName(node);
+     const auto & column_node = node->as<ColumnNode &>();
++
++    const auto & column_node_ptr = static_pointer_cast<ColumnNode>(node);
++    if (correlated_columns_set.contains(column_node_ptr))
++        return visitCorrelatedColumn(column_node_ptr);
++
++    auto column_node_name = action_node_name_helper.calculateActionNodeName(node);
+     if (column_node.hasExpression())
+     {
+         auto expression = column_node.getExpression();
+@@ -686,6 +741,7 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+         else if (!use_column_identifier_as_action_node_name)
+             return visitImpl(expression);
+     }
++
+     Int64 actions_stack_size = static_cast<Int64>(actions_stack.size() - 1);
+     for (Int64 i = actions_stack_size; i >= 0; --i)
+     {
+@@ -703,6 +759,16 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+     return {column_node_name, Levels(0)};
+ }
+ 
++PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitCorrelatedColumn(const ColumnNodePtr & node)
++{
++    auto column_node_name = action_node_name_helper.calculateActionNodeName(node);
++
++    for (auto & action_scope_node : actions_stack)
++        action_scope_node.addPlaceholderColumnIfNecessary(column_node_name, node->getColumnType());
++
++    return {column_node_name, Levels(0)};
++}
++
+ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitConstant(const QueryTreeNodePtr & node, const std::string & override_column_name)
+ {
+     const auto & constant_node = node->as<ConstantNode &>();
+@@ -913,11 +979,13 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+     ActionsDAG index_hint_actions_dag;
+     auto & index_hint_actions_dag_outputs = index_hint_actions_dag.getOutputs();
+     std::unordered_set<std::string_view> index_hint_actions_dag_output_node_names;
+-    PlannerActionsVisitor actions_visitor(planner_context);
++    ColumnNodePtrWithHashSet empty_correlated_columns_set;
++    PlannerActionsVisitor actions_visitor(planner_context, empty_correlated_columns_set);
+ 
+     for (const auto & argument : function_node.getArguments())
+     {
+-        auto index_hint_argument_expression_dag_nodes = actions_visitor.visit(index_hint_actions_dag, argument);
++        auto [index_hint_argument_expression_dag_nodes, subqueries] = actions_visitor.visit(index_hint_actions_dag, argument);
++        subqueries.assertEmpty("in 'indexHint' function arguments");
+ 
+         for (auto & expression_dag_node : index_hint_argument_expression_dag_nodes)
+         {
+@@ -939,12 +1007,44 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+     return {function_node_name, Levels(index_hint_function_level)};
+ }
+ 
++PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitExistsFunction(const QueryTreeNodePtr & node)
++{
++    const auto & function_node = node->as<FunctionNode &>();
++    auto function_node_name = action_node_name_helper.calculateActionNodeName(node);
++
++    size_t exists_function_level = actions_stack.size() - 1;
++    for (auto it = actions_stack.rbegin(); it != actions_stack.rend(); ++it)
++        it->addInputColumnIfNecessary(function_node_name, function_node.getResultType());
++
++    auto subquery_argument = function_node.getArguments().getNodes().front();
++    auto * query_node = subquery_argument->as<QueryNode>();
++    auto * union_node = subquery_argument->as<UnionNode>();
++    chassert(query_node != nullptr || union_node != nullptr);
++    const QueryTreeNodes & correlated_columns = query_node ? query_node->getCorrelatedColumns().getNodes() : union_node->getCorrelatedColumns().getNodes();
++
++    ColumnIdentifiers correlated_column_identifiers;
++    correlated_column_identifiers.reserve(correlated_columns.size());
++    for (const auto & column : correlated_columns)
++    {
++        correlated_column_identifiers.push_back(action_node_name_helper.calculateActionNodeName(column));
++    }
++
++    correlated_subtrees.subqueries.emplace_back(
++        function_node.getArguments().getNodes().front(),
++        CorrelatedSubqueryKind::EXISTS,
++        function_node_name,
++        std::move(correlated_column_identifiers));
++    return { function_node_name, Levels(exists_function_level) };
++}
++
+ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitFunction(const QueryTreeNodePtr & node)
+ {
+     const auto & function_node = node->as<FunctionNode &>();
+ 
+     if (function_node.getFunctionName() == "indexHint")
+         return visitIndexHintFunction(node);
++    if (function_node.getFunctionName() == "exists")
++        return visitExistsFunction(node);
+ 
+     std::optional<NodeNameAndNodeMinLevel> in_function_second_argument_node_name_with_level;
+ 
+@@ -1040,14 +1140,22 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
+ 
+ }
+ 
+-PlannerActionsVisitor::PlannerActionsVisitor(const PlannerContextPtr & planner_context_, bool use_column_identifier_as_action_node_name_)
++PlannerActionsVisitor::PlannerActionsVisitor(
++    const PlannerContextPtr & planner_context_,
++    const ColumnNodePtrWithHashSet & correlated_columns_set_,
++    bool use_column_identifier_as_action_node_name_)
+     : planner_context(planner_context_)
++    , correlated_columns_set(correlated_columns_set_)
+     , use_column_identifier_as_action_node_name(use_column_identifier_as_action_node_name_)
+ {}
+ 
+-ActionsDAG::NodeRawConstPtrs PlannerActionsVisitor::visit(ActionsDAG & actions_dag, QueryTreeNodePtr expression_node)
++std::pair<ActionsDAG::NodeRawConstPtrs, CorrelatedSubtrees> PlannerActionsVisitor::visit(ActionsDAG & actions_dag, QueryTreeNodePtr expression_node)
+ {
+-    PlannerActionsVisitorImpl actions_visitor_impl(actions_dag, planner_context, use_column_identifier_as_action_node_name);
++    PlannerActionsVisitorImpl actions_visitor_impl(
++        actions_dag,
++        planner_context,
++        correlated_columns_set,
++        use_column_identifier_as_action_node_name);
+     return actions_visitor_impl.visit(expression_node);
+ }
+ 
+diff --git a/src/Planner/PlannerActionsVisitor.h b/src/Planner/PlannerActionsVisitor.h
+index 6084f0dbd695..680ae5ef7a15 100644
+--- a/src/Planner/PlannerActionsVisitor.h
++++ b/src/Planner/PlannerActionsVisitor.h
+@@ -1,13 +1,13 @@
+ #pragma once
+ 
+-#include <optional>
+ #include <Core/Names.h>
+ #include <Core/NamesAndTypes.h>
+ 
+ #include <Interpreters/Context_fwd.h>
+ 
+-#include <Analyzer/IQueryTreeNode.h>
+ #include <Analyzer/ConstantNode.h>
++#include <Analyzer/HashUtils.h>
++#include <Analyzer/IQueryTreeNode.h>
+ 
+ #include <Interpreters/ActionsDAG.h>
+ #include <Interpreters/WindowDescription.h>
+@@ -15,9 +15,15 @@
+ namespace DB
+ {
+ 
++struct CorrelatedSubtrees;
++
+ class PlannerContext;
+ using PlannerContextPtr = std::shared_ptr<PlannerContext>;
+ 
++class ColumnNode;
++using ColumnNodePtr = std::shared_ptr<ColumnNode>;
++using ColumnNodes = std::vector<ColumnNodePtr>;
++
+ /** Planner actions visitor is responsible for adding necessary actions to calculate query tree expression node
+   * into actions dag.
+   *
+@@ -34,16 +40,20 @@ using PlannerContextPtr = std::shared_ptr<PlannerContext>;
+ class PlannerActionsVisitor
+ {
+ public:
+-    explicit PlannerActionsVisitor(const PlannerContextPtr & planner_context_, bool use_column_identifier_as_action_node_name_ = true);
++    explicit PlannerActionsVisitor(
++      const PlannerContextPtr & planner_context_,
++      const ColumnNodePtrWithHashSet & correlated_columns_set_,
++      bool use_column_identifier_as_action_node_name_ = true);
+ 
+     /** Add actions necessary to calculate expression node into expression dag.
+       * Necessary actions are not added in actions dag output.
+       * Returns query tree expression node actions dag nodes.
+       */
+-    ActionsDAG::NodeRawConstPtrs visit(ActionsDAG & actions_dag, QueryTreeNodePtr expression_node);
++    std::pair<ActionsDAG::NodeRawConstPtrs, CorrelatedSubtrees> visit(ActionsDAG & actions_dag, QueryTreeNodePtr expression_node);
+ 
+ private:
+     const PlannerContextPtr planner_context;
++    const ColumnNodePtrWithHashSet & correlated_columns_set;
+     bool use_column_identifier_as_action_node_name = true;
+ };
+ 
+diff --git a/src/Planner/PlannerContext.cpp b/src/Planner/PlannerContext.cpp
+index 61b1c5ec33ff..89663d6cce44 100644
+--- a/src/Planner/PlannerContext.cpp
++++ b/src/Planner/PlannerContext.cpp
+@@ -1,8 +1,10 @@
+ #include <Planner/PlannerContext.h>
+ 
+-#include <Analyzer/TableNode.h>
+ #include <Analyzer/ColumnNode.h>
+ #include <Analyzer/ConstantNode.h>
++#include <Analyzer/QueryNode.h>
++#include <Analyzer/TableNode.h>
++#include <Analyzer/UnionNode.h>
+ #include <Interpreters/Context.h>
+ #include <IO/WriteHelpers.h>
+ 
+@@ -46,6 +48,23 @@ bool GlobalPlannerContext::hasColumnIdentifier(const ColumnIdentifier & column_i
+     return column_identifiers.contains(column_identifier);
+ }
+ 
++void GlobalPlannerContext::collectTableExpressionDataForCorrelatedColumns(
++    const QueryTreeNodePtr & table_expression_node,
++    const PlannerContextPtr & planner_context)
++{
++
++    auto * query_node = table_expression_node->as<QueryNode>();
++    auto * union_node = table_expression_node->as<UnionNode>();
++    chassert(query_node != nullptr && query_node->isCorrelated() || union_node != nullptr && union_node->isCorrelated());
++
++    const auto & correlated_columns = query_node ? query_node->getCorrelatedColumns().getNodes() : union_node->getCorrelatedColumns().getNodes();
++    for (const auto & column : correlated_columns)
++    {
++        auto column_source = column->as<ColumnNode>()->getColumnSource();
++        shared_table_expression_data.emplace(column_source, &planner_context->getTableExpressionDataOrThrow(column_source));
++    }
++}
++
+ PlannerContext::PlannerContext(ContextMutablePtr query_context_, GlobalPlannerContextPtr global_planner_context_, const SelectQueryOptions & select_query_options_)
+     : query_context(std::move(query_context_))
+     , global_planner_context(std::move(global_planner_context_))
+@@ -60,6 +79,10 @@ PlannerContext::PlannerContext(ContextMutablePtr query_context_, PlannerContextP
+ 
+ TableExpressionData & PlannerContext::getOrCreateTableExpressionData(const QueryTreeNodePtr & table_expression_node)
+ {
++    auto & shared_table_expression_data = getSharedTableExpressionDataMap();
++    if (auto it = shared_table_expression_data.find(table_expression_node); it != shared_table_expression_data.end())
++        return *it->second;
++
+     auto [it, _] = table_expression_node_to_data.emplace(table_expression_node, TableExpressionData());
+     return it->second;
+ }
+@@ -68,9 +91,15 @@ const TableExpressionData & PlannerContext::getTableExpressionDataOrThrow(const
+ {
+     auto table_expression_data_it = table_expression_node_to_data.find(table_expression_node);
+     if (table_expression_data_it == table_expression_node_to_data.end())
++    {
++        const auto & shared_table_expression_data = getSharedTableExpressionDataMap();
++        if (auto it = shared_table_expression_data.find(table_expression_node); it != shared_table_expression_data.end())
++            return *it->second;
++
+         throw Exception(ErrorCodes::LOGICAL_ERROR,
+             "Table expression {} is not registered in planner context",
+             table_expression_node->formatASTForErrorMessage());
++    }
+ 
+     return table_expression_data_it->second;
+ }
+@@ -79,9 +108,17 @@ TableExpressionData & PlannerContext::getTableExpressionDataOrThrow(const QueryT
+ {
+     auto table_expression_data_it = table_expression_node_to_data.find(table_expression_node);
+     if (table_expression_data_it == table_expression_node_to_data.end())
++    {
++        auto & shared_table_expression_data = getSharedTableExpressionDataMap();
++
++        auto it = shared_table_expression_data.find(table_expression_node);
++        if (it != shared_table_expression_data.end())
++            return *it->second;
++
+         throw Exception(ErrorCodes::LOGICAL_ERROR,
+             "Table expression {} is not registered in planner context",
+             table_expression_node->formatASTForErrorMessage());
++    }
+ 
+     return table_expression_data_it->second;
+ }
+@@ -90,7 +127,14 @@ const TableExpressionData * PlannerContext::getTableExpressionDataOrNull(const Q
+ {
+     auto table_expression_data_it = table_expression_node_to_data.find(table_expression_node);
+     if (table_expression_data_it == table_expression_node_to_data.end())
++    {
++        const auto & shared_table_expression_data = getSharedTableExpressionDataMap();
++
++        if (auto it = shared_table_expression_data.find(table_expression_node); it != shared_table_expression_data.end())
++            return it->second;
++
+         return nullptr;
++    }
+ 
+     return &table_expression_data_it->second;
+ }
+@@ -99,7 +143,14 @@ TableExpressionData * PlannerContext::getTableExpressionDataOrNull(const QueryTr
+ {
+     auto table_expression_data_it = table_expression_node_to_data.find(table_expression_node);
+     if (table_expression_data_it == table_expression_node_to_data.end())
++    {
++        auto & shared_table_expression_data = getSharedTableExpressionDataMap();
++
++        if (auto it = shared_table_expression_data.find(table_expression_node); it != shared_table_expression_data.end())
++            return it->second;
++
+         return nullptr;
++    }
+ 
+     return &table_expression_data_it->second;
+ }
+diff --git a/src/Planner/PlannerContext.h b/src/Planner/PlannerContext.h
+index b098a6270509..92af2687c59b 100644
+--- a/src/Planner/PlannerContext.h
++++ b/src/Planner/PlannerContext.h
+@@ -28,6 +28,10 @@ struct FiltersForTableExpression
+ 
+ using FiltersForTableExpressionMap = std::map<QueryTreeNodePtr, FiltersForTableExpression>;
+ 
++class PlannerContext;
++using PlannerContextPtr = std::shared_ptr<PlannerContext>;
++
++using RawTableExpressionDataMap = std::unordered_map<QueryTreeNodePtr, TableExpressionData *>;
+ 
+ class GlobalPlannerContext
+ {
+@@ -57,6 +61,13 @@ class GlobalPlannerContext
+     /// Check if context has column identifier
+     bool hasColumnIdentifier(const ColumnIdentifier & column_identifier);
+ 
++    void collectTableExpressionDataForCorrelatedColumns(
++      const QueryTreeNodePtr & table_expression_node,
++      const PlannerContextPtr & planner_context);
++
++    RawTableExpressionDataMap & getTableExpressionDataMap() noexcept { return shared_table_expression_data; }
++    const RawTableExpressionDataMap & getTableExpressionDataMap() const noexcept { return shared_table_expression_data; }
++
+     /// The query which will be executed with parallel replicas.
+     /// In case if only the most inner subquery can be executed with parallel replicas, node is nullptr.
+     const QueryNode * const parallel_replicas_node = nullptr;
+@@ -68,13 +79,13 @@ class GlobalPlannerContext
+ 
+ private:
+     std::unordered_set<ColumnIdentifier> column_identifiers;
++
++    /// Table expression node to data map for correlated columns sources
++    RawTableExpressionDataMap shared_table_expression_data;
+ };
+ 
+ using GlobalPlannerContextPtr = std::shared_ptr<GlobalPlannerContext>;
+ 
+-class PlannerContext;
+-using PlannerContextPtr = std::shared_ptr<PlannerContext>;
+-
+ class PlannerContext
+ {
+ public:
+@@ -176,6 +187,11 @@ class PlannerContext
+     bool isASTLevelOptimizationAllowed() const { return is_ast_level_optimization_allowed; }
+ 
+ private:
++
++    RawTableExpressionDataMap & getSharedTableExpressionDataMap() noexcept { return global_planner_context->getTableExpressionDataMap(); }
++
++    const RawTableExpressionDataMap & getSharedTableExpressionDataMap() const noexcept { return global_planner_context->getTableExpressionDataMap(); }
++
+     /// Query context
+     ContextMutablePtr query_context;
+ 
+diff --git a/src/Planner/PlannerCorrelatedSubqueries.cpp b/src/Planner/PlannerCorrelatedSubqueries.cpp
+new file mode 100644
+index 000000000000..b178e162eed6
+--- /dev/null
++++ b/src/Planner/PlannerCorrelatedSubqueries.cpp
+@@ -0,0 +1,457 @@
++#include <Planner/PlannerCorrelatedSubqueries.h>
++
++#include <Analyzer/QueryNode.h>
++#include <Analyzer/UnionNode.h>
++
++#include <Common/Exception.h>
++#include <Common/typeid_cast.h>
++
++#include <Core/Joins.h>
++#include <Core/Settings.h>
++
++#include <DataTypes/DataTypesNumber.h>
++
++#include <Interpreters/ActionsDAG.h>
++#include <Interpreters/JoinInfo.h>
++
++#include <Parsers/SelectUnionMode.h>
++
++#include <Planner/Planner.h>
++#include <Planner/PlannerActionsVisitor.h>
++#include <Planner/PlannerContext.h>
++#include <Planner/PlannerJoinsLogical.h>
++#include <Planner/Utils.h>
++
++#include <Processors/QueryPlan/AggregatingStep.h>
++#include <Processors/QueryPlan/ExpressionStep.h>
++#include <Processors/QueryPlan/FilterStep.h>
++#include <Processors/QueryPlan/JoinStepLogical.h>
++#include <Processors/QueryPlan/UnionStep.h>
++
++#include <memory>
++#include <string_view>
++#include <fmt/format.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++
++extern const int NOT_IMPLEMENTED;
++
++}
++
++namespace Setting
++{
++
++extern const SettingsBool join_use_nulls;
++
++}
++
++void CorrelatedSubtrees::assertEmpty(std::string_view reason) const
++{
++    if (notEmpty())
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Correlated subqueries {} are not supported", reason);
++}
++
++namespace
++{
++
++using CorrelatedPlanStepMap = std::unordered_map<QueryPlan::Node *, bool>;
++
++CorrelatedPlanStepMap buildCorrelatedPlanStepMap(QueryPlan & correlated_query_plan)
++{
++    CorrelatedPlanStepMap result;
++
++    struct State
++    {
++        QueryPlan::Node * node;
++        bool processed_children = false;
++    };
++
++    std::vector<State> nodes_to_process{ { .node = correlated_query_plan.getRootNode() } };
++    while (!nodes_to_process.empty())
++    {
++        size_t current_index = nodes_to_process.size() - 1;
++        if (nodes_to_process[current_index].processed_children)
++        {
++            auto * current = nodes_to_process[current_index].node;
++
++            auto & value = result[current];
++            value = current->step->hasCorrelatedExpressions();
++
++            for (auto * child : current->children)
++                value |= result[child];
++
++            nodes_to_process.pop_back();
++        }
++        else
++        {
++            for (auto * child : nodes_to_process[current_index].node->children)
++                nodes_to_process.push_back({ .node = child });
++            nodes_to_process[current_index].processed_children = true;
++        }
++    }
++
++    return result;
++}
++
++struct DecorrelationContext
++{
++    const PlannerContextPtr & planner_context;
++    QueryPlan query_plan; // LHS plan
++    QueryPlan correlated_query_plan;
++    CorrelatedPlanStepMap correlated_plan_steps;
++};
++
++/// Correlated subquery is represented by implicit dependent join operator.
++/// This function builds a query plan to evaluate correlated subquery by
++/// pushing dependent join down and replacing it with CROSS JOIN.
++QueryPlan decorrelateQueryPlan(
++    DecorrelationContext & context,
++    QueryPlan::Node * node
++)
++{
++    if (!context.correlated_plan_steps[node])
++    {
++        /// The rest of the query plan doesn't use any correlated columns.
++        auto lhs_plan = context.query_plan.clone();
++
++        const auto & settings = context.planner_context->getQueryContext()->getSettingsRef();
++
++        auto lhs_plan_header = lhs_plan.getCurrentHeader();
++        auto decorrelated_plan_header = node->step->getOutputHeader();
++
++        ColumnsWithTypeAndName output_columns_and_types;
++        output_columns_and_types.insert_range(output_columns_and_types.cend(), lhs_plan.getCurrentHeader().getColumnsWithTypeAndName());
++        output_columns_and_types.insert_range(output_columns_and_types.cend(), node->step->getOutputHeader().getColumnsWithTypeAndName());
++
++        JoinExpressionActions join_expression_actions(
++            lhs_plan_header.getColumnsWithTypeAndName(),
++            decorrelated_plan_header.getColumnsWithTypeAndName(),
++            output_columns_and_types);
++
++        Names output_columns;
++        output_columns.insert_range(output_columns.cend(), lhs_plan.getCurrentHeader().getNames());
++        output_columns.insert_range(output_columns.cend(), node->step->getOutputHeader().getNames());
++
++        auto decorrelated_join = std::make_unique<JoinStepLogical>(
++            lhs_plan_header,
++            /*right_header_=*/decorrelated_plan_header,
++            JoinInfo{
++                .expression = {},
++                .kind = JoinKind::Cross,
++                .strictness = JoinStrictness::All,
++                .locality = JoinLocality::Local
++            },
++            std::move(join_expression_actions),
++            std::move(output_columns),
++            settings[Setting::join_use_nulls],
++            JoinSettings(settings),
++            SortingStep::Settings(settings));
++        decorrelated_join->setStepDescription("JOIN to evaluate correlated expression");
++
++        /// Add CROSS JOIN
++        QueryPlan result_plan;
++
++        std::vector<QueryPlanPtr> plans;
++        plans.emplace_back(std::make_unique<QueryPlan>(std::move(lhs_plan)));
++        plans.emplace_back(std::make_unique<QueryPlan>(context.correlated_query_plan.extractSubplan(node)));
++
++        result_plan.unitePlans(std::move(decorrelated_join), {std::move(plans)});
++
++        return result_plan;
++    }
++
++    if (auto * expression_step = typeid_cast<ExpressionStep *>(node->step.get()))
++    {
++        auto decorrelated_query_plan = decorrelateQueryPlan(context, node->children.front());
++
++        auto input_header = decorrelated_query_plan.getCurrentHeader();
++
++        expression_step->decorrelateActions();
++        expression_step->getExpression().appendInputsForUnusedColumns(input_header);
++        for (const auto & column : input_header.getColumnsWithTypeAndName())
++            expression_step->getExpression().tryRestoreColumn(column.name);
++
++        expression_step->updateInputHeader(input_header);
++
++        decorrelated_query_plan.addStep(std::move(node->step));
++        return decorrelated_query_plan;
++    }
++    if (auto * filter_step = typeid_cast<FilterStep *>(node->step.get()))
++    {
++        auto decorrelated_query_plan = decorrelateQueryPlan(context, node->children.front());
++        auto input_header = decorrelated_query_plan.getCurrentHeader();
++
++        filter_step->decorrelateActions();
++        filter_step->getExpression().appendInputsForUnusedColumns(input_header);
++        for (const auto & column : input_header.getColumnsWithTypeAndName())
++            filter_step->getExpression().tryRestoreColumn(column.name);
++
++        node->step->updateInputHeader(input_header);
++
++        decorrelated_query_plan.addStep(std::move(node->step));
++        return decorrelated_query_plan;
++    }
++    if (auto * union_step = typeid_cast<UnionStep *>(node->step.get()))
++    {
++        auto decorrelated_lhs_plan = decorrelateQueryPlan(context, node->children.front());
++        auto decorrelated_rhs_plan = decorrelateQueryPlan(context, node->children.back());
++
++        Headers query_plans_headers{ decorrelated_lhs_plan.getCurrentHeader(), decorrelated_rhs_plan.getCurrentHeader() };
++
++        std::vector<QueryPlanPtr> child_plans;
++        child_plans.emplace_back(std::make_unique<QueryPlan>(std::move(decorrelated_lhs_plan)));
++        child_plans.emplace_back(std::make_unique<QueryPlan>(std::move(decorrelated_rhs_plan)));
++
++        Block union_common_header = buildCommonHeaderForUnion(query_plans_headers, SelectUnionMode::UNION_ALL); // Union mode doesn't matter here
++        addConvertingToCommonHeaderActionsIfNeeded(child_plans, union_common_header, query_plans_headers);
++
++        union_step->updateInputHeaders(std::move(query_plans_headers));
++
++        QueryPlan result_plan;
++        result_plan.unitePlans(std::move(node->step), std::move(child_plans));
++
++        return result_plan;
++    }
++    throw Exception(
++        ErrorCodes::NOT_IMPLEMENTED,
++        "Cannot decorrelate query, because '{}' step is not supported",
++        node->step->getStepDescription());
++}
++
++void buildExistsResultExpression(
++    QueryPlan & query_plan,
++    const CorrelatedSubquery & correlated_subquery,
++    bool project_only_correlated_columns
++)
++{
++    ActionsDAG dag(query_plan.getCurrentHeader().getNamesAndTypesList());
++    auto result_type = std::make_shared<DataTypeUInt8>();
++    auto column = result_type->createColumnConst(1, 1);
++    const auto * exists_result = &dag.materializeNode(dag.addColumn(ColumnWithTypeAndName(column, result_type, correlated_subquery.action_node_name)));
++
++    if (project_only_correlated_columns)
++    {
++        ActionsDAG::NodeRawConstPtrs new_outputs;
++        new_outputs.reserve(correlated_subquery.correlated_column_identifiers.size() + 1);
++
++        for (const auto & column_name : correlated_subquery.correlated_column_identifiers)
++        {
++            new_outputs.push_back(&dag.addAlias(dag.findInOutputs(column_name), fmt::format("{}.{}", correlated_subquery.action_node_name, column_name)));
++        }
++        new_outputs.push_back(exists_result);
++
++        dag.getOutputs() = std::move(new_outputs);
++    }
++    else
++    {
++        dag.addOrReplaceInOutputs(*exists_result);
++    }
++
++    auto expression_step = std::make_unique<ExpressionStep>(query_plan.getCurrentHeader(), std::move(dag));
++    expression_step->setStepDescription("Create result for always true EXISTS expression");
++    query_plan.addStep(std::move(expression_step));
++}
++
++/// Remove query plan steps that don't affect the number of rows in the result.
++/// Returns true if the query always returns at least 1 row.
++bool optimizeCorrelatedPlanForExists(QueryPlan & correlated_query_plan)
++{
++    auto * node = correlated_query_plan.getRootNode();
++    while (true)
++    {
++        if (typeid_cast<ExpressionStep *>(node->step.get()))
++        {
++            node = node->children[0];
++            continue;
++        }
++        if (auto * aggregation = typeid_cast<AggregatingStep *>(node->step.get()))
++        {
++            const auto & params = aggregation->getParams();
++            if (params.keys_size == 0 && !params.empty_result_for_aggregation_by_empty_set)
++            {
++                /// Subquery will always produce at least one row
++                return true;
++            }
++            node = node->children[0];
++            continue;
++        }
++        break;
++    }
++
++    if (node != correlated_query_plan.getRootNode())
++    {
++        correlated_query_plan = correlated_query_plan.extractSubplan(node);
++    }
++    return false;
++}
++
++QueryPlan buildLogicalJoin(
++    const PlannerContextPtr & planner_context,
++    QueryPlan left_plan,
++    QueryPlan right_plan,
++    const CorrelatedSubquery & correlated_subquery
++)
++{
++    const auto & lhs_plan_header = left_plan.getCurrentHeader();
++    const auto & rhs_plan_header = right_plan.getCurrentHeader();
++
++    ColumnsWithTypeAndName output_columns_and_types;
++    output_columns_and_types.insert_range(output_columns_and_types.cend(), lhs_plan_header.getColumnsWithTypeAndName());
++    output_columns_and_types.emplace_back(rhs_plan_header.getByName(correlated_subquery.action_node_name));
++
++    JoinExpressionActions join_expression_actions(
++        lhs_plan_header.getColumnsWithTypeAndName(),
++        rhs_plan_header.getColumnsWithTypeAndName(),
++        output_columns_and_types);
++
++    Names output_columns;
++    output_columns.insert_range(output_columns.cend(), lhs_plan_header.getNames());
++    output_columns.push_back(correlated_subquery.action_node_name);
++
++    const auto & settings = planner_context->getQueryContext()->getSettingsRef();
++
++    std::vector<JoinPredicate> predicates;
++    for (const auto & column_name : correlated_subquery.correlated_column_identifiers)
++    {
++        const auto * left_node = &join_expression_actions.left_pre_join_actions->findInOutputs(column_name);
++        const auto * right_node = &join_expression_actions.right_pre_join_actions->findInOutputs(fmt::format("{}.{}", correlated_subquery.action_node_name, column_name));
++
++        JoinPredicate predicate{
++            .left_node = JoinActionRef(left_node, join_expression_actions.left_pre_join_actions.get()),
++            .right_node = JoinActionRef(right_node, join_expression_actions.right_pre_join_actions.get()),
++            .op = PredicateOperator::Equals
++        };
++
++        predicates.emplace_back(std::move(predicate));
++    }
++
++    /// Add LEFT OUTER JOIN
++    auto result_join = std::make_unique<JoinStepLogical>(
++        lhs_plan_header,
++        rhs_plan_header,
++        JoinInfo{
++            .expression = JoinExpression{
++                .condition = JoinCondition{
++                    .predicates = std::move(predicates),
++                    .left_filter_conditions = {},
++                    .right_filter_conditions = {},
++                    .residual_conditions = {}
++                },
++                .disjunctive_conditions = {}
++            },
++            .kind = JoinKind::Left,
++            .strictness = JoinStrictness::Any,
++            .locality = JoinLocality::Local
++        },
++        std::move(join_expression_actions),
++        std::move(output_columns),
++        /*join_use_nulls=*/false,
++        JoinSettings(settings),
++        SortingStep::Settings(settings));
++    result_join->setStepDescription("JOIN to generate result stream");
++
++    QueryPlan result_plan;
++
++    std::vector<QueryPlanPtr> plans;
++    plans.emplace_back(std::make_unique<QueryPlan>(std::move(left_plan)));
++    plans.emplace_back(std::make_unique<QueryPlan>(std::move(right_plan)));
++
++    result_plan.unitePlans(std::move(result_join), {std::move(plans)});
++    return result_plan;
++}
++
++}
++
++/* Build query plan for correlated subquery using decorrelation algorithm
++ * on top of relational algebra operators proposed by TU Munich researchers
++ * Thomas Neumann and Alfons Kemper.
++ *
++ * Original research paper "Unnesting Arbitrary Queries": https://cs.emis.de/LNI/Proceedings/Proceedings241/383.pdf
++ * See also a follow-up paper, "Improving Unnesting of Complex Queries": https://dl.gi.de/items/b9df4765-d1b0-4267-a77c-4ce4ab0ee62d
++ *
++ * NOTE: ClickHouse does not explicitly build SQL query into relational algebra expression.
++ * Instead, it produces a query plan where almost every step has an analog from relational algebra.
++ * This function implements a decorrelation algorithm using the ClickHouse query plan.
++ *
++ * TODO: Support scalar correlated subqueries.
++ * TODO: Support decorrelation of all kinds of query plan steps.
++ * TODO: Implement left table substitution optimization: T_left DEPENDENT JOIN T_right is a subset of T_right
++ * if T_right has all the necessary columns of T_left.
++ */
++void buildQueryPlanForCorrelatedSubquery(
++    const PlannerContextPtr & planner_context,
++    QueryPlan & query_plan,
++    const CorrelatedSubquery & correlated_subquery,
++    const SelectQueryOptions & select_query_options)
++{
++    auto * query_node = correlated_subquery.query_tree->as<QueryNode>();
++    auto * union_node = correlated_subquery.query_tree->as<UnionNode>();
++    chassert(query_node != nullptr && query_node->isCorrelated() || union_node != nullptr && union_node->isCorrelated());
++
++    switch (correlated_subquery.kind)
++    {
++        case DB::CorrelatedSubqueryKind::SCALAR:
++        {
++            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Scalar correlated subqueries are not supported");
++        }
++        case CorrelatedSubqueryKind::EXISTS:
++        {
++            auto subquery_options = select_query_options.subquery();
++            auto global_planner_context = std::make_shared<GlobalPlannerContext>(nullptr, nullptr, FiltersForTableExpressionMap{});
++            /// Register table expression data for correlated columns sources in the global context.
++            /// Table expression data would be reused because it can't be initialized
++            /// during plan construction for correlated subquery.
++            global_planner_context->collectTableExpressionDataForCorrelatedColumns(correlated_subquery.query_tree, planner_context);
++
++            Planner subquery_planner(
++                correlated_subquery.query_tree,
++                subquery_options,
++                global_planner_context);
++            subquery_planner.buildQueryPlanIfNeeded();
++
++            /// Logical plan for correlated subquery
++            auto & correlated_query_plan = subquery_planner.getQueryPlan();
++
++            /// For EXISTS expression we can remove plan steps that doesn't change the number of result rows.
++            /// It may also result in non-correlated subquery plan
++            /// Example:
++            /// SELECT * FROM numbers(1) WHERE EXISTS (SELECT a = number FROM table)
++            if (optimizeCorrelatedPlanForExists(correlated_query_plan))
++            {
++                /// Subquery always produces at least 1 row.
++                buildExistsResultExpression(query_plan, correlated_subquery, /*project_only_correlated_columns=*/false);
++                return;
++            }
++
++            /// Mark all query plan steps if they or their subplans contain usage of correlated subqueries.
++            /// It's needed to identify the moment when dependent join can be replaced by CROSS JOIN.
++            auto correlated_step_map = buildCorrelatedPlanStepMap(correlated_query_plan);
++
++            DecorrelationContext context{
++                .planner_context = planner_context,
++                .query_plan = std::move(query_plan),
++                .correlated_query_plan = std::move(subquery_planner).extractQueryPlan(),
++                .correlated_plan_steps = std::move(correlated_step_map)
++            };
++
++            auto decorrelated_plan = decorrelateQueryPlan(context, context.correlated_query_plan.getRootNode());
++            /// Add a 'exists(<table expression id>)' expression that is always true.
++            buildExistsResultExpression(decorrelated_plan, correlated_subquery, /*project_only_correlated_columns=*/true);
++
++            /// Use LEFT OUTER JOIN to produce the result plan.
++            /// If there's no corresponding rows from the right side, 'exists(<table expression id>)' would be replaced by default value (false).
++            query_plan = buildLogicalJoin(
++                planner_context,
++                std::move(context.query_plan),
++                std::move(decorrelated_plan),
++                correlated_subquery);
++            break;
++        }
++    }
++}
++
++}
+diff --git a/src/Planner/PlannerCorrelatedSubqueries.h b/src/Planner/PlannerCorrelatedSubqueries.h
+new file mode 100644
+index 000000000000..8414ec1b0bc5
+--- /dev/null
++++ b/src/Planner/PlannerCorrelatedSubqueries.h
+@@ -0,0 +1,62 @@
++#pragma once
++
++#include <memory>
++#include <string_view>
++#include <vector>
++
++#include <Processors/QueryPlan/QueryPlan.h>
++
++namespace DB
++{
++
++struct SelectQueryOptions;
++
++class IQueryTreeNode;
++using QueryTreeNodePtr = std::shared_ptr<IQueryTreeNode>;
++using QueryTreeNodes = std::vector<QueryTreeNodePtr>;
++
++class PlannerContext;
++using PlannerContextPtr = std::shared_ptr<PlannerContext>;
++
++using ColumnIdentifier = std::string;
++using ColumnIdentifiers = std::vector<ColumnIdentifier>;
++
++enum class CorrelatedSubqueryKind
++{
++    SCALAR,
++    EXISTS,
++};
++
++struct CorrelatedSubquery
++{
++    CorrelatedSubquery(QueryTreeNodePtr query_tree_, CorrelatedSubqueryKind kind_, const String & action_node_name_, ColumnIdentifiers correlated_column_identifiers_)
++        : query_tree(std::move(query_tree_))
++        , kind(kind_)
++        , action_node_name(action_node_name_)
++        , correlated_column_identifiers(std::move(correlated_column_identifiers_))
++    {}
++
++    QueryTreeNodePtr query_tree;
++    CorrelatedSubqueryKind kind;
++    String action_node_name;
++    ColumnIdentifiers correlated_column_identifiers;
++};
++
++using CorrelatedSubqueries = std::vector<CorrelatedSubquery>;
++
++struct CorrelatedSubtrees
++{
++    bool notEmpty() const noexcept { return !subqueries.empty(); }
++
++    void assertEmpty(std::string_view reason) const;
++
++    CorrelatedSubqueries subqueries;
++};
++
++void buildQueryPlanForCorrelatedSubquery(
++    const PlannerContextPtr & planner_context,
++    QueryPlan & query_plan,
++    const CorrelatedSubquery & correlated_subquery,
++    const SelectQueryOptions & select_query_options);
++
++}
+diff --git a/src/Planner/PlannerExpressionAnalysis.cpp b/src/Planner/PlannerExpressionAnalysis.cpp
+index 885de50e65c2..caa5ce58afde 100644
+--- a/src/Planner/PlannerExpressionAnalysis.cpp
++++ b/src/Planner/PlannerExpressionAnalysis.cpp
+@@ -1,3 +1,5 @@
++#include <memory>
++#include <optional>
+ #include <Planner/PlannerExpressionAnalysis.h>
+ 
+ #include <Columns/ColumnNullable.h>
+@@ -26,6 +28,7 @@
+ #include <Planner/Utils.h>
+ 
+ #include <Core/Settings.h>
++#include "Analyzer/HashUtils.h"
+ 
+ namespace DB
+ {
+@@ -46,15 +49,20 @@ namespace
+   * Actions before filter are added into into actions chain.
+   * It is client responsibility to update filter analysis result if filter column must be removed after chain is finalized.
+   */
+-std::optional<FilterAnalysisResult> analyzeFilter(const QueryTreeNodePtr & filter_expression_node,
++std::optional<FilterAnalysisResult> analyzeFilter(
++    const QueryTreeNodePtr & filter_expression_node,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
+     FilterAnalysisResult result;
+ 
++    auto [filter_expression_dag, correlated_subtrees] = buildActionsDAGFromExpressionNode(filter_expression_node, input_columns, planner_context, correlated_columns_set);
++
+     result.filter_actions = std::make_shared<ActionsAndProjectInputsFlag>();
+-    result.filter_actions->dag = buildActionsDAGFromExpressionNode(filter_expression_node, input_columns, planner_context);
++    result.filter_actions->dag = std::move(filter_expression_dag);
++    result.correlated_subtrees = std::move(correlated_subtrees);
+ 
+     const auto * output = result.filter_actions->dag.getOutputs().at(0);
+     if (output->column && ConstantFilterDescription(*output->column).always_true)
+@@ -109,9 +117,11 @@ bool canRemoveConstantFromGroupByKey(const ConstantNode & root)
+ /** Construct aggregation analysis result if query tree has GROUP BY or aggregates.
+   * Actions before aggregation are added into actions chain, if result is not null optional.
+   */
+-std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodePtr & query_tree,
++std::optional<AggregationAnalysisResult> analyzeAggregation(
++    const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
+     auto & query_node = query_tree->as<QueryNode &>();
+@@ -135,7 +145,7 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodeP
+     GroupingSetsParamsList grouping_sets_parameters_list;
+     bool group_by_with_constant_keys = false;
+ 
+-    PlannerActionsVisitor actions_visitor(planner_context);
++    PlannerActionsVisitor actions_visitor(planner_context, correlated_columns_set);
+ 
+     /// Add expressions from GROUP BY
+     bool group_by_use_nulls = planner_context->getQueryContext()->getSettingsRef()[Setting::group_by_use_nulls]
+@@ -163,7 +173,8 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodeP
+                     if (constant_key && !aggregates_descriptions.empty() && (!check_constants_for_group_by_key || canRemoveConstantFromGroupByKey(*constant_key)))
+                         continue;
+ 
+-                    auto expression_dag_nodes = actions_visitor.visit(before_aggregation_actions->dag, grouping_set_key_node);
++                    auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_aggregation_actions->dag, grouping_set_key_node);
++                    correlated_subtrees.assertEmpty("in aggregation keys");
+                     aggregation_keys.reserve(expression_dag_nodes.size());
+ 
+                     for (auto & expression_dag_node : expression_dag_nodes)
+@@ -215,7 +226,8 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodeP
+                 if (constant_key && !aggregates_descriptions.empty() && (!check_constants_for_group_by_key || canRemoveConstantFromGroupByKey(*constant_key)))
+                     continue;
+ 
+-                auto expression_dag_nodes = actions_visitor.visit(before_aggregation_actions->dag, group_by_key_node);
++                auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_aggregation_actions->dag, group_by_key_node);
++                correlated_subtrees.assertEmpty("in aggregation keys");
+                 aggregation_keys.reserve(expression_dag_nodes.size());
+ 
+                 for (auto & expression_dag_node : expression_dag_nodes)
+@@ -242,7 +254,8 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodeP
+         auto & aggregate_function_node_typed = aggregate_function_node->as<FunctionNode &>();
+         for (const auto & aggregate_function_node_argument : aggregate_function_node_typed.getArguments().getNodes())
+         {
+-            auto expression_dag_nodes = actions_visitor.visit(before_aggregation_actions->dag, aggregate_function_node_argument);
++            auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_aggregation_actions->dag, aggregate_function_node_argument);
++            correlated_subtrees.assertEmpty("in aggregate function argument");
+             for (auto & expression_dag_node : expression_dag_nodes)
+             {
+                 if (before_aggregation_actions_output_node_names.contains(expression_dag_node->result_name))
+@@ -282,9 +295,11 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(const QueryTreeNodeP
+ /** Construct window analysis result if query tree has window functions.
+   * Actions before window functions are added into actions chain, if result is not null optional.
+   */
+-std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query_tree,
++std::optional<WindowAnalysisResult> analyzeWindow(
++    const QueryTreeNodePtr & query_tree,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
+     auto window_function_nodes = collectWindowFunctionNodes(query_tree);
+@@ -293,7 +308,7 @@ std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query
+ 
+     auto window_descriptions = extractWindowDescriptions(window_function_nodes, *planner_context);
+ 
+-    PlannerActionsVisitor actions_visitor(planner_context);
++    PlannerActionsVisitor actions_visitor(planner_context, correlated_columns_set);
+ 
+     ActionsAndProjectInputsFlagPtr before_window_actions = std::make_shared<ActionsAndProjectInputsFlag>();
+     before_window_actions->dag = ActionsDAG(input_columns);
+@@ -306,7 +321,8 @@ std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query
+         auto & window_function_node_typed = window_function_node->as<FunctionNode &>();
+         auto & window_node = window_function_node_typed.getWindowNode()->as<WindowNode &>();
+ 
+-        auto expression_dag_nodes = actions_visitor.visit(before_window_actions->dag, window_function_node_typed.getArgumentsNode());
++        auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_window_actions->dag, window_function_node_typed.getArgumentsNode());
++        correlated_subtrees.assertEmpty("in window function arguments");
+ 
+         for (auto & expression_dag_node : expression_dag_nodes)
+         {
+@@ -317,7 +333,8 @@ std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query
+             before_window_actions_output_node_names.insert(expression_dag_node->result_name);
+         }
+ 
+-        expression_dag_nodes = actions_visitor.visit(before_window_actions->dag, window_node.getPartitionByNode());
++        std::tie(expression_dag_nodes, correlated_subtrees) = actions_visitor.visit(before_window_actions->dag, window_node.getPartitionByNode());
++        correlated_subtrees.assertEmpty("in window definition");
+ 
+         for (auto & expression_dag_node : expression_dag_nodes)
+         {
+@@ -335,7 +352,8 @@ std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query
+         for (auto & sort_node : order_by_node_list.getNodes())
+         {
+             auto & sort_node_typed = sort_node->as<SortNode &>();
+-            expression_dag_nodes = actions_visitor.visit(before_window_actions->dag, sort_node_typed.getExpression());
++            std::tie(expression_dag_nodes, correlated_subtrees) = actions_visitor.visit(before_window_actions->dag, sort_node_typed.getExpression());
++            correlated_subtrees.assertEmpty("in window order definition");
+ 
+             for (auto & expression_dag_node : expression_dag_nodes)
+             {
+@@ -370,13 +388,22 @@ std::optional<WindowAnalysisResult> analyzeWindow(const QueryTreeNodePtr & query
+   * Projection actions are added into actions chain.
+   * It is client responsibility to update projection analysis result with project names actions after chain is finalized.
+   */
+-ProjectionAnalysisResult analyzeProjection(const QueryNode & query_node,
++ProjectionAnalysisResult analyzeProjection(
++    const QueryNode & query_node,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
++    auto [projection_actions_dag, correlated_subtrees] = buildActionsDAGFromExpressionNode(
++        query_node.getProjectionNode(),
++        input_columns,
++        planner_context,
++        correlated_columns_set);
++    correlated_subtrees.assertEmpty("in projection list");
++
+     auto projection_actions = std::make_shared<ActionsAndProjectInputsFlag>();
+-    projection_actions->dag = buildActionsDAGFromExpressionNode(query_node.getProjectionNode(), input_columns, planner_context);
++    projection_actions->dag = std::move(projection_actions_dag);
+ 
+     auto projection_columns = query_node.getProjectionColumns();
+     size_t projection_columns_size = projection_columns.size();
+@@ -418,9 +445,11 @@ ProjectionAnalysisResult analyzeProjection(const QueryNode & query_node,
+ /** Construct sort analysis result.
+   * Actions before sort are added into actions chain.
+   */
+-SortAnalysisResult analyzeSort(const QueryNode & query_node,
++SortAnalysisResult analyzeSort(
++    const QueryNode & query_node,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
+     auto before_sort_actions = std::make_shared<ActionsAndProjectInputsFlag>();
+@@ -428,7 +457,7 @@ SortAnalysisResult analyzeSort(const QueryNode & query_node,
+     auto & before_sort_actions_outputs = before_sort_actions->dag.getOutputs();
+     before_sort_actions_outputs.clear();
+ 
+-    PlannerActionsVisitor actions_visitor(planner_context);
++    PlannerActionsVisitor actions_visitor(planner_context, correlated_columns_set);
+     bool has_with_fill = false;
+     std::unordered_set<std::string_view> before_sort_actions_dag_output_node_names;
+ 
+@@ -439,7 +468,8 @@ SortAnalysisResult analyzeSort(const QueryNode & query_node,
+     for (const auto & sort_node : order_by_node_list.getNodes())
+     {
+         auto & sort_node_typed = sort_node->as<SortNode &>();
+-        auto expression_dag_nodes = actions_visitor.visit(before_sort_actions->dag, sort_node_typed.getExpression());
++        auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_sort_actions->dag, sort_node_typed.getExpression());
++        correlated_subtrees.assertEmpty("in ORDER BY");
+         has_with_fill |= sort_node_typed.withFill();
+ 
+         for (auto & action_dag_node : expression_dag_nodes)
+@@ -463,7 +493,7 @@ SortAnalysisResult analyzeSort(const QueryNode & query_node,
+     {
+         auto & interpolate_list_node = query_node.getInterpolate()->as<ListNode &>();
+ 
+-        PlannerActionsVisitor interpolate_actions_visitor(planner_context);
++        PlannerActionsVisitor interpolate_actions_visitor(planner_context, correlated_columns_set);
+         ActionsDAG interpolate_actions_dag;
+ 
+         for (auto & interpolate_node : interpolate_list_node.getNodes())
+@@ -512,10 +542,18 @@ LimitByAnalysisResult analyzeLimitBy(const QueryNode & query_node,
+     const ColumnsWithTypeAndName & input_columns,
+     const PlannerContextPtr & planner_context,
+     const NameSet & required_output_nodes_names,
++    const ColumnNodePtrWithHashSet & correlated_columns_set,
+     ActionsChain & actions_chain)
+ {
++    auto [before_limit_by_actions_dag, correlated_subtrees] = buildActionsDAGFromExpressionNode(
++        query_node.getLimitByNode(),
++        input_columns,
++        planner_context,
++        correlated_columns_set);
++    correlated_subtrees.assertEmpty("in LIMIT BY expression");
++
+     auto before_limit_by_actions = std::make_shared<ActionsAndProjectInputsFlag>();
+-    before_limit_by_actions->dag = buildActionsDAGFromExpressionNode(query_node.getLimitByNode(), input_columns, planner_context);
++    before_limit_by_actions->dag = std::move(before_limit_by_actions_dag);
+ 
+     NameSet limit_by_column_names_set;
+     Names limit_by_column_names;
+@@ -550,14 +588,21 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+ 
+     ActionsChain actions_chain;
+ 
++    ColumnsWithTypeAndName current_output_columns = join_tree_input_columns;
++
++    auto correlated_columns_set = query_node.getCorrelatedColumnsSet();
++
+     std::optional<FilterAnalysisResult> where_analysis_result_optional;
+     std::optional<size_t> where_action_step_index_optional;
+ 
+-    ColumnsWithTypeAndName current_output_columns = join_tree_input_columns;
+-
+     if (query_node.hasWhere())
+     {
+-        where_analysis_result_optional = analyzeFilter(query_node.getWhere(), current_output_columns, planner_context, actions_chain);
++        where_analysis_result_optional = analyzeFilter(
++            query_node.getWhere(),
++            current_output_columns,
++            planner_context,
++            correlated_columns_set,
++            actions_chain);
+         if (where_analysis_result_optional)
+         {
+             where_action_step_index_optional = actions_chain.getLastStepIndex();
+@@ -565,7 +610,12 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+         }
+     }
+ 
+-    auto aggregation_analysis_result_optional = analyzeAggregation(query_tree, current_output_columns, planner_context, actions_chain);
++    auto aggregation_analysis_result_optional = analyzeAggregation(
++        query_tree,
++        current_output_columns,
++        planner_context,
++        correlated_columns_set,
++        actions_chain);
+     if (aggregation_analysis_result_optional)
+         current_output_columns = actions_chain.getLastStepAvailableOutputColumns();
+ 
+@@ -574,7 +624,12 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+ 
+     if (query_node.hasHaving())
+     {
+-        having_analysis_result_optional = analyzeFilter(query_node.getHaving(), current_output_columns, planner_context, actions_chain);
++        having_analysis_result_optional = analyzeFilter(
++            query_node.getHaving(),
++            current_output_columns,
++            planner_context,
++            correlated_columns_set,
++            actions_chain);
+         if (having_analysis_result_optional)
+         {
+             having_action_step_index_optional = actions_chain.getLastStepIndex();
+@@ -582,7 +637,12 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+         }
+     }
+ 
+-    auto window_analysis_result_optional = analyzeWindow(query_tree, current_output_columns, planner_context, actions_chain);
++    auto window_analysis_result_optional = analyzeWindow(
++        query_tree,
++        current_output_columns,
++        planner_context,
++        correlated_columns_set,
++        actions_chain);
+     if (window_analysis_result_optional)
+         current_output_columns = actions_chain.getLastStepAvailableOutputColumns();
+ 
+@@ -591,7 +651,12 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+ 
+     if (query_node.hasQualify())
+     {
+-        qualify_analysis_result_optional = analyzeFilter(query_node.getQualify(), current_output_columns, planner_context, actions_chain);
++        qualify_analysis_result_optional = analyzeFilter(
++            query_node.getQualify(),
++            current_output_columns,
++            planner_context,
++            correlated_columns_set,
++            actions_chain);
+         if (qualify_analysis_result_optional)
+         {
+             qualify_action_step_index_optional = actions_chain.getLastStepIndex();
+@@ -599,13 +664,23 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+         }
+     }
+ 
+-    auto projection_analysis_result = analyzeProjection(query_node, current_output_columns, planner_context, actions_chain);
++    auto projection_analysis_result = analyzeProjection(
++        query_node,
++        current_output_columns,
++        planner_context,
++        correlated_columns_set,
++        actions_chain);
+     current_output_columns = actions_chain.getLastStepAvailableOutputColumns();
+ 
+     std::optional<SortAnalysisResult> sort_analysis_result_optional;
+     if (query_node.hasOrderBy())
+     {
+-        sort_analysis_result_optional = analyzeSort(query_node, current_output_columns, planner_context, actions_chain);
++        sort_analysis_result_optional = analyzeSort(
++            query_node,
++            current_output_columns,
++            planner_context,
++            correlated_columns_set,
++            actions_chain);
+         current_output_columns = actions_chain.getLastStepAvailableOutputColumns();
+     }
+ 
+@@ -628,10 +703,12 @@ PlannerExpressionsAnalysisResult buildExpressionAnalysisResult(const QueryTreeNo
+                 required_output_nodes_names.insert(output_node->result_name);
+         }
+ 
+-        limit_by_analysis_result_optional = analyzeLimitBy(query_node,
++        limit_by_analysis_result_optional = analyzeLimitBy(
++            query_node,
+             current_output_columns,
+             planner_context,
+             required_output_nodes_names,
++            correlated_columns_set,
+             actions_chain);
+         current_output_columns = actions_chain.getLastStepAvailableOutputColumns();
+     }
+diff --git a/src/Planner/PlannerExpressionAnalysis.h b/src/Planner/PlannerExpressionAnalysis.h
+index 9ae2e672af93..dfa76d256f2f 100644
+--- a/src/Planner/PlannerExpressionAnalysis.h
++++ b/src/Planner/PlannerExpressionAnalysis.h
+@@ -6,10 +6,11 @@
+ 
+ #include <Interpreters/ActionsDAG.h>
+ 
+-#include <Planner/PlannerContext.h>
+ #include <Planner/PlannerAggregation.h>
+-#include <Planner/PlannerWindowFunctions.h>
++#include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ #include <Planner/PlannerQueryProcessingInfo.h>
++#include <Planner/PlannerWindowFunctions.h>
+ 
+ namespace DB
+ {
+@@ -25,6 +26,7 @@ struct ProjectionAnalysisResult
+ struct FilterAnalysisResult
+ {
+     ActionsAndProjectInputsFlagPtr filter_actions;
++    CorrelatedSubtrees correlated_subtrees;
+     std::string filter_column_name;
+     bool remove_filter_column = false;
+ };
+diff --git a/src/Planner/PlannerJoinTree.cpp b/src/Planner/PlannerJoinTree.cpp
+index d20fecf5e6d1..4d6d9d413094 100644
+--- a/src/Planner/PlannerJoinTree.cpp
++++ b/src/Planner/PlannerJoinTree.cpp
+@@ -2183,7 +2183,8 @@ JoinTreeQueryPlan buildQueryPlanForArrayJoinNode(const QueryTreeNodePtr & array_
+     auto plan_output_columns = plan.getCurrentHeader().getColumnsWithTypeAndName();
+ 
+     ActionsDAG array_join_action_dag(plan_output_columns);
+-    PlannerActionsVisitor actions_visitor(planner_context);
++    ColumnNodePtrWithHashSet empty_correlated_columns_set;
++    PlannerActionsVisitor actions_visitor(planner_context, empty_correlated_columns_set);
+     std::unordered_set<std::string> array_join_expressions_output_nodes;
+ 
+     Names array_join_column_names;
+@@ -2194,7 +2195,8 @@ JoinTreeQueryPlan buildQueryPlanForArrayJoinNode(const QueryTreeNodePtr & array_
+         array_join_column_names.push_back(array_join_column_identifier);
+ 
+         auto & array_join_expression_column = array_join_expression->as<ColumnNode &>();
+-        auto expression_dag_index_nodes = actions_visitor.visit(array_join_action_dag, array_join_expression_column.getExpressionOrThrow());
++        auto [expression_dag_index_nodes, correlated_subtrees] = actions_visitor.visit(array_join_action_dag, array_join_expression_column.getExpressionOrThrow());
++        correlated_subtrees.assertEmpty("in ARRAY JOIN");
+ 
+         for (auto & expression_dag_index_node : expression_dag_index_nodes)
+         {
+diff --git a/src/Planner/PlannerJoins.cpp b/src/Planner/PlannerJoins.cpp
+index bda27ad57ec2..2836da64256e 100644
+--- a/src/Planner/PlannerJoins.cpp
++++ b/src/Planner/PlannerJoins.cpp
+@@ -244,8 +244,10 @@ const ActionsDAG::Node * appendExpression(
+     const PlannerContextPtr & planner_context,
+     const JoinNode & join_node)
+ {
+-    PlannerActionsVisitor join_expression_visitor(planner_context);
+-    auto join_expression_dag_node_raw_pointers = join_expression_visitor.visit(dag, expression);
++    ColumnNodePtrWithHashSet empty_correlated_columns_set;
++    PlannerActionsVisitor join_expression_visitor(planner_context, empty_correlated_columns_set);
++    auto [join_expression_dag_node_raw_pointers, correlated_subtrees] = join_expression_visitor.visit(dag, expression);
++    correlated_subtrees.assertEmpty("in JOINs");
+     if (join_expression_dag_node_raw_pointers.size() != 1)
+         throw Exception(ErrorCodes::LOGICAL_ERROR,
+             "JOIN {} ON clause contains multiple expressions",
+@@ -913,8 +915,10 @@ JoinClausesAndActions buildJoinClausesAndActions(
+         if (result.join_clauses.size() > 1)
+         {
+             ActionsDAG residual_join_expressions_actions(result_relation_columns);
+-            PlannerActionsVisitor join_expression_visitor(planner_context);
+-            auto join_expression_dag_node_raw_pointers = join_expression_visitor.visit(residual_join_expressions_actions, join_expression);
++            ColumnNodePtrWithHashSet empty_correlated_columns_set;
++            PlannerActionsVisitor join_expression_visitor(planner_context, empty_correlated_columns_set);
++            auto [join_expression_dag_node_raw_pointers, correlated_subtrees] = join_expression_visitor.visit(residual_join_expressions_actions, join_expression);
++            correlated_subtrees.assertEmpty("in JOIN condition");
+             if (join_expression_dag_node_raw_pointers.size() != 1)
+                 throw Exception(
+                     ErrorCodes::LOGICAL_ERROR, "JOIN {} ON clause contains multiple expressions", join_node.formatASTForErrorMessage());
+diff --git a/src/Planner/PlannerJoinsLogical.cpp b/src/Planner/PlannerJoinsLogical.cpp
+index 871587535a80..76f49a44cd28 100644
+--- a/src/Planner/PlannerJoinsLogical.cpp
++++ b/src/Planner/PlannerJoinsLogical.cpp
+@@ -40,7 +40,9 @@
+ 
+ #include <Planner/PlannerActionsVisitor.h>
+ #include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ #include <Planner/Utils.h>
++
+ #include <Processors/QueryPlan/JoinStepLogical.h>
+ 
+ #include <Core/Settings.h>
+@@ -71,8 +73,11 @@ const ActionsDAG::Node * appendExpression(
+     const QueryTreeNodePtr & expression,
+     const PlannerContextPtr & planner_context)
+ {
+-    PlannerActionsVisitor join_expression_visitor(planner_context);
+-    auto join_expression_dag_node_raw_pointers = join_expression_visitor.visit(dag, expression);
++    ColumnNodePtrWithHashSet empty_correlated_columns_set;
++    PlannerActionsVisitor join_expression_visitor(planner_context, empty_correlated_columns_set);
++    auto [join_expression_dag_node_raw_pointers, correlated_subtrees] = join_expression_visitor.visit(dag, expression);
++    correlated_subtrees.assertEmpty("in join expression");
++
+     if (join_expression_dag_node_raw_pointers.size() != 1)
+         throw Exception(ErrorCodes::LOGICAL_ERROR,
+             "Expression {} expected be a single node, got {}",
+diff --git a/src/Planner/Utils.cpp b/src/Planner/Utils.cpp
+index 602a5507e73e..c4ec9fecbd72 100644
+--- a/src/Planner/Utils.cpp
++++ b/src/Planner/Utils.cpp
+@@ -42,9 +42,11 @@
+ 
+ #include <Core/Settings.h>
+ 
+-#include <Planner/PlannerActionsVisitor.h>
+-#include <Planner/CollectTableExpressionData.h>
+ #include <Planner/CollectSets.h>
++#include <Planner/CollectTableExpressionData.h>
++#include <Planner/PlannerActionsVisitor.h>
++
++#include <Processors/QueryPlan/ExpressionStep.h>
+ 
+ #include <stack>
+ 
+@@ -136,6 +138,30 @@ Block buildCommonHeaderForUnion(const Blocks & queries_headers, SelectUnionMode
+     return common_header;
+ }
+ 
++void addConvertingToCommonHeaderActionsIfNeeded(
++    std::vector<std::unique_ptr<QueryPlan>> & query_plans,
++    const Block & union_common_header,
++    Blocks & query_plans_headers)
++{
++    size_t queries_size = query_plans.size();
++    for (size_t i = 0; i < queries_size; ++i)
++    {
++        auto & query_node_plan = query_plans[i];
++        if (blocksHaveEqualStructure(query_node_plan->getCurrentHeader(), union_common_header))
++            continue;
++
++        auto actions_dag = ActionsDAG::makeConvertingActions(
++            query_node_plan->getCurrentHeader().getColumnsWithTypeAndName(),
++            union_common_header.getColumnsWithTypeAndName(),
++            ActionsDAG::MatchColumnsMode::Position);
++        auto converting_step = std::make_unique<ExpressionStep>(query_node_plan->getCurrentHeader(), std::move(actions_dag));
++        converting_step->setStepDescription("Conversion before UNION");
++        query_node_plan->addStep(std::move(converting_step));
++
++        query_plans_headers[i] = query_node_plan->getCurrentHeader();
++    }
++}
++
+ ASTPtr queryNodeToSelectQuery(const QueryTreeNodePtr & query_node)
+ {
+     auto & query_node_typed = query_node->as<QueryNode &>();
+@@ -243,16 +269,18 @@ StorageLimits buildStorageLimits(const Context & context, const SelectQueryOptio
+     return {limits, leaf_limits};
+ }
+ 
+-ActionsDAG buildActionsDAGFromExpressionNode(const QueryTreeNodePtr & expression_node,
++std::pair<ActionsDAG, CorrelatedSubtrees> buildActionsDAGFromExpressionNode(
++    const QueryTreeNodePtr & expression_node,
+     const ColumnsWithTypeAndName & input_columns,
+-    const PlannerContextPtr & planner_context)
++    const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set)
+ {
+     ActionsDAG action_dag(input_columns);
+-    PlannerActionsVisitor actions_visitor(planner_context);
+-    auto expression_dag_index_nodes = actions_visitor.visit(action_dag, expression_node);
++    PlannerActionsVisitor actions_visitor(planner_context, correlated_columns_set);
++    auto [expression_dag_index_nodes, correlated_subtrees] = actions_visitor.visit(action_dag, expression_node);
+     action_dag.getOutputs() = std::move(expression_dag_index_nodes);
+ 
+-    return action_dag;
++    return std::make_pair(std::move(action_dag), std::move(correlated_subtrees));
+ }
+ 
+ bool sortDescriptionIsPrefix(const SortDescription & prefix, const SortDescription & full)
+@@ -492,8 +520,10 @@ FilterDAGInfo buildFilterInfo(QueryTreeNodePtr filter_query_tree,
+ 
+     ActionsDAG filter_actions_dag;
+ 
+-    PlannerActionsVisitor actions_visitor(planner_context, false /*use_column_identifier_as_action_node_name*/);
+-    auto expression_nodes = actions_visitor.visit(filter_actions_dag, filter_query_tree);
++    ColumnNodePtrWithHashSet empty_correlated_columns_set;
++    PlannerActionsVisitor actions_visitor(planner_context, empty_correlated_columns_set, false /*use_column_identifier_as_action_node_name*/);
++    auto [expression_nodes, correlated_subtrees] = actions_visitor.visit(filter_actions_dag, filter_query_tree);
++    correlated_subtrees.assertEmpty("in row-policy and additional table filters");
+     if (expression_nodes.size() != 1)
+         throw Exception(ErrorCodes::BAD_ARGUMENTS,
+             "Filter actions must return single output node. Actual {}",
+diff --git a/src/Planner/Utils.h b/src/Planner/Utils.h
+index 5f27114f2e1b..bd7be4b1bd86 100644
+--- a/src/Planner/Utils.h
++++ b/src/Planner/Utils.h
+@@ -9,6 +9,7 @@
+ #include <Interpreters/SelectQueryOptions.h>
+ #include <Interpreters/ActionsDAG.h>
+ 
++#include <Analyzer/HashUtils.h>
+ #include <Analyzer/IQueryTreeNode.h>
+ 
+ #include <Processors/QueryPlan/QueryPlan.h>
+@@ -16,6 +17,7 @@
+ #include <QueryPipeline/StreamLocalLimits.h>
+ 
+ #include <Planner/PlannerContext.h>
++#include <Planner/PlannerCorrelatedSubqueries.h>
+ 
+ #include <Storages/SelectQueryInfo.h>
+ 
+@@ -33,6 +35,12 @@ String dumpQueryPipeline(const QueryPlan & query_plan);
+ /// Build common header for UNION query
+ Block buildCommonHeaderForUnion(const Blocks & queries_headers, SelectUnionMode union_mode);
+ 
++/// Add converting to common header actions if needed for each plan
++void addConvertingToCommonHeaderActionsIfNeeded(
++    std::vector<std::unique_ptr<QueryPlan>> & query_plans,
++    const Block & union_common_header,
++    Blocks & query_plans_headers);
++
+ /// Convert query node to ASTSelectQuery
+ ASTPtr queryNodeToSelectQuery(const QueryTreeNodePtr & query_node);
+ 
+@@ -49,9 +57,11 @@ StorageLimits buildStorageLimits(const Context & context, const SelectQueryOptio
+   * Inputs are not used for actions dag outputs.
+   * Only root query tree expression node is used as actions dag output.
+   */
+-ActionsDAG buildActionsDAGFromExpressionNode(const QueryTreeNodePtr & expression_node,
++std::pair<ActionsDAG, CorrelatedSubtrees> buildActionsDAGFromExpressionNode(
++    const QueryTreeNodePtr & expression_node,
+     const ColumnsWithTypeAndName & input_columns,
+-    const PlannerContextPtr & planner_context);
++    const PlannerContextPtr & planner_context,
++    const ColumnNodePtrWithHashSet & correlated_columns_set);
+ 
+ /// Returns true if prefix sort description is prefix of full sort descriptor, false otherwise
+ bool sortDescriptionIsPrefix(const SortDescription & prefix, const SortDescription & full);
+diff --git a/src/Processors/QueryPlan/ExpressionStep.cpp b/src/Processors/QueryPlan/ExpressionStep.cpp
+index e7ef789b901f..d0a00e8c4b91 100644
+--- a/src/Processors/QueryPlan/ExpressionStep.cpp
++++ b/src/Processors/QueryPlan/ExpressionStep.cpp
+@@ -97,6 +97,11 @@ std::unique_ptr<IQueryPlanStep> ExpressionStep::deserialize(Deserialization & ct
+     return std::make_unique<ExpressionStep>(ctx.input_headers.front(), std::move(actions_dag));
+ }
+ 
++QueryPlanStepPtr ExpressionStep::clone() const
++{
++    return std::make_unique<ExpressionStep>(*this);
++}
++
+ void registerExpressionStep(QueryPlanStepRegistry & registry)
+ {
+     registry.registerStep("Expression", ExpressionStep::deserialize);
+diff --git a/src/Processors/QueryPlan/ExpressionStep.h b/src/Processors/QueryPlan/ExpressionStep.h
+index cc9cd0956c24..cc6f1535f402 100644
+--- a/src/Processors/QueryPlan/ExpressionStep.h
++++ b/src/Processors/QueryPlan/ExpressionStep.h
+@@ -13,6 +13,12 @@ class ExpressionStep : public ITransformingStep
+ {
+ public:
+     explicit ExpressionStep(const Header & input_header_, ActionsDAG actions_dag_);
++
++    ExpressionStep(const ExpressionStep & other)
++        : ITransformingStep(other)
++        , actions_dag(other.actions_dag.clone())
++    {}
++
+     String getName() const override { return "Expression"; }
+ 
+     void transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) override;
+@@ -27,7 +33,12 @@ class ExpressionStep : public ITransformingStep
+     void serialize(Serialization & ctx) const override;
+     bool isSerializable() const override { return true; }
+ 
+-    static std::unique_ptr<IQueryPlanStep> deserialize(Deserialization & ctx);
++    static QueryPlanStepPtr deserialize(Deserialization & ctx);
++
++    QueryPlanStepPtr clone() const override;
++
++    bool hasCorrelatedExpressions() const override { return actions_dag.hasCorrelatedColumns(); }
++    void decorrelateActions() { actions_dag.decorrelate(); }
+ 
+ private:
+     void updateOutputHeader() override;
+diff --git a/src/Processors/QueryPlan/FilterStep.cpp b/src/Processors/QueryPlan/FilterStep.cpp
+index 9725d7caec3b..a0f3dc855a1e 100644
+--- a/src/Processors/QueryPlan/FilterStep.cpp
++++ b/src/Processors/QueryPlan/FilterStep.cpp
+@@ -271,7 +271,7 @@ void FilterStep::serialize(Serialization & ctx) const
+     actions_dag.serialize(ctx.out, ctx.registry);
+ }
+ 
+-std::unique_ptr<IQueryPlanStep> FilterStep::deserialize(Deserialization & ctx)
++QueryPlanStepPtr FilterStep::deserialize(Deserialization & ctx)
+ {
+     if (ctx.input_headers.size() != 1)
+         throw Exception(ErrorCodes::INCORRECT_DATA, "FilterStep must have one input stream");
+@@ -289,6 +289,11 @@ std::unique_ptr<IQueryPlanStep> FilterStep::deserialize(Deserialization & ctx)
+     return std::make_unique<FilterStep>(ctx.input_headers.front(), std::move(actions_dag), std::move(filter_column_name), remove_filter_column);
+ }
+ 
++QueryPlanStepPtr FilterStep::clone() const
++{
++    return std::make_unique<FilterStep>(*this);
++}
++
+ void registerFilterStep(QueryPlanStepRegistry & registry)
+ {
+     registry.registerStep("Filter", FilterStep::deserialize);
+diff --git a/src/Processors/QueryPlan/FilterStep.h b/src/Processors/QueryPlan/FilterStep.h
+index 23d307c4720e..31115504b240 100644
+--- a/src/Processors/QueryPlan/FilterStep.h
++++ b/src/Processors/QueryPlan/FilterStep.h
+@@ -15,6 +15,14 @@ class FilterStep : public ITransformingStep
+         String filter_column_name_,
+         bool remove_filter_column_);
+ 
++    FilterStep(const FilterStep & other)
++        : ITransformingStep(other)
++        , actions_dag(other.actions_dag.clone())
++        , filter_column_name(other.filter_column_name)
++        , remove_filter_column(other.remove_filter_column)
++        , condition(other.condition)
++    {}
++
+     String getName() const override { return "Filter"; }
+     void transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) override;
+ 
+@@ -33,7 +41,12 @@ class FilterStep : public ITransformingStep
+     void serialize(Serialization & ctx) const override;
+     bool isSerializable() const override { return true; }
+ 
+-    static std::unique_ptr<IQueryPlanStep> deserialize(Deserialization & ctx);
++    static QueryPlanStepPtr deserialize(Deserialization & ctx);
++
++    QueryPlanStepPtr clone() const override;
++
++    bool hasCorrelatedExpressions() const override { return actions_dag.hasCorrelatedColumns(); }
++    void decorrelateActions() { actions_dag.decorrelate(); }
+ 
+ private:
+     void updateOutputHeader() override;
+diff --git a/src/Processors/QueryPlan/IQueryPlanStep.cpp b/src/Processors/QueryPlan/IQueryPlanStep.cpp
+index 156f26053053..20527c7f49f6 100644
+--- a/src/Processors/QueryPlan/IQueryPlanStep.cpp
++++ b/src/Processors/QueryPlan/IQueryPlanStep.cpp
+@@ -37,6 +37,11 @@ void IQueryPlanStep::updateInputHeader(Header input_header, size_t idx)
+     updateOutputHeader();
+ }
+ 
++bool IQueryPlanStep::hasCorrelatedExpressions() const
++{
++    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot check {} plan step for correlated expressions", getName());
++}
++
+ const Header & IQueryPlanStep::getOutputHeader() const
+ {
+     if (!hasOutputHeader())
+@@ -45,6 +50,11 @@ const Header & IQueryPlanStep::getOutputHeader() const
+     return *output_header;
+ }
+ 
++QueryPlanStepPtr IQueryPlanStep::clone() const
++{
++    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot clone {} plan step", getName());
++}
++
+ const SortDescription & IQueryPlanStep::getSortDescription() const
+ {
+     static SortDescription empty;
+diff --git a/src/Processors/QueryPlan/IQueryPlanStep.h b/src/Processors/QueryPlan/IQueryPlanStep.h
+index af71f44b9259..cafb8ea44e13 100644
+--- a/src/Processors/QueryPlan/IQueryPlanStep.h
++++ b/src/Processors/QueryPlan/IQueryPlanStep.h
+@@ -29,12 +29,18 @@ using Headers = std::vector<Header>;
+ 
+ struct ExplainPlanOptions;
+ 
++class IQueryPlanStep;
++using QueryPlanStepPtr = std::unique_ptr<IQueryPlanStep>;
++
+ /// Single step of query plan.
+ class IQueryPlanStep
+ {
+ public:
+     IQueryPlanStep();
+ 
++    IQueryPlanStep(const IQueryPlanStep &) = default;
++    IQueryPlanStep(IQueryPlanStep &&) = default;
++
+     virtual ~IQueryPlanStep() = default;
+ 
+     virtual String getName() const = 0;
+@@ -64,6 +70,8 @@ class IQueryPlanStep
+     virtual void serialize(Serialization & /*ctx*/) const;
+     virtual bool isSerializable() const { return false; }
+ 
++    virtual QueryPlanStepPtr clone() const;
++
+     virtual const SortDescription & getSortDescription() const;
+ 
+     struct FormatSettings
+@@ -103,6 +111,8 @@ class IQueryPlanStep
+     void updateInputHeaders(Headers input_headers_);
+     void updateInputHeader(Header input_header, size_t idx = 0);
+ 
++    virtual bool hasCorrelatedExpressions() const;
++
+ protected:
+     virtual void updateOutputHeader() = 0;
+ 
+@@ -122,5 +132,4 @@ class IQueryPlanStep
+     size_t step_index = 0;
+ };
+ 
+-using QueryPlanStepPtr = std::unique_ptr<IQueryPlanStep>;
+ }
+diff --git a/src/Processors/QueryPlan/ISourceStep.h b/src/Processors/QueryPlan/ISourceStep.h
+index d1aa900bdbe7..815b30f37680 100644
+--- a/src/Processors/QueryPlan/ISourceStep.h
++++ b/src/Processors/QueryPlan/ISourceStep.h
+@@ -10,12 +10,17 @@ class ISourceStep : public IQueryPlanStep
+ public:
+     explicit ISourceStep(Header output_header_);
+ 
++    ISourceStep(const ISourceStep &) = default;
++    ISourceStep(ISourceStep &&) = default;
++
+     QueryPipelineBuilderPtr updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings & settings) override;
+ 
+     virtual void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) = 0;
+ 
+     void describePipeline(FormatSettings & settings) const override;
+ 
++    bool hasCorrelatedExpressions() const override { return false; }
++
+ protected:
+     void updateOutputHeader() override {}
+ };
+diff --git a/src/Processors/QueryPlan/ITransformingStep.h b/src/Processors/QueryPlan/ITransformingStep.h
+index 5c7a03ad5756..9e3ef351e002 100644
+--- a/src/Processors/QueryPlan/ITransformingStep.h
++++ b/src/Processors/QueryPlan/ITransformingStep.h
+@@ -47,6 +47,7 @@ class ITransformingStep : public IQueryPlanStep
+     };
+ 
+     ITransformingStep(Header input_header, Header output_header, Traits traits, bool collect_processors_ = true);
++    ITransformingStep(const ITransformingStep &) = default;
+ 
+     QueryPipelineBuilderPtr updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings & settings) override;
+ 
+diff --git a/src/Processors/QueryPlan/Optimizations/useDataParallelAggregation.cpp b/src/Processors/QueryPlan/Optimizations/useDataParallelAggregation.cpp
+index 79c7f8545e88..31dc3ffb5538 100644
+--- a/src/Processors/QueryPlan/Optimizations/useDataParallelAggregation.cpp
++++ b/src/Processors/QueryPlan/Optimizations/useDataParallelAggregation.cpp
+@@ -12,6 +12,13 @@
+ 
+ using namespace DB;
+ 
++namespace DB::ErrorCodes
++{
++
++extern const int LOGICAL_ERROR;
++
++}
++
+ namespace
+ {
+ 
+@@ -68,6 +75,8 @@ void removeInjectiveFunctionsFromResultsRecursively(const ActionsDAG::Node * nod
+         case ActionsDAG::ActionType::INPUT:
+             irreducible.insert(node);
+             break;
++        case ActionsDAG::ActionType::PLACEHOLDER:
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "PLACEHOLDER action node must be removed before query plan optimization");
+     }
+ }
+ 
+@@ -120,6 +129,8 @@ bool allOutputsDependsOnlyOnAllowedNodes(
+                 break;
+             case ActionsDAG::ActionType::INPUT:
+                 break;
++            case ActionsDAG::ActionType::PLACEHOLDER:
++                throw Exception(ErrorCodes::LOGICAL_ERROR, "PLACEHOLDER action node must be removed before query plan optimization");
+         }
+     }
+     visited[node] = res;
+diff --git a/src/Processors/QueryPlan/QueryPlan.cpp b/src/Processors/QueryPlan/QueryPlan.cpp
+index a1565beee6e5..b2e5e56d2be0 100644
+--- a/src/Processors/QueryPlan/QueryPlan.cpp
++++ b/src/Processors/QueryPlan/QueryPlan.cpp
+@@ -618,4 +618,82 @@ std::pair<QueryPlan::Nodes, QueryPlanResourceHolder> QueryPlan::detachNodesAndRe
+     return {std::move(plan.nodes), std::move(plan.resources)};
+ }
+ 
++QueryPlan QueryPlan::extractSubplan(Node * subplan_root)
++{
++    std::unordered_set<Node *> used;
++    std::stack<Node *> stack;
++
++    stack.push(subplan_root);
++    used.insert(subplan_root);
++    while (!stack.empty())
++    {
++        const auto * node = stack.top();
++        stack.pop();
++
++        for (auto * child : node->children)
++        {
++            used.insert(child);
++            stack.push(child);
++        }
++    }
++
++    QueryPlan new_plan;
++    new_plan.root = subplan_root;
++
++    auto it = nodes.begin();
++    while (it != nodes.end())
++    {
++        auto curr = it;
++        ++it;
++
++        if (used.contains(&*curr))
++            new_plan.nodes.splice(new_plan.nodes.end(), nodes, curr);
++    }
++
++    return new_plan;
++}
++
++QueryPlan QueryPlan::clone() const
++{
++    QueryPlan result;
++
++    struct Frame
++    {
++        Node * node;
++        Node * clone;
++        std::vector<Node *> children = {};
++    };
++
++    result.nodes.emplace_back(Node{ .step = {}, .children = {} });
++    result.root = &result.nodes.back();
++
++    std::vector<Frame> nodes_to_process{ Frame{ .node = root, .clone = result.root } };
++
++    while (!nodes_to_process.empty())
++    {
++        auto & frame = nodes_to_process.back();
++        if (frame.children.size() == frame.node->children.size())
++        {
++            frame.clone->step = frame.node->step->clone();
++            frame.clone->children = std::move(frame.children);
++            nodes_to_process.pop_back();
++        }
++        else
++        {
++            size_t next_child = frame.children.size();
++            auto * child = frame.node->children[next_child];
++
++            result.nodes.emplace_back(Node{ .step = {} });
++            result.nodes.back().children.reserve(child->children.size());
++            auto * child_clone = &result.nodes.back();
++
++            frame.children.push_back(child_clone);
++
++            nodes_to_process.push_back(Frame{ .node = child, .clone = child_clone });
++        }
++    }
++
++    return result;
++}
++
+ }
+diff --git a/src/Processors/QueryPlan/QueryPlan.h b/src/Processors/QueryPlan/QueryPlan.h
+index 6e473adbfeb8..3f7598bc2fd6 100644
+--- a/src/Processors/QueryPlan/QueryPlan.h
++++ b/src/Processors/QueryPlan/QueryPlan.h
+@@ -139,6 +139,9 @@ class QueryPlan
+     Node * getRootNode() const { return root; }
+     static std::pair<Nodes, QueryPlanResourceHolder> detachNodesAndResources(QueryPlan && plan);
+ 
++    QueryPlan extractSubplan(Node * subplan_root);
++    QueryPlan clone() const;
++
+ private:
+     struct SerializationFlags;
+ 
+diff --git a/src/Processors/QueryPlan/ReadFromMemoryStorageStep.cpp b/src/Processors/QueryPlan/ReadFromMemoryStorageStep.cpp
+index cb4342b0fa2c..e51020373162 100644
+--- a/src/Processors/QueryPlan/ReadFromMemoryStorageStep.cpp
++++ b/src/Processors/QueryPlan/ReadFromMemoryStorageStep.cpp
+@@ -135,6 +135,11 @@ void ReadFromMemoryStorageStep::initializePipeline(QueryPipelineBuilder & pipeli
+     pipeline.init(std::move(pipe));
+ }
+ 
++QueryPlanStepPtr ReadFromMemoryStorageStep::clone() const
++{
++    return std::make_unique<ReadFromMemoryStorageStep>(*this);
++}
++
+ Pipe ReadFromMemoryStorageStep::makePipe()
+ {
+     storage_snapshot->check(columns_to_read);
+diff --git a/src/Processors/QueryPlan/ReadFromMemoryStorageStep.h b/src/Processors/QueryPlan/ReadFromMemoryStorageStep.h
+index a9c2d2df2c4d..d56bc899a0d3 100644
+--- a/src/Processors/QueryPlan/ReadFromMemoryStorageStep.h
++++ b/src/Processors/QueryPlan/ReadFromMemoryStorageStep.h
+@@ -25,16 +25,18 @@ class ReadFromMemoryStorageStep final : public SourceStepWithFilter
+         bool delay_read_for_global_sub_queries_);
+ 
+     ReadFromMemoryStorageStep() = delete;
+-    ReadFromMemoryStorageStep(const ReadFromMemoryStorageStep &) = delete;
++    ReadFromMemoryStorageStep(const ReadFromMemoryStorageStep &) = default;
+     ReadFromMemoryStorageStep & operator=(const ReadFromMemoryStorageStep &) = delete;
+ 
+     ReadFromMemoryStorageStep(ReadFromMemoryStorageStep &&) = default;
+-    ReadFromMemoryStorageStep & operator=(ReadFromMemoryStorageStep &&) = default;
++    ReadFromMemoryStorageStep & operator=(ReadFromMemoryStorageStep &&) = delete;
+ 
+     String getName() const override { return name; }
+ 
+     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+ 
++    QueryPlanStepPtr clone() const override;
++
+     const StoragePtr & getStorage() const { return storage; }
+ 
+ private:
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index f1d5e35ce2db..ae28a6964dbb 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -2249,6 +2249,11 @@ Pipe ReadFromMergeTree::groupStreamsByPartition(AnalysisResult & result, std::op
+     return Pipe::unitePipes(std::move(pipes));
+ }
+ 
++QueryPlanStepPtr ReadFromMergeTree::clone() const
++{
++    return std::make_unique<ReadFromMergeTree>(*this);
++}
++
+ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+ {
+     auto result = getAnalysisResult();
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.h b/src/Processors/QueryPlan/ReadFromMergeTree.h
+index 65f846651dca..08d03362b2c1 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.h
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.h
+@@ -131,6 +131,9 @@ class ReadFromMergeTree final : public SourceStepWithFilter
+         std::optional<MergeTreeReadTaskCallback> read_task_callback_ = std::nullopt,
+         std::optional<size_t> number_of_current_replica_ = std::nullopt);
+ 
++    ReadFromMergeTree(const ReadFromMergeTree &) = default;
++    ReadFromMergeTree(ReadFromMergeTree &&) = default;
++
+     std::unique_ptr<ReadFromMergeTree> createLocalParallelReplicasReadingStep(
+         AnalysisResultPtr analyzed_result_ptr_,
+         MergeTreeAllRangesCallback all_ranges_callback_,
+@@ -140,6 +143,8 @@ class ReadFromMergeTree final : public SourceStepWithFilter
+     static constexpr auto name = "ReadFromMergeTree";
+     String getName() const override { return name; }
+ 
++    QueryPlanStepPtr clone() const override;
++
+     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+ 
+     void describeActions(FormatSettings & format_settings) const override;
+diff --git a/src/Processors/QueryPlan/SourceStepWithFilter.h b/src/Processors/QueryPlan/SourceStepWithFilter.h
+index 4718ad78947f..f681c20791ce 100644
+--- a/src/Processors/QueryPlan/SourceStepWithFilter.h
++++ b/src/Processors/QueryPlan/SourceStepWithFilter.h
+@@ -19,6 +19,27 @@ class SourceStepWithFilterBase : public ISourceStep
+     {
+     }
+ 
++    SourceStepWithFilterBase(const SourceStepWithFilterBase & other)
++        : ISourceStep(other)
++        , filter_nodes()
++        , filter_dags()
++        , limit(other.limit)
++        , filter_actions_dag()
++    {
++        filter_dags.reserve(other.filter_dags.size());
++        filter_nodes.nodes.reserve(other.filter_dags.size());
++
++        for (size_t i = 0; i < other.filter_dags.size(); ++i)
++        {
++            filter_dags.push_back(other.filter_dags[i].clone());
++            filter_nodes.nodes.push_back(&filter_dags.back().findInOutputs(other.filter_nodes.nodes[i]->result_name));
++        }
++
++        if (other.filter_actions_dag)
++            filter_actions_dag = other.filter_actions_dag->clone();
++    }
++    SourceStepWithFilterBase(SourceStepWithFilterBase &&) = default;
++
+     void addFilter(ActionsDAG filter_dag, std::string column_name)
+     {
+         filter_nodes.nodes.push_back(&filter_dag.findInOutputs(column_name));
+@@ -46,6 +67,13 @@ class SourceStepWithFilterBase : public ISourceStep
+     const std::optional<ActionsDAG> & getFilterActionsDAG() const { return filter_actions_dag; }
+     std::optional<ActionsDAG> detachFilterActionsDAG() { return std::move(filter_actions_dag); }
+ 
++    bool hasCorrelatedExpressions() const override
++    {
++        if (filter_actions_dag)
++            return filter_actions_dag->hasCorrelatedColumns();
++        return false;
++    }
++
+ private:
+     /// Will be cleared after applyFilters() is called.
+     ActionDAGNodes filter_nodes;
+@@ -81,6 +109,8 @@ class SourceStepWithFilter : public SourceStepWithFilterBase
+     {
+     }
+ 
++    SourceStepWithFilter(const SourceStepWithFilter &) = default;
++
+     const SelectQueryInfo & getQueryInfo() const { return query_info; }
+     PrewhereInfoPtr getPrewhereInfo() const override { return prewhere_info; }
+     ContextPtr getContext() const { return context; }
+diff --git a/src/Processors/QueryPlan/UnionStep.h b/src/Processors/QueryPlan/UnionStep.h
+index e3e340ca0166..0c92b4c29fe6 100644
+--- a/src/Processors/QueryPlan/UnionStep.h
++++ b/src/Processors/QueryPlan/UnionStep.h
+@@ -24,6 +24,8 @@ class UnionStep : public IQueryPlanStep
+ 
+     static std::unique_ptr<IQueryPlanStep> deserialize(Deserialization & ctx);
+ 
++    bool hasCorrelatedExpressions() const override { return false; }
++
+ private:
+     void updateOutputHeader() override;
+ 
+diff --git a/src/Storages/MergeTree/KeyCondition.cpp b/src/Storages/MergeTree/KeyCondition.cpp
+index 9599f5f9f9bd..625a61ddb315 100644
+--- a/src/Storages/MergeTree/KeyCondition.cpp
++++ b/src/Storages/MergeTree/KeyCondition.cpp
+@@ -742,6 +742,13 @@ static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
+                     }
+                 }
+             }
++            break;
++        }
++        case ActionsDAG::ActionType::PLACEHOLDER:
++        {
++            /// I guess it should work as INPUT.
++            res = &inverted_dag.addPlaceholder(node.result_name, node.result_type);
++            break;
+         }
+     }
+ 
+diff --git a/src/Storages/MergeTree/RPNBuilder.cpp b/src/Storages/MergeTree/RPNBuilder.cpp
+index 21abfd8c7869..6a63fe332629 100644
+--- a/src/Storages/MergeTree/RPNBuilder.cpp
++++ b/src/Storages/MergeTree/RPNBuilder.cpp
+@@ -86,7 +86,11 @@ void appendColumnNameWithoutAlias(const ActionsDAG::Node & node, WriteBuffer & o
+                 appendColumnNameWithoutAlias(*arg, out, allow_experimental_analyzer, legacy);
+             }
+             writeChar(')', out);
++            break;
+         }
++        case ActionsDAG::ActionType::PLACEHOLDER:
++            writeString(node.result_name, out);
++            break;
+     }
+ }
+ 
+diff --git a/src/Storages/StorageMerge.cpp b/src/Storages/StorageMerge.cpp
+index cad8e2a52efb..e7fcd63fb7c0 100644
+--- a/src/Storages/StorageMerge.cpp
++++ b/src/Storages/StorageMerge.cpp
+@@ -997,7 +997,8 @@ SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextMutablePtr & mo
+                     column_node = std::make_shared<ColumnNode>(NameAndTypePair{column, storage_columns.getColumn(get_column_options, column).type }, modified_query_info.table_expression);
+                 }
+ 
+-                PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, false /*use_column_identifier_as_action_node_name*/);
++                ColumnNodePtrWithHashSet empty_correlated_columns_set;
++                PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, empty_correlated_columns_set, false /*use_column_identifier_as_action_node_name*/);
+                 actions_visitor.visit(*filter_actions_dag, column_node);
+             }
+             column_names_as_aliases = filter_actions_dag->getRequiredColumnsNames();
+@@ -1495,8 +1496,9 @@ void ReadFromMerge::convertAndFilterSourceStream(
+             QueryAnalysisPass query_analysis_pass(modified_query_info.table_expression);
+             query_analysis_pass.run(query_tree, local_context);
+ 
+-            PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, false /*use_column_identifier_as_action_node_name*/);
+-            const auto & nodes = actions_visitor.visit(actions_dag, query_tree);
++            ColumnNodePtrWithHashSet empty_correlated_columns_set;
++            PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, empty_correlated_columns_set, false /*use_column_identifier_as_action_node_name*/);
++            const auto & [nodes, _] = actions_visitor.visit(actions_dag, query_tree);
+ 
+             if (nodes.size() != 1)
+                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to have 1 output but got {}", nodes.size());

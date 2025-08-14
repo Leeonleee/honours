@@ -1,0 +1,134 @@
+diff --git a/src/Processors/QueryPlan/ParallelReplicasLocalPlan.cpp b/src/Processors/QueryPlan/ParallelReplicasLocalPlan.cpp
+index d6bed228fdf3..df152b039e99 100644
+--- a/src/Processors/QueryPlan/ParallelReplicasLocalPlan.cpp
++++ b/src/Processors/QueryPlan/ParallelReplicasLocalPlan.cpp
+@@ -99,7 +99,7 @@ std::pair<QueryPlanPtr, bool> createLocalPlanForParallelReplicas(
+     { return coordinator->handleRequest(std::move(req)); };
+ 
+     auto read_from_merge_tree_parallel_replicas = reading->createLocalParallelReplicasReadingStep(
+-        analyzed_result_ptr, std::move(all_ranges_cb), std::move(read_task_cb), replica_number);
++        context, analyzed_result_ptr, std::move(all_ranges_cb), std::move(read_task_cb), replica_number);
+     node->step = std::move(read_from_merge_tree_parallel_replicas);
+ 
+     addConvertingActions(*query_plan, header, /*has_missing_objects=*/false);
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index c9f944221461..f088b1ed5842 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -416,6 +416,7 @@ ReadFromMergeTree::ReadFromMergeTree(
+ }
+ 
+ std::unique_ptr<ReadFromMergeTree> ReadFromMergeTree::createLocalParallelReplicasReadingStep(
++    ContextPtr & context_,
+     AnalysisResultPtr analyzed_result_ptr_,
+     MergeTreeAllRangesCallback all_ranges_callback_,
+     MergeTreeReadTaskCallback read_task_callback_,
+@@ -429,7 +430,7 @@ std::unique_ptr<ReadFromMergeTree> ReadFromMergeTree::createLocalParallelReplica
+         data,
+         getQueryInfo(),
+         getStorageSnapshot(),
+-        getContext(),
++        context_,
+         block_size.max_block_size_rows,
+         requested_num_streams,
+         max_block_numbers_to_read,
+@@ -643,9 +644,7 @@ Pipe ReadFromMergeTree::readInOrder(
+     /// If parallel replicas enabled, set total rows in progress here only on initiator with local plan
+     /// Otherwise rows will counted multiple times
+     const UInt64 in_order_limit = query_info.input_order_info ? query_info.input_order_info->limit : 0;
+-    const bool parallel_replicas_local_plan_for_initiator = is_parallel_reading_from_replicas
+-        && context->getSettingsRef()[Setting::parallel_replicas_local_plan] && context->canUseParallelReplicasOnInitiator();
+-    const bool set_total_rows_approx = !is_parallel_reading_from_replicas || parallel_replicas_local_plan_for_initiator;
++    const bool set_total_rows_approx = !is_parallel_reading_from_replicas || isParallelReplicasLocalPlanForInitiator();
+ 
+     Pipes pipes;
+     for (size_t i = 0; i < parts_with_ranges.size(); ++i)
+@@ -2079,6 +2078,12 @@ void ReadFromMergeTree::updateSortDescription()
+         enable_vertical_final);
+ }
+ 
++bool ReadFromMergeTree::isParallelReplicasLocalPlanForInitiator() const
++{
++    return is_parallel_reading_from_replicas && context->getSettingsRef()[Setting::parallel_replicas_local_plan]
++        && context->canUseParallelReplicasOnInitiator();
++}
++
+ bool ReadFromMergeTree::requestReadingInOrder(size_t prefix_size, int direction, size_t read_limit, std::optional<ActionsDAG> virtual_row_conversion_)
+ {
+     /// if dirction is not set, use current one
+@@ -2417,6 +2422,22 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
+     if (reader_settings.use_query_condition_cache && !query_info.prewhere_info && !query_info.filter_actions_dag)
+         reader_settings.use_query_condition_cache = false;
+ 
++    /// Initializing parallel replicas coordinator with empty ranges to read in case of
++    /// local plan for initiator to prevent coordinator initialization by other replicas
++    /// (which may skip index analysis).
++    if (result.parts_with_ranges.empty() && isParallelReplicasLocalPlanForInitiator())
++    {
++        const auto & client_info = context->getClientInfo();
++
++        auto extension = ParallelReadingExtension{
++            all_ranges_callback.value(),
++            read_task_callback.value(),
++            number_of_current_replica.value_or(client_info.number_of_current_replica),
++            context->getClusterForParallelReplicas()->getShardsInfo().at(0).getAllNodeCount()};
++
++        extension.sendInitialRequest(CoordinationMode::Default, result.parts_with_ranges, /*mark_segment_size=*/1);
++    }
++
+     if (result.parts_with_ranges.empty())
+     {
+         pipeline.init(Pipe(std::make_shared<NullSource>(getOutputHeader())));
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.h b/src/Processors/QueryPlan/ReadFromMergeTree.h
+index 22691674d2a8..3940bd58c573 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.h
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.h
+@@ -157,6 +157,7 @@ class ReadFromMergeTree final : public SourceStepWithFilter
+     ReadFromMergeTree(ReadFromMergeTree &&) noexcept = default;
+ 
+     std::unique_ptr<ReadFromMergeTree> createLocalParallelReplicasReadingStep(
++        ContextPtr & context_,
+         AnalysisResultPtr analyzed_result_ptr_,
+         MergeTreeAllRangesCallback all_ranges_callback_,
+         MergeTreeReadTaskCallback read_task_callback_,
+@@ -325,6 +326,8 @@ class ReadFromMergeTree final : public SourceStepWithFilter
+     int getSortDirection() const;
+     void updateSortDescription();
+ 
++    bool isParallelReplicasLocalPlanForInitiator() const;
++
+     mutable AnalysisResultPtr analyzed_result_ptr;
+     VirtualFields shared_virtual_fields;
+ 
+diff --git a/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp
+index 8f5e45200125..08990b720bed 100644
+--- a/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp
++++ b/src/Storages/MergeTree/ParallelReplicasReadingCoordinator.cpp
+@@ -188,6 +188,7 @@ class ParallelReplicasReadingCoordinator::ImplInterface
+     virtual void doHandleInitialAllRangesAnnouncement(InitialAllRangesAnnouncement announcement) = 0;
+     virtual void markReplicaAsUnavailable(size_t replica_number) = 0;
+     virtual bool isReadingCompleted() const { return false; }
++    virtual bool initializedWithEmptyRanges() const { return false; }
+ 
+     void handleInitialAllRangesAnnouncement(InitialAllRangesAnnouncement announcement)
+     {
+@@ -236,6 +237,8 @@ class DefaultCoordinator : public ParallelReplicasReadingCoordinator::ImplInterf
+ 
+     bool isReadingCompleted() const override;
+ 
++    bool initializedWithEmptyRanges() const override { return state_initialized && all_parts_to_read.empty(); }
++
+ private:
+     /// This many granules will represent a single segment of marks that will be assigned to a replica
+     size_t mark_segment_size{0};
+@@ -1175,7 +1178,9 @@ ParallelReadResponse ParallelReplicasReadingCoordinator::handleRequest(ParallelR
+                 "All ranges for reading has been assigned to replicas. Cancelling execution for unused replicas. Used replicas: {}",
+                 replicas);
+ 
+-            chassert(!replicas_used.empty());
++            if (pimpl && !pimpl->initializedWithEmptyRanges())
++                chassert(!replicas_used.empty());
++
+             (*read_completed_callback)(replicas_to_exclude);
+             read_completed_callback.reset();
+         }

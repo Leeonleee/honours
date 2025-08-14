@@ -1,0 +1,238 @@
+diff --git a/src/Access/AccessControl.cpp b/src/Access/AccessControl.cpp
+index cb748393c029..4b1e7051a9be 100644
+--- a/src/Access/AccessControl.cpp
++++ b/src/Access/AccessControl.cpp
+@@ -25,8 +25,6 @@
+ #include <IO/Operators.h>
+ #include <Poco/AccessExpireCache.h>
+ #include <boost/algorithm/string/join.hpp>
+-#include <boost/algorithm/string/split.hpp>
+-#include <boost/algorithm/string/trim.hpp>
+ #include <re2/re2.h>
+ #include <filesystem>
+ #include <mutex>
+@@ -695,14 +693,7 @@ std::shared_ptr<const ContextAccess> AccessControl::getContextAccess(
+ 
+     /// Extract the last entry from comma separated list of X-Forwarded-For addresses.
+     /// Only the last proxy can be trusted (if any).
+-    Strings forwarded_addresses;
+-    boost::split(forwarded_addresses, client_info.forwarded_for, boost::is_any_of(","));
+-    if (!forwarded_addresses.empty())
+-    {
+-        String & last_forwarded_address = forwarded_addresses.back();
+-        boost::trim(last_forwarded_address);
+-        params.forwarded_address = last_forwarded_address;
+-    }
++    params.forwarded_address = client_info.getLastForwardedFor();
+ 
+     return getContextAccess(params);
+ }
+diff --git a/src/Interpreters/ClientInfo.h b/src/Interpreters/ClientInfo.h
+index f7a172b226de..5c5a284d63b8 100644
+--- a/src/Interpreters/ClientInfo.h
++++ b/src/Interpreters/ClientInfo.h
+@@ -4,6 +4,7 @@
+ #include <Poco/Net/SocketAddress.h>
+ #include <base/types.h>
+ #include <Common/OpenTelemetryTraceContext.h>
++#include <boost/algorithm/string/trim.hpp>
+ 
+ namespace DB
+ {
+@@ -101,6 +102,14 @@ class ClientInfo
+     /// The element can be trusted only if you trust the corresponding proxy.
+     /// NOTE This field can also be reused in future for TCP interface with PROXY v1/v2 protocols.
+     String forwarded_for;
++    String getLastForwardedFor() const
++    {
++        if (forwarded_for.empty())
++            return {};
++        String last = forwarded_for.substr(forwarded_for.find_last_of(',') + 1);
++        boost::trim(last);
++        return last;
++    }
+ 
+     /// Common
+     String quota_key;
+diff --git a/src/Server/HTTP/HTTPServerConnection.cpp b/src/Server/HTTP/HTTPServerConnection.cpp
+index 926d37a11ee2..ad17bc4348ad 100644
+--- a/src/Server/HTTP/HTTPServerConnection.cpp
++++ b/src/Server/HTTP/HTTPServerConnection.cpp
+@@ -34,6 +34,9 @@ void HTTPServerConnection::run()
+ 
+                 Poco::Timestamp now;
+ 
++                if (!forwarded_for.empty())
++                    request.set("X-Forwarded-For", forwarded_for);
++
+                 if (request.isSecure())
+                 {
+                     size_t hsts_max_age = context->getMaxHstsAge();
+diff --git a/src/Server/HTTP/HTTPServerConnection.h b/src/Server/HTTP/HTTPServerConnection.h
+index cce4f44f203d..7087f8d5a216 100644
+--- a/src/Server/HTTP/HTTPServerConnection.h
++++ b/src/Server/HTTP/HTTPServerConnection.h
+@@ -21,6 +21,18 @@ class HTTPServerConnection : public Poco::Net::TCPServerConnection
+         Poco::Net::HTTPServerParams::Ptr params,
+         HTTPRequestHandlerFactoryPtr factory);
+ 
++    HTTPServerConnection(
++        HTTPContextPtr context_,
++        TCPServer & tcp_server_,
++        const Poco::Net::StreamSocket & socket_,
++        Poco::Net::HTTPServerParams::Ptr params_,
++        HTTPRequestHandlerFactoryPtr factory_,
++        const String & forwarded_for_)
++    : HTTPServerConnection(context_, tcp_server_, socket_, params_, factory_)
++    {
++        forwarded_for = forwarded_for_;
++    }
++
+     void run() override;
+ 
+ protected:
+@@ -31,6 +43,7 @@ class HTTPServerConnection : public Poco::Net::TCPServerConnection
+     TCPServer & tcp_server;
+     Poco::Net::HTTPServerParams::Ptr params;
+     HTTPRequestHandlerFactoryPtr factory;
++    String forwarded_for;
+     bool stopped;
+     std::mutex mutex;  // guards the |factory| with assumption that creating handlers is not thread-safe.
+ };
+diff --git a/src/Server/HTTP/HTTPServerConnectionFactory.cpp b/src/Server/HTTP/HTTPServerConnectionFactory.cpp
+index 7e4edbbf5422..2c9ac0cda2ab 100644
+--- a/src/Server/HTTP/HTTPServerConnectionFactory.cpp
++++ b/src/Server/HTTP/HTTPServerConnectionFactory.cpp
+@@ -16,4 +16,9 @@ Poco::Net::TCPServerConnection * HTTPServerConnectionFactory::createConnection(c
+     return new HTTPServerConnection(context, tcp_server, socket, params, factory);
+ }
+ 
++Poco::Net::TCPServerConnection * HTTPServerConnectionFactory::createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server, TCPProtocolStackData & stack_data)
++{
++    return new HTTPServerConnection(context, tcp_server, socket, params, factory, stack_data.forwarded_for);
++}
++
+ }
+diff --git a/src/Server/HTTP/HTTPServerConnectionFactory.h b/src/Server/HTTP/HTTPServerConnectionFactory.h
+index 03648ce7be7b..e18249da4ded 100644
+--- a/src/Server/HTTP/HTTPServerConnectionFactory.h
++++ b/src/Server/HTTP/HTTPServerConnectionFactory.h
+@@ -15,6 +15,7 @@ class HTTPServerConnectionFactory : public TCPServerConnectionFactory
+     HTTPServerConnectionFactory(HTTPContextPtr context, Poco::Net::HTTPServerParams::Ptr params, HTTPRequestHandlerFactoryPtr factory);
+ 
+     Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server) override;
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server, TCPProtocolStackData & stack_data) override;
+ 
+ private:
+     HTTPContextPtr context;
+diff --git a/src/Server/HTTPHandler.cpp b/src/Server/HTTPHandler.cpp
+index 2b63524fb79e..7856659c6a7d 100644
+--- a/src/Server/HTTPHandler.cpp
++++ b/src/Server/HTTPHandler.cpp
+@@ -41,6 +41,7 @@
+ #include <Poco/MemoryStream.h>
+ #include <Poco/StreamCopier.h>
+ #include <Poco/String.h>
++#include <Poco/Net/SocketAddress.h>
+ 
+ #include <chrono>
+ #include <sstream>
+@@ -469,9 +470,15 @@ bool HTTPHandler::authenticateUser(
+     client_info.forwarded_for = request.get("X-Forwarded-For", "");
+     client_info.quota_key = quota_key;
+ 
++    /// Extract the last entry from comma separated list of forwarded_for addresses.
++    /// Only the last proxy can be trusted (if any).
++    String forwarded_address = client_info.getLastForwardedFor();
+     try
+     {
+-        session->authenticate(*request_credentials, request.clientAddress());
++        if (!forwarded_address.empty() && server.config().getBool("auth_use_forwarded_address", false))
++            session->authenticate(*request_credentials, Poco::Net::SocketAddress(forwarded_address, request.clientAddress().port()));
++        else
++            session->authenticate(*request_credentials, request.clientAddress());
+     }
+     catch (const Authentication::Require<BasicCredentials> & required_credentials)
+     {
+diff --git a/src/Server/ProxyV1Handler.cpp b/src/Server/ProxyV1Handler.cpp
+index 838a1de1c04a..bf02f34c6a38 100644
+--- a/src/Server/ProxyV1Handler.cpp
++++ b/src/Server/ProxyV1Handler.cpp
+@@ -60,6 +60,9 @@ void ProxyV1Handler::run()
+     // read port and "\r
+"
+     if (!readWord(5, word, eol) || !eol)
+         throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    if (!stack_data.forwarded_for.empty())
++        LOG_TRACE(log, "Forwarded client address from PROXY header: {}", stack_data.forwarded_for);
+ }
+ 
+ bool ProxyV1Handler::readWord(int max_len, std::string & word, bool & eol)
+diff --git a/src/Server/ProxyV1Handler.h b/src/Server/ProxyV1Handler.h
+index 062cc0e291a6..e56f4cd35451 100644
+--- a/src/Server/ProxyV1Handler.h
++++ b/src/Server/ProxyV1Handler.h
+@@ -3,6 +3,7 @@
+ #include <Poco/Net/TCPServerConnection.h>
+ #include <Server/IServer.h>
+ #include <Server/TCPProtocolStackData.h>
++#include <Common/logger_useful.h>
+ 
+ 
+ namespace DB
+@@ -13,7 +14,7 @@ class ProxyV1Handler : public Poco::Net::TCPServerConnection
+     using StreamSocket = Poco::Net::StreamSocket;
+ public:
+     explicit ProxyV1Handler(const StreamSocket & socket, IServer & server_, const std::string & conf_name_, TCPProtocolStackData & stack_data_)
+-        : Poco::Net::TCPServerConnection(socket), server(server_), conf_name(conf_name_), stack_data(stack_data_) {}
++        : Poco::Net::TCPServerConnection(socket), log(&Poco::Logger::get("ProxyV1Handler")), server(server_), conf_name(conf_name_), stack_data(stack_data_) {}
+ 
+     void run() override;
+ 
+@@ -21,6 +22,7 @@ class ProxyV1Handler : public Poco::Net::TCPServerConnection
+     bool readWord(int max_len, std::string & word, bool & eol);
+ 
+ private:
++    Poco::Logger * log;
+     IServer & server;
+     std::string conf_name;
+     TCPProtocolStackData & stack_data;
+diff --git a/src/Server/TCPHandler.cpp b/src/Server/TCPHandler.cpp
+index 39814e9dfd5e..331313fedab2 100644
+--- a/src/Server/TCPHandler.cpp
++++ b/src/Server/TCPHandler.cpp
+@@ -9,6 +9,7 @@
+ #include <base/types.h>
+ #include <base/scope_guard.h>
+ #include <Poco/Net/NetException.h>
++#include <Poco/Net/SocketAddress.h>
+ #include <Poco/Util/LayeredConfiguration.h>
+ #include <Common/CurrentThread.h>
+ #include <Common/Stopwatch.h>
+@@ -120,6 +121,8 @@ TCPHandler::TCPHandler(IServer & server_, TCPServer & tcp_server_, const Poco::N
+     , default_database(stack_data.default_database)
+     , server_display_name(std::move(server_display_name_))
+ {
++    if (!forwarded_for.empty())
++        LOG_TRACE(log, "Forwarded client address: {}", forwarded_for);
+ }
+ 
+ TCPHandler::~TCPHandler()
+@@ -1156,7 +1159,15 @@ void TCPHandler::receiveHello()
+     }
+ 
+     session = makeSession();
+-    session->authenticate(user, password, socket().peerAddress());
++    auto & client_info = session->getClientInfo();
++
++    /// Extract the last entry from comma separated list of forwarded_for addresses.
++    /// Only the last proxy can be trusted (if any).
++    String forwarded_address = client_info.getLastForwardedFor();
++    if (!forwarded_address.empty() && server.config().getBool("auth_use_forwarded_address", false))
++        session->authenticate(user, password, Poco::Net::SocketAddress(forwarded_address, socket().peerAddress().port()));
++    else
++        session->authenticate(user, password, socket().peerAddress());
+ }
+ 
+ void TCPHandler::receiveAddendum()

@@ -1,0 +1,1723 @@
+diff --git a/programs/local/LocalServer.cpp b/programs/local/LocalServer.cpp
+index ce7e27026f10..22c94e01a516 100644
+--- a/programs/local/LocalServer.cpp
++++ b/programs/local/LocalServer.cpp
+@@ -207,7 +207,7 @@ void LocalServer::tryInitPath()
+ 
+     global_context->setPath(path);
+ 
+-    global_context->setTemporaryStorage(path + "tmp", "", 0);
++    global_context->setTemporaryStoragePath(path + "tmp/", 0);
+     global_context->setFlagsPath(path + "flags");
+ 
+     global_context->setUserFilesPath(""); // user's files are everywhere
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index b6ce358a5efd..e772208c30ef 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -203,46 +203,6 @@ int mainEntryClickHouseServer(int argc, char ** argv)
+ namespace
+ {
+ 
+-void setupTmpPath(Poco::Logger * log, const std::string & path)
+-try
+-{
+-    LOG_DEBUG(log, "Setting up {} to store temporary data in it", path);
+-
+-    fs::create_directories(path);
+-
+-    /// Clearing old temporary files.
+-    fs::directory_iterator dir_end;
+-    size_t unknown_files = 0;
+-    for (fs::directory_iterator it(path); it != dir_end; ++it)
+-    {
+-        if (it->is_regular_file() && startsWith(it->path().filename(), "tmp"))
+-        {
+-            LOG_DEBUG(log, "Removing old temporary file {}", it->path().string());
+-            fs::remove(it->path());
+-        }
+-        else
+-        {
+-            unknown_files++;
+-            if (unknown_files < 100)
+-                LOG_DEBUG(log, "Found unknown {} {} in temporary path",
+-                    it->is_regular_file() ? "file" : (it->is_directory() ? "directory" : "element"),
+-                    it->path().string());
+-        }
+-    }
+-
+-    if (unknown_files)
+-        LOG_DEBUG(log, "Found {} unknown files in temporary path", unknown_files);
+-}
+-catch (...)
+-{
+-    DB::tryLogCurrentException(
+-        log,
+-        fmt::format(
+-            "Caught exception while setup temporary path: {}. It is ok to skip this exception as cleaning old temporary files is not "
+-            "necessary",
+-            path));
+-}
+-
+ size_t waitServersToFinish(std::vector<DB::ProtocolServerAdapter> & servers, size_t seconds_to_wait)
+ {
+     const size_t sleep_max_ms = 1000 * seconds_to_wait;
+@@ -1037,13 +997,21 @@ try
+     LOG_TRACE(log, "Initialized DateLUT with time zone '{}'.", DateLUT::instance().getTimeZone());
+ 
+     /// Storage with temporary data for processing of heavy queries.
++    if (auto temporary_policy = config().getString("tmp_policy", ""); !temporary_policy.empty())
++    {
++        size_t max_size = config().getUInt64("max_temporary_data_on_disk_size", 0);
++        global_context->setTemporaryStoragePolicy(temporary_policy, max_size);
++    }
++    else if (auto temporary_cache = config().getString("tmp_cache", ""); !temporary_cache.empty())
++    {
++        size_t max_size = config().getUInt64("max_temporary_data_on_disk_size", 0);
++        global_context->setTemporaryStorageInCache(temporary_cache, max_size);
++    }
++    else
+     {
+         std::string temporary_path = config().getString("tmp_path", path / "tmp/");
+-        std::string temporary_policy = config().getString("tmp_policy", "");
+         size_t max_size = config().getUInt64("max_temporary_data_on_disk_size", 0);
+-        const VolumePtr & volume = global_context->setTemporaryStorage(temporary_path, temporary_policy, max_size);
+-        for (const DiskPtr & disk : volume->getDisks())
+-            setupTmpPath(log, disk->getPath());
++        global_context->setTemporaryStoragePath(temporary_path, max_size);
+     }
+ 
+     /** Directory with 'flags': files indicating temporary settings for the server set by system administrator.
+@@ -1442,7 +1410,7 @@ try
+     }
+     catch (...)
+     {
+-        tryLogCurrentException(log);
++        tryLogCurrentException(log, "Caught exception while setting up access control.");
+         throw;
+     }
+ 
+diff --git a/src/Common/filesystemHelpers.cpp b/src/Common/filesystemHelpers.cpp
+index 07a08dc7fbca..43f88dd7faa6 100644
+--- a/src/Common/filesystemHelpers.cpp
++++ b/src/Common/filesystemHelpers.cpp
+@@ -64,11 +64,11 @@ bool enoughSpaceInDirectory(const std::string & path, size_t data_size)
+     return data_size <= free_space;
+ }
+ 
+-std::unique_ptr<TemporaryFile> createTemporaryFile(const std::string & path)
++std::unique_ptr<PocoTemporaryFile> createTemporaryFile(const std::string & folder_path)
+ {
+     ProfileEvents::increment(ProfileEvents::ExternalProcessingFilesTotal);
+-    fs::create_directories(path);
+-    return std::make_unique<TemporaryFile>(path);
++    fs::create_directories(folder_path);
++    return std::make_unique<PocoTemporaryFile>(folder_path);
+ }
+ 
+ #if !defined(OS_LINUX)
+diff --git a/src/Common/filesystemHelpers.h b/src/Common/filesystemHelpers.h
+index 0e6e16941bb3..14ee5f54322f 100644
+--- a/src/Common/filesystemHelpers.h
++++ b/src/Common/filesystemHelpers.h
+@@ -14,10 +14,10 @@ namespace fs = std::filesystem;
+ namespace DB
+ {
+ 
+-using TemporaryFile = Poco::TemporaryFile;
++using PocoTemporaryFile = Poco::TemporaryFile;
+ 
+ bool enoughSpaceInDirectory(const std::string & path, size_t data_size);
+-std::unique_ptr<TemporaryFile> createTemporaryFile(const std::string & path);
++std::unique_ptr<PocoTemporaryFile> createTemporaryFile(const std::string & folder_path);
+ 
+ 
+ // Determine what block device is responsible for specified path
+diff --git a/src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp b/src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp
+index 5b5d746ab550..0dd40e7f1532 100644
+--- a/src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp
++++ b/src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp
+@@ -118,10 +118,7 @@ void CachedOnDiskReadBufferFromFile::initialize(size_t offset, size_t size)
+     }
+     else
+     {
+-        CreateFileSegmentSettings create_settings{
+-            .is_persistent = is_persistent
+-        };
+-
++        CreateFileSegmentSettings create_settings(is_persistent ? FileSegmentKind::Persistent : FileSegmentKind::Regular);
+         file_segments_holder.emplace(cache->getOrSet(cache_key, offset, size, create_settings));
+     }
+ 
+@@ -951,7 +948,7 @@ bool CachedOnDiskReadBufferFromFile::nextImplStep()
+             }
+             else
+             {
+-                LOG_TRACE(log, "No space left in cache, will continue without cache download");
++                LOG_TRACE(log, "No space left in cache to reserve {} bytes, will continue without cache download", size);
+                 file_segment->completeWithState(FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION);
+             }
+ 
+diff --git a/src/Disks/IO/CachedOnDiskWriteBufferFromFile.cpp b/src/Disks/IO/CachedOnDiskWriteBufferFromFile.cpp
+index 994bb743c5f7..b11edd7e7011 100644
+--- a/src/Disks/IO/CachedOnDiskWriteBufferFromFile.cpp
++++ b/src/Disks/IO/CachedOnDiskWriteBufferFromFile.cpp
+@@ -51,16 +51,42 @@ FileSegmentRangeWriter::FileSegmentRangeWriter(
+ {
+ }
+ 
+-bool FileSegmentRangeWriter::write(const char * data, size_t size, size_t offset, bool is_persistent)
++bool FileSegmentRangeWriter::write(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind)
++{
++    size_t written_size = tryWrite(data, size, offset, segment_kind, true);
++    return written_size == size;
++}
++
++size_t FileSegmentRangeWriter::tryWrite(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind, bool strict)
++{
++    size_t total_written_size = 0;
++    while (size > 0)
++    {
++        size_t written_size = tryWriteImpl(data, size, offset, segment_kind, strict);
++        chassert(written_size <= size);
++        if (written_size == 0)
++            break;
++
++        if (data)
++            data += written_size;
++
++        size -= written_size;
++        offset += written_size;
++        total_written_size += written_size;
++    }
++    return total_written_size;
++}
++
++size_t FileSegmentRangeWriter::tryWriteImpl(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind, bool strict)
+ {
+     if (finalized)
+-        return false;
++        return 0;
+ 
+     auto & file_segments = file_segments_holder.file_segments;
+ 
+     if (current_file_segment_it == file_segments.end())
+     {
+-        current_file_segment_it = allocateFileSegment(current_file_segment_write_offset, is_persistent);
++        current_file_segment_it = allocateFileSegment(current_file_segment_write_offset, segment_kind);
+     }
+     else
+     {
+@@ -78,7 +104,7 @@ bool FileSegmentRangeWriter::write(const char * data, size_t size, size_t offset
+         if (file_segment->range().size() == file_segment->getDownloadedSize())
+         {
+             completeFileSegment(*file_segment);
+-            current_file_segment_it = allocateFileSegment(current_file_segment_write_offset, is_persistent);
++            current_file_segment_it = allocateFileSegment(current_file_segment_write_offset, segment_kind);
+         }
+     }
+ 
+@@ -93,20 +119,26 @@ bool FileSegmentRangeWriter::write(const char * data, size_t size, size_t offset
+             file_segment->completePartAndResetDownloader();
+     });
+ 
+-    bool reserved = file_segment->reserve(size);
+-    if (!reserved)
++    size_t reserved_size = file_segment->tryReserve(size, strict);
++    if (reserved_size == 0 || (strict && reserved_size != size))
+     {
+-        file_segment->completeWithState(FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION);
+-        appendFilesystemCacheLog(*file_segment);
++        if (strict)
++        {
++            file_segment->completeWithState(FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION);
++            appendFilesystemCacheLog(*file_segment);
++        }
+ 
+         LOG_DEBUG(
+             &Poco::Logger::get("FileSegmentRangeWriter"),
+             "Unsuccessful space reservation attempt (size: {}, file segment info: {}",
+             size, file_segment->getInfoForLog());
+ 
+-        return false;
++        return 0;
+     }
+ 
++    /// Shrink to reserved size, because we can't write more than reserved
++    size = reserved_size;
++
+     try
+     {
+         file_segment->write(data, size, offset);
+@@ -120,7 +152,17 @@ bool FileSegmentRangeWriter::write(const char * data, size_t size, size_t offset
+     file_segment->completePartAndResetDownloader();
+     current_file_segment_write_offset += size;
+ 
+-    return true;
++    return size;
++}
++
++bool FileSegmentRangeWriter::reserve(size_t size, size_t offset)
++{
++    return write(nullptr, size, offset, FileSegmentKind::Temporary);
++}
++
++size_t FileSegmentRangeWriter::tryReserve(size_t size, size_t offset)
++{
++    return tryWrite(nullptr, size, offset, FileSegmentKind::Temporary);
+ }
+ 
+ void FileSegmentRangeWriter::finalize()
+@@ -129,6 +171,7 @@ void FileSegmentRangeWriter::finalize()
+         return;
+ 
+     auto & file_segments = file_segments_holder.file_segments;
++
+     if (file_segments.empty() || current_file_segment_it == file_segments.end())
+         return;
+ 
+@@ -149,7 +192,7 @@ FileSegmentRangeWriter::~FileSegmentRangeWriter()
+     }
+ }
+ 
+-FileSegments::iterator FileSegmentRangeWriter::allocateFileSegment(size_t offset, bool is_persistent)
++FileSegments::iterator FileSegmentRangeWriter::allocateFileSegment(size_t offset, FileSegmentKind segment_kind)
+ {
+     /**
+     * Allocate a new file segment starting `offset`.
+@@ -158,10 +201,7 @@ FileSegments::iterator FileSegmentRangeWriter::allocateFileSegment(size_t offset
+ 
+     std::lock_guard cache_lock(cache->mutex);
+ 
+-    CreateFileSegmentSettings create_settings
+-    {
+-        .is_persistent = is_persistent,
+-    };
++    CreateFileSegmentSettings create_settings(segment_kind);
+ 
+     /// We set max_file_segment_size to be downloaded,
+     /// if we have less size to write, file segment will be resized in complete() method.
+@@ -196,12 +236,15 @@ void FileSegmentRangeWriter::appendFilesystemCacheLog(const FileSegment & file_s
+     }
+ }
+ 
+-void FileSegmentRangeWriter::completeFileSegment(FileSegment & file_segment)
++void FileSegmentRangeWriter::completeFileSegment(FileSegment & file_segment, std::optional<FileSegment::State> state)
+ {
+     /// File segment can be detached if space reservation failed.
+     if (file_segment.isDetached())
+         return;
+ 
++    if (state.has_value())
++        file_segment.setDownloadState(*state);
++
+     file_segment.completeWithoutState();
+     appendFilesystemCacheLog(file_segment);
+ }
+@@ -270,7 +313,8 @@ void CachedOnDiskWriteBufferFromFile::cacheData(char * data, size_t size)
+ 
+     try
+     {
+-        if (!cache_writer->write(data, size, current_download_offset, is_persistent_cache_file))
++        auto segment_kind = is_persistent_cache_file ? FileSegmentKind::Persistent : FileSegmentKind::Regular;
++        if (!cache_writer->write(data, size, current_download_offset, segment_kind))
+         {
+             LOG_INFO(log, "Write-through cache is stopped as cache limit is reached and nothing can be evicted");
+             return;
+diff --git a/src/Disks/IO/CachedOnDiskWriteBufferFromFile.h b/src/Disks/IO/CachedOnDiskWriteBufferFromFile.h
+index cec7305ab1ba..38ec2b46a5d2 100644
+--- a/src/Disks/IO/CachedOnDiskWriteBufferFromFile.h
++++ b/src/Disks/IO/CachedOnDiskWriteBufferFromFile.h
+@@ -4,6 +4,7 @@
+ #include <IO/WriteSettings.h>
+ #include <Interpreters/Cache/FileCache.h>
+ #include <Interpreters/FilesystemCacheLog.h>
++#include <Common/filesystemHelpers.h>
+ 
+ namespace Poco
+ {
+@@ -28,22 +29,44 @@ class FileSegmentRangeWriter
+         FileCache * cache_, const FileSegment::Key & key_,
+         std::shared_ptr<FilesystemCacheLog> cache_log_, const String & query_id_, const String & source_path_);
+ 
+-    /**
+-    * Write a range of file segments. Allocate file segment of `max_file_segment_size` and write to
+-    * it until it is full and then allocate next file segment.
+-    */
+-    bool write(const char * data, size_t size, size_t offset, bool is_persistent);
++    /* Write a range of file segments.
++     * Allocate file segment of `max_file_segment_size` and write to it until it is full and then allocate next file segment.
++     * If it's impossible to allocate new file segment and reserve space to write all data, then returns false.
++     *
++     * Note: the data that was written to file segments before the error occurred is not rolled back.
++     */
++    bool write(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind);
++
++    /* Tries to write data to current file segment.
++     * Size of written data may be less than requested_size, because it may not be enough space.
++     *
++     * Returns size of written data.
++     */
++    size_t tryWrite(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind = FileSegmentKind::Regular, bool strict = false);
++
++    /// Same as `write/tryWrite`, but doesn't write anything, just reserves some space in cache
++    bool reserve(size_t size, size_t offset);
++    size_t tryReserve(size_t size, size_t offset);
+ 
+     void finalize();
+ 
++    size_t currentOffset() const { return current_file_segment_write_offset; }
++
+     ~FileSegmentRangeWriter();
+ 
+ private:
+-    FileSegments::iterator allocateFileSegment(size_t offset, bool is_persistent);
++    FileSegments::iterator allocateFileSegment(size_t offset, FileSegmentKind segment_kind);
+ 
+     void appendFilesystemCacheLog(const FileSegment & file_segment);
+ 
+-    void completeFileSegment(FileSegment & file_segment);
++    void completeFileSegment(FileSegment & file_segment, std::optional<FileSegment::State> state = {});
++
++    /* Writes data to current file segment as much as possible and returns size of written data, do not allocate new file segments
++     * In `strict` mode it will write all data or nothing, otherwise it will write as much as possible
++     * If returned non zero value, then we can try to write again to next file segment.
++     * If no space is available, returns zero.
++     */
++    size_t tryWriteImpl(const char * data, size_t size, size_t offset, FileSegmentKind segment_kind, bool strict);
+ 
+     FileCache * cache;
+     FileSegment::Key key;
+diff --git a/src/Disks/IO/FileCachePlaceholder.cpp b/src/Disks/IO/FileCachePlaceholder.cpp
+new file mode 100644
+index 000000000000..d45d7b2d83d9
+--- /dev/null
++++ b/src/Disks/IO/FileCachePlaceholder.cpp
+@@ -0,0 +1,73 @@
++#include <Disks/IO/FileCachePlaceholder.h>
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int NOT_ENOUGH_SPACE;
++}
++
++void ISpacePlaceholder::reserveCapacity(size_t requested_capacity)
++{
++    chassert(used_space <= capacity);
++
++    size_t remaining_space = capacity - used_space;
++    LOG_TEST(&Poco::Logger::get("ISpacePlaceholder"), "Reserving {} bytes (used_space: {}, capacity: {})", requested_capacity, used_space, capacity);
++
++    if (requested_capacity <= remaining_space)
++        return;
++
++    size_t capacity_to_reserve = requested_capacity - remaining_space;
++    reserveImpl(capacity_to_reserve);
++    capacity += capacity_to_reserve;
++}
++
++void ISpacePlaceholder::setUsed(size_t size)
++{
++    LOG_TEST(&Poco::Logger::get("ISpacePlaceholder"), "Using {} bytes ({} already used, {} capacity)", size, used_space, capacity);
++
++    if (used_space + size > capacity)
++    {
++        LOG_WARNING(&Poco::Logger::get("ISpacePlaceholder"), "Used space is greater than capacity. It may lead to not enough space error");
++        reserveCapacity(size);
++    }
++
++    used_space = used_space + size;
++}
++
++FileCachePlaceholder::FileCachePlaceholder(FileCache * cache, const String & name)
++    : key_name(name)
++    , file_cache(cache)
++{
++}
++
++void FileCachePlaceholder::reserveImpl(size_t requested_size)
++{
++    /// We create new cache_writer and will try to reserve requested_size in it
++    String key = fmt::format("{}_{}", key_name, cache_writers.size());
++    auto cache_writer = std::make_unique<FileSegmentRangeWriter>(file_cache,
++                                                                 file_cache->hash(key),
++                                                                 /* cache_log_ */ nullptr,
++                                                                 /* query_id_ */ "",
++                                                                 /* source_path_ */ key);
++
++    size_t current_offset = cache_writer->currentOffset();
++    size_t reserved_size = cache_writer->tryReserve(requested_size, current_offset);
++    if (reserved_size != requested_size)
++    {
++        throw Exception(ErrorCodes::NOT_ENOUGH_SPACE,
++            "Cannot reserve space in file cache "
++            "({} bytes required, got {} reserved "
++            "{} / {} bytes used, "
++            "{} / {} elements used)"
++            , requested_size, reserved_size
++            , file_cache->getUsedCacheSize(), file_cache->getTotalMaxSize()
++            , file_cache->getFileSegmentsNum(), file_cache->getTotalMaxElements());
++    }
++    /// Add to cache_writers only if we successfully reserved space, otherwise free reserved_size back
++    cache_writers.push_back(std::move(cache_writer));
++}
++
++
++}
+diff --git a/src/Disks/IO/FileCachePlaceholder.h b/src/Disks/IO/FileCachePlaceholder.h
+new file mode 100644
+index 000000000000..6ddeb85286b4
+--- /dev/null
++++ b/src/Disks/IO/FileCachePlaceholder.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <Interpreters/Cache/FileCache.h>
++#include <Disks/IO/CachedOnDiskWriteBufferFromFile.h>
++
++#include <Poco/Logger.h>
++#include <Poco/ConsoleChannel.h>
++
++#include <filesystem>
++
++namespace fs = std::filesystem;
++
++namespace DB
++{
++
++
++/* ISpacePlaceholder is a base class for all classes that need to reserve space in some storage.
++ * You should resrve space with call reserveCapacity() before writing to it.
++ * After writing you should call setUsed() to let ISpacePlaceholder know how much space was used.
++ * It can be different because in some cases you don't know exact size of data you will write (because of compression, for example).
++ * It's better to reserve more space in advance not to overuse space.
++ */
++class ISpacePlaceholder
++{
++public:
++    /// Reserve space in storage
++    void reserveCapacity(size_t requested_capacity);
++
++    /// Indicate that some space is used
++    /// It uses reserved space if it is possible, otherwise it reserves more space
++    void setUsed(size_t size);
++
++    virtual ~ISpacePlaceholder() = default;
++
++private:
++    virtual void reserveImpl(size_t size) = 0;
++
++    size_t capacity = 0;
++    size_t used_space = 0;
++};
++
++/* FileCachePlaceholder is a class that reserves space in FileCache.
++ * Data is written externally, and FileCachePlaceholder is only used to hold space in FileCache.
++ */
++class FileCachePlaceholder : public ISpacePlaceholder
++{
++public:
++    FileCachePlaceholder(FileCache * cache, const String & name);
++
++    void reserveImpl(size_t requested_size) override;
++
++private:
++    std::string key_name;
++    FileCache * file_cache;
++
++    /// On each reserveImpl() call we create new FileSegmentRangeWriter that would be hold space
++    /// It's required to easily release already reserved space on unsuccessful attempt
++    std::vector<std::unique_ptr<FileSegmentRangeWriter>> cache_writers;
++};
++
++}
+diff --git a/src/Disks/ObjectStorages/Cached/CachedObjectStorage.h b/src/Disks/ObjectStorages/Cached/CachedObjectStorage.h
+index 2d67203be0f8..119dc25c66b1 100644
+--- a/src/Disks/ObjectStorages/Cached/CachedObjectStorage.h
++++ b/src/Disks/ObjectStorages/Cached/CachedObjectStorage.h
+@@ -113,6 +113,8 @@ class CachedObjectStorage final : public IObjectStorage
+ 
+     WriteSettings getAdjustedSettingsFromMetadataFile(const WriteSettings & settings, const std::string & path) const override;
+ 
++    FileCachePtr getCache() const { return cache; }
++
+ private:
+     FileCache::Key getCacheKey(const std::string & path) const;
+ 
+diff --git a/src/Disks/ObjectStorages/DiskObjectStorage.cpp b/src/Disks/ObjectStorages/DiskObjectStorage.cpp
+index 263a9a9d0e10..4230fb6254a3 100644
+--- a/src/Disks/ObjectStorages/DiskObjectStorage.cpp
++++ b/src/Disks/ObjectStorages/DiskObjectStorage.cpp
+@@ -519,6 +519,14 @@ void DiskObjectStorage::wrapWithCache(FileCachePtr cache, const FileCacheSetting
+     object_storage = std::make_shared<CachedObjectStorage>(object_storage, cache, cache_settings, layer_name);
+ }
+ 
++FileCachePtr DiskObjectStorage::getCache() const
++{
++    const auto * cached_object_storage = typeid_cast<CachedObjectStorage *>(object_storage.get());
++    if (!cached_object_storage)
++        return nullptr;
++    return cached_object_storage->getCache();
++}
++
+ NameSet DiskObjectStorage::getCacheLayersNames() const
+ {
+     NameSet cache_layers;
+diff --git a/src/Disks/ObjectStorages/DiskObjectStorage.h b/src/Disks/ObjectStorages/DiskObjectStorage.h
+index 00e3cf98142e..a24acc270c00 100644
+--- a/src/Disks/ObjectStorages/DiskObjectStorage.h
++++ b/src/Disks/ObjectStorages/DiskObjectStorage.h
+@@ -186,6 +186,7 @@ friend class DiskObjectStorageRemoteMetadataRestoreHelper;
+     /// There can be any number of cache layers:
+     /// DiskObjectStorage(CachedObjectStorage(...CacheObjectStorage(S3ObjectStorage)...))
+     void wrapWithCache(FileCachePtr cache, const FileCacheSettings & cache_settings, const String & layer_name);
++    FileCachePtr getCache() const;
+ 
+     /// Get structure of object storage this disk works with. Examples:
+     /// DiskObjectStorage(S3ObjectStorage)
+diff --git a/src/Disks/TemporaryFileInPath.cpp b/src/Disks/TemporaryFileInPath.cpp
+new file mode 100644
+index 000000000000..eae7fa668557
+--- /dev/null
++++ b/src/Disks/TemporaryFileInPath.cpp
+@@ -0,0 +1,20 @@
++#include <Disks/TemporaryFileInPath.h>
++#include <Common/filesystemHelpers.h>
++
++namespace DB
++{
++
++TemporaryFileInPath::TemporaryFileInPath(const String & folder_path)
++    : tmp_file(createTemporaryFile(folder_path))
++{
++    chassert(tmp_file);
++}
++
++String TemporaryFileInPath::getPath() const
++{
++    return tmp_file->path();
++}
++
++TemporaryFileInPath::~TemporaryFileInPath() = default;
++
++}
+diff --git a/src/Disks/TemporaryFileInPath.h b/src/Disks/TemporaryFileInPath.h
+new file mode 100644
+index 000000000000..503247e3f899
+--- /dev/null
++++ b/src/Disks/TemporaryFileInPath.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <Disks/TemporaryFileOnDisk.h>
++#include <Poco/TemporaryFile.h>
++
++namespace DB
++{
++
++/// Wrapper around Poco::TemporaryFile to implement ITemporaryFile.
++class TemporaryFileInPath : public ITemporaryFile
++{
++public:
++    explicit TemporaryFileInPath(const String & folder_path);
++    String getPath() const override;
++
++    ~TemporaryFileInPath() override;
++private:
++    std::unique_ptr<Poco::TemporaryFile> tmp_file;
++};
++
++}
+diff --git a/src/Disks/TemporaryFileOnDisk.cpp b/src/Disks/TemporaryFileOnDisk.cpp
+index 4f3485190370..af1f3f87c71f 100644
+--- a/src/Disks/TemporaryFileOnDisk.cpp
++++ b/src/Disks/TemporaryFileOnDisk.cpp
+@@ -2,6 +2,7 @@
+ #include <Poco/TemporaryFile.h>
+ #include <Common/CurrentMetrics.h>
+ #include <Common/logger_useful.h>
++#include <Disks/TemporaryFileInPath.h>
+ 
+ #include <filesystem>
+ 
+@@ -15,7 +16,6 @@ namespace CurrentMetrics
+     extern const Metric TotalTemporaryFiles;
+ }
+ 
+-
+ namespace DB
+ {
+ 
+diff --git a/src/Disks/TemporaryFileOnDisk.h b/src/Disks/TemporaryFileOnDisk.h
+index 9ba59c3eaf0a..fa3a03832973 100644
+--- a/src/Disks/TemporaryFileOnDisk.h
++++ b/src/Disks/TemporaryFileOnDisk.h
+@@ -9,21 +9,30 @@ namespace DB
+ {
+ using DiskPtr = std::shared_ptr<IDisk>;
+ 
++class ITemporaryFile
++{
++public:
++    virtual String getPath() const = 0;
++    virtual ~ITemporaryFile() = default;
++};
++
++using TemporaryFileHolder = std::unique_ptr<ITemporaryFile>;
++
+ /// This class helps with the handling of temporary files or directories.
+ /// A unique name for the temporary file or directory is automatically chosen based on a specified prefix.
+ /// Create a directory in the constructor.
+ /// The destructor always removes the temporary file or directory with all contained files.
+-class TemporaryFileOnDisk
++class TemporaryFileOnDisk : public ITemporaryFile
+ {
+ public:
+     explicit TemporaryFileOnDisk(const DiskPtr & disk_);
+     explicit TemporaryFileOnDisk(const DiskPtr & disk_, CurrentMetrics::Value metric_scope);
+     explicit TemporaryFileOnDisk(const DiskPtr & disk_, const String & prefix);
+ 
+-    ~TemporaryFileOnDisk();
++    ~TemporaryFileOnDisk() override;
+ 
+     DiskPtr getDisk() const { return disk; }
+-    String getPath() const;
++    String getPath() const override;
+ 
+ private:
+     DiskPtr disk;
+diff --git a/src/Formats/NativeWriter.cpp b/src/Formats/NativeWriter.cpp
+index c4dea371afd1..e932bb88c2de 100644
+--- a/src/Formats/NativeWriter.cpp
++++ b/src/Formats/NativeWriter.cpp
+@@ -64,8 +64,10 @@ static void writeData(const ISerialization & serialization, const ColumnPtr & co
+ }
+ 
+ 
+-void NativeWriter::write(const Block & block)
++size_t NativeWriter::write(const Block & block)
+ {
++    size_t written_before = ostr.count();
++
+     /// Additional information about the block.
+     if (client_revision > 0)
+         block.info.write(ostr);
+@@ -161,6 +163,10 @@ void NativeWriter::write(const Block & block)
+ 
+     if (index)
+         index->blocks.emplace_back(std::move(index_block));
++
++    size_t written_after = ostr.count();
++    size_t written_size = written_after - written_before;
++    return written_size;
+ }
+ 
+ }
+diff --git a/src/Formats/NativeWriter.h b/src/Formats/NativeWriter.h
+index 010a03ec722b..7bb377d2e4ae 100644
+--- a/src/Formats/NativeWriter.h
++++ b/src/Formats/NativeWriter.h
+@@ -27,7 +27,9 @@ class NativeWriter
+         IndexForNativeFormat * index_ = nullptr, size_t initial_size_of_file_ = 0);
+ 
+     Block getHeader() const { return header; }
+-    void write(const Block & block);
++
++    /// Returns the number of bytes written.
++    size_t write(const Block & block);
+     void flush();
+ 
+     static String getContentType() { return "application/octet-stream"; }
+diff --git a/src/IO/WriteBufferFromTemporaryFile.cpp b/src/IO/WriteBufferFromTemporaryFile.cpp
+index f93c79ca5879..4562ad512b3c 100644
+--- a/src/IO/WriteBufferFromTemporaryFile.cpp
++++ b/src/IO/WriteBufferFromTemporaryFile.cpp
+@@ -13,7 +13,7 @@ namespace ErrorCodes
+ }
+ 
+ 
+-WriteBufferFromTemporaryFile::WriteBufferFromTemporaryFile(std::unique_ptr<TemporaryFile> && tmp_file_)
++WriteBufferFromTemporaryFile::WriteBufferFromTemporaryFile(std::unique_ptr<PocoTemporaryFile> && tmp_file_)
+     : WriteBufferFromFile(tmp_file_->path(), DBMS_DEFAULT_BUFFER_SIZE, O_RDWR | O_TRUNC | O_CREAT, 0600), tmp_file(std::move(tmp_file_))
+ {}
+ 
+@@ -40,11 +40,11 @@ class ReadBufferFromTemporaryWriteBuffer : public ReadBufferFromFile
+         return std::make_shared<ReadBufferFromTemporaryWriteBuffer>(fd, file_name, std::move(origin->tmp_file));
+     }
+ 
+-    ReadBufferFromTemporaryWriteBuffer(int fd_, const std::string & file_name_, std::unique_ptr<TemporaryFile> && tmp_file_)
++    ReadBufferFromTemporaryWriteBuffer(int fd_, const std::string & file_name_, std::unique_ptr<PocoTemporaryFile> && tmp_file_)
+         : ReadBufferFromFile(fd_, file_name_), tmp_file(std::move(tmp_file_))
+     {}
+ 
+-    std::unique_ptr<TemporaryFile> tmp_file;
++    std::unique_ptr<PocoTemporaryFile> tmp_file;
+ };
+ 
+ 
+diff --git a/src/IO/WriteBufferFromTemporaryFile.h b/src/IO/WriteBufferFromTemporaryFile.h
+index 06e2911db260..a4e83b95ac6e 100644
+--- a/src/IO/WriteBufferFromTemporaryFile.h
++++ b/src/IO/WriteBufferFromTemporaryFile.h
+@@ -20,11 +20,11 @@ class WriteBufferFromTemporaryFile : public WriteBufferFromFile, public IReadabl
+     ~WriteBufferFromTemporaryFile() override;
+ 
+ private:
+-    explicit WriteBufferFromTemporaryFile(std::unique_ptr<TemporaryFile> && tmp_file);
++    explicit WriteBufferFromTemporaryFile(std::unique_ptr<PocoTemporaryFile> && tmp_file);
+ 
+     std::shared_ptr<ReadBuffer> getReadBufferImpl() override;
+ 
+-    std::unique_ptr<TemporaryFile> tmp_file;
++    std::unique_ptr<PocoTemporaryFile> tmp_file;
+ 
+     friend class ReadBufferFromTemporaryWriteBuffer;
+ };
+diff --git a/src/Interpreters/Cache/FileCache.cpp b/src/Interpreters/Cache/FileCache.cpp
+index 72fa1b3c324e..e2a0e839f19e 100644
+--- a/src/Interpreters/Cache/FileCache.cpp
++++ b/src/Interpreters/Cache/FileCache.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <Common/randomSeed.h>
+ #include <Common/SipHash.h>
++#include <Common/logger_useful.h>
+ #include <Interpreters/Cache/FileCacheSettings.h>
+ #include <Interpreters/Cache/LRUFileCachePriority.h>
+ #include <IO/ReadHelpers.h>
+@@ -12,6 +13,7 @@
+ #include <pcg-random/pcg_random.hpp>
+ #include <filesystem>
+ 
++
+ namespace fs = std::filesystem;
+ 
+ namespace DB
+@@ -46,13 +48,27 @@ FileCache::Key FileCache::hash(const String & path)
+     return Key(sipHash128(path.data(), path.size()));
+ }
+ 
+-String FileCache::getPathInLocalCache(const Key & key, size_t offset, bool is_persistent) const
++String FileCache::getPathInLocalCache(const Key & key, size_t offset, FileSegmentKind segment_kind) const
+ {
++    String file_suffix;
++    switch (segment_kind)
++    {
++        case FileSegmentKind::Persistent:
++            file_suffix = "_persistent";
++            break;
++        case FileSegmentKind::Temporary:
++            file_suffix = "_temporary";
++            break;
++        case FileSegmentKind::Regular:
++            file_suffix = "";
++            break;
++    }
++
+     auto key_str = key.toString();
+     return fs::path(cache_base_path)
+         / key_str.substr(0, 3)
+         / key_str
+-        / (std::to_string(offset) + (is_persistent ? "_persistent" : ""));
++        / (std::to_string(offset) + file_suffix);
+ }
+ 
+ String FileCache::getPathInLocalCache(const Key & key) const
+@@ -540,9 +556,6 @@ FileSegmentPtr FileCache::createFileSegmentForDownload(
+     assertCacheCorrectness(key, cache_lock);
+ #endif
+ 
+-    if (size > max_file_segment_size)
+-        throw Exception(ErrorCodes::REMOTE_FS_OBJECT_CACHE_ERROR, "Requested size exceeds max file segment size");
+-
+     auto * cell = getCell(key, offset, cache_lock);
+     if (cell)
+         throw Exception(
+@@ -999,9 +1012,17 @@ void FileCache::loadCacheInfoIntoMemory(std::lock_guard<std::mutex> & cache_lock
+         fs::directory_iterator key_it{key_prefix_it->path()};
+         for (; key_it != fs::directory_iterator(); ++key_it)
+         {
+-            if (!key_it->is_directory())
++            if (key_it->is_regular_file())
+             {
+-                LOG_DEBUG(log, "Unexpected file: {}. Expected a directory", key_it->path().string());
++                if (key_prefix_it->path().filename() == "tmp" && startsWith(key_it->path().filename(), "tmp"))
++                {
++                    LOG_DEBUG(log, "Found temporary file '{}', will remove it", key_it->path().string());
++                    fs::remove(key_it->path());
++                }
++                else
++                {
++                    LOG_DEBUG(log, "Unexpected file: {}. Expected a directory", key_it->path().string());
++                }
+                 continue;
+             }
+ 
+@@ -1009,17 +1030,26 @@ void FileCache::loadCacheInfoIntoMemory(std::lock_guard<std::mutex> & cache_lock
+             fs::directory_iterator offset_it{key_it->path()};
+             for (; offset_it != fs::directory_iterator(); ++offset_it)
+             {
++                if (offset_it->is_directory())
++                {
++                    LOG_DEBUG(log, "Unexpected directory: {}. Expected a file", offset_it->path().string());
++                    continue;
++                }
++
+                 auto offset_with_suffix = offset_it->path().filename().string();
+                 auto delim_pos = offset_with_suffix.find('_');
+                 bool parsed;
+-                bool is_persistent = false;
++                FileSegmentKind segment_kind = FileSegmentKind::Regular;
+ 
+                 if (delim_pos == std::string::npos)
+                     parsed = tryParse<UInt64>(offset, offset_with_suffix);
+                 else
+                 {
+                     parsed = tryParse<UInt64>(offset, offset_with_suffix.substr(0, delim_pos));
+-                    is_persistent = offset_with_suffix.substr(delim_pos+1) == "persistent";
++                    if (offset_with_suffix.substr(delim_pos+1) == "persistent")
++                        segment_kind = FileSegmentKind::Persistent;
++                    if (offset_with_suffix.substr(delim_pos+1) == "temporary")
++                        segment_kind = FileSegmentKind::Temporary;
+                 }
+ 
+                 if (!parsed)
+@@ -1039,7 +1069,7 @@ void FileCache::loadCacheInfoIntoMemory(std::lock_guard<std::mutex> & cache_lock
+                 {
+                     auto * cell = addCell(
+                         key, offset, size, FileSegment::State::DOWNLOADED,
+-                        CreateFileSegmentSettings{ .is_persistent = is_persistent }, cache_lock);
++                        CreateFileSegmentSettings(segment_kind), cache_lock);
+ 
+                     if (cell)
+                         queue_entries.emplace_back(cell->queue_iterator, cell->file_segment);
+@@ -1151,7 +1181,7 @@ std::vector<String> FileCache::tryGetCachePaths(const Key & key)
+     for (const auto & [offset, cell] : cells_by_offset)
+     {
+         if (cell.file_segment->state() == FileSegment::State::DOWNLOADED)
+-            cache_paths.push_back(getPathInLocalCache(key, offset, cell.file_segment->isPersistent()));
++            cache_paths.push_back(getPathInLocalCache(key, offset, cell.file_segment->getKind()));
+     }
+ 
+     return cache_paths;
+@@ -1173,6 +1203,16 @@ size_t FileCache::getAvailableCacheSizeUnlocked(std::lock_guard<std::mutex> & ca
+     return max_size - getUsedCacheSizeUnlocked(cache_lock);
+ }
+ 
++size_t FileCache::getTotalMaxSize() const
++{
++    return max_size;
++}
++
++size_t FileCache::getTotalMaxElements() const
++{
++    return max_element_size;
++}
++
+ size_t FileCache::getFileSegmentsNum() const
+ {
+     std::lock_guard cache_lock(mutex);
+diff --git a/src/Interpreters/Cache/FileCache.h b/src/Interpreters/Cache/FileCache.h
+index 706762b69153..4a2610fd76b4 100644
+--- a/src/Interpreters/Cache/FileCache.h
++++ b/src/Interpreters/Cache/FileCache.h
+@@ -80,7 +80,7 @@ using QueryContextPtr = std::shared_ptr<QueryContext>;
+ 
+     static Key hash(const String & path);
+ 
+-    String getPathInLocalCache(const Key & key, size_t offset, bool is_persistent) const;
++    String getPathInLocalCache(const Key & key, size_t offset, FileSegmentKind segment_kind) const;
+ 
+     String getPathInLocalCache(const Key & key) const;
+ 
+@@ -89,8 +89,10 @@ using QueryContextPtr = std::shared_ptr<QueryContext>;
+     size_t capacity() const { return max_size; }
+ 
+     size_t getUsedCacheSize() const;
++    size_t getTotalMaxSize() const;
+ 
+     size_t getFileSegmentsNum() const;
++    size_t getTotalMaxElements() const;
+ 
+     static bool isReadOnly();
+ 
+@@ -221,6 +223,8 @@ using QueryContextPtr = std::shared_ptr<QueryContext>;
+ 
+     FileSegmentCell * getCell(const Key & key, size_t offset, std::lock_guard<std::mutex> & cache_lock);
+ 
++    /// Returns non-owened pointer to the cell stored in the `files` map.
++    /// Doesn't reserve any space.
+     FileSegmentCell * addCell(
+         const Key & key,
+         size_t offset,
+diff --git a/src/Interpreters/Cache/FileCacheFactory.cpp b/src/Interpreters/Cache/FileCacheFactory.cpp
+index b276760c0dd4..e120fe3fc277 100644
+--- a/src/Interpreters/Cache/FileCacheFactory.cpp
++++ b/src/Interpreters/Cache/FileCacheFactory.cpp
+@@ -31,14 +31,21 @@ const FileCacheSettings & FileCacheFactory::getSettings(const std::string & cach
+ 
+ }
+ 
+-FileCachePtr FileCacheFactory::get(const std::string & cache_base_path)
++FileCachePtr FileCacheFactory::tryGet(const std::string & cache_base_path)
+ {
+     std::lock_guard lock(mutex);
+     auto it = caches_by_path.find(cache_base_path);
+     if (it == caches_by_path.end())
+-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No cache found by path: {}", cache_base_path);
++        return nullptr;
+     return it->second->cache;
++}
+ 
++FileCachePtr FileCacheFactory::get(const std::string & cache_base_path)
++{
++    auto file_cache_ptr = tryGet(cache_base_path);
++    if (!file_cache_ptr)
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No cache found by path: {}", cache_base_path);
++    return file_cache_ptr;
+ }
+ 
+ FileCachePtr FileCacheFactory::getOrCreate(
+diff --git a/src/Interpreters/Cache/FileCacheFactory.h b/src/Interpreters/Cache/FileCacheFactory.h
+index 82e0ec8f9282..32ecd05f019d 100644
+--- a/src/Interpreters/Cache/FileCacheFactory.h
++++ b/src/Interpreters/Cache/FileCacheFactory.h
+@@ -33,6 +33,7 @@ class FileCacheFactory final : private boost::noncopyable
+ 
+     FileCachePtr getOrCreate(const std::string & cache_base_path, const FileCacheSettings & file_cache_settings, const std::string & name);
+ 
++    FileCachePtr tryGet(const std::string & cache_base_path);
+     FileCachePtr get(const std::string & cache_base_path);
+ 
+     CacheByBasePath getAll();
+diff --git a/src/Interpreters/Cache/FileSegment.cpp b/src/Interpreters/Cache/FileSegment.cpp
+index 418bcee05d94..e070317e454c 100644
+--- a/src/Interpreters/Cache/FileSegment.cpp
++++ b/src/Interpreters/Cache/FileSegment.cpp
+@@ -23,6 +23,19 @@ namespace ErrorCodes
+     extern const int LOGICAL_ERROR;
+ }
+ 
++String toString(FileSegmentKind type)
++{
++    switch (type)
++    {
++        case FileSegmentKind::Regular:
++            return "Regular";
++        case FileSegmentKind::Persistent:
++            return "Persistent";
++        case FileSegmentKind::Temporary:
++            return "Temporary";
++    }
++}
++
+ FileSegment::FileSegment(
+         size_t offset_,
+         size_t size_,
+@@ -39,7 +52,7 @@ FileSegment::FileSegment(
+ #else
+     , log(&Poco::Logger::get("FileSegment"))
+ #endif
+-    , is_persistent(settings.is_persistent)
++    , segment_kind(settings.type)
+ {
+     /// On creation, file segment state can be EMPTY, DOWNLOADED, DOWNLOADING.
+     switch (download_state)
+@@ -73,7 +86,8 @@ FileSegment::FileSegment(
+ 
+ String FileSegment::getPathInLocalCache() const
+ {
+-    return cache->getPathInLocalCache(key(), offset(), isPersistent());
++    chassert(cache);
++    return cache->getPathInLocalCache(key(), offset(), segment_kind);
+ }
+ 
+ FileSegment::State FileSegment::state() const
+@@ -309,7 +323,7 @@ void FileSegment::write(const char * from, size_t size, size_t offset)
+         if (current_downloaded_size == range().size())
+             throw Exception(ErrorCodes::LOGICAL_ERROR, "File segment is already fully downloaded");
+ 
+-        if (!cache_writer)
++        if (!cache_writer && from != nullptr)
+         {
+             if (current_downloaded_size > 0)
+                 throw Exception(
+@@ -324,11 +338,14 @@ void FileSegment::write(const char * from, size_t size, size_t offset)
+ 
+     try
+     {
+-        cache_writer->write(from, size);
++        /// if `from` is nullptr, then we just allocate and hold space by current segment and it was (or would) be written outside
++        if (cache_writer && from != nullptr)
++            cache_writer->write(from, size);
+ 
+         std::unique_lock download_lock(download_mutex);
+ 
+-        cache_writer->next();
++        if (cache_writer && from != nullptr)
++            cache_writer->next();
+ 
+         downloaded_size += size;
+     }
+@@ -379,6 +396,13 @@ FileSegment::State FileSegment::wait()
+ }
+ 
+ bool FileSegment::reserve(size_t size_to_reserve)
++{
++    size_t reserved = tryReserve(size_to_reserve, true);
++    assert(reserved == 0 || reserved == size_to_reserve);
++    return reserved == size_to_reserve;
++}
++
++size_t FileSegment::tryReserve(size_t size_to_reserve, bool strict)
+ {
+     if (!size_to_reserve)
+         throw Exception(ErrorCodes::REMOTE_FS_OBJECT_CACHE_ERROR, "Zero space reservation is not allowed");
+@@ -394,10 +418,16 @@ bool FileSegment::reserve(size_t size_to_reserve)
+         expected_downloaded_size = getDownloadedSizeUnlocked(segment_lock);
+ 
+         if (expected_downloaded_size + size_to_reserve > range().size())
+-            throw Exception(
+-                ErrorCodes::REMOTE_FS_OBJECT_CACHE_ERROR,
+-                "Attempt to reserve space too much space ({}) for file segment with range: {} (downloaded size: {})",
+-                size_to_reserve, range().toString(), downloaded_size);
++        {
++            if (strict)
++            {
++                throw Exception(
++                    ErrorCodes::REMOTE_FS_OBJECT_CACHE_ERROR,
++                    "Attempt to reserve space too much space ({}) for file segment with range: {} (downloaded size: {})",
++                    size_to_reserve, range().toString(), downloaded_size);
++            }
++            size_to_reserve = range().size() - expected_downloaded_size;
++        }
+ 
+         chassert(reserved_size >= expected_downloaded_size);
+     }
+@@ -415,17 +445,16 @@ bool FileSegment::reserve(size_t size_to_reserve)
+     {
+         std::lock_guard cache_lock(cache->mutex);
+ 
+-        size_to_reserve = size_to_reserve - already_reserved_size;
+-        reserved = cache->tryReserve(key(), offset(), size_to_reserve, cache_lock);
++        size_t need_to_reserve = size_to_reserve - already_reserved_size;
++        reserved = cache->tryReserve(key(), offset(), need_to_reserve, cache_lock);
+ 
+-        if (reserved)
+-        {
+-            std::lock_guard segment_lock(mutex);
+-            reserved_size += size_to_reserve;
+-        }
+-    }
++        if (!reserved)
++            return 0;
+ 
+-    return reserved;
++        std::lock_guard segment_lock(mutex);
++        reserved_size += need_to_reserve;
++    }
++    return size_to_reserve;
+ }
+ 
+ void FileSegment::setDownloadedUnlocked([[maybe_unused]] std::unique_lock<std::mutex> & segment_lock)
+@@ -545,6 +574,15 @@ void FileSegment::completeBasedOnCurrentState(std::lock_guard<std::mutex> & cach
+         resetDownloaderUnlocked(segment_lock);
+     }
+ 
++    if (segment_kind == FileSegmentKind::Temporary && is_last_holder)
++    {
++        LOG_TEST(log, "Removing temporary file segment: {}", getInfoForLogUnlocked(segment_lock));
++        detach(cache_lock, segment_lock);
++        setDownloadState(State::SKIP_CACHE);
++        cache->remove(key(), offset(), cache_lock, segment_lock);
++        return;
++    }
++
+     switch (download_state)
+     {
+         case State::SKIP_CACHE:
+@@ -626,7 +664,7 @@ String FileSegment::getInfoForLogUnlocked(std::unique_lock<std::mutex> & segment
+     info << "first non-downloaded offset: " << getFirstNonDownloadedOffsetUnlocked(segment_lock) << ", ";
+     info << "caller id: " << getCallerId() << ", ";
+     info << "detached: " << is_detached << ", ";
+-    info << "persistent: " << is_persistent;
++    info << "kind: " << toString(segment_kind);
+ 
+     return info.str();
+ }
+@@ -721,7 +759,7 @@ FileSegmentPtr FileSegment::getSnapshot(const FileSegmentPtr & file_segment, std
+     snapshot->ref_count = file_segment.use_count();
+     snapshot->downloaded_size = file_segment->getDownloadedSizeUnlocked(segment_lock);
+     snapshot->download_state = file_segment->download_state;
+-    snapshot->is_persistent = file_segment->isPersistent();
++    snapshot->segment_kind = file_segment->getKind();
+ 
+     return snapshot;
+ }
+@@ -783,6 +821,8 @@ FileSegmentsHolder::~FileSegmentsHolder()
+         if (!cache)
+             cache = file_segment->cache;
+ 
++        assert(cache == file_segment->cache); /// all segments should belong to the same cache
++
+         try
+         {
+             bool is_detached = false;
+diff --git a/src/Interpreters/Cache/FileSegment.h b/src/Interpreters/Cache/FileSegment.h
+index 8f9c0097d779..8915b2f0a36e 100644
+--- a/src/Interpreters/Cache/FileSegment.h
++++ b/src/Interpreters/Cache/FileSegment.h
+@@ -30,9 +30,38 @@ using FileSegmentPtr = std::shared_ptr<FileSegment>;
+ using FileSegments = std::list<FileSegmentPtr>;
+ 
+ 
++/*
++ * FileSegmentKind is used to specify the eviction policy for file segments.
++ */
++enum class FileSegmentKind
++{
++    /* `Regular` file segment is still in cache after usage, and can be evicted
++     * (unless there're some holders).
++     */
++    Regular,
++
++    /* `Persistent` file segment can't be evicted from cache,
++     * it should be removed manually.
++     */
++    Persistent,
++
++    /* `Temporary` file segment is removed right after relesing.
++     * Also corresponding files are removed during cache loading (if any).
++     */
++    Temporary,
++};
++
++String toString(FileSegmentKind type);
++
+ struct CreateFileSegmentSettings
+ {
+-    bool is_persistent = false;
++    FileSegmentKind type = FileSegmentKind::Regular;
++
++    CreateFileSegmentSettings() = default;
++
++    explicit CreateFileSegmentSettings(FileSegmentKind type_)
++        : type(type_)
++    {}
+ };
+ 
+ class FileSegment : private boost::noncopyable, public std::enable_shared_from_this<FileSegment>
+@@ -127,7 +156,8 @@ friend class StorageSystemFilesystemCache;
+ 
+     size_t offset() const { return range().left; }
+ 
+-    bool isPersistent() const { return is_persistent; }
++    FileSegmentKind getKind() const { return segment_kind; }
++    bool isPersistent() const { return segment_kind == FileSegmentKind::Persistent; }
+ 
+     using UniqueId = std::pair<FileCacheKey, size_t>;
+     UniqueId getUniqueId() const { return std::pair(key(), offset()); }
+@@ -183,19 +213,19 @@ friend class StorageSystemFilesystemCache;
+ 
+     void assertCorrectness() const;
+ 
+-    /**
+-     * ========== Methods for _only_ file segment's `writer` ======================
+-     */
+-
+-    void synchronousWrite(const char * from, size_t size, size_t offset);
+-
+     /**
+      * ========== Methods for _only_ file segment's `downloader` ==================
+      */
+ 
+     /// Try to reserve exactly `size` bytes.
++    /// Returns true if reservation was successful, false otherwise.
+     bool reserve(size_t size_to_reserve);
+ 
++    /// Try to reserve at max `size` bytes.
++    /// Returns actual size reserved.
++    /// In strict mode throws an error on attempt to reserve space too much space
++    size_t tryReserve(size_t size_to_reserve, bool strict = false);
++
+     /// Write data into reserved space.
+     void write(const char * from, size_t size, size_t offset);
+ 
+@@ -247,9 +277,9 @@ friend class StorageSystemFilesystemCache;
+     void assertIsDownloaderUnlocked(const std::string & operation, std::unique_lock<std::mutex> & segment_lock) const;
+     void assertCorrectnessUnlocked(std::unique_lock<std::mutex> & segment_lock) const;
+ 
+-    /// complete() without any completion state is called from destructor of
+-    /// FileSegmentsHolder. complete() might check if the caller of the method
+-    /// is the last alive holder of the segment. Therefore, complete() and destruction
++    /// completeWithoutStateUnlocked() is called from destructor of FileSegmentsHolder.
++    /// Function might check if the caller of the method
++    /// is the last alive holder of the segment. Therefore, completion and destruction
+     /// of the file segment pointer must be done under the same cache mutex.
+     void completeWithoutStateUnlocked(std::lock_guard<std::mutex> & cache_lock);
+     void completeBasedOnCurrentState(std::lock_guard<std::mutex> & cache_lock, std::unique_lock<std::mutex> & segment_lock);
+@@ -295,12 +325,12 @@ friend class StorageSystemFilesystemCache;
+     /// In general case, all file segments are owned by cache.
+     bool is_detached = false;
+ 
+-    bool is_downloaded{false};
++    bool is_downloaded = false;
+ 
+     std::atomic<size_t> hits_count = 0; /// cache hits.
+     std::atomic<size_t> ref_count = 0; /// Used for getting snapshot state
+ 
+-    bool is_persistent;
++    FileSegmentKind segment_kind;
+ 
+     CurrentMetrics::Increment metric_increment{CurrentMetrics::CacheFileSegments};
+ };
+@@ -313,6 +343,8 @@ struct FileSegmentsHolder : private boost::noncopyable
+ 
+     FileSegmentsHolder(FileSegmentsHolder && other) noexcept : file_segments(std::move(other.file_segments)) {}
+ 
++    void reset() { file_segments.clear(); }
++
+     ~FileSegmentsHolder();
+ 
+     String toString();
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 913b0535358d..796b93998a97 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -32,6 +32,7 @@
+ #include <Storages/StorageS3Settings.h>
+ #include <Disks/DiskLocal.h>
+ #include <Disks/DiskDecorator.h>
++#include <Disks/ObjectStorages/DiskObjectStorage.h>
+ #include <Disks/ObjectStorages/IObjectStorage.h>
+ #include <Disks/IO/ThreadPoolRemoteFSReader.h>
+ #include <Disks/IO/ThreadPoolReader.h>
+@@ -102,6 +103,7 @@
+ #include <Interpreters/Lemmatizers.h>
+ #include <Interpreters/ClusterDiscovery.h>
+ #include <Interpreters/TransactionLog.h>
++#include <Interpreters/Cache/FileCacheFactory.h>
+ #include <filesystem>
+ #include <re2/re2.h>
+ 
+@@ -746,29 +748,66 @@ void Context::setPath(const String & path)
+         shared->user_scripts_path = shared->path + "user_scripts/";
+ }
+ 
+-VolumePtr Context::setTemporaryStorage(const String & path, const String & policy_name, size_t max_size)
++static void setupTmpPath(Poco::Logger * log, const std::string & path)
++try
+ {
+-    std::lock_guard lock(shared->storage_policies_mutex);
+-    VolumePtr volume;
++    LOG_DEBUG(log, "Setting up {} to store temporary data in it", path);
+ 
+-    if (policy_name.empty())
+-    {
+-        shared->tmp_path = path;
+-        if (!shared->tmp_path.ends_with('/'))
+-            shared->tmp_path += '/';
++    fs::create_directories(path);
+ 
+-        auto disk = std::make_shared<DiskLocal>("_tmp_default", shared->tmp_path, 0);
+-        volume = std::make_shared<SingleDiskVolume>("_tmp_default", disk, 0);
++    /// Clearing old temporary files.
++    fs::directory_iterator dir_end;
++    for (fs::directory_iterator it(path); it != dir_end; ++it)
++    {
++        if (it->is_regular_file() && startsWith(it->path().filename(), "tmp"))
++        {
++            LOG_DEBUG(log, "Removing old temporary file {}", it->path().string());
++            fs::remove(it->path());
++        }
++        else
++            LOG_DEBUG(log, "Found unknown file in temporary path {}", it->path().string());
+     }
+-    else
++}
++catch (...)
++{
++    DB::tryLogCurrentException(log, fmt::format(
++        "Caught exception while setup temporary path: {}. "
++        "It is ok to skip this exception as cleaning old temporary files is not necessary", path));
++}
++
++static VolumePtr createLocalSingleDiskVolume(const std::string & path)
++{
++    auto disk = std::make_shared<DiskLocal>("_tmp_default", path, 0);
++    VolumePtr volume = std::make_shared<SingleDiskVolume>("_tmp_default", disk, 0);
++    return volume;
++}
++
++void Context::setTemporaryStoragePath(const String & path, size_t max_size)
++{
++    shared->tmp_path = path;
++    if (!shared->tmp_path.ends_with('/'))
++        shared->tmp_path += '/';
++
++    VolumePtr volume = createLocalSingleDiskVolume(shared->tmp_path);
++
++    for (const auto & disk : volume->getDisks())
+     {
+-        StoragePolicyPtr tmp_policy = getStoragePolicySelector(lock)->get(policy_name);
+-        if (tmp_policy->getVolumes().size() != 1)
+-             throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
+-                "Policy '{}' is used temporary files, such policy should have exactly one volume", policy_name);
+-        volume = tmp_policy->getVolume(0);
++        setupTmpPath(shared->log, disk->getPath());
+     }
+ 
++    shared->temp_data_on_disk = std::make_shared<TemporaryDataOnDiskScope>(volume, nullptr, max_size);
++}
++
++void Context::setTemporaryStoragePolicy(const String & policy_name, size_t max_size)
++{
++    std::lock_guard lock(shared->storage_policies_mutex);
++
++     StoragePolicyPtr tmp_policy = getStoragePolicySelector(lock)->get(policy_name);
++    if (tmp_policy->getVolumes().size() != 1)
++            throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
++            "Policy '{}' is used temporary files, such policy should have exactly one volume", policy_name);
++    VolumePtr volume = tmp_policy->getVolume(0);
++
+     if (volume->getDisks().empty())
+          throw Exception("No disks volume for temporary files", ErrorCodes::NO_ELEMENTS_IN_CONFIG);
+ 
+@@ -789,10 +828,33 @@ VolumePtr Context::setTemporaryStorage(const String & path, const String & polic
+                 "Disk '{}' ({}) is not local and can't be used for temporary files",
+                 disk_ptr->getName(), typeid(*disk_raw_ptr).name());
+         }
++
++        setupTmpPath(shared->log, disk->getPath());
+     }
+ 
+-    shared->temp_data_on_disk = std::make_shared<TemporaryDataOnDiskScope>(volume, max_size);
+-    return volume;
++    shared->temp_data_on_disk = std::make_shared<TemporaryDataOnDiskScope>(volume, nullptr, max_size);
++}
++
++
++void Context::setTemporaryStorageInCache(const String & cache_disk_name, size_t max_size)
++{
++    auto disk_ptr = getDisk(cache_disk_name);
++    if (!disk_ptr)
++        throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG, "Disk '{}' is not found", cache_disk_name);
++
++    const auto * disk_object_storage_ptr = dynamic_cast<const DiskObjectStorage *>(disk_ptr.get());
++    if (!disk_object_storage_ptr)
++        throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG, "Disk '{}' does not use cache", cache_disk_name);
++
++    auto file_cache = disk_object_storage_ptr->getCache();
++    if (!file_cache)
++        throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG, "Cache '{}' is not found", file_cache->getBasePath());
++
++    LOG_DEBUG(shared->log, "Using file cache ({}) for temporary files", file_cache->getBasePath());
++
++    shared->tmp_path = file_cache->getBasePath();
++    VolumePtr volume = createLocalSingleDiskVolume(shared->tmp_path);
++    shared->temp_data_on_disk = std::make_shared<TemporaryDataOnDiskScope>(volume, file_cache.get(), max_size);
+ }
+ 
+ void Context::setFlagsPath(const String & path)
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index bc89ce36edca..2c3122e41091 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -461,7 +461,9 @@ class Context: public std::enable_shared_from_this<Context>
+ 
+     void addWarningMessage(const String & msg) const;
+ 
+-    VolumePtr setTemporaryStorage(const String & path, const String & policy_name, size_t max_size);
++    void setTemporaryStorageInCache(const String & cache_disk_name, size_t max_size);
++    void setTemporaryStoragePolicy(const String & policy_name, size_t max_size);
++    void setTemporaryStoragePath(const String & path, size_t max_size);
+ 
+     using ConfigurationPtr = Poco::AutoPtr<Poco::Util::AbstractConfiguration>;
+ 
+diff --git a/src/Interpreters/TemporaryDataOnDisk.cpp b/src/Interpreters/TemporaryDataOnDisk.cpp
+index c5ae6f6c8856..a039053b011f 100644
+--- a/src/Interpreters/TemporaryDataOnDisk.cpp
++++ b/src/Interpreters/TemporaryDataOnDisk.cpp
+@@ -7,6 +7,7 @@
+ #include <Formats/NativeWriter.h>
+ #include <Formats/NativeReader.h>
+ #include <Core/ProtocolDefines.h>
++#include <Disks/TemporaryFileInPath.h>
+ 
+ #include <Common/logger_useful.h>
+ 
+@@ -35,35 +36,32 @@ void TemporaryDataOnDiskScope::deltaAllocAndCheck(ssize_t compressed_delta, ssiz
+ 
+     size_t new_consumprion = stat.compressed_size + compressed_delta;
+     if (compressed_delta > 0 && limit && new_consumprion > limit)
+-        throw Exception(ErrorCodes::TOO_MANY_ROWS_OR_BYTES, "Limit for temporary files size exceeded");
++        throw Exception(ErrorCodes::TOO_MANY_ROWS_OR_BYTES,
++            "Limit for temporary files size exceeded (would consume {} / {} bytes)", new_consumprion, limit);
+ 
+     stat.compressed_size += compressed_delta;
+     stat.uncompressed_size += uncompressed_delta;
+ }
+ 
++VolumePtr TemporaryDataOnDiskScope::getVolume() const
++{
++    if (!volume)
++        throw Exception("TemporaryDataOnDiskScope has no volume", ErrorCodes::LOGICAL_ERROR);
++    return volume;
++}
++
+ TemporaryFileStream & TemporaryDataOnDisk::createStream(const Block & header, size_t max_file_size)
+ {
+-    DiskPtr disk;
+-    if (max_file_size > 0)
+-    {
+-        auto reservation = volume->reserve(max_file_size);
+-        if (!reservation)
+-            throw Exception("Not enough space on temporary disk", ErrorCodes::NOT_ENOUGH_SPACE);
+-        disk = reservation->getDisk();
+-    }
++    TemporaryFileStreamPtr tmp_stream;
++    if (cache)
++        tmp_stream = TemporaryFileStream::create(cache, header, max_file_size, this);
+     else
+-    {
+-        disk = volume->getDisk();
+-    }
+-
+-    auto tmp_file = std::make_unique<TemporaryFileOnDisk>(disk, current_metric_scope);
++        tmp_stream = TemporaryFileStream::create(volume, header, max_file_size, this);
+ 
+     std::lock_guard lock(mutex);
+-    TemporaryFileStreamPtr & tmp_stream = streams.emplace_back(std::make_unique<TemporaryFileStream>(std::move(tmp_file), header, this));
+-    return *tmp_stream;
++    return *streams.emplace_back(std::move(tmp_stream));
+ }
+ 
+-
+ std::vector<TemporaryFileStream *> TemporaryDataOnDisk::getStreams() const
+ {
+     std::vector<TemporaryFileStream *> res;
+@@ -89,12 +87,13 @@ struct TemporaryFileStream::OutputWriter
+     {
+     }
+ 
+-    void write(const Block & block)
++    size_t write(const Block & block)
+     {
+         if (finalized)
+             throw Exception("Cannot write to finalized stream", ErrorCodes::LOGICAL_ERROR);
+-        out_writer.write(block);
++        size_t written_bytes = out_writer.write(block);
+         num_rows += block.rows();
++        return written_bytes;
+     }
+ 
+     void finalize()
+@@ -155,21 +154,68 @@ struct TemporaryFileStream::InputReader
+     NativeReader in_reader;
+ };
+ 
+-TemporaryFileStream::TemporaryFileStream(TemporaryFileOnDiskHolder file_, const Block & header_, TemporaryDataOnDisk * parent_)
++TemporaryFileStreamPtr TemporaryFileStream::create(const VolumePtr & volume, const Block & header, size_t max_file_size, TemporaryDataOnDisk * parent_)
++{
++    if (!volume)
++        throw Exception("TemporaryDataOnDiskScope has no volume", ErrorCodes::LOGICAL_ERROR);
++
++    DiskPtr disk;
++    if (max_file_size > 0)
++    {
++        auto reservation = volume->reserve(max_file_size);
++        if (!reservation)
++            throw Exception("Not enough space on temporary disk", ErrorCodes::NOT_ENOUGH_SPACE);
++        disk = reservation->getDisk();
++    }
++    else
++    {
++        disk = volume->getDisk();
++    }
++
++    auto tmp_file = std::make_unique<TemporaryFileOnDisk>(disk, parent_->getMetricScope());
++    return std::make_unique<TemporaryFileStream>(std::move(tmp_file), header, /* cache_placeholder */ nullptr, /* parent */ parent_);
++}
++
++TemporaryFileStreamPtr TemporaryFileStream::create(FileCache * cache, const Block & header, size_t max_file_size, TemporaryDataOnDisk * parent_)
++{
++    auto tmp_file = std::make_unique<TemporaryFileInPath>(fs::path(cache->getBasePath()) / "tmp");
++
++    auto cache_placeholder = std::make_unique<FileCachePlaceholder>(cache, tmp_file->getPath());
++    cache_placeholder->reserveCapacity(max_file_size);
++
++    return std::make_unique<TemporaryFileStream>(std::move(tmp_file), header, std::move(cache_placeholder), parent_);
++}
++
++TemporaryFileStream::TemporaryFileStream(
++    TemporaryFileHolder file_,
++    const Block & header_,
++    std::unique_ptr<ISpacePlaceholder> space_holder_,
++    TemporaryDataOnDisk * parent_)
+     : parent(parent_)
+     , header(header_)
+     , file(std::move(file_))
++    , space_holder(std::move(space_holder_))
+     , out_writer(std::make_unique<OutputWriter>(file->getPath(), header))
+ {
+ }
+ 
+-void TemporaryFileStream::write(const Block & block)
++size_t TemporaryFileStream::write(const Block & block)
+ {
+     if (!out_writer)
+         throw Exception("Writing has been finished", ErrorCodes::LOGICAL_ERROR);
+ 
++    size_t block_size_in_memory = block.bytes();
++
++    if (space_holder)
++        space_holder->reserveCapacity(block_size_in_memory);
++
+     updateAllocAndCheck();
+-    out_writer->write(block);
++
++    size_t bytes_written = out_writer->write(block);
++    if (space_holder)
++        space_holder->setUsed(bytes_written);
++
++    return bytes_written;
+ }
+ 
+ TemporaryFileStream::Stat TemporaryFileStream::finishWriting()
+diff --git a/src/Interpreters/TemporaryDataOnDisk.h b/src/Interpreters/TemporaryDataOnDisk.h
+index 11edc8700d20..2790529754f7 100644
+--- a/src/Interpreters/TemporaryDataOnDisk.h
++++ b/src/Interpreters/TemporaryDataOnDisk.h
+@@ -6,6 +6,7 @@
+ #include <Disks/TemporaryFileOnDisk.h>
+ #include <Disks/IVolume.h>
+ #include <Common/CurrentMetrics.h>
++#include <Disks/IO/FileCachePlaceholder.h>
+ 
+ 
+ namespace CurrentMetrics
+@@ -40,23 +41,25 @@ class TemporaryDataOnDiskScope : boost::noncopyable
+         std::atomic<size_t> uncompressed_size;
+     };
+ 
+-    explicit TemporaryDataOnDiskScope(VolumePtr volume_, size_t limit_)
+-        : volume(std::move(volume_)), limit(limit_)
++    explicit TemporaryDataOnDiskScope(VolumePtr volume_, FileCache * cache_, size_t limit_)
++        : volume(std::move(volume_)), cache(cache_), limit(limit_)
+     {}
+ 
+     explicit TemporaryDataOnDiskScope(TemporaryDataOnDiskScopePtr parent_, size_t limit_)
+-        : parent(std::move(parent_)), volume(parent->volume), limit(limit_)
++        : parent(std::move(parent_)), volume(parent->volume), cache(parent->cache), limit(limit_)
+     {}
+ 
+     /// TODO: remove
+     /// Refactor all code that uses volume directly to use TemporaryDataOnDisk.
+-    VolumePtr getVolume() const { return volume; }
++    VolumePtr getVolume() const;
+ 
+ protected:
+     void deltaAllocAndCheck(ssize_t compressed_delta, ssize_t uncompressed_delta);
+ 
+     TemporaryDataOnDiskScopePtr parent = nullptr;
++
+     VolumePtr volume;
++    FileCache * cache = nullptr;
+ 
+     StatAtomic stat;
+     size_t limit = 0;
+@@ -91,6 +94,7 @@ class TemporaryDataOnDisk : private TemporaryDataOnDiskScope
+     bool empty() const;
+ 
+     const StatAtomic & getStat() const { return stat; }
++    CurrentMetrics::Value getMetricScope() const { return current_metric_scope; }
+ 
+ private:
+     mutable std::mutex mutex;
+@@ -116,9 +120,14 @@ class TemporaryFileStream : boost::noncopyable
+         size_t num_rows = 0;
+     };
+ 
+-    TemporaryFileStream(TemporaryFileOnDiskHolder file_, const Block & header_, TemporaryDataOnDisk * parent_);
++    static TemporaryFileStreamPtr create(const VolumePtr & volume, const Block & header, size_t max_file_size, TemporaryDataOnDisk * parent_);
++    static TemporaryFileStreamPtr create(FileCache * cache, const Block & header, size_t max_file_size, TemporaryDataOnDisk * parent_);
++
++    TemporaryFileStream(TemporaryFileHolder file_, const Block & header_, std::unique_ptr<ISpacePlaceholder> space_holder, TemporaryDataOnDisk * parent_);
++
++    /// Returns number of written bytes
++    size_t write(const Block & block);
+ 
+-    void write(const Block & block);
+     Stat finishWriting();
+     bool isWriteFinished() const;
+ 
+@@ -142,7 +151,8 @@ class TemporaryFileStream : boost::noncopyable
+ 
+     Block header;
+ 
+-    TemporaryFileOnDiskHolder file;
++    TemporaryFileHolder file;
++    std::unique_ptr<ISpacePlaceholder> space_holder;
+ 
+     Stat stat;
+ 
+diff --git a/src/Storages/MergeTree/MergeTask.h b/src/Storages/MergeTree/MergeTask.h
+index 6a29cdbb5ca8..2b8d9055cff8 100644
+--- a/src/Storages/MergeTree/MergeTask.h
++++ b/src/Storages/MergeTree/MergeTask.h
+@@ -192,7 +192,7 @@ class MergeTask
+         bool force_ttl{false};
+         CompressionCodecPtr compression_codec{nullptr};
+         size_t sum_input_rows_upper_bound{0};
+-        std::unique_ptr<TemporaryFile> rows_sources_file{nullptr};
++        std::unique_ptr<PocoTemporaryFile> rows_sources_file{nullptr};
+         std::unique_ptr<WriteBufferFromFileBase> rows_sources_uncompressed_write_buf{nullptr};
+         std::unique_ptr<WriteBuffer> rows_sources_write_buf{nullptr};
+         std::optional<ColumnSizeEstimator> column_sizes{};
+@@ -257,7 +257,7 @@ class MergeTask
+         /// Begin dependencies from previous stage
+         std::unique_ptr<WriteBuffer> rows_sources_write_buf{nullptr};
+         std::unique_ptr<WriteBufferFromFileBase> rows_sources_uncompressed_write_buf{nullptr};
+-        std::unique_ptr<TemporaryFile> rows_sources_file;
++        std::unique_ptr<PocoTemporaryFile> rows_sources_file;
+         std::optional<ColumnSizeEstimator> column_sizes;
+         CompressionCodecPtr compression_codec;
+         DiskPtr tmp_disk{nullptr};
+diff --git a/src/Storages/System/StorageSystemFilesystemCache.cpp b/src/Storages/System/StorageSystemFilesystemCache.cpp
+index cd9324b32534..bec92a604360 100644
+--- a/src/Storages/System/StorageSystemFilesystemCache.cpp
++++ b/src/Storages/System/StorageSystemFilesystemCache.cpp
+@@ -24,7 +24,8 @@ NamesAndTypesList StorageSystemFilesystemCache::getNamesAndTypes()
+         {"cache_hits", std::make_shared<DataTypeUInt64>()},
+         {"references", std::make_shared<DataTypeUInt64>()},
+         {"downloaded_size", std::make_shared<DataTypeUInt64>()},
+-        {"persistent", std::make_shared<DataTypeNumber<UInt8>>()}
++        {"persistent", std::make_shared<DataTypeNumber<UInt8>>()},
++        {"kind", std::make_shared<DataTypeString>()},
+     };
+ }
+ 
+@@ -45,8 +46,11 @@ void StorageSystemFilesystemCache::fillData(MutableColumns & res_columns, Contex
+         for (const auto & file_segment : file_segments)
+         {
+             res_columns[0]->insert(cache_base_path);
++
++            /// Do not use `file_segment->getPathInLocalCache` here because it will lead to nullptr dereference
++            /// (because file_segments in getSnapshot doesn't have `cache` field set)
+             res_columns[1]->insert(
+-                cache->getPathInLocalCache(file_segment->key(), file_segment->offset(), file_segment->isPersistent()));
++                cache->getPathInLocalCache(file_segment->key(), file_segment->offset(), file_segment->getKind()));
+ 
+             const auto & range = file_segment->range();
+             res_columns[2]->insert(range.left);
+@@ -57,6 +61,7 @@ void StorageSystemFilesystemCache::fillData(MutableColumns & res_columns, Contex
+             res_columns[7]->insert(file_segment->getRefCount());
+             res_columns[8]->insert(file_segment->getDownloadedSize());
+             res_columns[9]->insert(file_segment->isPersistent());
++            res_columns[10]->insert(toString(file_segment->getKind()));
+         }
+     }
+ }

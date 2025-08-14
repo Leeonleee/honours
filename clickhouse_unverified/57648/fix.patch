@@ -1,0 +1,282 @@
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.cpp b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+index 38ecd8f40678..d5e1cf25188a 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.cpp
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+@@ -593,6 +593,23 @@ UInt64 IMergeTreeDataPart::getMarksCount() const
+     return index_granularity.getMarksCount();
+ }
+ 
++UInt64 IMergeTreeDataPart::getExistingBytesOnDisk() const
++{
++    if (!supportLightweightDeleteMutate() || !hasLightweightDelete() || !rows_count
++        || !storage.getSettings()->exclude_deleted_rows_for_part_size_in_merge)
++        return bytes_on_disk;
++
++    /// Uninitialized existing_rows_count
++    /// (if existing_rows_count equals rows_count, it means that previously we failed to read existing_rows_count)
++    if (existing_rows_count > rows_count)
++        readExistingRowsCount();
++
++    if (existing_rows_count < rows_count)
++        return bytes_on_disk * existing_rows_count / rows_count;
++    else /// Load failed
++        return bytes_on_disk;
++}
++
+ size_t IMergeTreeDataPart::getFileSizeOrZero(const String & file_name) const
+ {
+     auto checksum = checksums.files.find(file_name);
+@@ -1285,6 +1302,85 @@ void IMergeTreeDataPart::loadRowsCount()
+     }
+ }
+ 
++void IMergeTreeDataPart::readExistingRowsCount() const
++{
++    if (!supportLightweightDeleteMutate() || !hasLightweightDelete() || !storage.getSettings()->exclude_deleted_rows_for_part_size_in_merge
++        || existing_rows_count < rows_count || !getMarksCount())
++        return;
++
++    std::lock_guard lock(existing_rows_count_mutex);
++
++    /// Already read by another thread
++    if (existing_rows_count < rows_count)
++        return;
++
++    NamesAndTypesList cols;
++    cols.push_back(LightweightDeleteDescription::FILTER_COLUMN);
++
++    StorageMetadataPtr metadata_ptr = storage.getInMemoryMetadataPtr();
++    StorageSnapshotPtr storage_snapshot_ptr = std::make_shared<StorageSnapshot>(storage, metadata_ptr);
++
++    MergeTreeReaderPtr reader = getReader(
++        cols,
++        storage_snapshot_ptr,
++        MarkRanges{MarkRange(0, getMarksCount())},
++        nullptr,
++        storage.getContext()->getMarkCache().get(),
++        std::make_shared<AlterConversions>(),
++        MergeTreeReaderSettings{},
++        ValueSizeMap{},
++        ReadBufferFromFileBase::ProfileCallback{});
++
++    if (!reader)
++    {
++        LOG_WARNING(storage.log, "Create reader failed while reading existing rows count");
++        existing_rows_count = rows_count;
++        return;
++    }
++
++    size_t current_mark = 0;
++    const size_t total_mark = getMarksCount();
++
++    bool continue_reading = false;
++    size_t current_row = 0;
++    size_t existing_count = 0;
++
++    while (current_row < rows_count)
++    {
++        size_t rows_to_read = index_granularity.getMarkRows(current_mark);
++        continue_reading = (current_mark != 0);
++
++        Columns result;
++        result.resize(1);
++
++        size_t rows_read = reader->readRows(current_mark, total_mark, continue_reading, rows_to_read, result);
++        if (!rows_read)
++        {
++            LOG_WARNING(storage.log, "Part {} has lightweight delete, but _row_exists column not found", name);
++            existing_rows_count = rows_count;
++            return;
++        }
++
++        current_row += rows_read;
++        current_mark += (rows_to_read == rows_read);
++
++        const ColumnUInt8 * row_exists_col = typeid_cast<const ColumnUInt8 *>(result[0].get());
++        if (!row_exists_col)
++        {
++            LOG_WARNING(storage.log, "Part {} _row_exists column type is not UInt8", name);
++            existing_rows_count = rows_count;
++            return;
++        }
++
++        for (UInt8 row_exists : row_exists_col->getData())
++            if (row_exists)
++                existing_count++;
++    }
++
++    existing_rows_count = existing_count;
++    LOG_DEBUG(storage.log, "Part {} existing_rows_count = {}", name, existing_rows_count);
++}
++
+ void IMergeTreeDataPart::appendFilesOfRowsCount(Strings & files)
+ {
+     files.push_back("count.txt");
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.h b/src/Storages/MergeTree/IMergeTreeDataPart.h
+index 06e0712646a4..349f58da7c1b 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.h
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.h
+@@ -229,6 +229,13 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+ 
+     size_t rows_count = 0;
+ 
++    /// Existing rows count (excluding lightweight deleted rows)
++    /// UINT64_MAX -> uninitialized
++    /// 0 -> all rows were deleted
++    /// if reading failed, it will be set to rows_count
++    mutable size_t existing_rows_count = UINT64_MAX;
++    mutable std::mutex existing_rows_count_mutex;
++
+     time_t modification_time = 0;
+     /// When the part is removed from the working set. Changes once.
+     mutable std::atomic<time_t> remove_time { std::numeric_limits<time_t>::max() };
+@@ -372,6 +379,10 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+     UInt64 getBytesOnDisk() const { return bytes_on_disk; }
+     void setBytesOnDisk(UInt64 bytes_on_disk_) { bytes_on_disk = bytes_on_disk_; }
+ 
++    /// Returns estimated size of existing rows if setting exclude_deleted_rows_for_part_size_in_merge is true
++    /// Otherwise returns bytes_on_disk
++    UInt64 getExistingBytesOnDisk() const;
++
+     size_t getFileSizeOrZero(const String & file_name) const;
+     auto getFilesChecksums() const { return checksums.files; }
+ 
+@@ -498,6 +509,9 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+     /// True if here is lightweight deleted mask file in part.
+     bool hasLightweightDelete() const { return columns.contains(LightweightDeleteDescription::FILTER_COLUMN.name); }
+ 
++    /// Read existing rows count from _row_exists column
++    void readExistingRowsCount() const;
++
+     void writeChecksums(const MergeTreeDataPartChecksums & checksums_, const WriteSettings & settings);
+ 
+     /// Checks the consistency of this data part.
+diff --git a/src/Storages/MergeTree/MergeFromLogEntryTask.cpp b/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
+index 3d8bc62b5cc3..975cffbed9f2 100644
+--- a/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
++++ b/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
+@@ -160,7 +160,7 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
+     }
+ 
+     /// Start to make the main work
+-    size_t estimated_space_for_merge = MergeTreeDataMergerMutator::estimateNeededDiskSpace(parts);
++    size_t estimated_space_for_merge = MergeTreeDataMergerMutator::estimateNeededDiskSpace(parts, true);
+ 
+     /// Can throw an exception while reserving space.
+     IMergeTreeDataPart::TTLInfos ttl_infos;
+diff --git a/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp b/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+index f78b383e1732..042a6cce24cc 100644
+--- a/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+@@ -405,7 +405,7 @@ MergeTreeDataMergerMutator::MergeSelectingInfo MergeTreeDataMergerMutator::getPo
+         }
+ 
+         IMergeSelector::Part part_info;
+-        part_info.size = part->getBytesOnDisk();
++        part_info.size = part->getExistingBytesOnDisk();
+         part_info.age = res.current_time - part->modification_time;
+         part_info.level = part->info.level;
+         part_info.data = &part;
+@@ -611,7 +611,7 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectAllPartsToMergeWithinParti
+             return SelectPartsDecision::CANNOT_SELECT;
+         }
+ 
+-        sum_bytes += (*it)->getBytesOnDisk();
++        sum_bytes += (*it)->getExistingBytesOnDisk();
+ 
+         prev_it = it;
+         ++it;
+@@ -793,7 +793,7 @@ MergeTreeData::DataPartPtr MergeTreeDataMergerMutator::renameMergedTemporaryPart
+ }
+ 
+ 
+-size_t MergeTreeDataMergerMutator::estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts)
++size_t MergeTreeDataMergerMutator::estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts, const bool & is_merge)
+ {
+     size_t res = 0;
+     time_t current_time = std::time(nullptr);
+@@ -804,7 +804,10 @@ size_t MergeTreeDataMergerMutator::estimateNeededDiskSpace(const MergeTreeData::
+         if (part_max_ttl && part_max_ttl <= current_time)
+             continue;
+ 
+-        res += part->getBytesOnDisk();
++        if (is_merge && part->storage.getSettings()->exclude_deleted_rows_for_part_size_in_merge)
++            res += part->getExistingBytesOnDisk();
++        else
++            res += part->getBytesOnDisk();
+     }
+ 
+     return static_cast<size_t>(res * DISK_USAGE_COEFFICIENT_TO_RESERVE);
+diff --git a/src/Storages/MergeTree/MergeTreeDataMergerMutator.h b/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
+index 6eab0ee0c371..4cc9ea170f3e 100644
+--- a/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
++++ b/src/Storages/MergeTree/MergeTreeDataMergerMutator.h
+@@ -193,7 +193,7 @@ class MergeTreeDataMergerMutator
+ 
+ 
+     /// The approximate amount of disk space needed for merge or mutation. With a surplus.
+-    static size_t estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts);
++    static size_t estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts, const bool & is_merge);
+ 
+ private:
+     /** Select all parts belonging to the same partition.
+diff --git a/src/Storages/MergeTree/MergeTreeSettings.h b/src/Storages/MergeTree/MergeTreeSettings.h
+index 5bb712ea7861..07051a695de5 100644
+--- a/src/Storages/MergeTree/MergeTreeSettings.h
++++ b/src/Storages/MergeTree/MergeTreeSettings.h
+@@ -73,6 +73,7 @@ struct Settings;
+     M(UInt64, number_of_mutations_to_throw, 1000, "If table has at least that many unfinished mutations, throw 'Too many mutations' exception. Disabled if set to 0", 0) \
+     M(UInt64, min_delay_to_mutate_ms, 10, "Min delay of mutating MergeTree table in milliseconds, if there are a lot of unfinished mutations", 0) \
+     M(UInt64, max_delay_to_mutate_ms, 1000, "Max delay of mutating MergeTree table in milliseconds, if there are a lot of unfinished mutations", 0) \
++    M(Bool, exclude_deleted_rows_for_part_size_in_merge, false, "Use an estimated source part size (excluding lightweight deleted rows) when selecting parts to merge", 0) \
+     \
+     /** Inserts settings. */ \
+     M(UInt64, parts_to_delay_insert, 1000, "If table contains at least that many active parts in single partition, artificially slow down insert into table. Disabled if set to 0", 0) \
+diff --git a/src/Storages/MergeTree/MutateFromLogEntryTask.cpp b/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
+index a9ff687fe4de..620b0e34c6ad 100644
+--- a/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
++++ b/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
+@@ -49,7 +49,7 @@ ReplicatedMergeMutateTaskBase::PrepareResult MutateFromLogEntryTask::prepare()
+     }
+ 
+     /// TODO - some better heuristic?
+-    size_t estimated_space_for_result = MergeTreeDataMergerMutator::estimateNeededDiskSpace({source_part});
++    size_t estimated_space_for_result = MergeTreeDataMergerMutator::estimateNeededDiskSpace({source_part}, false);
+ 
+     if (entry.create_time + storage_settings_ptr->prefer_fetch_merged_part_time_threshold.totalSeconds() <= time(nullptr)
+         && estimated_space_for_result >= storage_settings_ptr->prefer_fetch_merged_part_size_threshold)
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index bb74c4dd7bb6..c45abb282a08 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1349,7 +1349,7 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
+                 if (auto part_in_memory = asInMemoryPart(part))
+                     sum_parts_size_in_bytes += part_in_memory->block.bytes();
+                 else
+-                    sum_parts_size_in_bytes += part->getBytesOnDisk();
++                    sum_parts_size_in_bytes += part->getExistingBytesOnDisk();
+             }
+         }
+ 
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index e9a0dd5fbf34..d1192bbfbd90 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -1062,7 +1062,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMerge(
+     if (isTTLMergeType(future_part->merge_type))
+         getContext()->getMergeList().bookMergeWithTTL();
+ 
+-    merging_tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace(future_part->parts), *this, metadata_snapshot, false);
++    merging_tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace(future_part->parts, true), *this, metadata_snapshot, false);
+     return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(merging_tagger), std::make_shared<MutationCommands>());
+ }
+ 
+@@ -1279,7 +1279,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
+             future_part->name = part->getNewName(new_part_info);
+             future_part->part_format = part->getFormat();
+ 
+-            tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace({part}), *this, metadata_snapshot, true);
++            tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace({part}, false), *this, metadata_snapshot, true);
+             return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(tagger), commands, txn);
+         }
+     }

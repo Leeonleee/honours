@@ -1,0 +1,1170 @@
+diff --git a/docs/en/sql-reference/statements/show.md b/docs/en/sql-reference/statements/show.md
+index e94718394de3..82af20fd18c6 100644
+--- a/docs/en/sql-reference/statements/show.md
++++ b/docs/en/sql-reference/statements/show.md
+@@ -208,7 +208,7 @@ The optional keyword `FULL` causes the output to include the collation, comment
+ The statement produces a result table with the following structure:
+ - field - The name of the column (String)
+ - type - The column data type (String)
+-- null - If the column data type is Nullable (UInt8)
++- null - `YES` if the column data type is Nullable, `NO` otherwise (String)
+ - key - `PRI` if the column is part of the primary key, `SOR` if the column is part of the sorting key, empty otherwise (String)
+ - default - Default expression of the column if it is of type `ALIAS`, `DEFAULT`, or `MATERIALIZED`, otherwise `NULL`. (Nullable(String))
+ - extra - Additional information, currently unused (String)
+diff --git a/src/Core/MySQL/PacketsGeneric.h b/src/Core/MySQL/PacketsGeneric.h
+index cf990bbf15cb..969716dfc7af 100644
+--- a/src/Core/MySQL/PacketsGeneric.h
++++ b/src/Core/MySQL/PacketsGeneric.h
+@@ -54,6 +54,9 @@ enum Command
+     COM_CHANGE_USER = 0x11,
+     COM_BINLOG_DUMP = 0x12,
+     COM_REGISTER_SLAVE = 0x15,
++    COM_STMT_PREPARE = 0x16,
++    COM_STMT_EXECUTE = 0x17,
++    COM_STMT_CLOSE = 0x19,
+     COM_RESET_CONNECTION = 0x1f,
+     COM_DAEMON = 0x1d,
+     COM_BINLOG_DUMP_GTID = 0x1e
+diff --git a/src/Core/MySQL/PacketsPreparedStatements.cpp b/src/Core/MySQL/PacketsPreparedStatements.cpp
+new file mode 100644
+index 000000000000..654c28379d91
+--- /dev/null
++++ b/src/Core/MySQL/PacketsPreparedStatements.cpp
+@@ -0,0 +1,42 @@
++#include <Core/MySQL/PacketsPreparedStatements.h>
++#include <IO/WriteHelpers.h>
++#include <Common/logger_useful.h>
++
++
++namespace DB
++{
++namespace MySQLProtocol
++{
++namespace PreparedStatements
++{
++size_t PreparedStatementResponseOK::getPayloadSize() const
++{
++    // total = 13
++    return 1 // status
++        + 4 // statement_id
++        + 2 // num_columns
++        + 2 // num_params
++        + 1 // reserved_1 (filler)
++        + 2 // warnings_count
++        + 1; // metadata_follows
++}
++
++void PreparedStatementResponseOK::writePayloadImpl(WriteBuffer & buffer) const
++{
++    buffer.write(reinterpret_cast<const char *>(&status), 1);
++    buffer.write(reinterpret_cast<const char *>(&statement_id), 4);
++    buffer.write(reinterpret_cast<const char *>(&num_columns), 2);
++    buffer.write(reinterpret_cast<const char *>(&num_params), 2);
++    buffer.write(reinterpret_cast<const char *>(&reserved_1), 1);
++    buffer.write(reinterpret_cast<const char *>(&warnings_count), 2);
++    buffer.write(0x0); // RESULTSET_METADATA_NONE
++}
++
++PreparedStatementResponseOK::PreparedStatementResponseOK(
++    uint32_t statement_id_, uint16_t num_columns_, uint16_t num_params_, uint16_t warnings_count_)
++    : statement_id(statement_id_), num_columns(num_columns_), num_params(num_params_), warnings_count(warnings_count_)
++{
++}
++}
++}
++}
+diff --git a/src/Core/MySQL/PacketsPreparedStatements.h b/src/Core/MySQL/PacketsPreparedStatements.h
+new file mode 100644
+index 000000000000..2c5ab8b55965
+--- /dev/null
++++ b/src/Core/MySQL/PacketsPreparedStatements.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <Core/MySQL/IMySQLWritePacket.h>
++
++namespace DB
++{
++namespace MySQLProtocol
++{
++namespace PreparedStatements
++{
++// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_prepare.html#sect_protocol_com_stmt_prepare_response_ok
++class PreparedStatementResponseOK : public IMySQLWritePacket
++{
++public:
++    const uint8_t status = 0x00;
++    uint32_t statement_id;
++    uint16_t num_columns;
++    uint16_t num_params;
++    const uint8_t reserved_1 = 0;
++    uint16_t warnings_count;
++
++protected:
++    size_t getPayloadSize() const override;
++
++    void writePayloadImpl(WriteBuffer & buffer) const override;
++
++public:
++    PreparedStatementResponseOK(uint32_t statement_id_, uint16_t num_columns_, uint16_t num_params_, uint16_t warnings_count_);
++};
++}
++}
++}
+diff --git a/src/Core/MySQL/PacketsProtocolBinary.cpp b/src/Core/MySQL/PacketsProtocolBinary.cpp
+new file mode 100644
+index 000000000000..9f799d898355
+--- /dev/null
++++ b/src/Core/MySQL/PacketsProtocolBinary.cpp
+@@ -0,0 +1,365 @@
++#include <Columns/IColumn.h>
++#include <Core/MySQL/IMySQLReadPacket.h>
++#include <Core/MySQL/IMySQLWritePacket.h>
++#include <Core/MySQL/PacketsProtocolBinary.h>
++#include "Common/LocalDate.h"
++#include "Common/LocalDateTime.h"
++#include "Columns/ColumnLowCardinality.h"
++#include "Columns/ColumnNullable.h"
++#include "Columns/ColumnVector.h"
++#include "Columns/ColumnsDateTime.h"
++#include "Core/DecimalFunctions.h"
++#include "DataTypes/DataTypeDateTime64.h"
++#include "DataTypes/DataTypeLowCardinality.h"
++#include "DataTypes/DataTypeNullable.h"
++#include "DataTypes/DataTypesNumber.h"
++#include "Formats/FormatSettings.h"
++#include "IO/WriteBufferFromString.h"
++#include "base/DayNum.h"
++#include "base/Decimal.h"
++#include "base/types.h"
++
++namespace DB
++{
++namespace MySQLProtocol
++{
++namespace ProtocolBinary
++{
++ResultSetRow::ResultSetRow(const Serializations & serializations_, const DataTypes & data_types_, const Columns & columns_, int row_num_)
++    : row_num(row_num_), columns(columns_), data_types(data_types_), serializations(serializations_)
++{
++    payload_size = 1 + null_bitmap_size;
++    FormatSettings format_settings;
++    for (size_t i = 0; i < columns.size(); ++i)
++    {
++        ColumnPtr col = getColumn(i);
++        if (col->isNullAt(row_num))
++        {
++            // See https://dev.mysql.com/doc/dev/mysql-server/8.1.0/page_protocol_binary_resultset.html#sect_protocol_binary_resultset_row
++            size_t byte = (i + 2) / 8;
++            int bit = 1 << ((i + 2) % 8);
++            null_bitmap[byte] |= bit;
++            continue; // NULLs are stored in the null bitmap only
++        }
++
++        DataTypePtr data_type = removeLowCardinality(removeNullable((data_types[i])));
++        TypeIndex type_index = data_type->getTypeId();
++        switch (type_index)
++        {
++            case TypeIndex::Int8:
++                payload_size += 1;
++                break;
++            case TypeIndex::UInt8:
++                if (data_type->getName() == "Bool")
++                    payload_size += 2; // BIT MySQL type is string<lenenc> in binary
++                else
++                    payload_size += 1;
++                break;
++            case TypeIndex::Int16:
++            case TypeIndex::UInt16:
++                payload_size += 2;
++                break;
++            case TypeIndex::Int32:
++            case TypeIndex::UInt32:
++            case TypeIndex::Float32:
++                payload_size += 4;
++                break;
++            case TypeIndex::Int64:
++            case TypeIndex::UInt64:
++            case TypeIndex::Float64:
++                payload_size += 8;
++                break;
++            case TypeIndex::Date:
++            case TypeIndex::Date32: {
++                size_t size = 1 // number of bytes following
++                    + 2 // year
++                    + 1 // month
++                    + 1; // day
++                payload_size += size;
++                break;
++            }
++            case TypeIndex::DateTime: {
++                UInt32 value = assert_cast<const ColumnVector<UInt32> &>(*col).getData()[row_num];
++                LocalDateTime ldt = LocalDateTime(value, DateLUT::instance(getDateTimeTimezone(*data_type)));
++
++                bool has_time = !(ldt.hour() == 0 && ldt.minute() == 0 && ldt.second() == 0);
++                size_t size = 1 // number of bytes following
++                    + 2 // year
++                    + 1 // month
++                    + 1; // day
++                payload_size += size;
++                if (has_time)
++                {
++                    size_t additional_size = 1 // hour
++                        + 1 // minute
++                        + 1; // second
++                    payload_size += additional_size;
++                }
++                break;
++            }
++            case TypeIndex::DateTime64: {
++                auto [components, scale] = getDateTime64ComponentsWithScale(data_type, col);
++                if (scale > 6)
++                {
++                    // MySQL Timestamp has max scale of 6
++                    components.fractional /= static_cast<int>(pow(10, scale - 6));
++                }
++
++                LocalDateTime ldt = LocalDateTime(components.whole, DateLUT::instance(getDateTimeTimezone(*data_type)));
++
++                bool has_microseconds = components.fractional != 0;
++                bool has_time = !(ldt.hour() == 0 && ldt.minute() == 0 && ldt.second() == 0);
++                size_t size = 1 // number of bytes following
++                    + 2 // year
++                    + 1 // month
++                    + 1; // day
++                payload_size += size;
++                if (has_microseconds)
++                {
++                    size_t additional_size = 1 // hour
++                        + 1 // minute
++                        + 1 // second
++                        + 4; // microsecond;
++                    payload_size += additional_size;
++                }
++                else if (has_time)
++                {
++                    size_t additional_size = 1 // hour
++                        + 1 // minute
++                        + 1; // second
++                    payload_size += additional_size;
++                }
++                break;
++            }
++            // All other types including all Decimal types are string<lenenc> in binary
++            default:
++                WriteBufferFromOwnString ostr;
++                serializations[i]->serializeText(*columns[i], row_num, ostr, format_settings);
++                payload_size += getLengthEncodedStringSize(ostr.str());
++                serialized[i] = std::move(ostr.str());
++                break;
++        }
++    }
++}
++
++size_t ResultSetRow::getPayloadSize() const
++{
++    return payload_size;
++}
++
++void ResultSetRow::writePayloadImpl(WriteBuffer & buffer) const
++{
++    buffer.write(static_cast<char>(0x00));
++    buffer.write(null_bitmap.data(), null_bitmap_size);
++    for (size_t i = 0; i < columns.size(); ++i)
++    {
++        ColumnPtr col = getColumn(i);
++        if (col->isNullAt(row_num))
++            continue;
++
++        DataTypePtr data_type = removeLowCardinality(removeNullable((data_types[i])));
++        TypeIndex type_index = data_type->getTypeId();
++        switch (type_index)
++        {
++            case TypeIndex::Int8: {
++                Int8 value = assert_cast<const ColumnVector<Int8> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 1);
++                break;
++            }
++            case TypeIndex::UInt8: {
++                UInt8 value = assert_cast<const ColumnVector<UInt8> &>(*col).getData()[row_num];
++                if (data_type->getName() == "Bool")
++                    buffer.write(static_cast<char>(1));
++                buffer.write(reinterpret_cast<char *>(&value), 1);
++                break;
++            }
++            case TypeIndex::Int16: {
++                Int16 value = assert_cast<const ColumnVector<Int16> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 2);
++                break;
++            }
++            case TypeIndex::UInt16: {
++                UInt16 value = assert_cast<const ColumnVector<UInt16> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 2);
++                break;
++            }
++            case TypeIndex::Int32: {
++                Int32 value = assert_cast<const ColumnVector<Int32> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 4);
++                break;
++            }
++            case TypeIndex::UInt32: {
++                UInt32 value = assert_cast<const ColumnVector<UInt32> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 4);
++                break;
++            }
++            case TypeIndex::Float32: {
++                Float32 value = assert_cast<const ColumnVector<Float32> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 4);
++                break;
++            }
++            case TypeIndex::Int64: {
++                Int64 value = assert_cast<const ColumnVector<Int64> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 8);
++                break;
++            }
++            case TypeIndex::UInt64: {
++                UInt64 value = assert_cast<const ColumnVector<UInt64> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 8);
++                break;
++            }
++            case TypeIndex::Float64: {
++                Float64 value = assert_cast<const ColumnVector<Float64> &>(*col).getData()[row_num];
++                buffer.write(reinterpret_cast<char *>(&value), 8);
++                break;
++            }
++            case TypeIndex::Date: {
++                UInt16 value = assert_cast<const ColumnVector<UInt16> &>(*col).getData()[row_num];
++                LocalDate ld = LocalDate(DayNum(value));
++                buffer.write(static_cast<char>(4)); // bytes_following
++                UInt16 year = ld.year();
++                UInt8 month = ld.month();
++                UInt8 day = ld.day();
++                buffer.write(reinterpret_cast<const char *>(&year), 2);
++                buffer.write(reinterpret_cast<const char *>(&month), 1);
++                buffer.write(reinterpret_cast<const char *>(&day), 1);
++                break;
++            }
++            case TypeIndex::Date32: {
++                Int32 value = assert_cast<const ColumnVector<Int32> &>(*col).getData()[row_num];
++                LocalDate ld = LocalDate(ExtendedDayNum(value));
++                buffer.write(static_cast<char>(4)); // bytes_following
++                UInt16 year = ld.year();
++                UInt8 month = ld.month();
++                UInt8 day = ld.day();
++                buffer.write(reinterpret_cast<const char *>(&year), 2);
++                buffer.write(reinterpret_cast<const char *>(&month), 1);
++                buffer.write(reinterpret_cast<const char *>(&day), 1);
++                break;
++            }
++            case TypeIndex::DateTime: {
++                UInt32 value = assert_cast<const ColumnVector<UInt32> &>(*col).getData()[row_num];
++                String timezone = getDateTimeTimezone(*data_type);
++                LocalDateTime ldt = LocalDateTime(value, DateLUT::instance(timezone));
++                UInt16 year = ldt.year();
++                UInt8 month = ldt.month();
++                UInt8 day = ldt.day();
++                UInt8 hour = ldt.hour();
++                UInt8 minute = ldt.minute();
++                UInt8 second = ldt.second();
++                bool has_time = !(hour == 0 && minute == 0 && second == 0);
++                size_t bytes_following = has_time ? 7 : 4;
++                buffer.write(reinterpret_cast<const char *>(&bytes_following), 1);
++                buffer.write(reinterpret_cast<const char *>(&year), 2);
++                buffer.write(reinterpret_cast<const char *>(&month), 1);
++                buffer.write(reinterpret_cast<const char *>(&day), 1);
++                if (has_time)
++                {
++                    buffer.write(reinterpret_cast<const char *>(&hour), 1);
++                    buffer.write(reinterpret_cast<const char *>(&minute), 1);
++                    buffer.write(reinterpret_cast<const char *>(&second), 1);
++                }
++                break;
++            }
++            case TypeIndex::DateTime64: {
++                auto [components, scale] = getDateTime64ComponentsWithScale(data_type, col);
++                if (components.fractional != 0)
++                {
++                    if (scale > 6)
++                    {
++                        // MySQL Timestamp has max scale of 6
++                        components.fractional /= static_cast<int>(pow(10, scale - 6));
++                    }
++                    else
++                    {
++                        // fractional == 1 is a different microsecond value depending on the scale
++                        // Scale 1 = 100000
++                        // Scale 2 = 010000
++                        // Scale 3 = 001000
++                        // Scale 4 = 000100
++                        // Scale 5 = 000010
++                        // Scale 6 = 000001
++                        components.fractional *= static_cast<int>(pow(10, 6 - scale));
++                    }
++                }
++
++                String timezone = getDateTimeTimezone(*data_type);
++                LocalDateTime ldt = LocalDateTime(components.whole, DateLUT::instance(timezone));
++                UInt16 year = ldt.year();
++                UInt8 month = ldt.month();
++                UInt8 day = ldt.day();
++                UInt8 hour = ldt.hour();
++                UInt8 minute = ldt.minute();
++                UInt8 second = ldt.second();
++
++                bool has_time = !(hour == 0 && minute == 0 && second == 0);
++                bool has_microseconds = components.fractional != 0;
++
++                if (has_microseconds)
++                {
++                    buffer.write(static_cast<char>(11)); // bytes_following
++                    buffer.write(reinterpret_cast<const char *>(&year), 2);
++                    buffer.write(reinterpret_cast<const char *>(&month), 1);
++                    buffer.write(reinterpret_cast<const char *>(&day), 1);
++                    buffer.write(reinterpret_cast<const char *>(&hour), 1);
++                    buffer.write(reinterpret_cast<const char *>(&minute), 1);
++                    buffer.write(reinterpret_cast<const char *>(&second), 1);
++                    buffer.write(reinterpret_cast<const char *>(&components.fractional), 4);
++                }
++                else if (has_time)
++                {
++                    buffer.write(static_cast<char>(7)); // bytes_following
++                    buffer.write(reinterpret_cast<const char *>(&year), 2);
++                    buffer.write(reinterpret_cast<const char *>(&month), 1);
++                    buffer.write(reinterpret_cast<const char *>(&day), 1);
++                    buffer.write(reinterpret_cast<const char *>(&hour), 1);
++                    buffer.write(reinterpret_cast<const char *>(&minute), 1);
++                    buffer.write(reinterpret_cast<const char *>(&second), 1);
++                }
++                else
++                {
++                    buffer.write(static_cast<char>(4)); // bytes_following
++                    buffer.write(reinterpret_cast<const char *>(&year), 2);
++                    buffer.write(reinterpret_cast<const char *>(&month), 1);
++                    buffer.write(reinterpret_cast<const char *>(&day), 1);
++                }
++                break;
++            }
++            // All other types including all Decimal types are string<lenenc> in binary
++            default:
++                writeLengthEncodedString(serialized[i], buffer);
++                break;
++        }
++    }
++}
++
++ResultSetRow::DateTime64ComponentsWithScale ResultSetRow::getDateTime64ComponentsWithScale(DataTypePtr data_type, ColumnPtr col) const
++{
++    const auto * date_time_type = typeid_cast<const DataTypeDateTime64 *>(data_type.get());
++
++    static constexpr UInt32 MaxScale = DecimalUtils::max_precision<DateTime64>;
++    UInt32 scale = std::min(MaxScale, date_time_type->getScale());
++
++    const auto value = assert_cast<const ColumnDateTime64 &>(*col).getData()[row_num];
++    auto components = DecimalUtils::split(value, scale);
++
++    using T = typename DateTime64::NativeType;
++    if (value.value < 0 && components.fractional)
++    {
++        components.fractional = DecimalUtils::scaleMultiplier<T>(scale) + (components.whole ? T(-1) : T(1)) * components.fractional;
++        --components.whole;
++    }
++
++    return {components, scale};
++}
++
++ColumnPtr ResultSetRow::getColumn(size_t i) const
++{
++    ColumnPtr col = columns[i]->convertToFullIfNeeded();
++    if (col->isNullable())
++        return assert_cast<const ColumnNullable &>(*col).getNestedColumnPtr();
++    return col;
++}
++}
++}
++}
+diff --git a/src/Core/MySQL/PacketsProtocolBinary.h b/src/Core/MySQL/PacketsProtocolBinary.h
+new file mode 100644
+index 000000000000..a0a4d5684ce8
+--- /dev/null
++++ b/src/Core/MySQL/PacketsProtocolBinary.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include <vector>
++#include <Columns/IColumn.h>
++#include <Core/MySQL/IMySQLReadPacket.h>
++#include <Core/MySQL/IMySQLWritePacket.h>
++#include "Core/DecimalFunctions.h"
++#include "DataTypes/IDataType.h"
++#include "DataTypes/Serializations/ISerialization.h"
++
++namespace DB
++{
++namespace MySQLProtocol
++{
++namespace ProtocolBinary
++{
++class ResultSetRow : public IMySQLWritePacket
++{
++    using DateTime64ComponentsWithScale = std::pair<DecimalUtils::DecimalComponents<DateTime64>, UInt32>;
++
++private:
++    DateTime64ComponentsWithScale getDateTime64ComponentsWithScale(DataTypePtr data_type, ColumnPtr col) const;
++    ColumnPtr getColumn(size_t i) const;
++
++protected:
++    int row_num;
++    const Columns & columns;
++    const DataTypes & data_types;
++    const Serializations & serializations;
++
++    std::vector<String> serialized = std::vector<String>(columns.size());
++
++    // See https://dev.mysql.com/doc/dev/mysql-server/8.1.0/page_protocol_binary_resultset.html#sect_protocol_binary_resultset_row
++    size_t null_bitmap_size = (columns.size() + 7 + 2) / 8;
++    std::vector<char> null_bitmap = std::vector<char>(null_bitmap_size, static_cast<char>(0));
++
++    size_t payload_size = 0;
++
++    size_t getPayloadSize() const override;
++
++    void writePayloadImpl(WriteBuffer & buffer) const override;
++
++public:
++    ResultSetRow(const Serializations & serializations_, const DataTypes & data_types_, const Columns & columns_, int row_num_);
++};
++}
++}
++}
+diff --git a/src/Core/MySQL/PacketsProtocolText.cpp b/src/Core/MySQL/PacketsProtocolText.cpp
+index 728e8061e874..3be8acad3ea2 100644
+--- a/src/Core/MySQL/PacketsProtocolText.cpp
++++ b/src/Core/MySQL/PacketsProtocolText.cpp
+@@ -1,7 +1,12 @@
+ #include <Core/MySQL/PacketsProtocolText.h>
+-#include <IO/WriteBufferFromString.h>
+ #include <IO/ReadHelpers.h>
++#include <IO/WriteBufferFromString.h>
+ #include <IO/WriteHelpers.h>
++#include "Common/assert_cast.h"
++#include "Core/MySQL/IMySQLWritePacket.h"
++#include "DataTypes/DataTypeLowCardinality.h"
++#include "DataTypes/DataTypeNullable.h"
++#include "DataTypes/DataTypesDecimal.h"
+ 
+ namespace DB
+ {
+@@ -131,16 +136,25 @@ void ColumnDefinition::writePayloadImpl(WriteBuffer & buffer) const
+     }
+ }
+ 
+-ColumnDefinition getColumnDefinition(const String & column_name, const TypeIndex type_index)
++ColumnDefinition getColumnDefinition(const String & column_name, const DataTypePtr & data_type)
+ {
+     ColumnType column_type;
+     CharacterSet charset = CharacterSet::binary;
+     int flags = 0;
++    uint8_t decimals = 0;
++    TypeIndex type_index = removeLowCardinality(removeNullable(data_type))->getTypeId();
+     switch (type_index)
+     {
+         case TypeIndex::UInt8:
+-            column_type = ColumnType::MYSQL_TYPE_TINY;
+-            flags = ColumnDefinitionFlags::BINARY_FLAG | ColumnDefinitionFlags::UNSIGNED_FLAG;
++            if (data_type->getName() == "Bool")
++            {
++                column_type = ColumnType::MYSQL_TYPE_BIT;
++            }
++            else
++            {
++                column_type = ColumnType::MYSQL_TYPE_TINY;
++                flags = ColumnDefinitionFlags::BINARY_FLAG | ColumnDefinitionFlags::UNSIGNED_FLAG;
++            }
+             break;
+         case TypeIndex::UInt16:
+             column_type = ColumnType::MYSQL_TYPE_SHORT;
+@@ -173,30 +187,51 @@ ColumnDefinition getColumnDefinition(const String & column_name, const TypeIndex
+         case TypeIndex::Float32:
+             column_type = ColumnType::MYSQL_TYPE_FLOAT;
+             flags = ColumnDefinitionFlags::BINARY_FLAG;
++            decimals = 31;
+             break;
+         case TypeIndex::Float64:
+             column_type = ColumnType::MYSQL_TYPE_DOUBLE;
+             flags = ColumnDefinitionFlags::BINARY_FLAG;
++            decimals = 31;
+             break;
+         case TypeIndex::Date:
++        case TypeIndex::Date32:
+             column_type = ColumnType::MYSQL_TYPE_DATE;
+             flags = ColumnDefinitionFlags::BINARY_FLAG;
+             break;
+         case TypeIndex::DateTime:
++        case TypeIndex::DateTime64:
+             column_type = ColumnType::MYSQL_TYPE_DATETIME;
+             flags = ColumnDefinitionFlags::BINARY_FLAG;
+             break;
+-        case TypeIndex::String:
+-        case TypeIndex::FixedString:
+-            column_type = ColumnType::MYSQL_TYPE_STRING;
+-            charset = CharacterSet::utf8_general_ci;
++        case TypeIndex::Decimal32:
++        case TypeIndex::Decimal64:
++            column_type = ColumnType::MYSQL_TYPE_DECIMAL;
++            flags = ColumnDefinitionFlags::BINARY_FLAG;
+             break;
++        case TypeIndex::Decimal128: {
++            // MySQL Decimal has max 65 precision and 30 scale
++            // Decimal256 (min scale is 39) is higher than the MySQL supported range and handled in the default case
++            // See https://dev.mysql.com/doc/refman/8.0/en/precision-math-decimal-characteristics.html
++            const auto & type = assert_cast<const DataTypeDecimal128 &>(*data_type);
++            if (type.getPrecision() > 65 || type.getScale() > 30)
++            {
++                column_type = ColumnType::MYSQL_TYPE_STRING;
++                charset = CharacterSet::utf8_general_ci;
++            }
++            else
++            {
++                column_type = ColumnType::MYSQL_TYPE_DECIMAL;
++                flags = ColumnDefinitionFlags::BINARY_FLAG;
++            }
++            break;
++        }
+         default:
+             column_type = ColumnType::MYSQL_TYPE_STRING;
+             charset = CharacterSet::utf8_general_ci;
+             break;
+     }
+-    return ColumnDefinition(column_name, charset, 0, column_type, flags, 0);
++    return ColumnDefinition(column_name, charset, 0, column_type, flags, decimals);
+ }
+ 
+ }
+diff --git a/src/Core/MySQL/PacketsProtocolText.h b/src/Core/MySQL/PacketsProtocolText.h
+index aeeedc4dbf8c..1de9aabe9bb1 100644
+--- a/src/Core/MySQL/PacketsProtocolText.h
++++ b/src/Core/MySQL/PacketsProtocolText.h
+@@ -116,16 +116,29 @@ class ColumnDefinition : public IMySQLWritePacket, public IMySQLReadPacket
+     ColumnDefinition();
+ 
+     ColumnDefinition(
+-        String schema_, String table_, String org_table_, String name_, String org_name_, uint16_t character_set_, uint32_t column_length_,
+-        ColumnType column_type_, uint16_t flags_, uint8_t decimals_, bool with_defaults_ = false);
++        String schema_,
++        String table_,
++        String org_table_,
++        String name_,
++        String org_name_,
++        uint16_t character_set_,
++        uint32_t column_length_,
++        ColumnType column_type_,
++        uint16_t flags_,
++        uint8_t decimals_,
++        bool with_defaults_ = false);
+ 
+     /// Should be used when column metadata (original name, table, original table, database) is unknown.
+     ColumnDefinition(
+-        String name_, uint16_t character_set_, uint32_t column_length_, ColumnType column_type_, uint16_t flags_, uint8_t decimals_);
+-
++        String name_,
++        uint16_t character_set_,
++        uint32_t column_length_,
++        ColumnType column_type_,
++        uint16_t flags_,
++        uint8_t decimals_);
+ };
+ 
+-ColumnDefinition getColumnDefinition(const String & column_name, const TypeIndex index);
++ColumnDefinition getColumnDefinition(const String & column_name, const DataTypePtr & data_type);
+ 
+ }
+ 
+diff --git a/src/DataTypes/DataTypesDecimal.cpp b/src/DataTypes/DataTypesDecimal.cpp
+index 6529ce094566..49214f4aa459 100644
+--- a/src/DataTypes/DataTypesDecimal.cpp
++++ b/src/DataTypes/DataTypesDecimal.cpp
+@@ -31,6 +31,12 @@ std::string DataTypeDecimal<T>::doGetName() const
+ template <is_decimal T>
+ std::string DataTypeDecimal<T>::getSQLCompatibleName() const
+ {
++    /// See https://dev.mysql.com/doc/refman/8.0/en/precision-math-decimal-characteristics.html
++    /// DECIMAL(M,D)
++    /// M is the maximum number of digits (the precision). It has a range of 1 to 65.
++    /// D is the number of digits to the right of the decimal point (the scale). It has a range of 0 to 30 and must be no larger than M.
++    if (this->precision > 65 || this->scale > 30)
++        return "TEXT";
+     return fmt::format("DECIMAL({}, {})", this->precision, this->scale);
+ }
+ 
+diff --git a/src/Formats/FormatSettings.h b/src/Formats/FormatSettings.h
+index c2744f680882..db35f8925a50 100644
+--- a/src/Formats/FormatSettings.h
++++ b/src/Formats/FormatSettings.h
+@@ -288,6 +288,14 @@ struct FormatSettings
+         uint32_t client_capabilities = 0;
+         size_t max_packet_size = 0;
+         uint8_t * sequence_id = nullptr; /// Not null if it's MySQLWire output format used to handle MySQL protocol connections.
++        /**
++         * COM_QUERY uses Text ResultSet
++         * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
++         * COM_STMT_EXECUTE uses Binary Protocol ResultSet
++         * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute_response.html
++         * By default, use Text ResultSet.
++         */
++        bool binary_protocol = false;
+     } mysql_wire;
+ 
+     struct
+diff --git a/src/Interpreters/InterpreterShowColumnsQuery.cpp b/src/Interpreters/InterpreterShowColumnsQuery.cpp
+index c86d3c753c49..e1f736ba4fb3 100644
+--- a/src/Interpreters/InterpreterShowColumnsQuery.cpp
++++ b/src/Interpreters/InterpreterShowColumnsQuery.cpp
+@@ -37,11 +37,14 @@ String InterpreterShowColumnsQuery::getRewrittenQuery()
+ SELECT
+     name AS field,
+     type AS type,
+-    startsWith(type, 'Nullable') AS null,
++    if (startsWith(type, 'Nullable'), 'YES', 'NO') AS `null`,
+     trim(concatWithSeparator(' ', if (is_in_primary_key, 'PRI', ''), if (is_in_sorting_key, 'SOR', ''))) AS key,
+     if (default_kind IN ('ALIAS', 'DEFAULT', 'MATERIALIZED'), default_expression, NULL) AS default,
+     '' AS extra )";
+ 
++    // Known issue: Field 'null' is wrong for types like 'LowCardinality(Nullable(String))'. Can't simply replace 'startsWith' by
++    // `hasSubsequence` as that would return `true` for non-nullable types such as `Tuple(Nullable(String), String)`...
++
+     // TODO Interpret query.extended. It is supposed to show internal/virtual columns. Need to fetch virtual column names, see
+     // IStorage::getVirtuals(). We can't easily do that via SQL.
+ 
+diff --git a/src/Processors/Formats/Impl/MySQLOutputFormat.cpp b/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
+index f2157f63c252..87c8c742f8db 100644
+--- a/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
+@@ -1,19 +1,19 @@
+ #include <Processors/Formats/Impl/MySQLOutputFormat.h>
+ #include <Core/MySQL/PacketsGeneric.h>
++#include <Core/MySQL/PacketsProtocolBinary.h>
+ #include <Core/MySQL/PacketsProtocolText.h>
+ #include <Formats/FormatFactory.h>
+ #include <Formats/FormatSettings.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/ProcessList.h>
+ 
+-
+ namespace DB
+ {
+ 
+ using namespace MySQLProtocol;
+ using namespace MySQLProtocol::Generic;
+ using namespace MySQLProtocol::ProtocolText;
+-
++using namespace MySQLProtocol::ProtocolBinary;
+ 
+ MySQLOutputFormat::MySQLOutputFormat(WriteBuffer & out_, const Block & header_, const FormatSettings & settings_)
+     : IOutputFormat(header_, out_)
+@@ -24,6 +24,8 @@ MySQLOutputFormat::MySQLOutputFormat(WriteBuffer & out_, const Block & header_,
+     /// But it's also possible to specify MySQLWire as output format for clickhouse-client or clickhouse-local.
+     /// There is no `sequence_id` stored in `settings_.mysql_wire` in this case, so we create a dummy one.
+     sequence_id = settings_.mysql_wire.sequence_id ? settings_.mysql_wire.sequence_id : &dummy_sequence_id;
++    /// Switch between Text (COM_QUERY) and Binary (COM_EXECUTE_STMT) ResultSet
++    use_binary_result_set = settings_.mysql_wire.binary_protocol;
+ 
+     const auto & header = getPort(PortKind::Main).getHeader();
+     data_types = header.getDataTypes();
+@@ -51,10 +53,10 @@ void MySQLOutputFormat::writePrefix()
+         for (size_t i = 0; i < header.columns(); ++i)
+         {
+             const auto & column_name = header.getColumnsWithTypeAndName()[i].name;
+-            packet_endpoint->sendPacket(getColumnDefinition(column_name, data_types[i]->getTypeId()));
++            packet_endpoint->sendPacket(getColumnDefinition(column_name, data_types[i]));
+         }
+ 
+-        if (!(client_capabilities & Capability::CLIENT_DEPRECATE_EOF))
++        if (!(client_capabilities & Capability::CLIENT_DEPRECATE_EOF) && !use_binary_result_set)
+         {
+             packet_endpoint->sendPacket(EOFPacket(0, 0));
+         }
+@@ -63,39 +65,67 @@ void MySQLOutputFormat::writePrefix()
+ 
+ void MySQLOutputFormat::consume(Chunk chunk)
+ {
+-    for (size_t i = 0; i < chunk.getNumRows(); ++i)
++    if (!use_binary_result_set)
+     {
+-        ProtocolText::ResultSetRow row_packet(serializations, chunk.getColumns(), static_cast<int>(i));
+-        packet_endpoint->sendPacket(row_packet);
++        for (size_t i = 0; i < chunk.getNumRows(); ++i)
++        {
++            ProtocolText::ResultSetRow row_packet(serializations, chunk.getColumns(), static_cast<int>(i));
++            packet_endpoint->sendPacket(row_packet);
++        }
++    }
++    else
++    {
++        for (size_t i = 0; i < chunk.getNumRows(); ++i)
++        {
++            ProtocolBinary::ResultSetRow row_packet(serializations, data_types, chunk.getColumns(), static_cast<int>(i));
++            packet_endpoint->sendPacket(row_packet);
++        }
+     }
+ }
+ 
+ void MySQLOutputFormat::finalizeImpl()
+ {
+-    size_t affected_rows = 0;
+-    std::string human_readable_info;
+-    if (QueryStatusPtr process_list_elem = getContext()->getProcessListElement())
++    if (!use_binary_result_set)
+     {
+-        CurrentThread::finalizePerformanceCounters();
+-        QueryStatusInfo info = process_list_elem->getInfo();
+-        affected_rows = info.written_rows;
+-        double elapsed_seconds = static_cast<double>(info.elapsed_microseconds) / 1000000.0;
+-        human_readable_info = fmt::format(
+-            "Read {} rows, {} in {} sec., {} rows/sec., {}/sec.",
+-            info.read_rows,
+-            ReadableSize(info.read_bytes),
+-            elapsed_seconds,
+-            static_cast<size_t>(info.read_rows / elapsed_seconds),
+-            ReadableSize(info.read_bytes / elapsed_seconds));
+-    }
++        size_t affected_rows = 0;
++        std::string human_readable_info;
++        if (QueryStatusPtr process_list_elem = getContext()->getProcessListElement())
++        {
++            CurrentThread::finalizePerformanceCounters();
++            QueryStatusInfo info = process_list_elem->getInfo();
++            affected_rows = info.written_rows;
++            double elapsed_seconds = static_cast<double>(info.elapsed_microseconds) / 1000000.0;
++            human_readable_info = fmt::format(
++                "Read {} rows, {} in {} sec., {} rows/sec., {}/sec.",
++                info.read_rows,
++                ReadableSize(info.read_bytes),
++                elapsed_seconds,
++                static_cast<size_t>(info.read_rows / elapsed_seconds),
++                ReadableSize(info.read_bytes / elapsed_seconds));
++        }
+ 
+-    const auto & header = getPort(PortKind::Main).getHeader();
+-    if (header.columns() == 0)
+-        packet_endpoint->sendPacket(OKPacket(0x0, client_capabilities, affected_rows, 0, 0, "", human_readable_info), true);
+-    else if (client_capabilities & CLIENT_DEPRECATE_EOF)
+-        packet_endpoint->sendPacket(OKPacket(0xfe, client_capabilities, affected_rows, 0, 0, "", human_readable_info), true);
++        const auto & header = getPort(PortKind::Main).getHeader();
++        if (header.columns() == 0)
++            packet_endpoint->sendPacket(OKPacket(0x0, client_capabilities, affected_rows, 0, 0, "", human_readable_info), true);
++        else if (client_capabilities & CLIENT_DEPRECATE_EOF)
++            packet_endpoint->sendPacket(OKPacket(0xfe, client_capabilities, affected_rows, 0, 0, "", human_readable_info), true);
++        else
++            packet_endpoint->sendPacket(EOFPacket(0, 0), true);
++    }
+     else
+-        packet_endpoint->sendPacket(EOFPacket(0, 0), true);
++    {
++        size_t affected_rows = 0;
++        if (QueryStatusPtr process_list_elem = getContext()->getProcessListElement())
++        {
++            CurrentThread::finalizePerformanceCounters();
++            QueryStatusInfo info = process_list_elem->getInfo();
++            affected_rows = info.written_rows;
++        }
++        if (client_capabilities & CLIENT_DEPRECATE_EOF)
++            packet_endpoint->sendPacket(OKPacket(0xfe, client_capabilities, affected_rows, 0, 0, "", ""), true);
++        else
++            packet_endpoint->sendPacket(EOFPacket(0, 0), true);
++    }
+ }
+ 
+ void MySQLOutputFormat::flush()
+diff --git a/src/Processors/Formats/Impl/MySQLOutputFormat.h b/src/Processors/Formats/Impl/MySQLOutputFormat.h
+index 9481ef670703..6161b6bdc14f 100644
+--- a/src/Processors/Formats/Impl/MySQLOutputFormat.h
++++ b/src/Processors/Formats/Impl/MySQLOutputFormat.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+-#include <Processors/Formats/IRowOutputFormat.h>
+ #include <Core/Block.h>
++#include <Processors/Formats/IRowOutputFormat.h>
+ 
+ #include <Core/MySQL/PacketEndpoint.h>
+ #include <Processors/Formats/IOutputFormat.h>
+@@ -39,6 +39,7 @@ class MySQLOutputFormat final : public IOutputFormat, WithContext
+     MySQLProtocol::PacketEndpointPtr packet_endpoint;
+     DataTypes data_types;
+     Serializations serializations;
++    bool use_binary_result_set = false;
+ };
+ 
+ }
+diff --git a/src/Server/MySQLHandler.cpp b/src/Server/MySQLHandler.cpp
+index f98b86e6cf82..f9155a07e2b5 100644
+--- a/src/Server/MySQLHandler.cpp
++++ b/src/Server/MySQLHandler.cpp
+@@ -1,28 +1,30 @@
+ #include "MySQLHandler.h"
+ 
+ #include <limits>
+-#include <Common/NetException.h>
+-#include <Common/OpenSSLHelpers.h>
+-#include <Core/MySQL/PacketsGeneric.h>
++#include <optional>
++#include <regex>
++#include <Core/MySQL/Authentication.h>
+ #include <Core/MySQL/PacketsConnection.h>
++#include <Core/MySQL/PacketsGeneric.h>
++#include <Core/MySQL/PacketsPreparedStatements.h>
+ #include <Core/MySQL/PacketsProtocolText.h>
+ #include <Core/NamesAndTypes.h>
+-#include <Interpreters/Session.h>
+-#include <Interpreters/executeQuery.h>
+-#include <IO/copyData.h>
+ #include <IO/LimitReadBuffer.h>
+ #include <IO/ReadBufferFromPocoSocket.h>
+ #include <IO/ReadBufferFromString.h>
++#include <IO/ReadHelpers.h>
+ #include <IO/WriteBufferFromPocoSocket.h>
+ #include <IO/WriteBufferFromString.h>
+-#include <IO/ReadHelpers.h>
++#include <IO/copyData.h>
++#include <Interpreters/Session.h>
++#include <Interpreters/executeQuery.h>
+ #include <Server/TCPServer.h>
+ #include <Storages/IStorage.h>
+-#include <regex>
+-#include <Common/setThreadName.h>
+-#include <Core/MySQL/Authentication.h>
+-#include <Common/logger_useful.h>
+ #include <base/scope_guard.h>
++#include <Common/NetException.h>
++#include <Common/OpenSSLHelpers.h>
++#include <Common/logger_useful.h>
++#include <Common/setThreadName.h>
+ 
+ #include "config_version.h"
+ 
+@@ -40,6 +42,7 @@ using namespace MySQLProtocol;
+ using namespace MySQLProtocol::Generic;
+ using namespace MySQLProtocol::ProtocolText;
+ using namespace MySQLProtocol::ConnectionPhase;
++using namespace MySQLProtocol::PreparedStatements;
+ 
+ #if USE_SSL
+ using Poco::Net::SecureStreamSocket;
+@@ -173,7 +176,7 @@ void MySQLHandler::run()
+                         comInitDB(limited_payload);
+                         break;
+                     case COM_QUERY:
+-                        comQuery(payload);
++                        comQuery(payload, false);
+                         break;
+                     case COM_FIELD_LIST:
+                         comFieldList(limited_payload);
+@@ -181,6 +184,15 @@ void MySQLHandler::run()
+                     case COM_PING:
+                         comPing();
+                         break;
++                    case COM_STMT_PREPARE:
++                        comStmtPrepare(payload);
++                        break;
++                    case COM_STMT_EXECUTE:
++                        comStmtExecute(payload);
++                        break;
++                    case COM_STMT_CLOSE:
++                        comStmtClose(payload);
++                        break;
+                     default:
+                         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Command {} is not implemented.", command);
+                 }
+@@ -254,7 +266,8 @@ void MySQLHandler::authenticate(const String & user_name, const String & auth_pl
+ {
+     try
+     {
+-        // For compatibility with JavaScript MySQL client, Native41 authentication plugin is used when possible (if password is specified using double SHA1). Otherwise SHA256 plugin is used.
++        // For compatibility with JavaScript MySQL client, Native41 authentication plugin is used when possible
++        // (if password is specified using double SHA1). Otherwise, SHA256 plugin is used.
+         if (session->getAuthenticationTypeOrLogInFailure(user_name) == DB::AuthenticationType::SHA256_PASSWORD)
+         {
+             authPluginSSL();
+@@ -306,7 +319,7 @@ void MySQLHandler::comPing()
+ 
+ static bool isFederatedServerSetupSetCommand(const String & query);
+ 
+-void MySQLHandler::comQuery(ReadBuffer & payload)
++void MySQLHandler::comQuery(ReadBuffer & payload, bool binary_protocol)
+ {
+     String query = String(payload.position(), payload.buffer().end());
+ 
+@@ -352,6 +365,7 @@ void MySQLHandler::comQuery(ReadBuffer & payload)
+         format_settings.mysql_wire.client_capabilities = client_capabilities;
+         format_settings.mysql_wire.max_packet_size = max_packet_size;
+         format_settings.mysql_wire.sequence_id = &sequence_id;
++        format_settings.mysql_wire.binary_protocol = binary_protocol;
+ 
+         auto set_result_details = [&with_output](const QueryResultDetails & details)
+         {
+@@ -371,6 +385,90 @@ void MySQLHandler::comQuery(ReadBuffer & payload)
+     }
+ }
+ 
++void MySQLHandler::comStmtPrepare(DB::ReadBuffer & payload)
++{
++    String statement;
++    readStringUntilEOF(statement, payload);
++
++    auto statement_id_opt = emplacePreparedStatement(std::move(statement));
++    if (statement_id_opt.has_value())
++        packet_endpoint->sendPacket(PreparedStatementResponseOK(statement_id_opt.value(), 0, 0, 0), true);
++    else
++        packet_endpoint->sendPacket(ERRPacket(), true);
++}
++
++void MySQLHandler::comStmtExecute(ReadBuffer & payload)
++{
++    uint32_t statement_id;
++    payload.readStrict(reinterpret_cast<char *>(&statement_id), 4);
++
++    auto statement_opt = getPreparedStatement(statement_id);
++    if (statement_opt.has_value())
++        MySQLHandler::comQuery(statement_opt.value(), true);
++    else
++        packet_endpoint->sendPacket(ERRPacket(), true);
++};
++
++void MySQLHandler::comStmtClose(ReadBuffer & payload)
++{
++    uint32_t statement_id;
++    payload.readStrict(reinterpret_cast<char *>(&statement_id), 4);
++
++    // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_close.html
++    // No response packet is sent back to the client.
++    erasePreparedStatement(statement_id);
++};
++
++std::optional<UInt32> MySQLHandler::emplacePreparedStatement(String statement)
++{
++    static constexpr size_t MAX_PREPARED_STATEMENTS = 10'000;
++    std::lock_guard<std::mutex> lock(prepared_statements_mutex);
++    if (prepared_statements.size() > MAX_PREPARED_STATEMENTS) /// Shouldn't happen in reality as COM_STMT_CLOSE cleans up the elements
++    {
++        LOG_ERROR(log, "Too many prepared statements");
++        current_prepared_statement_id = 0;
++        prepared_statements.clear();
++        return {};
++    }
++
++    uint32_t statement_id = current_prepared_statement_id;
++    ++current_prepared_statement_id;
++
++    // Key collisions should not happen here, as we remove the elements from the map with COM_STMT_CLOSE,
++    // and we have quite a big range of available identifiers with 32-bit unsigned integer
++    if (prepared_statements.contains(statement_id))
++    {
++        LOG_ERROR(
++            log,
++            "Failed to store a new statement `{}` with id {}; it is already taken by `{}`",
++            statement,
++            statement_id,
++            prepared_statements.at(statement_id));
++        return {};
++    }
++
++    prepared_statements.emplace(statement_id, statement);
++    return std::make_optional(statement_id);
++};
++
++std::optional<ReadBufferFromString> MySQLHandler::getPreparedStatement(UInt32 statement_id)
++{
++    std::lock_guard<std::mutex> lock(prepared_statements_mutex);
++    if (!prepared_statements.contains(statement_id))
++    {
++        LOG_ERROR(log, "Could not find prepared statement with id {}", statement_id);
++        return {};
++    }
++    // Temporary workaround as we work only with queries that do not bind any parameters atm
++    return std::make_optional<ReadBufferFromString>(prepared_statements.at(statement_id));
++}
++
++void MySQLHandler::erasePreparedStatement(UInt32 statement_id)
++{
++    std::lock_guard<std::mutex> lock(prepared_statements_mutex);
++    prepared_statements.erase(statement_id);
++}
++
+ void MySQLHandler::authPluginSSL()
+ {
+     throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+diff --git a/src/Server/MySQLHandler.h b/src/Server/MySQLHandler.h
+index 3366e8792c9e..194b18bdc39f 100644
+--- a/src/Server/MySQLHandler.h
++++ b/src/Server/MySQLHandler.h
+@@ -1,14 +1,17 @@
+ #pragma once
+ 
+-#include <Poco/Net/TCPServerConnection.h>
+-#include <base/getFQDNOrHostName.h>
+-#include <Common/CurrentMetrics.h>
++#include <optional>
+ #include <Core/MySQL/Authentication.h>
+-#include <Core/MySQL/PacketsGeneric.h>
+ #include <Core/MySQL/PacketsConnection.h>
++#include <Core/MySQL/PacketsGeneric.h>
+ #include <Core/MySQL/PacketsProtocolText.h>
++#include <base/getFQDNOrHostName.h>
++#include <Poco/Net/TCPServerConnection.h>
++#include <Common/CurrentMetrics.h>
++#include "IO/ReadBufferFromString.h"
+ #include "IServer.h"
+ 
++#include "base/types.h"
+ #include "config.h"
+ 
+ #if USE_SSL
+@@ -30,6 +33,9 @@ class TCPServer;
+ /// Handler for MySQL wire protocol connections. Allows to connect to ClickHouse using MySQL client.
+ class MySQLHandler : public Poco::Net::TCPServerConnection
+ {
++    /// statement_id -> statement
++    using PreparedStatements = std::unordered_map<UInt32, String>;
++
+ public:
+     MySQLHandler(
+         IServer & server_,
+@@ -46,7 +52,7 @@ class MySQLHandler : public Poco::Net::TCPServerConnection
+     /// Enables SSL, if client requested.
+     void finishHandshake(MySQLProtocol::ConnectionPhase::HandshakeResponse &);
+ 
+-    void comQuery(ReadBuffer & payload);
++    void comQuery(ReadBuffer & payload, bool binary_protocol);
+ 
+     void comFieldList(ReadBuffer & payload);
+ 
+@@ -56,6 +62,18 @@ class MySQLHandler : public Poco::Net::TCPServerConnection
+ 
+     void authenticate(const String & user_name, const String & auth_plugin_name, const String & auth_response);
+ 
++    void comStmtPrepare(ReadBuffer & payload);
++
++    void comStmtExecute(ReadBuffer & payload);
++
++    void comStmtClose(ReadBuffer & payload);
++
++    /// Contains statement_id if the statement was emplaced successfully
++    std::optional<UInt32> emplacePreparedStatement(String statement);
++    /// Contains statement as a buffer if we could find previously stored statement using provided statement_id
++    std::optional<ReadBufferFromString> getPreparedStatement(UInt32 statement_id);
++    void erasePreparedStatement(UInt32 statement_id);
++
+     virtual void authPluginSSL();
+     virtual void finishHandshakeSSL(size_t packet_size, char * buf, size_t pos, std::function<void(size_t)> read_bytes, MySQLProtocol::ConnectionPhase::HandshakeResponse & packet);
+ 
+@@ -76,6 +94,10 @@ class MySQLHandler : public Poco::Net::TCPServerConnection
+     using Replacements = std::unordered_map<std::string, ReplacementFn>;
+     Replacements replacements;
+ 
++    std::mutex prepared_statements_mutex;
++    UInt32 current_prepared_statement_id TSA_GUARDED_BY(prepared_statements_mutex) = 0;
++    PreparedStatements prepared_statements TSA_GUARDED_BY(prepared_statements_mutex);
++
+     std::unique_ptr<MySQLProtocol::Authentication::IPlugin> auth_plugin;
+     std::shared_ptr<ReadBufferFromPocoSocket> in;
+     std::shared_ptr<WriteBuffer> out;

@@ -1,0 +1,192 @@
+diff --git a/programs/client/Client.cpp b/programs/client/Client.cpp
+index 396cd3e646b1..9ae5dd735edb 100644
+--- a/programs/client/Client.cpp
++++ b/programs/client/Client.cpp
+@@ -1178,7 +1178,7 @@ void Client::processConfig()
+ 
+     pager = config().getString("pager", "");
+ 
+-    setDefaultFormatsFromConfiguration();
++    setDefaultFormatsAndCompressionFromConfiguration();
+ 
+     global_context->setClientName(std::string(DEFAULT_CLIENT_NAME));
+     global_context->setQueryKindInitial();
+diff --git a/programs/local/LocalServer.cpp b/programs/local/LocalServer.cpp
+index 5f2a51406e15..f18c03062546 100644
+--- a/programs/local/LocalServer.cpp
++++ b/programs/local/LocalServer.cpp
+@@ -611,7 +611,7 @@ void LocalServer::processConfig()
+     if (config().has("macros"))
+         global_context->setMacros(std::make_unique<Macros>(config(), "macros", log));
+ 
+-    setDefaultFormatsFromConfiguration();
++    setDefaultFormatsAndCompressionFromConfiguration();
+ 
+     /// Sets external authenticators config (LDAP, Kerberos).
+     global_context->setExternalAuthenticatorsConfig(config());
+diff --git a/src/Client/ClientBase.cpp b/src/Client/ClientBase.cpp
+index bd4430648c58..61d95e6eb4c8 100644
+--- a/src/Client/ClientBase.cpp
++++ b/src/Client/ClientBase.cpp
+@@ -21,6 +21,7 @@
+ #include <Common/StringUtils/StringUtils.h>
+ #include <Common/filesystemHelpers.h>
+ #include <Common/NetException.h>
++#include <Common/tryGetFileNameByFileDescriptor.h>
+ #include <Columns/ColumnString.h>
+ #include <Columns/ColumnsNumber.h>
+ #include <Formats/FormatFactory.h>
+@@ -643,6 +644,9 @@ try
+         bool extras_into_stdout = need_render_progress || logs_into_stdout;
+         bool select_only_into_file = select_into_file && !select_into_file_and_stdout;
+ 
++        if (!out_file_buf && default_output_compression_method != CompressionMethod::None)
++            out_file_buf = wrapWriteBufferWithCompressionMethod(out_buf, default_output_compression_method, 3, 0);
++
+         /// It is not clear how to write progress and logs
+         /// intermixed with data with parallel formatting.
+         /// It may increase code complexity significantly.
+@@ -735,7 +739,7 @@ bool ClientBase::isRegularFile(int fd)
+     return fstat(fd, &file_stat) == 0 && S_ISREG(file_stat.st_mode);
+ }
+ 
+-void ClientBase::setDefaultFormatsFromConfiguration()
++void ClientBase::setDefaultFormatsAndCompressionFromConfiguration()
+ {
+     if (config().has("output-format"))
+     {
+@@ -759,6 +763,10 @@ void ClientBase::setDefaultFormatsFromConfiguration()
+             default_output_format = *format_from_file_name;
+         else
+             default_output_format = "TSV";
++
++        std::optional<String> file_name = tryGetFileNameFromFileDescriptor(STDOUT_FILENO);
++        if (file_name)
++            default_output_compression_method = chooseCompressionMethod(*file_name, "");
+     }
+     else if (is_interactive)
+     {
+diff --git a/src/Client/ClientBase.h b/src/Client/ClientBase.h
+index 64cbdbe8989c..7a0489641c8c 100644
+--- a/src/Client/ClientBase.h
++++ b/src/Client/ClientBase.h
+@@ -190,7 +190,7 @@ class ClientBase : public Poco::Util::Application, public IHints<2>
+     /// Adjust some settings after command line options and config had been processed.
+     void adjustSettings();
+ 
+-    void setDefaultFormatsFromConfiguration();
++    void setDefaultFormatsAndCompressionFromConfiguration();
+ 
+     void initTTYBuffer(ProgressOption progress);
+ 
+@@ -224,6 +224,7 @@ class ClientBase : public Poco::Util::Application, public IHints<2>
+     String pager;
+ 
+     String default_output_format; /// Query results output format.
++    CompressionMethod default_output_compression_method = CompressionMethod::None;
+     String default_input_format; /// Tables' format for clickhouse-local.
+ 
+     bool select_into_file = false; /// If writing result INTO OUTFILE. It affects progress rendering.
+diff --git a/src/Common/tryGetFileNameByFileDescriptor.cpp b/src/Common/tryGetFileNameByFileDescriptor.cpp
+new file mode 100644
+index 000000000000..47e810503886
+--- /dev/null
++++ b/src/Common/tryGetFileNameByFileDescriptor.cpp
+@@ -0,0 +1,33 @@
++#include <Common/tryGetFileNameByFileDescriptor.h>
++
++#ifdef OS_LINUX
++#    include <unistd.h>
++#elif defined(OS_DARWIN)
++#    include <fcntl.h>
++#endif
++
++#include <fmt/format.h>
++
++
++namespace DB
++{
++std::optional<String> tryGetFileNameFromFileDescriptor(int fd)
++{
++#ifdef OS_LINUX
++    std::string proc_path = fmt::format("/proc/self/fd/{}", fd);
++    char file_path[PATH_MAX] = {'\0'};
++    if (readlink(proc_path.c_str(), file_path, sizeof(file_path) - 1) != -1)
++        return file_path;
++    return std::nullopt;
++#elif defined(OS_DARWIN)
++    char file_path[PATH_MAX] = {'\0'};
++    if (fcntl(fd, F_GETPATH, file_path) != -1)
++        return file_path;
++    return std::nullopt;
++#else
++    (void)fd;
++    return std::nullopt;
++#endif
++}
++
++}
+diff --git a/src/Common/tryGetFileNameByFileDescriptor.h b/src/Common/tryGetFileNameByFileDescriptor.h
+new file mode 100644
+index 000000000000..c38ccb4f8510
+--- /dev/null
++++ b/src/Common/tryGetFileNameByFileDescriptor.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <optional>
++#include <base/types.h>
++
++namespace DB
++{
++/// Supports only Linux/MacOS. On other platforms, returns nullopt.
++std::optional<String> tryGetFileNameFromFileDescriptor(int fd);
++}
+diff --git a/src/Formats/FormatFactory.cpp b/src/Formats/FormatFactory.cpp
+index b7e9899da46d..783daba44fd1 100644
+--- a/src/Formats/FormatFactory.cpp
++++ b/src/Formats/FormatFactory.cpp
+@@ -1,6 +1,7 @@
+ #include <Formats/FormatFactory.h>
+ 
+ #include <algorithm>
++#include <unistd.h>
+ #include <Formats/FormatSettings.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/ProcessList.h>
+@@ -15,7 +16,7 @@
+ #include <Poco/URI.h>
+ #include <Common/Exception.h>
+ #include <Common/KnownObjectNames.h>
+-#include <unistd.h>
++#include <Common/tryGetFileNameByFileDescriptor.h>
+ 
+ #include <boost/algorithm/string/case_conv.hpp>
+ 
+@@ -692,21 +693,12 @@ String FormatFactory::getFormatFromFileName(String file_name)
+ 
+ std::optional<String> FormatFactory::tryGetFormatFromFileDescriptor(int fd)
+ {
+-#ifdef OS_LINUX
+-    std::string proc_path = fmt::format("/proc/self/fd/{}", fd);
+-    char file_path[PATH_MAX] = {'\0'};
+-    if (readlink(proc_path.c_str(), file_path, sizeof(file_path) - 1) != -1)
+-        return tryGetFormatFromFileName(file_path);
+-    return std::nullopt;
+-#elif defined(OS_DARWIN)
+-    char file_path[PATH_MAX] = {'\0'};
+-    if (fcntl(fd, F_GETPATH, file_path) != -1)
+-        return tryGetFormatFromFileName(file_path);
+-    return std::nullopt;
+-#else
+-    (void)fd;
++    std::optional<String> file_name = tryGetFileNameFromFileDescriptor(fd);
++
++    if (file_name)
++        return tryGetFormatFromFileName(*file_name);
++
+     return std::nullopt;
+-#endif
+ }
+ 
+ String FormatFactory::getFormatFromFileDescriptor(int fd)

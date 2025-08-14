@@ -1,0 +1,143 @@
+diff --git a/src/Interpreters/MutationsInterpreter.cpp b/src/Interpreters/MutationsInterpreter.cpp
+index 4b0cbec4f9fb..2db4fce81f0d 100644
+--- a/src/Interpreters/MutationsInterpreter.cpp
++++ b/src/Interpreters/MutationsInterpreter.cpp
+@@ -40,6 +40,7 @@
+ #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
+ #include <Parsers/makeASTForLogicalFunction.h>
+ #include <Common/logger_useful.h>
++#include <Storages/MergeTree/MergeTreeDataPartType.h>
+ 
+ namespace DB
+ {
+@@ -304,6 +305,11 @@ bool MutationsInterpreter::Source::hasProjection(const String & name) const
+     return part && part->hasProjection(name);
+ }
+ 
++bool MutationsInterpreter::Source::isCompactPart() const
++{
++    return part && part->getType() == MergeTreeDataPartType::Compact;
++}
++
+ static Names getAvailableColumnsWithVirtuals(StorageMetadataPtr metadata_snapshot, const IStorage & storage)
+ {
+     auto all_columns = metadata_snapshot->getColumns().getNamesOfPhysical();
+@@ -562,7 +568,8 @@ void MutationsInterpreter::prepare(bool dry_run)
+     if (settings.recalculate_dependencies_of_updated_columns)
+         dependencies = getAllColumnDependencies(metadata_snapshot, updated_columns, has_dependency);
+ 
+-    bool has_alter_delete = false;
++    bool need_rebuild_indexes = false;
++    bool need_rebuild_projections = false;
+     std::vector<String> read_columns;
+ 
+     /// First, break a sequence of commands into stages.
+@@ -583,7 +590,9 @@ void MutationsInterpreter::prepare(bool dry_run)
+                 predicate = makeASTFunction("isZeroOrNull", predicate);
+ 
+             stages.back().filters.push_back(predicate);
+-            has_alter_delete = true;
++            /// ALTER DELETE can changes number of rows in the part, so we need to rebuild indexes and projection
++            need_rebuild_indexes = true;
++            need_rebuild_projections = true;
+         }
+         else if (command.type == MutationCommand::UPDATE)
+         {
+@@ -687,6 +696,11 @@ void MutationsInterpreter::prepare(bool dry_run)
+                     }
+                 }
+             }
++
++            /// If the part is compact and adaptive index granularity is enabled, modify data in one column via ALTER UPDATE can change
++            /// the part granularity, so we need to rebuild indexes
++            if (source.isCompactPart() && source.getMergeTreeData() && source.getMergeTreeData()->getSettings()->index_granularity_bytes > 0)
++                need_rebuild_indexes = true;
+         }
+         else if (command.type == MutationCommand::MATERIALIZE_COLUMN)
+         {
+@@ -892,7 +906,7 @@ void MutationsInterpreter::prepare(bool dry_run)
+         if (!source.hasSecondaryIndex(index.name))
+             continue;
+ 
+-        if (has_alter_delete)
++        if (need_rebuild_indexes)
+         {
+             materialized_indices.insert(index.name);
+             continue;
+@@ -913,7 +927,7 @@ void MutationsInterpreter::prepare(bool dry_run)
+         if (!source.hasProjection(projection.name))
+             continue;
+ 
+-        if (has_alter_delete)
++        if (need_rebuild_projections)
+         {
+             materialized_projections.insert(projection.name);
+             continue;
+diff --git a/src/Interpreters/MutationsInterpreter.h b/src/Interpreters/MutationsInterpreter.h
+index 9b4caaae2313..c53b86ddb5ec 100644
+--- a/src/Interpreters/MutationsInterpreter.h
++++ b/src/Interpreters/MutationsInterpreter.h
+@@ -122,6 +122,7 @@ class MutationsInterpreter
+         bool materializeTTLRecalculateOnly() const;
+         bool hasSecondaryIndex(const String & name) const;
+         bool hasProjection(const String & name) const;
++        bool isCompactPart() const;
+ 
+         void read(
+             Stage & first_stage,
+diff --git a/src/Storages/MergeTree/MergeTreeMarksLoader.cpp b/src/Storages/MergeTree/MergeTreeMarksLoader.cpp
+index c9b22c8a03e2..7531c03a011e 100644
+--- a/src/Storages/MergeTree/MergeTreeMarksLoader.cpp
++++ b/src/Storages/MergeTree/MergeTreeMarksLoader.cpp
+@@ -107,13 +107,14 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+     // We first read the marks into a temporary simple array, then compress them into a more compact
+     // representation.
+     PODArray<MarkInCompressedFile> plain_marks(marks_count * columns_in_mark); // temporary
++    auto full_mark_path = std::string(fs::path(data_part_storage->getFullPath()) / mrk_path);
+ 
+     if (file_size == 0 && marks_count != 0)
+     {
+         throw Exception(
+             ErrorCodes::CORRUPTED_DATA,
+             "Empty marks file '{}': {}, must be: {}",
+-            std::string(fs::path(data_part_storage->getFullPath()) / mrk_path),
++            full_mark_path,
+             file_size, expected_uncompressed_size);
+     }
+ 
+@@ -121,7 +122,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+         throw Exception(
+             ErrorCodes::CORRUPTED_DATA,
+             "Bad size of marks file '{}': {}, must be: {}",
+-            std::string(fs::path(data_part_storage->getFullPath()) / mrk_path),
++            full_mark_path,
+             file_size,
+             expected_uncompressed_size);
+ 
+@@ -142,7 +143,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+             throw Exception(
+                 ErrorCodes::CANNOT_READ_ALL_DATA,
+                 "Cannot read all marks from file {}, is eof: {}, buffer size: {}, file size: {}",
+-                mrk_path,
++                full_mark_path,
+                 reader->eof(),
+                 reader->buffer().size(),
+                 file_size);
+@@ -155,7 +156,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+                 throw Exception(
+                     ErrorCodes::CANNOT_READ_ALL_DATA,
+                     "Cannot read all marks from file {}, marks expected {} (bytes size {}), marks read {} (bytes size {})",
+-                    mrk_path, marks_count, expected_uncompressed_size, i, reader->count());
++                    full_mark_path, marks_count, expected_uncompressed_size, i, reader->count());
+ 
+             size_t granularity;
+             reader->readStrict(
+@@ -167,7 +168,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+             throw Exception(
+                 ErrorCodes::CANNOT_READ_ALL_DATA,
+                 "Too many marks in file {}, marks expected {} (bytes size {})",
+-                mrk_path, marks_count, expected_uncompressed_size);
++                full_mark_path, marks_count, expected_uncompressed_size);
+     }
+ 
+ #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__

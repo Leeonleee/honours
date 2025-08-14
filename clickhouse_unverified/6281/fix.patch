@@ -1,0 +1,144 @@
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionFactory.cpp b/dbms/src/AggregateFunctions/AggregateFunctionFactory.cpp
+index ce7adf5b96db..83fb9f48abe3 100644
+--- a/dbms/src/AggregateFunctions/AggregateFunctionFactory.cpp
++++ b/dbms/src/AggregateFunctions/AggregateFunctionFactory.cpp
+@@ -49,12 +49,7 @@ static DataTypes convertLowCardinalityTypesToNested(const DataTypes & types)
+     DataTypes res_types;
+     res_types.reserve(types.size());
+     for (const auto & type : types)
+-    {
+-        if (auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+-            res_types.push_back(low_cardinality_type->getDictionaryType());
+-        else
+-            res_types.push_back(type);
+-    }
++        res_types.emplace_back(recursiveRemoveLowCardinality(type));
+ 
+     return res_types;
+ }
+@@ -69,7 +64,7 @@ AggregateFunctionPtr AggregateFunctionFactory::get(
+ 
+     /// If one of types is Nullable, we apply aggregate function combinator "Null".
+ 
+-    if (std::any_of(argument_types.begin(), argument_types.end(),
++    if (std::any_of(type_without_low_cardinality.begin(), type_without_low_cardinality.end(),
+         [](const auto & type) { return type->isNullable(); }))
+     {
+         AggregateFunctionCombinatorPtr combinator = AggregateFunctionCombinatorFactory::instance().tryFindSuffix("Null");
+@@ -83,11 +78,11 @@ AggregateFunctionPtr AggregateFunctionFactory::get(
+ 
+         /// A little hack - if we have NULL arguments, don't even create nested function.
+         /// Combinator will check if nested_function was created.
+-        if (name == "count" || std::none_of(argument_types.begin(), argument_types.end(),
++        if (name == "count" || std::none_of(type_without_low_cardinality.begin(), type_without_low_cardinality.end(),
+             [](const auto & type) { return type->onlyNull(); }))
+             nested_function = getImpl(name, nested_types, nested_parameters, recursion_level);
+ 
+-        return combinator->transformAggregateFunction(nested_function, argument_types, parameters);
++        return combinator->transformAggregateFunction(nested_function, type_without_low_cardinality, parameters);
+     }
+ 
+     auto res = getImpl(name, type_without_low_cardinality, parameters, recursion_level);
+diff --git a/dbms/src/DataStreams/AggregatingSortedBlockInputStream.cpp b/dbms/src/DataStreams/AggregatingSortedBlockInputStream.cpp
+index d3d5bd5c9089..44e8e7386da4 100644
+--- a/dbms/src/DataStreams/AggregatingSortedBlockInputStream.cpp
++++ b/dbms/src/DataStreams/AggregatingSortedBlockInputStream.cpp
+@@ -4,6 +4,7 @@
+ #include <Common/Arena.h>
+ #include <DataTypes/DataTypeAggregateFunction.h>
+ #include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
++#include <DataTypes/DataTypeLowCardinality.h>
+ 
+ 
+ namespace DB
+@@ -15,10 +16,52 @@ namespace ErrorCodes
+ }
+ 
+ 
++class RemovingLowCardinalityBlockInputStream : public IBlockInputStream
++{
++public:
++    RemovingLowCardinalityBlockInputStream(BlockInputStreamPtr input_, ColumnNumbers positions_)
++        : input(std::move(input_)), positions(std::move(positions_))
++    {
++        header = transform(input->getHeader());
++    }
++
++    Block transform(Block block)
++    {
++        if (block)
++        {
++            for (auto & pos : positions)
++            {
++                auto & col = block.safeGetByPosition(pos);
++                col.column = recursiveRemoveLowCardinality(col.column);
++                col.type = recursiveRemoveLowCardinality(col.type);
++            }
++        }
++
++        return block;
++    }
++
++    String getName() const override { return "RemovingLowCardinality"; }
++    Block getHeader() const override { return header; }
++    const BlockMissingValues & getMissingValues() const override { return input->getMissingValues(); }
++    bool isSortedOutput() const override { return input->isSortedOutput(); }
++    const SortDescription & getSortDescription() const override { return input->getSortDescription(); }
++
++protected:
++    Block readImpl() override { return transform(input->read()); }
++
++private:
++    Block header;
++    BlockInputStreamPtr input;
++    ColumnNumbers positions;
++};
++
++
+ AggregatingSortedBlockInputStream::AggregatingSortedBlockInputStream(
+     const BlockInputStreams & inputs_, const SortDescription & description_, size_t max_block_size_)
+     : MergingSortedBlockInputStream(inputs_, description_, max_block_size_)
+ {
++    ColumnNumbers positions;
++
+     /// Fill in the column numbers that need to be aggregated.
+     for (size_t i = 0; i < num_columns; ++i)
+     {
+@@ -51,6 +94,9 @@ AggregatingSortedBlockInputStream::AggregatingSortedBlockInputStream(
+                 allocatesMemoryInArena = true;
+ 
+             columns_to_simple_aggregate.emplace_back(std::move(desc));
++
++            if (recursiveRemoveLowCardinality(column.type).get() != column.type.get())
++                positions.emplace_back(i);
+         }
+         else
+         {
+@@ -58,6 +104,14 @@ AggregatingSortedBlockInputStream::AggregatingSortedBlockInputStream(
+             column_numbers_to_aggregate.push_back(i);
+         }
+     }
++
++    if (!positions.empty())
++    {
++        for (auto & input : children)
++            input = std::make_shared<RemovingLowCardinalityBlockInputStream>(input, positions);
++
++        header = children.at(0)->getHeader();
++    }
+ }
+ 
+ 
+diff --git a/dbms/src/Interpreters/ExpressionAnalyzer.cpp b/dbms/src/Interpreters/ExpressionAnalyzer.cpp
+index 055f5c8f3ec0..04b41e1bfe24 100644
+--- a/dbms/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/dbms/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -412,7 +412,7 @@ void ExpressionAnalyzer::getAggregates(const ASTPtr & ast, ExpressionActionsPtr
+ 
+             getRootActions(arguments[i], true, actions);
+             const std::string & name = arguments[i]->getColumnName();
+-            types[i] = recursiveRemoveLowCardinality(actions->getSampleBlock().getByName(name).type);
++            types[i] = actions->getSampleBlock().getByName(name).type;
+             aggregate.argument_names[i] = name;
+         }
+ 

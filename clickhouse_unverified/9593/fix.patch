@@ -1,0 +1,368 @@
+diff --git a/dbms/src/Access/AccessFlags.h b/dbms/src/Access/AccessFlags.h
+index f35c88f98317..5af804ddc48b 100644
+--- a/dbms/src/Access/AccessFlags.h
++++ b/dbms/src/Access/AccessFlags.h
+@@ -401,6 +401,7 @@ class AccessFlags::Impl
+         auto input = std::make_unique<Node>("input()", next_flag++, GLOBAL_LEVEL);
+         auto values = std::make_unique<Node>("values()", next_flag++, GLOBAL_LEVEL);
+         auto numbers = std::make_unique<Node>("numbers()", next_flag++, GLOBAL_LEVEL);
++        auto zeros = std::make_unique<Node>("zeros()", next_flag++, GLOBAL_LEVEL);
+         auto merge = std::make_unique<Node>("merge()", next_flag++, DATABASE_LEVEL);
+         auto remote = std::make_unique<Node>("remote()", next_flag++, GLOBAL_LEVEL);
+         ext::push_back(remote->aliases, "remoteSecure()", "cluster()");
+@@ -409,7 +410,7 @@ class AccessFlags::Impl
+         auto jdbc = std::make_unique<Node>("jdbc()", next_flag++, GLOBAL_LEVEL);
+         auto hdfs = std::make_unique<Node>("hdfs()", next_flag++, GLOBAL_LEVEL);
+         auto s3 = std::make_unique<Node>("s3()", next_flag++, GLOBAL_LEVEL);
+-        auto table_functions = std::make_unique<Node>("TABLE FUNCTIONS", std::move(file), std::move(url), std::move(input), std::move(values), std::move(numbers), std::move(merge), std::move(remote), std::move(mysql), std::move(odbc), std::move(jdbc), std::move(hdfs), std::move(s3));
++        auto table_functions = std::make_unique<Node>("TABLE FUNCTIONS", std::move(file), std::move(url), std::move(input), std::move(values), std::move(numbers), std::move(zeros), std::move(merge), std::move(remote), std::move(mysql), std::move(odbc), std::move(jdbc), std::move(hdfs), std::move(s3));
+         ext::push_back(all, std::move(table_functions));
+ 
+         flags_to_keyword_tree_ = std::make_unique<Node>("ALL", std::move(all));
+diff --git a/dbms/src/Access/AccessType.h b/dbms/src/Access/AccessType.h
+index 4b65f9498858..205840eecdfc 100644
+--- a/dbms/src/Access/AccessType.h
++++ b/dbms/src/Access/AccessType.h
+@@ -129,6 +129,7 @@ enum class AccessType
+     input,
+     values,
+     numbers,
++    zeros,
+     merge,
+     remote,
+     mysql,
+@@ -288,6 +289,7 @@ namespace impl
+             ACCESS_TYPE_TO_KEYWORD_CASE(input);
+             ACCESS_TYPE_TO_KEYWORD_CASE(values);
+             ACCESS_TYPE_TO_KEYWORD_CASE(numbers);
++            ACCESS_TYPE_TO_KEYWORD_CASE(zeros);
+             ACCESS_TYPE_TO_KEYWORD_CASE(merge);
+             ACCESS_TYPE_TO_KEYWORD_CASE(remote);
+             ACCESS_TYPE_TO_KEYWORD_CASE(mysql);
+diff --git a/dbms/src/Storages/System/StorageSystemZeros.cpp b/dbms/src/Storages/System/StorageSystemZeros.cpp
+new file mode 100644
+index 000000000000..ae9bf3d09029
+--- /dev/null
++++ b/dbms/src/Storages/System/StorageSystemZeros.cpp
+@@ -0,0 +1,132 @@
++#include <Storages/System/StorageSystemZeros.h>
++
++#include <Processors/Sources/SourceWithProgress.h>
++#include <Processors/Pipe.h>
++
++#include <DataTypes/DataTypesNumber.h>
++#include <Columns/ColumnsNumber.h>
++
++namespace DB
++{
++
++namespace
++{
++
++struct ZerosState
++{
++    std::atomic<UInt64> num_generated_rows = 0;
++};
++
++using ZerosStatePtr = std::shared_ptr<ZerosState>;
++
++
++/// Source which generates zeros.
++/// Uses state to share the number of generated rows between threads.
++/// If state is nullptr, then limit is ignored.
++class ZerosSource : public SourceWithProgress
++{
++public:
++    ZerosSource(UInt64 block_size, UInt64 limit_, ZerosStatePtr state_)
++            : SourceWithProgress(createHeader()), limit(limit_), state(std::move(state_))
++    {
++        column = createColumn(block_size);
++    }
++
++    String getName() const override { return "Zeros"; }
++
++protected:
++    Chunk generate() override
++    {
++        auto column_ptr = column;
++        size_t column_size = column_ptr->size();
++
++        if (state)
++        {
++            auto generated_rows = state->num_generated_rows.fetch_add(column_size, std::memory_order_acquire);
++
++            if (generated_rows >= limit)
++                return {};
++
++            if (generated_rows + column_size > limit)
++            {
++                column_size = limit - generated_rows;
++                column_ptr = createColumn(column_size);
++            }
++        }
++
++        progress({column->size(), column->byteSize()});
++
++        return { Columns {std::move(column_ptr)}, column_size };
++    }
++
++private:
++    UInt64 limit;
++    ZerosStatePtr state;
++    ColumnPtr column;
++
++    static Block createHeader()
++    {
++        return { ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "zero") };
++    }
++
++    static ColumnPtr createColumn(size_t size)
++    {
++        auto column_ptr = ColumnUInt8::create();
++        /// It is probably the fastest method to create zero column, cause resize_fill uses memset internally.
++        column_ptr->getData().resize_fill(size);
++
++        return column_ptr;
++    }
++};
++
++}
++
++StorageSystemZeros::StorageSystemZeros(const std::string & name_, bool multithreaded_, std::optional<UInt64> limit_)
++    : IStorage({"system", name_}), multithreaded(multithreaded_), limit(limit_)
++{
++    setColumns(ColumnsDescription({{"zero", std::make_shared<DataTypeUInt8>()}}));
++}
++
++Pipes StorageSystemZeros::read(
++        const Names & column_names,
++        const SelectQueryInfo &,
++        const Context & /*context*/,
++        QueryProcessingStage::Enum /*processed_stage*/,
++        size_t max_block_size,
++        unsigned num_streams)
++{
++    check(column_names);
++
++    bool use_multiple_streams = multithreaded;
++
++    if (limit && *limit < max_block_size)
++    {
++        max_block_size = static_cast<size_t>(*limit);
++        use_multiple_streams = false;
++    }
++
++    if (!use_multiple_streams)
++        num_streams = 1;
++
++    Pipes res;
++    res.reserve(num_streams);
++
++    ZerosStatePtr state;
++
++    if (limit)
++        state = std::make_shared<ZerosState>();
++
++    for (size_t i = 0; i < num_streams; ++i)
++    {
++        auto source = std::make_shared<ZerosSource>(max_block_size, *limit, state);
++
++        if (limit && i == 0)
++            source->addTotalRowsApprox(*limit);
++
++        res.emplace_back(std::move(source));
++    }
++
++    return res;
++}
++
++}
+diff --git a/dbms/src/Storages/System/StorageSystemZeros.h b/dbms/src/Storages/System/StorageSystemZeros.h
+new file mode 100644
+index 000000000000..36032608637f
+--- /dev/null
++++ b/dbms/src/Storages/System/StorageSystemZeros.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <ext/shared_ptr_helper.h>
++#include <optional>
++#include <Storages/IStorage.h>
++
++namespace DB
++{
++
++/** Implements a table engine for the system table "zeros".
++  * The table contains the only column zero UInt8.
++  * From this table, you can read non-materialized zeros.
++  *
++  * You could also specify a limit (how many zeros to give).
++  * If multithreaded is specified, zeros will be generated in several streams.
++  */
++class StorageSystemZeros : public ext::shared_ptr_helper<StorageSystemZeros>, public IStorage
++{
++    friend struct ext::shared_ptr_helper<StorageSystemZeros>;
++public:
++    std::string getName() const override { return "SystemZeros"; }
++
++    Pipes read(
++            const Names & column_names,
++            const SelectQueryInfo & query_info,
++            const Context & context,
++            QueryProcessingStage::Enum processed_stage,
++            size_t max_block_size,
++            unsigned num_streams) override;
++
++    bool hasEvenlyDistributedRead() const override { return true; }
++
++private:
++    bool multithreaded;
++    std::optional<UInt64> limit;
++
++protected:
++    /// If even_distribution is true, numbers are distributed evenly between streams.
++    /// Otherwise, streams concurrently increment atomic.
++    StorageSystemZeros(const std::string & name_, bool multithreaded_, std::optional<UInt64> limit_ = std::nullopt);
++};
++
++}
+diff --git a/dbms/src/Storages/System/attachSystemTables.cpp b/dbms/src/Storages/System/attachSystemTables.cpp
+index 06f00783384a..db76d68f091c 100644
+--- a/dbms/src/Storages/System/attachSystemTables.cpp
++++ b/dbms/src/Storages/System/attachSystemTables.cpp
+@@ -39,6 +39,7 @@
+ #include <Storages/System/StorageSystemContributors.h>
+ #include <Storages/System/StorageSystemDisks.h>
+ #include <Storages/System/StorageSystemStoragePolicies.h>
++#include <Storages/System/StorageSystemZeros.h>
+ 
+ #ifdef OS_LINUX
+ #include <Storages/System/StorageSystemStackTrace.h>
+@@ -53,6 +54,8 @@ void attachSystemTablesLocal(IDatabase & system_database)
+     system_database.attachTable("one", StorageSystemOne::create("one"));
+     system_database.attachTable("numbers", StorageSystemNumbers::create("numbers", false));
+     system_database.attachTable("numbers_mt", StorageSystemNumbers::create("numbers_mt", true));
++    system_database.attachTable("zeros", StorageSystemZeros::create("zeros", false));
++    system_database.attachTable("zeros_mt", StorageSystemZeros::create("zeros_mt", true));
+     system_database.attachTable("databases", StorageSystemDatabases::create("databases"));
+     system_database.attachTable("tables", StorageSystemTables::create("tables"));
+     system_database.attachTable("columns", StorageSystemColumns::create("columns"));
+diff --git a/dbms/src/TableFunctions/TableFunctionZeros.cpp b/dbms/src/TableFunctions/TableFunctionZeros.cpp
+new file mode 100644
+index 000000000000..79f49dc5d284
+--- /dev/null
++++ b/dbms/src/TableFunctions/TableFunctionZeros.cpp
+@@ -0,0 +1,56 @@
++#include <TableFunctions/ITableFunction.h>
++#include <TableFunctions/TableFunctionZeros.h>
++#include <TableFunctions/TableFunctionFactory.h>
++#include <Parsers/ASTFunction.h>
++#include <Parsers/ASTLiteral.h>
++#include <Common/typeid_cast.h>
++#include <Storages/System/StorageSystemZeros.h>
++#include <Access/AccessFlags.h>
++#include <Interpreters/evaluateConstantExpression.h>
++#include <Interpreters/Context.h>
++#include "registerTableFunctions.h"
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++}
++
++template <bool multithreaded>
++StoragePtr TableFunctionZeros<multithreaded>::executeImpl(const ASTPtr & ast_function, const Context & context, const std::string & table_name) const
++{
++    if (const auto * function = ast_function->as<ASTFunction>())
++    {
++        auto arguments = function->arguments->children;
++
++        if (arguments.size() != 1)
++            throw Exception("Table function '" + getName() + "' requires 'length'.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++
++        UInt64 length = evaluateArgument(context, arguments[0]);
++
++        context.checkAccess(AccessType::zeros);
++
++        auto res = StorageSystemZeros::create(table_name, multithreaded, length);
++        res->startup();
++        return res;
++    }
++    throw Exception("Table function '" + getName() + "' requires 'limit'.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++}
++
++void registerTableFunctionZeros(TableFunctionFactory & factory)
++{
++    factory.registerFunction<TableFunctionZeros<true>>();
++    factory.registerFunction<TableFunctionZeros<false>>();
++}
++
++template <bool multithreaded>
++UInt64 TableFunctionZeros<multithreaded>::evaluateArgument(const Context & context, ASTPtr & argument) const
++{
++    return evaluateConstantExpressionOrIdentifierAsLiteral(argument, context)->as<ASTLiteral &>().value.safeGet<UInt64>();
++}
++
++}
+diff --git a/dbms/src/TableFunctions/TableFunctionZeros.h b/dbms/src/TableFunctions/TableFunctionZeros.h
+new file mode 100644
+index 000000000000..c8f3cbabc0e0
+--- /dev/null
++++ b/dbms/src/TableFunctions/TableFunctionZeros.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <TableFunctions/ITableFunction.h>
++#include <Core/Types.h>
++
++
++namespace DB
++{
++
++/* zeros(limit), zeros_mt(limit)
++ * - the same as SELECT zero FROM system.zeros LIMIT limit.
++ * Used for testing purposes, as a simple example of table function.
++ */
++template <bool multithreaded>
++class TableFunctionZeros : public ITableFunction
++{
++public:
++    static constexpr auto name = multithreaded ? "zeros_mt" : "zeros";
++    std::string getName() const override { return name; }
++private:
++    StoragePtr executeImpl(const ASTPtr & ast_function, const Context & context, const std::string & table_name) const override;
++
++    UInt64 evaluateArgument(const Context & context, ASTPtr & argument) const;
++};
++
++
++}
+diff --git a/dbms/src/TableFunctions/registerTableFunctions.cpp b/dbms/src/TableFunctions/registerTableFunctions.cpp
+index b9a96532b13b..662f7b58d487 100644
+--- a/dbms/src/TableFunctions/registerTableFunctions.cpp
++++ b/dbms/src/TableFunctions/registerTableFunctions.cpp
+@@ -11,6 +11,7 @@ void registerTableFunctions()
+     registerTableFunctionMerge(factory);
+     registerTableFunctionRemote(factory);
+     registerTableFunctionNumbers(factory);
++    registerTableFunctionZeros(factory);
+     registerTableFunctionFile(factory);
+     registerTableFunctionURL(factory);
+     registerTableFunctionValues(factory);
+diff --git a/dbms/src/TableFunctions/registerTableFunctions.h b/dbms/src/TableFunctions/registerTableFunctions.h
+index e1be5477c252..3cde28685cc9 100644
+--- a/dbms/src/TableFunctions/registerTableFunctions.h
++++ b/dbms/src/TableFunctions/registerTableFunctions.h
+@@ -8,6 +8,7 @@ class TableFunctionFactory;
+ void registerTableFunctionMerge(TableFunctionFactory & factory);
+ void registerTableFunctionRemote(TableFunctionFactory & factory);
+ void registerTableFunctionNumbers(TableFunctionFactory & factory);
++void registerTableFunctionZeros(TableFunctionFactory & factory);
+ void registerTableFunctionFile(TableFunctionFactory & factory);
+ void registerTableFunctionURL(TableFunctionFactory & factory);
+ void registerTableFunctionValues(TableFunctionFactory & factory);

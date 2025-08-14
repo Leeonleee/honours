@@ -1,0 +1,483 @@
+diff --git a/programs/local/LocalServer.cpp b/programs/local/LocalServer.cpp
+index 6b0b8fc5b505..0d731ed0e147 100644
+--- a/programs/local/LocalServer.cpp
++++ b/programs/local/LocalServer.cpp
+@@ -14,6 +14,7 @@
+ #include <Databases/registerDatabases.h>
+ #include <Databases/DatabaseFilesystem.h>
+ #include <Databases/DatabaseMemory.h>
++#include <Databases/DatabaseAtomic.h>
+ #include <Databases/DatabasesOverlay.h>
+ #include <Storages/System/attachSystemTables.h>
+ #include <Storages/System/attachInformationSchemaTables.h>
+@@ -50,7 +51,6 @@
+ #include <Dictionaries/registerDictionaries.h>
+ #include <Disks/registerDisks.h>
+ #include <Formats/registerFormats.h>
+-#include <boost/algorithm/string/replace.hpp>
+ #include <boost/program_options/options_description.hpp>
+ #include <base/argsToConfig.h>
+ #include <filesystem>
+@@ -216,12 +216,12 @@ static DatabasePtr createMemoryDatabaseIfNotExists(ContextPtr context, const Str
+     return system_database;
+ }
+ 
+-static DatabasePtr createClickHouseLocalDatabaseOverlay(const String & name_, ContextPtr context_)
++static DatabasePtr createClickHouseLocalDatabaseOverlay(const String & name_, ContextPtr context)
+ {
+-    auto databaseCombiner = std::make_shared<DatabasesOverlay>(name_, context_);
+-    databaseCombiner->registerNextDatabase(std::make_shared<DatabaseFilesystem>(name_, "", context_));
+-    databaseCombiner->registerNextDatabase(std::make_shared<DatabaseMemory>(name_, context_));
+-    return databaseCombiner;
++    auto overlay = std::make_shared<DatabasesOverlay>(name_, context);
++    overlay->registerNextDatabase(std::make_shared<DatabaseAtomic>(name_, fs::weakly_canonical(context->getPath()), UUIDHelpers::generateV4(), context));
++    overlay->registerNextDatabase(std::make_shared<DatabaseFilesystem>(name_, "", context));
++    return overlay;
+ }
+ 
+ /// If path is specified and not empty, will try to setup server environment and load existing metadata
+@@ -367,7 +367,7 @@ std::string LocalServer::getInitialCreateTableQuery()
+     else
+         table_structure = "(" + table_structure + ")";
+ 
+-    return fmt::format("CREATE TABLE {} {} ENGINE = File({}, {});",
++    return fmt::format("CREATE TEMPORARY TABLE {} {} ENGINE = File({}, {});",
+                        table_name, table_structure, data_format, table_file);
+ }
+ 
+@@ -761,7 +761,12 @@ void LocalServer::processConfig()
+     DatabaseCatalog::instance().initializeAndLoadTemporaryDatabase();
+ 
+     std::string default_database = server_settings.default_database;
+-    DatabaseCatalog::instance().attachDatabase(default_database, createClickHouseLocalDatabaseOverlay(default_database, global_context));
++    {
++        DatabasePtr database = createClickHouseLocalDatabaseOverlay(default_database, global_context);
++        if (UUID uuid = database->getUUID(); uuid != UUIDHelpers::Nil)
++            DatabaseCatalog::instance().addUUIDMapping(uuid);
++        DatabaseCatalog::instance().attachDatabase(default_database, database);
++    }
+     global_context->setCurrentDatabase(default_database);
+ 
+     if (getClientConfiguration().has("path"))
+diff --git a/src/Databases/DatabaseAtomic.cpp b/src/Databases/DatabaseAtomic.cpp
+index d86e29ca915c..83b82976e4f2 100644
+--- a/src/Databases/DatabaseAtomic.cpp
++++ b/src/Databases/DatabaseAtomic.cpp
+@@ -53,9 +53,6 @@ DatabaseAtomic::DatabaseAtomic(String name_, String metadata_path_, UUID uuid, c
+     , db_uuid(uuid)
+ {
+     assert(db_uuid != UUIDHelpers::Nil);
+-    fs::create_directories(fs::path(getContext()->getPath()) / "metadata");
+-    fs::create_directories(path_to_table_symlinks);
+-    tryCreateMetadataSymlink();
+ }
+ 
+ DatabaseAtomic::DatabaseAtomic(String name_, String metadata_path_, UUID uuid, ContextPtr context_)
+@@ -63,6 +60,16 @@ DatabaseAtomic::DatabaseAtomic(String name_, String metadata_path_, UUID uuid, C
+ {
+ }
+ 
++void DatabaseAtomic::createDirectories()
++{
++    if (database_atomic_directories_created.test_and_set())
++        return;
++    DatabaseOnDisk::createDirectories();
++    fs::create_directories(fs::path(getContext()->getPath()) / "metadata");
++    fs::create_directories(path_to_table_symlinks);
++    tryCreateMetadataSymlink();
++}
++
+ String DatabaseAtomic::getTableDataPath(const String & table_name) const
+ {
+     std::lock_guard lock(mutex);
+@@ -99,6 +106,7 @@ void DatabaseAtomic::drop(ContextPtr)
+ void DatabaseAtomic::attachTable(ContextPtr /* context_ */, const String & name, const StoragePtr & table, const String & relative_table_path)
+ {
+     assert(relative_table_path != data_path && !relative_table_path.empty());
++    createDirectories();
+     DetachedTables not_in_use;
+     std::lock_guard lock(mutex);
+     not_in_use = cleanupDetachedTables();
+@@ -200,11 +208,15 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
+     if (exchange && !supportsAtomicRename())
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RENAME EXCHANGE is not supported");
+ 
++    createDirectories();
+     waitDatabaseStarted();
+ 
+     auto & other_db = dynamic_cast<DatabaseAtomic &>(to_database);
+     bool inside_database = this == &other_db;
+ 
++    if (!inside_database)
++        other_db.createDirectories();
++
+     String old_metadata_path = getObjectMetadataPath(table_name);
+     String new_metadata_path = to_database.getObjectMetadataPath(to_table_name);
+ 
+@@ -325,6 +337,7 @@ void DatabaseAtomic::commitCreateTable(const ASTCreateQuery & query, const Stora
+                                        const String & table_metadata_tmp_path, const String & table_metadata_path,
+                                        ContextPtr query_context)
+ {
++    createDirectories();
+     DetachedTables not_in_use;
+     auto table_data_path = getTableDataPath(query);
+     try
+@@ -461,6 +474,9 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
+     if (mode < LoadingStrictnessLevel::FORCE_RESTORE)
+         return;
+ 
++    if (!fs::exists(path_to_table_symlinks))
++        return;
++
+     /// Recreate symlinks to table data dirs in case of force restore, because some of them may be broken
+     for (const auto & table_path : fs::directory_iterator(path_to_table_symlinks))
+     {
+@@ -588,6 +604,7 @@ void DatabaseAtomic::renameDatabase(ContextPtr query_context, const String & new
+ {
+     /// CREATE, ATTACH, DROP, DETACH and RENAME DATABASE must hold DDLGuard
+ 
++    createDirectories();
+     waitDatabaseStarted();
+ 
+     bool check_ref_deps = query_context->getSettingsRef().check_referential_table_dependencies;
+@@ -679,4 +696,5 @@ void registerDatabaseAtomic(DatabaseFactory & factory)
+     };
+     factory.registerDatabase("Atomic", create_fn);
+ }
++
+ }
+diff --git a/src/Databases/DatabaseAtomic.h b/src/Databases/DatabaseAtomic.h
+index 4a4ccfa25733..ca24494f6006 100644
+--- a/src/Databases/DatabaseAtomic.h
++++ b/src/Databases/DatabaseAtomic.h
+@@ -76,6 +76,9 @@ class DatabaseAtomic : public DatabaseOrdinary
+     using DetachedTables = std::unordered_map<UUID, StoragePtr>;
+     [[nodiscard]] DetachedTables cleanupDetachedTables() TSA_REQUIRES(mutex);
+ 
++    std::atomic_flag database_atomic_directories_created = ATOMIC_FLAG_INIT;
++    void createDirectories();
++
+     void tryCreateMetadataSymlink();
+ 
+     virtual bool allowMoveTableToOtherDatabaseEngine(IDatabase & /*to_database*/) const { return false; }
+diff --git a/src/Databases/DatabaseLazy.cpp b/src/Databases/DatabaseLazy.cpp
+index 3fb6d30fcb82..e43adfc5d378 100644
+--- a/src/Databases/DatabaseLazy.cpp
++++ b/src/Databases/DatabaseLazy.cpp
+@@ -47,12 +47,13 @@ DatabaseLazy::DatabaseLazy(const String & name_, const String & metadata_path_,
+     : DatabaseOnDisk(name_, metadata_path_, std::filesystem::path("data") / escapeForFileName(name_) / "", "DatabaseLazy (" + name_ + ")", context_)
+     , expiration_time(expiration_time_)
+ {
++    createDirectories();
+ }
+ 
+ 
+ void DatabaseLazy::loadStoredObjects(ContextMutablePtr local_context, LoadingStrictnessLevel /*mode*/)
+ {
+-    iterateMetadataFiles(local_context, [this, &local_context](const String & file_name)
++    iterateMetadataFiles([this, &local_context](const String & file_name)
+     {
+         const std::string table_name = unescapeForFileName(file_name.substr(0, file_name.size() - 4));
+ 
+diff --git a/src/Databases/DatabaseLazy.h b/src/Databases/DatabaseLazy.h
+index 41cfb7511415..aeac130594f7 100644
+--- a/src/Databases/DatabaseLazy.h
++++ b/src/Databases/DatabaseLazy.h
+@@ -12,7 +12,7 @@ class DatabaseLazyIterator;
+ class Context;
+ 
+ /** Lazy engine of databases.
+-  * Works like DatabaseOrdinary, but stores in memory only the cache.
++  * Works like DatabaseOrdinary, but stores only recently accessed tables in memory.
+   * Can be used only with *Log engines.
+   */
+ class DatabaseLazy final : public DatabaseOnDisk
+diff --git a/src/Databases/DatabaseOnDisk.cpp b/src/Databases/DatabaseOnDisk.cpp
+index 734f354d9a5a..82a81b0b32d0 100644
+--- a/src/Databases/DatabaseOnDisk.cpp
++++ b/src/Databases/DatabaseOnDisk.cpp
+@@ -172,7 +172,14 @@ DatabaseOnDisk::DatabaseOnDisk(
+     , metadata_path(metadata_path_)
+     , data_path(data_path_)
+ {
+-    fs::create_directories(local_context->getPath() + data_path);
++}
++
++
++void DatabaseOnDisk::createDirectories()
++{
++    if (directories_created.test_and_set())
++        return;
++    fs::create_directories(std::filesystem::path(getContext()->getPath()) / data_path);
+     fs::create_directories(metadata_path);
+ }
+ 
+@@ -190,6 +197,8 @@ void DatabaseOnDisk::createTable(
+     const StoragePtr & table,
+     const ASTPtr & query)
+ {
++    createDirectories();
++
+     const auto & settings = local_context->getSettingsRef();
+     const auto & create = query->as<ASTCreateQuery &>();
+     assert(table_name == create.getTable());
+@@ -257,7 +266,6 @@ void DatabaseOnDisk::createTable(
+     }
+ 
+     commitCreateTable(create, table, table_metadata_tmp_path, table_metadata_path, local_context);
+-
+     removeDetachedPermanentlyFlag(local_context, table_name, table_metadata_path, false);
+ }
+ 
+@@ -285,6 +293,8 @@ void DatabaseOnDisk::commitCreateTable(const ASTCreateQuery & query, const Stora
+ {
+     try
+     {
++        createDirectories();
++
+         /// Add a table to the map of known tables.
+         attachTable(query_context, query.getTable(), table, getTableDataPath(query));
+ 
+@@ -420,6 +430,7 @@ void DatabaseOnDisk::renameTable(
+             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Moving tables between databases of different engines is not supported");
+     }
+ 
++    createDirectories();
+     waitDatabaseStarted();
+ 
+     auto table_data_relative_path = getTableDataPath(table_name);
+@@ -568,14 +579,14 @@ void DatabaseOnDisk::drop(ContextPtr local_context)
+     assert(TSA_SUPPRESS_WARNING_FOR_READ(tables).empty());
+     if (local_context->getSettingsRef().force_remove_data_recursively_on_drop)
+     {
+-        (void)fs::remove_all(local_context->getPath() + getDataPath());
++        (void)fs::remove_all(std::filesystem::path(getContext()->getPath()) / data_path);
+         (void)fs::remove_all(getMetadataPath());
+     }
+     else
+     {
+         try
+         {
+-            (void)fs::remove(local_context->getPath() + getDataPath());
++            (void)fs::remove(std::filesystem::path(getContext()->getPath()) / data_path);
+             (void)fs::remove(getMetadataPath());
+         }
+         catch (const fs::filesystem_error & e)
+@@ -613,15 +624,18 @@ time_t DatabaseOnDisk::getObjectMetadataModificationTime(const String & object_n
+     }
+ }
+ 
+-void DatabaseOnDisk::iterateMetadataFiles(ContextPtr local_context, const IteratingFunction & process_metadata_file) const
++void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_metadata_file) const
+ {
++    if (!fs::exists(metadata_path))
++        return;
++
+     auto process_tmp_drop_metadata_file = [&](const String & file_name)
+     {
+         assert(getUUID() == UUIDHelpers::Nil);
+         static const char * tmp_drop_ext = ".sql.tmp_drop";
+         const std::string object_name = file_name.substr(0, file_name.size() - strlen(tmp_drop_ext));
+ 
+-        if (fs::exists(local_context->getPath() + getDataPath() + '/' + object_name))
++        if (fs::exists(std::filesystem::path(getContext()->getPath()) / data_path / object_name))
+         {
+             fs::rename(getMetadataPath() + file_name, getMetadataPath() + object_name + ".sql");
+             LOG_WARNING(log, "Object {} was not dropped previously and will be restored", backQuote(object_name));
+@@ -638,7 +652,7 @@ void DatabaseOnDisk::iterateMetadataFiles(ContextPtr local_context, const Iterat
+     std::vector<std::pair<String, bool>> metadata_files;
+ 
+     fs::directory_iterator dir_end;
+-    for (fs::directory_iterator dir_it(getMetadataPath()); dir_it != dir_end; ++dir_it)
++    for (fs::directory_iterator dir_it(metadata_path); dir_it != dir_end; ++dir_it)
+     {
+         String file_name = dir_it->path().filename();
+         /// For '.svn', '.gitignore' directory and similar.
+diff --git a/src/Databases/DatabaseOnDisk.h b/src/Databases/DatabaseOnDisk.h
+index 12656068643b..0c0ecf76a266 100644
+--- a/src/Databases/DatabaseOnDisk.h
++++ b/src/Databases/DatabaseOnDisk.h
+@@ -64,7 +64,7 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+     time_t getObjectMetadataModificationTime(const String & object_name) const override;
+ 
+     String getDataPath() const override { return data_path; }
+-    String getTableDataPath(const String & table_name) const override { return data_path + escapeForFileName(table_name) + "/"; }
++    String getTableDataPath(const String & table_name) const override { return std::filesystem::path(data_path) / escapeForFileName(table_name) / ""; }
+     String getTableDataPath(const ASTCreateQuery & query) const override { return getTableDataPath(query.getTable()); }
+     String getMetadataPath() const override { return metadata_path; }
+ 
+@@ -83,7 +83,7 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+ 
+     using IteratingFunction = std::function<void(const String &)>;
+ 
+-    void iterateMetadataFiles(ContextPtr context, const IteratingFunction & process_metadata_file) const;
++    void iterateMetadataFiles(const IteratingFunction & process_metadata_file) const;
+ 
+     ASTPtr getCreateTableQueryImpl(
+         const String & table_name,
+@@ -99,6 +99,9 @@ class DatabaseOnDisk : public DatabaseWithOwnTablesBase
+     virtual void removeDetachedPermanentlyFlag(ContextPtr context, const String & table_name, const String & table_metadata_path, bool attach);
+     virtual void setDetachedTableNotInUseForce(const UUID & /*uuid*/) {}
+ 
++    std::atomic_flag directories_created = ATOMIC_FLAG_INIT;
++    void createDirectories();
++
+     const String metadata_path;
+     const String data_path;
+ };
+diff --git a/src/Databases/DatabaseOrdinary.cpp b/src/Databases/DatabaseOrdinary.cpp
+index 8808261654f7..dd8a3f42ea8a 100644
+--- a/src/Databases/DatabaseOrdinary.cpp
++++ b/src/Databases/DatabaseOrdinary.cpp
+@@ -55,7 +55,7 @@ static constexpr size_t METADATA_FILE_BUFFER_SIZE = 32768;
+ static constexpr const char * const CONVERT_TO_REPLICATED_FLAG_NAME = "convert_to_replicated";
+ 
+ DatabaseOrdinary::DatabaseOrdinary(const String & name_, const String & metadata_path_, ContextPtr context_)
+-    : DatabaseOrdinary(name_, metadata_path_, "data/" + escapeForFileName(name_) + "/", "DatabaseOrdinary (" + name_ + ")", context_)
++    : DatabaseOrdinary(name_, metadata_path_, std::filesystem::path("data") / escapeForFileName(name_) / "", "DatabaseOrdinary (" + name_ + ")", context_)
+ {
+ }
+ 
+@@ -265,7 +265,7 @@ void DatabaseOrdinary::loadTablesMetadata(ContextPtr local_context, ParsedTables
+         }
+     };
+ 
+-    iterateMetadataFiles(local_context, process_metadata);
++    iterateMetadataFiles(process_metadata);
+ 
+     size_t objects_in_database = metadata.parsed_tables.size() - prev_tables_count;
+     size_t dictionaries_in_database = metadata.total_dictionaries - prev_total_dictionaries;
+diff --git a/src/Databases/DatabasesOverlay.cpp b/src/Databases/DatabasesOverlay.cpp
+index 801356b3dd79..495733e15fd5 100644
+--- a/src/Databases/DatabasesOverlay.cpp
++++ b/src/Databases/DatabasesOverlay.cpp
+@@ -14,6 +14,8 @@ namespace ErrorCodes
+ {
+     extern const int LOGICAL_ERROR;
+     extern const int CANNOT_GET_CREATE_TABLE_QUERY;
++    extern const int BAD_ARGUMENTS;
++    extern const int UNKNOWN_TABLE;
+ }
+ 
+ DatabasesOverlay::DatabasesOverlay(const String & name_, ContextPtr context_)
+@@ -124,6 +126,39 @@ StoragePtr DatabasesOverlay::detachTable(ContextPtr context_, const String & tab
+         getEngineName());
+ }
+ 
++void DatabasesOverlay::renameTable(
++    ContextPtr current_context,
++    const String & name,
++    IDatabase & to_database,
++    const String & to_name,
++    bool exchange,
++    bool dictionary)
++{
++    for (auto & db : databases)
++    {
++        if (db->isTableExist(name, current_context))
++        {
++            if (DatabasesOverlay * to_overlay_database = typeid_cast<DatabasesOverlay *>(&to_database))
++            {
++                /// Renaming from Overlay database inside itself or into another Overlay database.
++                /// Just use the first database in the overlay as a destination.
++                if (to_overlay_database->databases.empty())
++                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "The destination Overlay database {} does not have any members", to_database.getDatabaseName());
++
++                db->renameTable(current_context, name, *to_overlay_database->databases[0], to_name, exchange, dictionary);
++            }
++            else
++            {
++                /// Renaming into a different type of database. E.g. from Overlay on top of Atomic database into just Atomic database.
++                db->renameTable(current_context, name, to_database, to_name, exchange, dictionary);
++            }
++
++            return;
++        }
++    }
++    throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {}.{} doesn't exist", backQuote(getDatabaseName()), backQuote(name));
++}
++
+ ASTPtr DatabasesOverlay::getCreateTableQueryImpl(const String & name, ContextPtr context_, bool throw_on_error) const
+ {
+     ASTPtr result = nullptr;
+@@ -178,6 +213,18 @@ String DatabasesOverlay::getTableDataPath(const ASTCreateQuery & query) const
+     return result;
+ }
+ 
++UUID DatabasesOverlay::getUUID() const
++{
++    UUID result = UUIDHelpers::Nil;
++    for (const auto & db : databases)
++    {
++        result = db->getUUID();
++        if (result != UUIDHelpers::Nil)
++            break;
++    }
++    return result;
++}
++
+ UUID DatabasesOverlay::tryGetTableUUID(const String & table_name) const
+ {
+     UUID result = UUIDHelpers::Nil;
+diff --git a/src/Databases/DatabasesOverlay.h b/src/Databases/DatabasesOverlay.h
+index b0c7e7e40326..40c653e5cb50 100644
+--- a/src/Databases/DatabasesOverlay.h
++++ b/src/Databases/DatabasesOverlay.h
+@@ -35,12 +35,21 @@ class DatabasesOverlay : public IDatabase, protected WithContext
+ 
+     StoragePtr detachTable(ContextPtr context, const String & table_name) override;
+ 
++    void renameTable(
++        ContextPtr current_context,
++        const String & name,
++        IDatabase & to_database,
++        const String & to_name,
++        bool exchange,
++        bool dictionary) override;
++
+     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr context, bool throw_on_error) const override;
+     ASTPtr getCreateDatabaseQuery() const override;
+ 
+     String getTableDataPath(const String & table_name) const override;
+     String getTableDataPath(const ASTCreateQuery & query) const override;
+ 
++    UUID getUUID() const override;
+     UUID tryGetTableUUID(const String & table_name) const override;
+ 
+     void drop(ContextPtr context) override;
+diff --git a/src/Databases/IDatabase.h b/src/Databases/IDatabase.h
+index f94326d220e4..02418abb2b06 100644
+--- a/src/Databases/IDatabase.h
++++ b/src/Databases/IDatabase.h
+@@ -416,6 +416,7 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+         std::lock_guard lock{mutex};
+         return database_name;
+     }
++
+     /// Get UUID of database.
+     virtual UUID getUUID() const { return UUIDHelpers::Nil; }
+ 
+diff --git a/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp b/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
+index 2f5477a6b9d5..8b3850c4e0c9 100644
+--- a/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
++++ b/src/Databases/MySQL/DatabaseMaterializedMySQL.cpp
+@@ -46,6 +46,7 @@ DatabaseMaterializedMySQL::DatabaseMaterializedMySQL(
+     , settings(std::move(settings_))
+     , materialize_thread(context_, database_name_, mysql_database_name_, std::move(pool_), std::move(client_), binlog_client_, settings.get())
+ {
++    createDirectories();
+ }
+ 
+ void DatabaseMaterializedMySQL::rethrowExceptionIfNeeded() const
+diff --git a/src/Interpreters/StorageID.h b/src/Interpreters/StorageID.h
+index f9afbc7b98d9..ad55d16e284d 100644
+--- a/src/Interpreters/StorageID.h
++++ b/src/Interpreters/StorageID.h
+@@ -27,7 +27,6 @@ class ASTQueryWithTableAndOutput;
+ class ASTTableIdentifier;
+ class Context;
+ 
+-// TODO(ilezhankin): refactor and merge |ASTTableIdentifier|
+ struct StorageID
+ {
+     String database_name;

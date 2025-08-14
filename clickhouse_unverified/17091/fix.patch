@@ -1,0 +1,335 @@
+diff --git a/src/Core/MySQL/MySQLClient.cpp b/src/Core/MySQL/MySQLClient.cpp
+index 9cb21a2d39a3..f65fbe622740 100644
+--- a/src/Core/MySQL/MySQLClient.cpp
++++ b/src/Core/MySQL/MySQLClient.cpp
+@@ -6,6 +6,7 @@
+ #include <Core/MySQL/PacketsProtocolText.h>
+ #include <Core/MySQL/PacketsReplication.h>
+ #include <Core/MySQL/MySQLReplication.h>
++#include <Poco/String.h>
+ 
+ namespace DB
+ {
+@@ -132,11 +133,19 @@ void MySQLClient::ping()
+     writeCommand(Command::COM_PING, "");
+ }
+ 
+-void MySQLClient::startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid_str)
++void MySQLClient::setBinlogChecksum(const String & binlog_checksum)
+ {
+-    /// Set binlog checksum to CRC32.
+-    String checksum = "CRC32";
+-    writeCommand(Command::COM_QUERY, "SET @master_binlog_checksum = '" + checksum + "'");
++    replication.setChecksumSignatureLength(Poco::toUpper(binlog_checksum) == "NONE" ? 0 : 4);
++}
++
++void MySQLClient::startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid_str, const String & binlog_checksum)
++{
++    /// Maybe CRC32 or NONE. mysqlbinlog.cc use NONE, see its below comments:
++    /// Make a notice to the server that this client is checksum-aware.
++    /// It does not need the first fake Rotate necessary checksummed.
++    writeCommand(Command::COM_QUERY, "SET @master_binlog_checksum = 'CRC32'");
++
++    setBinlogChecksum(binlog_checksum);
+ 
+     /// Set heartbeat 1s.
+     UInt64 period_ns = (1 * 1e9);
+diff --git a/src/Core/MySQL/MySQLClient.h b/src/Core/MySQL/MySQLClient.h
+index a31794acc423..5835e9801494 100644
+--- a/src/Core/MySQL/MySQLClient.h
++++ b/src/Core/MySQL/MySQLClient.h
+@@ -29,10 +29,12 @@ class MySQLClient
+     void disconnect();
+     void ping();
+ 
++    void setBinlogChecksum(const String & binlog_checksum);
++
+     /// Start replication stream by GTID.
+     /// replicate_db: replication database schema, events from other databases will be ignored.
+     /// gtid: executed gtid sets format like 'hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh:x-y'.
+-    void startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid);
++    void startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid, const String & binlog_checksum);
+ 
+     BinlogEventPtr readOneBinlogEvent(UInt64 milliseconds = 0);
+     Position getPosition() const { return replication.getPosition(); }
+diff --git a/src/Core/MySQL/MySQLReplication.cpp b/src/Core/MySQL/MySQLReplication.cpp
+index 6ff1670777ac..a33d65fcbd5e 100644
+--- a/src/Core/MySQL/MySQLReplication.cpp
++++ b/src/Core/MySQL/MySQLReplication.cpp
+@@ -57,7 +57,6 @@ namespace MySQLReplication
+         payload.readStrict(reinterpret_cast<char *>(&create_timestamp), 4);
+         payload.readStrict(reinterpret_cast<char *>(&event_header_length), 1);
+         assert(event_header_length == EVENT_HEADER_LENGTH);
+-
+         readStringUntilEOF(event_type_header_length, payload);
+     }
+ 
+@@ -745,7 +744,7 @@ namespace MySQLReplication
+         // skip the generic response packets header flag.
+         payload.ignore(1);
+ 
+-        MySQLBinlogEventReadBuffer event_payload(payload);
++        MySQLBinlogEventReadBuffer event_payload(payload, checksum_signature_length);
+ 
+         EventHeader event_header;
+         event_header.parse(event_payload);
+diff --git a/src/Core/MySQL/MySQLReplication.h b/src/Core/MySQL/MySQLReplication.h
+index 394ac729d1bf..bbefb368aafe 100644
+--- a/src/Core/MySQL/MySQLReplication.h
++++ b/src/Core/MySQL/MySQLReplication.h
+@@ -526,6 +526,8 @@ namespace MySQLReplication
+         virtual BinlogEventPtr readOneEvent() = 0;
+         virtual void setReplicateDatabase(String db) = 0;
+         virtual void setGTIDSets(GTIDSets sets) = 0;
++        virtual void setChecksumSignatureLength(size_t checksum_signature_length_) = 0;
++
+         virtual ~IFlavor() override = default;
+     };
+ 
+@@ -538,12 +540,14 @@ namespace MySQLReplication
+         BinlogEventPtr readOneEvent() override { return event; }
+         void setReplicateDatabase(String db) override { replicate_do_db = std::move(db); }
+         void setGTIDSets(GTIDSets sets) override { position.gtid_sets = std::move(sets); }
++        void setChecksumSignatureLength(size_t checksum_signature_length_) override { checksum_signature_length = checksum_signature_length_; }
+ 
+     private:
+         Position position;
+         BinlogEventPtr event;
+         String replicate_do_db;
+         std::shared_ptr<TableMapEvent> table_map;
++        size_t checksum_signature_length = 4;
+ 
+         inline bool do_replicate() { return (replicate_do_db.empty() || table_map->schema == replicate_do_db); }
+     };
+diff --git a/src/Databases/MySQL/MaterializeMetadata.cpp b/src/Databases/MySQL/MaterializeMetadata.cpp
+index eed4bddb5885..c001955a8ae9 100644
+--- a/src/Databases/MySQL/MaterializeMetadata.cpp
++++ b/src/Databases/MySQL/MaterializeMetadata.cpp
+@@ -91,6 +91,29 @@ void MaterializeMetadata::fetchMasterStatus(mysqlxx::PoolWithFailover::Entry & c
+     executed_gtid_set = (*master_status.getByPosition(4).column)[0].safeGet<String>();
+ }
+ 
++void MaterializeMetadata::fetchMasterVariablesValue(const mysqlxx::PoolWithFailover::Entry & connection)
++{
++    Block variables_header{
++        {std::make_shared<DataTypeString>(), "Variable_name"},
++        {std::make_shared<DataTypeString>(), "Value"}
++    };
++
++    const String & fetch_query = "SHOW VARIABLES WHERE Variable_name = 'binlog_checksum'";
++    MySQLBlockInputStream variables_input(connection, fetch_query, variables_header, DEFAULT_BLOCK_SIZE);
++
++    while (Block variables_block = variables_input.read())
++    {
++        ColumnPtr variables_name = variables_block.getByName("Variable_name").column;
++        ColumnPtr variables_value = variables_block.getByName("Value").column;
++
++        for (size_t index = 0; index < variables_block.rows(); ++index)
++        {
++            if (variables_name->getDataAt(index) == "binlog_checksum")
++                binlog_checksum = variables_value->getDataAt(index).toString();
++        }
++    }
++}
++
+ static Block getShowMasterLogHeader(const String & mysql_version)
+ {
+     if (startsWith(mysql_version, "5."))
+@@ -241,6 +264,7 @@ MaterializeMetadata::MaterializeMetadata(
+ 
+         locked_tables = true;
+         fetchMasterStatus(connection);
++        fetchMasterVariablesValue(connection);
+         connection->query("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;").execute();
+         connection->query("START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */;").execute();
+ 
+diff --git a/src/Databases/MySQL/MaterializeMetadata.h b/src/Databases/MySQL/MaterializeMetadata.h
+index 5e77620e365b..94dfc73e5df2 100644
+--- a/src/Databases/MySQL/MaterializeMetadata.h
++++ b/src/Databases/MySQL/MaterializeMetadata.h
+@@ -34,10 +34,13 @@ struct MaterializeMetadata
+ 
+     size_t data_version = 1;
+     size_t meta_version = 2;
++    String binlog_checksum = "CRC32";
+     std::unordered_map<String, String> need_dumping_tables;
+ 
+     void fetchMasterStatus(mysqlxx::PoolWithFailover::Entry & connection);
+ 
++    void fetchMasterVariablesValue(const mysqlxx::PoolWithFailover::Entry & connection);
++
+     bool checkBinlogFileExists(mysqlxx::PoolWithFailover::Entry & connection, const String & mysql_version) const;
+ 
+     void transaction(const MySQLReplication::Position & position, const std::function<void()> & fun);
+diff --git a/src/Databases/MySQL/MaterializeMySQLSyncThread.cpp b/src/Databases/MySQL/MaterializeMySQLSyncThread.cpp
+index 0bc4e6c22d3a..b8f13f4ed189 100644
+--- a/src/Databases/MySQL/MaterializeMySQLSyncThread.cpp
++++ b/src/Databases/MySQL/MaterializeMySQLSyncThread.cpp
+@@ -364,7 +364,7 @@ std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchroniz
+                 connection->query("COMMIT").execute();
+ 
+             client.connect();
+-            client.startBinlogDumpGTID(randomNumber(), mysql_database_name, metadata.executed_gtid_set);
++            client.startBinlogDumpGTID(randomNumber(), mysql_database_name, metadata.executed_gtid_set, metadata.binlog_checksum);
+             return metadata;
+         }
+         catch (...)
+@@ -648,16 +648,27 @@ void MaterializeMySQLSyncThread::onEvent(Buffers & buffers, const BinlogEventPtr
+         metadata.transaction(position_before_ddl, [&]() { buffers.commit(global_context); });
+         metadata.transaction(client.getPosition(),[&](){ executeDDLAtomic(query_event); });
+     }
+-    else if (receive_event->header.type != HEARTBEAT_EVENT)
++    else
+     {
+-        const auto & dump_event_message = [&]()
++        /// MYSQL_UNHANDLED_EVENT
++        if (receive_event->header.type == ROTATE_EVENT)
+         {
+-            WriteBufferFromOwnString buf;
+-            receive_event->dump(buf);
+-            return buf.str();
+-        };
++            /// Some behaviors(such as changing the value of "binlog_checksum") rotate the binlog file.
++            /// To ensure that the synchronization continues, we need to handle these events
++            metadata.fetchMasterVariablesValue(pool.get());
++            client.setBinlogChecksum(metadata.binlog_checksum);
++        }
++        else if (receive_event->header.type != HEARTBEAT_EVENT)
++        {
++            const auto & dump_event_message = [&]()
++            {
++                WriteBufferFromOwnString buf;
++                receive_event->dump(buf);
++                return buf.str();
++            };
+ 
+-        LOG_DEBUG(log, "Skip MySQL event: 
+ {}", dump_event_message());
++            LOG_DEBUG(log, "Skip MySQL event: 
+ {}", dump_event_message());
++        }
+     }
+ }
+ 
+diff --git a/src/IO/MySQLBinlogEventReadBuffer.cpp b/src/IO/MySQLBinlogEventReadBuffer.cpp
+index 3a2aba045d36..5b1d23545a2b 100644
+--- a/src/IO/MySQLBinlogEventReadBuffer.cpp
++++ b/src/IO/MySQLBinlogEventReadBuffer.cpp
+@@ -4,9 +4,18 @@
+ namespace DB
+ {
+ 
+-MySQLBinlogEventReadBuffer::MySQLBinlogEventReadBuffer(ReadBuffer & in_)
+-    : ReadBuffer(nullptr, 0, 0), in(in_)
++namespace ErrorCodes
+ {
++    extern const int LOGICAL_ERROR;
++}
++
++MySQLBinlogEventReadBuffer::MySQLBinlogEventReadBuffer(ReadBuffer & in_, size_t checksum_signature_length_)
++    : ReadBuffer(nullptr, 0, 0), in(in_), checksum_signature_length(checksum_signature_length_)
++{
++    if (checksum_signature_length > MAX_CHECKSUM_SIGNATURE_LENGTH)
++        throw Exception("LOGICAL ERROR: checksum_signature_length must be less than MAX_CHECKSUM_SIGNATURE_LENGTH. It is a bug.",
++            ErrorCodes::LOGICAL_ERROR);
++
+     nextIfAtEnd();
+ }
+ 
+@@ -20,15 +29,15 @@ bool MySQLBinlogEventReadBuffer::nextImpl()
+ 
+     if (checksum_buff_size == checksum_buff_limit)
+     {
+-        if (likely(in.available() > CHECKSUM_CRC32_SIGNATURE_LENGTH))
++        if (likely(in.available() > checksum_signature_length))
+         {
+-            working_buffer = ReadBuffer::Buffer(in.position(), in.buffer().end() - CHECKSUM_CRC32_SIGNATURE_LENGTH);
++            working_buffer = ReadBuffer::Buffer(in.position(), in.buffer().end() - checksum_signature_length);
+             in.ignore(working_buffer.size());
+             return true;
+         }
+ 
+-        in.readStrict(checksum_buf, CHECKSUM_CRC32_SIGNATURE_LENGTH);
+-        checksum_buff_size = checksum_buff_limit = CHECKSUM_CRC32_SIGNATURE_LENGTH;
++        in.readStrict(checksum_buf, checksum_signature_length);
++        checksum_buff_size = checksum_buff_limit = checksum_signature_length;
+     }
+     else
+     {
+@@ -36,17 +45,17 @@ bool MySQLBinlogEventReadBuffer::nextImpl()
+             checksum_buf[index] = checksum_buf[checksum_buff_limit + index];
+ 
+         checksum_buff_size -= checksum_buff_limit;
+-        size_t read_bytes = CHECKSUM_CRC32_SIGNATURE_LENGTH - checksum_buff_size;
+-        in.readStrict(checksum_buf + checksum_buff_size, read_bytes);   /// Minimum CHECKSUM_CRC32_SIGNATURE_LENGTH bytes
+-        checksum_buff_size = checksum_buff_limit = CHECKSUM_CRC32_SIGNATURE_LENGTH;
++        size_t read_bytes = checksum_signature_length - checksum_buff_size;
++        in.readStrict(checksum_buf + checksum_buff_size, read_bytes);   /// Minimum checksum_signature_length bytes
++        checksum_buff_size = checksum_buff_limit = checksum_signature_length;
+     }
+ 
+     if (in.eof())
+         return false;
+ 
+-    if (in.available() < CHECKSUM_CRC32_SIGNATURE_LENGTH)
++    if (in.available() < checksum_signature_length)
+     {
+-        size_t left_move_size = CHECKSUM_CRC32_SIGNATURE_LENGTH - in.available();
++        size_t left_move_size = checksum_signature_length - in.available();
+         checksum_buff_limit = checksum_buff_size - left_move_size;
+     }
+ 
+@@ -58,7 +67,7 @@ MySQLBinlogEventReadBuffer::~MySQLBinlogEventReadBuffer()
+ {
+     try
+     {
+-        /// ignore last 4 bytes
++        /// ignore last checksum_signature_length bytes
+         nextIfAtEnd();
+     }
+     catch (...)
+diff --git a/src/IO/MySQLBinlogEventReadBuffer.h b/src/IO/MySQLBinlogEventReadBuffer.h
+index e9452aa551ec..d31e19d82b81 100644
+--- a/src/IO/MySQLBinlogEventReadBuffer.h
++++ b/src/IO/MySQLBinlogEventReadBuffer.h
+@@ -8,19 +8,21 @@ namespace DB
+ class MySQLBinlogEventReadBuffer : public ReadBuffer
+ {
+ protected:
+-    static const size_t CHECKSUM_CRC32_SIGNATURE_LENGTH = 4;
++    static const size_t MAX_CHECKSUM_SIGNATURE_LENGTH = 4;
++
+     ReadBuffer & in;
++    size_t checksum_signature_length;
+ 
+     size_t checksum_buff_size = 0;
+     size_t checksum_buff_limit = 0;
+-    char checksum_buf[CHECKSUM_CRC32_SIGNATURE_LENGTH];
++    char checksum_buf[MAX_CHECKSUM_SIGNATURE_LENGTH];
+ 
+     bool nextImpl() override;
+ 
+ public:
+     ~MySQLBinlogEventReadBuffer() override;
+ 
+-    MySQLBinlogEventReadBuffer(ReadBuffer & in_);
++    MySQLBinlogEventReadBuffer(ReadBuffer & in_, size_t checksum_signature_length_);
+ 
+ };
+ 
+diff --git a/utils/check-mysql-binlog/main.cpp b/utils/check-mysql-binlog/main.cpp
+index 0d831b84dcee..ccdc4cd168c3 100644
+--- a/utils/check-mysql-binlog/main.cpp
++++ b/utils/check-mysql-binlog/main.cpp
+@@ -18,10 +18,7 @@ static DB::MySQLReplication::BinlogEventPtr parseSingleEventBody(
+ {
+     DB::MySQLReplication::BinlogEventPtr event;
+     DB::ReadBufferPtr limit_read_buffer = std::make_shared<DB::LimitReadBuffer>(payload, header.event_size - 19, false);
+-    DB::ReadBufferPtr event_payload = limit_read_buffer;
+-
+-    if (exist_checksum)
+-        event_payload = std::make_shared<DB::MySQLBinlogEventReadBuffer>(*limit_read_buffer);
++    DB::ReadBufferPtr event_payload = std::make_shared<DB::MySQLBinlogEventReadBuffer>(*limit_read_buffer, exist_checksum ? 4 : 0);
+ 
+     switch (header.type)
+     {

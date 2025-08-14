@@ -1,0 +1,622 @@
+diff --git a/src/Processors/Formats/IInputFormat.cpp b/src/Processors/Formats/IInputFormat.cpp
+index 0fbc78ea8c09..069d25564b16 100644
+--- a/src/Processors/Formats/IInputFormat.cpp
++++ b/src/Processors/Formats/IInputFormat.cpp
+@@ -13,6 +13,7 @@ namespace ErrorCodes
+ IInputFormat::IInputFormat(Block header, ReadBuffer & in_)
+     : ISource(std::move(header)), in(in_)
+ {
++    column_mapping = std::make_shared<ColumnMapping>();
+ }
+ 
+ void IInputFormat::resetParser()
+diff --git a/src/Processors/Formats/IInputFormat.h b/src/Processors/Formats/IInputFormat.h
+index e1537aff6c56..95910bf51e5b 100644
+--- a/src/Processors/Formats/IInputFormat.h
++++ b/src/Processors/Formats/IInputFormat.h
+@@ -2,9 +2,29 @@
+ 
+ #include <Processors/ISource.h>
+ 
++#include <memory>
++
+ 
+ namespace DB
+ {
++/// Used to pass info from header between different InputFormats in ParallelParsing
++struct ColumnMapping
++{
++    /// Non-atomic because there is strict `happens-before` between read and write access
++    /// See InputFormatParallelParsing
++    bool is_set;
++    /// Maps indexes of columns in the input file to indexes of table columns
++    using OptionalIndexes = std::vector<std::optional<size_t>>;
++    OptionalIndexes column_indexes_for_input_fields;
++
++    /// Tracks which columns we have read in a single read() call.
++    /// For columns that are never read, it is initialized to false when we
++    /// read the file header, and never changed afterwards.
++    /// For other columns, it is updated on each read() call.
++    std::vector<UInt8> read_columns;
++};
++
++using ColumnMappingPtr = std::shared_ptr<ColumnMapping>;
+ 
+ class ReadBuffer;
+ 
+@@ -39,9 +59,17 @@ class IInputFormat : public ISource
+         return none;
+     }
+ 
++    /// Must be called from ParallelParsingInputFormat after readSuffix
++    ColumnMappingPtr getColumnMapping() const { return column_mapping; }
++    /// Must be called from ParallelParsingInputFormat before readPrefix
++    void setColumnMapping(ColumnMappingPtr column_mapping_) { column_mapping = column_mapping_; }
++
+     size_t getCurrentUnitNumber() const { return current_unit_number; }
+     void setCurrentUnitNumber(size_t current_unit_number_) { current_unit_number = current_unit_number_; }
+ 
++protected:
++    ColumnMappingPtr column_mapping{};
++
+ private:
+     /// Number of currently parsed chunk (if parallel parsing is enabled)
+     size_t current_unit_number = 0;
+diff --git a/src/Processors/Formats/Impl/CSVRowInputFormat.cpp b/src/Processors/Formats/Impl/CSVRowInputFormat.cpp
+index f7f08411dfa0..4cec07f38dc5 100644
+--- a/src/Processors/Formats/Impl/CSVRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/CSVRowInputFormat.cpp
+@@ -55,13 +55,13 @@ void CSVRowInputFormat::addInputColumn(const String & column_name)
+     {
+         if (format_settings.skip_unknown_fields)
+         {
+-            column_indexes_for_input_fields.push_back(std::nullopt);
++            column_mapping->column_indexes_for_input_fields.push_back(std::nullopt);
+             return;
+         }
+ 
+         throw Exception(
+                 "Unknown field found in CSV header: '" + column_name + "' " +
+-                "at position " + std::to_string(column_indexes_for_input_fields.size()) +
++                "at position " + std::to_string(column_mapping->column_indexes_for_input_fields.size()) +
+                 "
+Set the 'input_format_skip_unknown_fields' parameter explicitly to ignore and proceed",
+                 ErrorCodes::INCORRECT_DATA
+         );
+@@ -69,11 +69,11 @@ void CSVRowInputFormat::addInputColumn(const String & column_name)
+ 
+     const auto column_index = column_it->second;
+ 
+-    if (read_columns[column_index])
++    if (column_mapping->read_columns[column_index])
+         throw Exception("Duplicate field found while parsing CSV header: " + column_name, ErrorCodes::INCORRECT_DATA);
+ 
+-    read_columns[column_index] = true;
+-    column_indexes_for_input_fields.emplace_back(column_index);
++    column_mapping->read_columns[column_index] = true;
++    column_mapping->column_indexes_for_input_fields.emplace_back(column_index);
+ }
+ 
+ static void skipEndOfLine(ReadBuffer & in)
+@@ -145,6 +145,16 @@ static void skipRow(ReadBuffer & in, const FormatSettings::CSV & settings, size_
+     }
+ }
+ 
++void CSVRowInputFormat::setupAllColumnsByTableSchema()
++{
++    const auto & header = getPort().getHeader();
++    column_mapping->read_columns.assign(header.columns(), true);
++    column_mapping->column_indexes_for_input_fields.resize(header.columns());
++
++    for (size_t i = 0; i < column_mapping->column_indexes_for_input_fields.size(); ++i)
++        column_mapping->column_indexes_for_input_fields[i] = i;
++}
++
+ 
+ void CSVRowInputFormat::readPrefix()
+ {
+@@ -155,7 +165,9 @@ void CSVRowInputFormat::readPrefix()
+     size_t num_columns = data_types.size();
+     const auto & header = getPort().getHeader();
+ 
+-    if (with_names)
++    /// This is a bit of abstraction leakage, but we have almost the same code in other places.
++    /// Thus, we check if this InputFormat is working with the "real" beginning of the data in case of parallel parsing.
++    if (with_names && getCurrentUnitNumber() == 0)
+     {
+         /// This CSV file has a header row with column names. Depending on the
+         /// settings, use it or skip it.
+@@ -163,7 +175,7 @@ void CSVRowInputFormat::readPrefix()
+         {
+             /// Look at the file header to see which columns we have there.
+             /// The missing columns are filled with defaults.
+-            read_columns.assign(header.columns(), false);
++            column_mapping->read_columns.assign(header.columns(), false);
+             do
+             {
+                 String column_name;
+@@ -177,7 +189,7 @@ void CSVRowInputFormat::readPrefix()
+ 
+             skipDelimiter(in, format_settings.csv.delimiter, true);
+ 
+-            for (auto read_column : read_columns)
++            for (auto read_column : column_mapping->read_columns)
+             {
+                 if (!read_column)
+                 {
+@@ -191,16 +203,8 @@ void CSVRowInputFormat::readPrefix()
+         else
+             skipRow(in, format_settings.csv, num_columns);
+     }
+-
+-    /// The default: map each column of the file to the column of the table with
+-    /// the same index.
+-    read_columns.assign(header.columns(), true);
+-    column_indexes_for_input_fields.resize(header.columns());
+-
+-    for (size_t i = 0; i < column_indexes_for_input_fields.size(); ++i)
+-    {
+-        column_indexes_for_input_fields[i] = i;
+-    }
++    else if (!column_mapping->is_set)
++        setupAllColumnsByTableSchema();
+ }
+ 
+ 
+@@ -216,12 +220,12 @@ bool CSVRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & ext
+     /// it doesn't have to check it.
+     bool have_default_columns = have_always_default_columns;
+ 
+-    ext.read_columns.assign(read_columns.size(), true);
++    ext.read_columns.assign(column_mapping->read_columns.size(), true);
+     const auto delimiter = format_settings.csv.delimiter;
+-    for (size_t file_column = 0; file_column < column_indexes_for_input_fields.size(); ++file_column)
++    for (size_t file_column = 0; file_column < column_mapping->column_indexes_for_input_fields.size(); ++file_column)
+     {
+-        const auto & table_column = column_indexes_for_input_fields[file_column];
+-        const bool is_last_file_column = file_column + 1 == column_indexes_for_input_fields.size();
++        const auto & table_column = column_mapping->column_indexes_for_input_fields[file_column];
++        const bool is_last_file_column = file_column + 1 == column_mapping->column_indexes_for_input_fields.size();
+ 
+         if (table_column)
+         {
+@@ -243,9 +247,9 @@ bool CSVRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & ext
+ 
+     if (have_default_columns)
+     {
+-        for (size_t i = 0; i < read_columns.size(); i++)
++        for (size_t i = 0; i < column_mapping->read_columns.size(); i++)
+         {
+-            if (!read_columns[i])
++            if (!column_mapping->read_columns[i])
+             {
+                 /// The column value for this row is going to be overwritten
+                 /// with default by the caller, but the general assumption is
+@@ -266,7 +270,7 @@ bool CSVRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns & columns,
+ {
+     const char delimiter = format_settings.csv.delimiter;
+ 
+-    for (size_t file_column = 0; file_column < column_indexes_for_input_fields.size(); ++file_column)
++    for (size_t file_column = 0; file_column < column_mapping->column_indexes_for_input_fields.size(); ++file_column)
+     {
+         if (file_column == 0 && in.eof())
+         {
+@@ -275,10 +279,10 @@ bool CSVRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns & columns,
+         }
+ 
+         skipWhitespacesAndTabs(in);
+-        if (column_indexes_for_input_fields[file_column].has_value())
++        if (column_mapping->column_indexes_for_input_fields[file_column].has_value())
+         {
+             const auto & header = getPort().getHeader();
+-            size_t col_idx = column_indexes_for_input_fields[file_column].value();
++            size_t col_idx = column_mapping->column_indexes_for_input_fields[file_column].value();
+             if (!deserializeFieldAndPrintDiagnosticInfo(header.getByPosition(col_idx).name, data_types[col_idx], *columns[col_idx],
+                                                         out, file_column))
+                 return false;
+@@ -294,7 +298,7 @@ bool CSVRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns & columns,
+         skipWhitespacesAndTabs(in);
+ 
+         /// Delimiters
+-        if (file_column + 1 == column_indexes_for_input_fields.size())
++        if (file_column + 1 == column_mapping->column_indexes_for_input_fields.size())
+         {
+             if (in.eof())
+                 return false;
+@@ -356,9 +360,9 @@ void CSVRowInputFormat::syncAfterError()
+ 
+ void CSVRowInputFormat::tryDeserializeField(const DataTypePtr & type, IColumn & column, size_t file_column)
+ {
+-    if (column_indexes_for_input_fields[file_column])
++    if (column_mapping->column_indexes_for_input_fields[file_column])
+     {
+-        const bool is_last_file_column = file_column + 1 == column_indexes_for_input_fields.size();
++        const bool is_last_file_column = file_column + 1 == column_mapping->column_indexes_for_input_fields.size();
+         readField(column, type, is_last_file_column);
+     }
+     else
+@@ -404,8 +408,8 @@ bool CSVRowInputFormat::readField(IColumn & column, const DataTypePtr & type, bo
+ void CSVRowInputFormat::resetParser()
+ {
+     RowInputFormatWithDiagnosticInfo::resetParser();
+-    column_indexes_for_input_fields.clear();
+-    read_columns.clear();
++    column_mapping->column_indexes_for_input_fields.clear();
++    column_mapping->read_columns.clear();
+     have_always_default_columns = false;
+ }
+ 
+@@ -492,6 +496,7 @@ static std::pair<bool, size_t> fileSegmentationEngineCSVImpl(ReadBuffer & in, DB
+ void registerFileSegmentationEngineCSV(FormatFactory & factory)
+ {
+     factory.registerFileSegmentationEngine("CSV", &fileSegmentationEngineCSVImpl);
++    factory.registerFileSegmentationEngine("CSVWithNames", &fileSegmentationEngineCSVImpl);
+ }
+ 
+ }
+diff --git a/src/Processors/Formats/Impl/CSVRowInputFormat.h b/src/Processors/Formats/Impl/CSVRowInputFormat.h
+index c884eb6c3db5..86e41cf0a43b 100644
+--- a/src/Processors/Formats/Impl/CSVRowInputFormat.h
++++ b/src/Processors/Formats/Impl/CSVRowInputFormat.h
+@@ -38,22 +38,13 @@ class CSVRowInputFormat : public RowInputFormatWithDiagnosticInfo
+     using IndexesMap = std::unordered_map<String, size_t>;
+     IndexesMap column_indexes_by_names;
+ 
+-    /// Maps indexes of columns in the input file to indexes of table columns
+-    using OptionalIndexes = std::vector<std::optional<size_t>>;
+-    OptionalIndexes column_indexes_for_input_fields;
+-
+-    /// Tracks which columns we have read in a single read() call.
+-    /// For columns that are never read, it is initialized to false when we
+-    /// read the file header, and never changed afterwards.
+-    /// For other columns, it is updated on each read() call.
+-    std::vector<UInt8> read_columns;
+-
+     /// Whether we have any columns that are not read from file at all,
+     /// and must be always initialized with defaults.
+     bool have_always_default_columns = false;
+ 
+     void addInputColumn(const String & column_name);
+ 
++    void setupAllColumnsByTableSchema();
+     bool parseRowAndPrintDiagnosticInfo(MutableColumns & columns, WriteBuffer & out) override;
+     void tryDeserializeField(const DataTypePtr & type, IColumn & column, size_t file_column) override;
+     bool isGarbageAfterField(size_t, ReadBuffer::Position pos) override
+diff --git a/src/Processors/Formats/Impl/ParallelParsingInputFormat.cpp b/src/Processors/Formats/Impl/ParallelParsingInputFormat.cpp
+index d1660b530190..1ad913a1a59e 100644
+--- a/src/Processors/Formats/Impl/ParallelParsingInputFormat.cpp
++++ b/src/Processors/Formats/Impl/ParallelParsingInputFormat.cpp
+@@ -89,6 +89,11 @@ void ParallelParsingInputFormat::parserThreadFunction(ThreadGroupStatusPtr threa
+         unit.chunk_ext.chunk.clear();
+         unit.chunk_ext.block_missing_values.clear();
+ 
++        /// Propagate column_mapping to other parsers.
++        /// Note: column_mapping is used only for *WithNames types
++        if (current_ticket_number != 0)
++            input_format->setColumnMapping(column_mapping);
++
+         // We don't know how many blocks will be. So we have to read them all
+         // until an empty block occurred.
+         Chunk chunk;
+@@ -100,6 +105,14 @@ void ParallelParsingInputFormat::parserThreadFunction(ThreadGroupStatusPtr threa
+             unit.chunk_ext.block_missing_values.emplace_back(parser.getMissingValues());
+         }
+ 
++        /// Extract column_mapping from first parser to propagate it to others
++        if (current_ticket_number == 0)
++        {
++            column_mapping = input_format->getColumnMapping();
++            column_mapping->is_set = true;
++            first_parser_finished.set();
++        }
++
+         // We suppose we will get at least some blocks for a non-empty buffer,
+         // except at the end of file. Also see a matching assert in readImpl().
+         assert(unit.is_last || !unit.chunk_ext.chunk.empty() || parsing_finished);
+@@ -117,8 +130,6 @@ void ParallelParsingInputFormat::parserThreadFunction(ThreadGroupStatusPtr threa
+ 
+ void ParallelParsingInputFormat::onBackgroundException(size_t offset)
+ {
+-    tryLogCurrentException(__PRETTY_FUNCTION__);
+-
+     std::unique_lock<std::mutex> lock(mutex);
+     if (!background_exception)
+     {
+@@ -129,6 +140,7 @@ void ParallelParsingInputFormat::onBackgroundException(size_t offset)
+     }
+     tryLogCurrentException(__PRETTY_FUNCTION__);
+     parsing_finished = true;
++    first_parser_finished.set();
+     reader_condvar.notify_all();
+     segmentator_condvar.notify_all();
+ }
+diff --git a/src/Processors/Formats/Impl/ParallelParsingInputFormat.h b/src/Processors/Formats/Impl/ParallelParsingInputFormat.h
+index 9dda2dfe55d0..559507055b9c 100644
+--- a/src/Processors/Formats/Impl/ParallelParsingInputFormat.h
++++ b/src/Processors/Formats/Impl/ParallelParsingInputFormat.h
+@@ -10,6 +10,8 @@
+ #include <IO/ReadBuffer.h>
+ #include <Processors/Formats/IRowInputFormat.h>
+ #include <Interpreters/Context.h>
++#include <common/logger_useful.h>
++#include <Poco/Event.h>
+ 
+ namespace DB
+ {
+@@ -97,6 +99,8 @@ class ParallelParsingInputFormat : public IInputFormat
+ 
+         segmentator_thread = ThreadFromGlobalPool(
+             &ParallelParsingInputFormat::segmentatorThreadFunction, this, CurrentThread::getGroup());
++
++        LOG_TRACE(&Poco::Logger::get("ParallelParsingInputFormat"), "Parallel parsing is used");
+     }
+ 
+     ~ParallelParsingInputFormat() override
+@@ -199,6 +203,8 @@ class ParallelParsingInputFormat : public IInputFormat
+     std::condition_variable reader_condvar;
+     std::condition_variable segmentator_condvar;
+ 
++    Poco::Event first_parser_finished;
++
+     std::atomic<bool> parsing_finished{false};
+ 
+     /// There are multiple "parsers", that's why we use thread pool.
+@@ -250,6 +256,9 @@ class ParallelParsingInputFormat : public IInputFormat
+         {
+             parserThreadFunction(group, ticket_number);
+         });
++        /// We have to wait here to possibly extract ColumnMappingPtr from the first parser.
++        if (ticket_number == 0)
++            first_parser_finished.wait();
+     }
+ 
+     void finishAndWait()
+diff --git a/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.cpp b/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.cpp
+index 96b01a5bd9b4..ffb1b96f70e3 100644
+--- a/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.cpp
+@@ -62,19 +62,19 @@ TabSeparatedRowInputFormat::TabSeparatedRowInputFormat(const Block & header_, Re
+         column_indexes_by_names.emplace(column_info.name, i);
+     }
+ 
+-    column_indexes_for_input_fields.reserve(num_columns);
+-    read_columns.assign(num_columns, false);
++    column_mapping->column_indexes_for_input_fields.reserve(num_columns);
++    column_mapping->read_columns.assign(num_columns, false);
+ }
+ 
+ 
+ void TabSeparatedRowInputFormat::setupAllColumnsByTableSchema()
+ {
+     const auto & header = getPort().getHeader();
+-    read_columns.assign(header.columns(), true);
+-    column_indexes_for_input_fields.resize(header.columns());
++    column_mapping->read_columns.assign(header.columns(), true);
++    column_mapping->column_indexes_for_input_fields.resize(header.columns());
+ 
+-    for (size_t i = 0; i < column_indexes_for_input_fields.size(); ++i)
+-        column_indexes_for_input_fields[i] = i;
++    for (size_t i = 0; i < column_mapping->column_indexes_for_input_fields.size(); ++i)
++        column_mapping->column_indexes_for_input_fields[i] = i;
+ }
+ 
+ 
+@@ -85,13 +85,13 @@ void TabSeparatedRowInputFormat::addInputColumn(const String & column_name)
+     {
+         if (format_settings.skip_unknown_fields)
+         {
+-            column_indexes_for_input_fields.push_back(std::nullopt);
++            column_mapping->column_indexes_for_input_fields.push_back(std::nullopt);
+             return;
+         }
+ 
+         throw Exception(
+                 "Unknown field found in TSV header: '" + column_name + "' " +
+-                "at position " + std::to_string(column_indexes_for_input_fields.size()) +
++                "at position " + std::to_string(column_mapping->column_indexes_for_input_fields.size()) +
+                 "
+Set the 'input_format_skip_unknown_fields' parameter explicitly to ignore and proceed",
+                 ErrorCodes::INCORRECT_DATA
+         );
+@@ -99,11 +99,11 @@ void TabSeparatedRowInputFormat::addInputColumn(const String & column_name)
+ 
+     const auto column_index = column_it->second;
+ 
+-    if (read_columns[column_index])
++    if (column_mapping->read_columns[column_index])
+         throw Exception("Duplicate field found while parsing TSV header: " + column_name, ErrorCodes::INCORRECT_DATA);
+ 
+-    read_columns[column_index] = true;
+-    column_indexes_for_input_fields.emplace_back(column_index);
++    column_mapping->read_columns[column_index] = true;
++    column_mapping->column_indexes_for_input_fields.emplace_back(column_index);
+ }
+ 
+ 
+@@ -113,8 +113,8 @@ void TabSeparatedRowInputFormat::fillUnreadColumnsWithDefaults(MutableColumns &
+     if (unlikely(row_num == 1))
+     {
+         columns_to_fill_with_default_values.clear();
+-        for (size_t index = 0; index < read_columns.size(); ++index)
+-            if (read_columns[index] == 0)
++        for (size_t index = 0; index < column_mapping->read_columns.size(); ++index)
++            if (column_mapping->read_columns[index] == 0)
+                 columns_to_fill_with_default_values.push_back(index);
+     }
+ 
+@@ -136,7 +136,9 @@ void TabSeparatedRowInputFormat::readPrefix()
+         skipBOMIfExists(in);
+     }
+ 
+-    if (with_names)
++    /// This is a bit of abstraction leakage, but we have almost the same code in other places.
++    /// Thus, we check if this InputFormat is working with the "real" beginning of the data in case of parallel parsing.
++    if (with_names && getCurrentUnitNumber() == 0)
+     {
+         if (format_settings.with_names_use_header)
+         {
+@@ -165,15 +167,15 @@ void TabSeparatedRowInputFormat::readPrefix()
+         else
+         {
+             setupAllColumnsByTableSchema();
+-            skipTSVRow(in, column_indexes_for_input_fields.size());
++            skipTSVRow(in, column_mapping->column_indexes_for_input_fields.size());
+         }
+     }
+-    else
++    else if (!column_mapping->is_set)
+         setupAllColumnsByTableSchema();
+ 
+     if (with_types)
+     {
+-        skipTSVRow(in, column_indexes_for_input_fields.size());
++        skipTSVRow(in, column_mapping->column_indexes_for_input_fields.size());
+     }
+ }
+ 
+@@ -185,11 +187,11 @@ bool TabSeparatedRowInputFormat::readRow(MutableColumns & columns, RowReadExtens
+ 
+     updateDiagnosticInfo();
+ 
+-    ext.read_columns.assign(read_columns.size(), true);
+-    for (size_t file_column = 0; file_column < column_indexes_for_input_fields.size(); ++file_column)
++    ext.read_columns.assign(column_mapping->read_columns.size(), true);
++    for (size_t file_column = 0; file_column < column_mapping->column_indexes_for_input_fields.size(); ++file_column)
+     {
+-        const auto & column_index = column_indexes_for_input_fields[file_column];
+-        const bool is_last_file_column = file_column + 1 == column_indexes_for_input_fields.size();
++        const auto & column_index = column_mapping->column_indexes_for_input_fields[file_column];
++        const bool is_last_file_column = file_column + 1 == column_mapping->column_indexes_for_input_fields.size();
+         if (column_index)
+         {
+             const auto & type = data_types[*column_index];
+@@ -202,7 +204,7 @@ bool TabSeparatedRowInputFormat::readRow(MutableColumns & columns, RowReadExtens
+         }
+ 
+         /// skip separators
+-        if (file_column + 1 < column_indexes_for_input_fields.size())
++        if (file_column + 1 < column_mapping->column_indexes_for_input_fields.size())
+         {
+             assertChar('\t', in);
+         }
+@@ -238,7 +240,7 @@ bool TabSeparatedRowInputFormat::readField(IColumn & column, const DataTypePtr &
+ 
+ bool TabSeparatedRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns & columns, WriteBuffer & out)
+ {
+-    for (size_t file_column = 0; file_column < column_indexes_for_input_fields.size(); ++file_column)
++    for (size_t file_column = 0; file_column < column_mapping->column_indexes_for_input_fields.size(); ++file_column)
+     {
+         if (file_column == 0 && in.eof())
+         {
+@@ -246,10 +248,10 @@ bool TabSeparatedRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns &
+             return false;
+         }
+ 
+-        if (column_indexes_for_input_fields[file_column].has_value())
++        if (column_mapping->column_indexes_for_input_fields[file_column].has_value())
+         {
+             const auto & header = getPort().getHeader();
+-            size_t col_idx = column_indexes_for_input_fields[file_column].value();
++            size_t col_idx = column_mapping->column_indexes_for_input_fields[file_column].value();
+             if (!deserializeFieldAndPrintDiagnosticInfo(header.getByPosition(col_idx).name, data_types[col_idx], *columns[col_idx],
+                                                         out, file_column))
+                 return false;
+@@ -264,7 +266,7 @@ bool TabSeparatedRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns &
+         }
+ 
+         /// Delimiters
+-        if (file_column + 1 == column_indexes_for_input_fields.size())
++        if (file_column + 1 == column_mapping->column_indexes_for_input_fields.size())
+         {
+             if (!in.eof())
+             {
+@@ -330,7 +332,7 @@ bool TabSeparatedRowInputFormat::parseRowAndPrintDiagnosticInfo(MutableColumns &
+ 
+ void TabSeparatedRowInputFormat::tryDeserializeField(const DataTypePtr & type, IColumn & column, size_t file_column)
+ {
+-    if (column_indexes_for_input_fields[file_column])
++    if (column_mapping->column_indexes_for_input_fields[file_column])
+     {
+         // check null value for type is not nullable. don't cross buffer bound for simplicity, so maybe missing some case
+         if (!type->isNullable() && !in.eof())
+@@ -349,7 +351,7 @@ void TabSeparatedRowInputFormat::tryDeserializeField(const DataTypePtr & type, I
+                 }
+             }
+         }
+-        const bool is_last_file_column = file_column + 1 == column_indexes_for_input_fields.size();
++        const bool is_last_file_column = file_column + 1 == column_mapping->column_indexes_for_input_fields.size();
+         readField(column, type, is_last_file_column);
+     }
+     else
+@@ -368,8 +370,8 @@ void TabSeparatedRowInputFormat::resetParser()
+ {
+     RowInputFormatWithDiagnosticInfo::resetParser();
+     const auto & sample = getPort().getHeader();
+-    read_columns.assign(sample.columns(), false);
+-    column_indexes_for_input_fields.clear();
++    column_mapping->read_columns.assign(sample.columns(), false);
++    column_mapping->column_indexes_for_input_fields.clear();
+     columns_to_fill_with_default_values.clear();
+ }
+ 
+@@ -463,7 +465,7 @@ static std::pair<bool, size_t> fileSegmentationEngineTabSeparatedImpl(ReadBuffer
+ void registerFileSegmentationEngineTabSeparated(FormatFactory & factory)
+ {
+     // We can use the same segmentation engine for TSKV.
+-    for (const auto * name : {"TabSeparated", "TSV", "TSKV"})
++    for (const auto & name : {"TabSeparated", "TSV", "TSKV", "TabSeparatedWithNames", "TSVWithNames"})
+     {
+         factory.registerFileSegmentationEngine(name, &fileSegmentationEngineTabSeparatedImpl);
+     }
+diff --git a/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.h b/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.h
+index 0141d87403ab..db70b4d3fea6 100644
+--- a/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.h
++++ b/src/Processors/Formats/Impl/TabSeparatedRowInputFormat.h
+@@ -41,10 +41,6 @@ class TabSeparatedRowInputFormat : public RowInputFormatWithDiagnosticInfo
+     using IndexesMap = std::unordered_map<String, size_t>;
+     IndexesMap column_indexes_by_names;
+ 
+-    using OptionalIndexes = std::vector<std::optional<size_t>>;
+-    OptionalIndexes column_indexes_for_input_fields;
+-
+-    std::vector<UInt8> read_columns;
+     std::vector<size_t> columns_to_fill_with_default_values;
+ 
+     void addInputColumn(const String & column_name);
+diff --git a/src/Processors/ISource.h b/src/Processors/ISource.h
+index b7e2b5dce8e2..db91c0c5bceb 100644
+--- a/src/Processors/ISource.h
++++ b/src/Processors/ISource.h
+@@ -19,7 +19,7 @@ class ISource : public IProcessor
+     virtual std::optional<Chunk> tryGenerate();
+ 
+ public:
+-    ISource(Block header);
++    explicit ISource(Block header);
+ 
+     Status prepare() override;
+     void work() override;
+diff --git a/src/Server/GRPCServer.cpp b/src/Server/GRPCServer.cpp
+index ede9bbff0630..52a2c1064888 100644
+--- a/src/Server/GRPCServer.cpp
++++ b/src/Server/GRPCServer.cpp
+@@ -783,8 +783,6 @@ namespace
+         if (!io.out)
+             return;
+ 
+-        initializeBlockInputStream(io.out->getHeader());
+-
+         bool has_data_to_insert = (insert_query && insert_query->data)
+                                   || !query_info.input_data().empty() || query_info.next_query_info();
+         if (!has_data_to_insert)
+@@ -795,6 +793,10 @@ namespace
+                 throw Exception("No data to insert", ErrorCodes::NO_DATA_TO_INSERT);
+         }
+ 
++        /// This is significant, because parallel parsing may be used.
++        /// So we mustn't touch the input stream from other thread.
++        initializeBlockInputStream(io.out->getHeader());
++
+         block_input_stream->readPrefix();
+         io.out->writePrefix();
+ 

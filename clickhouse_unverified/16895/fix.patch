@@ -1,0 +1,239 @@
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index dc940822abcd..6ff72cfe478b 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -1215,6 +1215,20 @@ void MergeTreeData::clearOldWriteAheadLogs()
+     }
+ }
+ 
++void MergeTreeData::clearEmptyParts()
++{
++    auto parts = getDataPartsVector();
++    for (const auto & part : parts)
++    {
++        if (part->rows_count == 0)
++        {
++            ASTPtr literal = std::make_shared<ASTLiteral>(part->name);
++            /// If another replica has already started drop, it's ok, no need to throw.
++            dropPartition(literal, /* detach = */ false, /*drop_part = */ true, global_context, /* throw_if_noop = */ false);
++        }
++    }
++}
++
+ void MergeTreeData::rename(const String & new_table_path, const StorageID & new_table_id)
+ {
+     auto disks = getStoragePolicy()->getDisks();
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index 0e3e5aff4f1d..34faafb3b1f3 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -498,6 +498,8 @@ class MergeTreeData : public IStorage
+     /// Must be called with locked lockForShare() because use relative_data_path.
+     void clearOldTemporaryDirectories(ssize_t custom_directories_lifetime_seconds = -1);
+ 
++    void clearEmptyParts();
++
+     /// After the call to dropAllData() no method can be called.
+     /// Deletes the data directory and flushes the uncompressed blocks cache and the marks cache.
+     void dropAllData();
+@@ -876,7 +878,7 @@ class MergeTreeData : public IStorage
+     // Partition helpers
+     bool canReplacePartition(const DataPartPtr & src_part) const;
+ 
+-    virtual void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context) = 0;
++    virtual void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context, bool throw_if_noop = true) = 0;
+     virtual PartitionCommandsResultInfo attachPartition(const ASTPtr & partition, const StorageMetadataPtr & metadata_snapshot, bool part, const Context & context) = 0;
+     virtual void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & context) = 0;
+     virtual void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, const Context & context) = 0;
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeCleanupThread.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeCleanupThread.cpp
+index 5de0a79b2c32..701cb2fa1ede 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeCleanupThread.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeCleanupThread.cpp
+@@ -72,6 +72,7 @@ void ReplicatedMergeTreeCleanupThread::iterate()
+         clearOldLogs();
+         clearOldBlocks();
+         clearOldMutations();
++        storage.clearEmptyParts();
+     }
+ }
+ 
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 9263dab638a7..7a76c6c82467 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -54,7 +54,8 @@ void ReplicatedMergeTreeQueue::addVirtualParts(const MergeTreeData::DataParts &
+ bool ReplicatedMergeTreeQueue::isVirtualPart(const MergeTreeData::DataPartPtr & data_part) const
+ {
+     std::lock_guard lock(state_mutex);
+-    return virtual_parts.getContainingPart(data_part->info) != data_part->name;
++    auto virtual_part_name = virtual_parts.getContainingPart(data_part->info);
++    return !virtual_part_name.empty() && virtual_part_name != data_part->name;
+ }
+ 
+ 
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 48220a106c24..4d4b35ce7c47 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -99,6 +99,7 @@ void StorageMergeTree::startup()
+ {
+     clearOldPartsFromFilesystem();
+     clearOldWriteAheadLogs();
++    clearEmptyParts();
+ 
+     /// Temporary directories contain incomplete results of merges (after forced restart)
+     ///  and don't allow to reinitialize them, so delete each of them immediately
+@@ -947,6 +948,7 @@ std::optional<JobAndPool> StorageMergeTree::getDataProcessingJob()
+             clearOldTemporaryDirectories();
+             clearOldWriteAheadLogs();
+             clearOldMutations();
++            clearEmptyParts();
+         }, PoolType::MERGE_MUTATE};
+     }
+     return {};
+@@ -1087,7 +1089,7 @@ ActionLock StorageMergeTree::stopMergesAndWait()
+ }
+ 
+ 
+-void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context)
++void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context, bool throw_if_noop)
+ {
+     {
+         /// Asks to complete merges and does not allow them to start.
+@@ -1105,8 +1107,10 @@ void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, bool
+ 
+             if (part)
+                 parts_to_remove.push_back(part);
+-            else
++            else if (throw_if_noop)
+                 throw Exception("Part " + part_name + " not found, won't try to drop it.", ErrorCodes::NO_SUCH_DATA_PART);
++            else
++                return;
+         }
+         else
+         {
+diff --git a/src/Storages/StorageMergeTree.h b/src/Storages/StorageMergeTree.h
+index e3796cb9d100..86d33e25df0f 100644
+--- a/src/Storages/StorageMergeTree.h
++++ b/src/Storages/StorageMergeTree.h
+@@ -187,7 +187,7 @@ class StorageMergeTree final : public ext::shared_ptr_helper<StorageMergeTree>,
+     void clearOldMutations(bool truncate = false);
+ 
+     // Partition helpers
+-    void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context) override;
++    void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & context, bool throw_if_noop) override;
+     PartitionCommandsResultInfo attachPartition(const ASTPtr & partition, const StorageMetadataPtr & metadata_snapshot, bool part, const Context & context) override;
+ 
+     void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & context) override;
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index b93500000b5a..48a8a80c781a 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -4230,7 +4230,7 @@ bool StorageReplicatedMergeTree::getFakePartCoveringAllPartsInPartition(const St
+ }
+ 
+ 
+-void StorageReplicatedMergeTree::dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & query_context)
++void StorageReplicatedMergeTree::dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & query_context, bool throw_if_noop)
+ {
+     assertNotReadonly();
+     if (!is_leader)
+@@ -4244,7 +4244,7 @@ void StorageReplicatedMergeTree::dropPartition(const ASTPtr & partition, bool de
+     if (drop_part)
+     {
+         String part_name = partition->as<ASTLiteral &>().value.safeGet<String>();
+-        did_drop = dropPart(zookeeper, part_name, entry, detach);
++        did_drop = dropPart(zookeeper, part_name, entry, detach, throw_if_noop);
+     }
+     else
+     {
+@@ -5937,7 +5937,7 @@ bool StorageReplicatedMergeTree::waitForShrinkingQueueSize(size_t queue_size, UI
+ }
+ 
+ bool StorageReplicatedMergeTree::dropPart(
+-    zkutil::ZooKeeperPtr & zookeeper, String part_name, LogEntry & entry, bool detach)
++    zkutil::ZooKeeperPtr & zookeeper, String part_name, LogEntry & entry, bool detach, bool throw_if_noop)
+ {
+     LOG_TRACE(log, "Will try to insert a log entry to DROP_RANGE for part: " + part_name);
+ 
+@@ -5950,32 +5950,52 @@ bool StorageReplicatedMergeTree::dropPart(
+         auto part = getPartIfExists(part_info, {MergeTreeDataPartState::Committed});
+ 
+         if (!part)
+-            throw Exception("Part " + part_name + " not found locally, won't try to drop it.", ErrorCodes::NO_SUCH_DATA_PART);
++        {
++            if (throw_if_noop)
++                throw Exception("Part " + part_name + " not found locally, won't try to drop it.", ErrorCodes::NO_SUCH_DATA_PART);
++            return false;
++        }
+ 
+         /// There isn't a lot we can do otherwise. Can't cancel merges because it is possible that a replica already
+         /// finished the merge.
+         if (partIsAssignedToBackgroundOperation(part))
+-            throw Exception("Part " + part_name
+-                            + " is currently participating in a background operation (mutation/merge)"
+-                            + ", try again later", ErrorCodes::PART_IS_TEMPORARILY_LOCKED);
++        {
++            if (throw_if_noop)
++                throw Exception("Part " + part_name
++                                + " is currently participating in a background operation (mutation/merge)"
++                                + ", try again later", ErrorCodes::PART_IS_TEMPORARILY_LOCKED);
++            return false;
++        }
+ 
+         if (partIsLastQuorumPart(part->info))
+-            throw Exception("Part " + part_name + " is last inserted part with quorum in partition. Cannot drop",
+-                            ErrorCodes::NOT_IMPLEMENTED);
++        {
++            if (throw_if_noop)
++                throw Exception("Part " + part_name + " is last inserted part with quorum in partition. Cannot drop",
++                                ErrorCodes::NOT_IMPLEMENTED);
++            return false;
++        }
+ 
+         if (partIsInsertingWithParallelQuorum(part->info))
+-            throw Exception("Part " + part_name + " is inserting with parallel quorum. Cannot drop",
+-                            ErrorCodes::NOT_IMPLEMENTED);
++        {
++            if (throw_if_noop)
++                throw Exception("Part " + part_name + " is inserting with parallel quorum. Cannot drop",
++                                ErrorCodes::NOT_IMPLEMENTED);
++            return false;
++        }
+ 
+         Coordination::Requests ops;
+         getClearBlocksInPartitionOps(ops, *zookeeper, part_info.partition_id, part_info.min_block, part_info.max_block);
+         size_t clean_block_ops_size = ops.size();
+ 
++        /// Set fake level to treat this part as virtual in queue.
++        auto drop_part_info = part->info;
++        drop_part_info.level = MergeTreePartInfo::MAX_LEVEL;
++
+         /// If `part_name` is result of a recent merge and source parts are still available then
+         /// DROP_RANGE with detach will move this part together with source parts to `detached/` dir.
+         entry.type = LogEntry::DROP_RANGE;
+         entry.source_replica = replica_name;
+-        entry.new_part_name = part_name;
++        entry.new_part_name = drop_part_info.getPartName();
+         entry.detach = detach;
+         entry.create_time = time(nullptr);
+ 
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index 3e6b809cfdf8..d3328f9843c2 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -548,12 +548,12 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+     /// Info about how other replicas can access this one.
+     ReplicatedMergeTreeAddress getReplicatedMergeTreeAddress() const;
+ 
+-    bool dropPart(zkutil::ZooKeeperPtr & zookeeper, String part_name, LogEntry & entry, bool detach);
++    bool dropPart(zkutil::ZooKeeperPtr & zookeeper, String part_name, LogEntry & entry, bool detach, bool throw_if_noop);
+     bool dropAllPartsInPartition(
+         zkutil::ZooKeeper & zookeeper, String & partition_id, LogEntry & entry, bool detach);
+ 
+     // Partition helpers
+-    void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & query_context) override;
++    void dropPartition(const ASTPtr & partition, bool detach, bool drop_part, const Context & query_context, bool throw_if_noop) override;
+     PartitionCommandsResultInfo attachPartition(const ASTPtr & partition, const StorageMetadataPtr & metadata_snapshot, bool part, const Context & query_context) override;
+     void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & query_context) override;
+     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, const Context & query_context) override;

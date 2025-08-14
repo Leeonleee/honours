@@ -1,0 +1,221 @@
+diff --git a/src/Storages/MergeTree/DataPartsExchange.cpp b/src/Storages/MergeTree/DataPartsExchange.cpp
+index d5f4d91850cb..2c830c56524f 100644
+--- a/src/Storages/MergeTree/DataPartsExchange.cpp
++++ b/src/Storages/MergeTree/DataPartsExchange.cpp
+@@ -470,9 +470,36 @@ MergeTreeData::MutableDataPartPtr Fetcher::fetchPart(
+         size_t sum_files_size = 0;
+         readBinary(sum_files_size, in);
+         IMergeTreeDataPart::TTLInfos ttl_infos;
+-        /// Skip ttl infos, not required for S3 metadata
+         String ttl_infos_string;
+         readBinary(ttl_infos_string, in);
++        ReadBufferFromString ttl_infos_buffer(ttl_infos_string);
++        assertString("ttl format version: 1
+", ttl_infos_buffer);
++        ttl_infos.read(ttl_infos_buffer);
++
++        ReservationPtr reservation
++            = data.balancedReservation(metadata_snapshot, sum_files_size, 0, part_name, part_info, {}, tagger_ptr, &ttl_infos, true);
++        if (!reservation)
++            reservation
++                = data.reserveSpacePreferringTTLRules(metadata_snapshot, sum_files_size, ttl_infos, std::time(nullptr), 0, true);
++        if (reservation)
++        {
++            /// When we have multi-volume storage, one of them was chosen, depends on TTL, free space, etc.
++            /// Chosen one may be S3 or not.
++            DiskPtr disk = reservation->getDisk();
++            if (disk && disk->getType() == DiskType::Type::S3)
++            {
++                for (const auto & d : disks_s3)
++                {
++                    if (d->getPath() == disk->getPath())
++                    {
++                        Disks disks_tmp = { disk };
++                        disks_s3.swap(disks_tmp);
++                        break;
++                    }
++                }
++            }
++        }
++
+         String part_type = "Wide";
+         readStringBinary(part_type, in);
+         if (part_type == "InMemory")
+@@ -795,7 +822,6 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToS3(
+     readBinary(files, in);
+ 
+     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk);
+-    MergeTreeData::MutableDataPartPtr new_data_part = data.createPart(part_name, volume, part_relative_path);
+ 
+     for (size_t i = 0; i < files; ++i)
+     {
+@@ -805,7 +831,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToS3(
+         readStringBinary(file_name, in);
+         readBinary(file_size, in);
+ 
+-        String data_path = new_data_part->getFullRelativePath() + file_name;
++        String data_path = part_download_path + file_name;
+         String metadata_file = fullPath(disk, data_path);
+ 
+         {
+@@ -837,6 +863,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToS3(
+ 
+     assertEOF(in);
+ 
++    MergeTreeData::MutableDataPartPtr new_data_part = data.createPart(part_name, volume, part_relative_path);
+     new_data_part->is_temp = true;
+     new_data_part->modification_time = time(nullptr);
+     new_data_part->loadColumnsChecksumsIndexes(true, false);
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.cpp b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+index dc68a1dcb41e..8a35ce3dcb88 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.cpp
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.cpp
+@@ -429,9 +429,9 @@ void IMergeTreeDataPart::removeIfNeeded()
+             }
+ 
+             if (parent_part)
+-                projectionRemove(parent_part->getFullRelativePath());
++                projectionRemove(parent_part->getFullRelativePath(), keep_s3_on_delete);
+             else
+-                remove(false);
++                remove(keep_s3_on_delete);
+ 
+             if (state == State::DeleteOnDestroy)
+             {
+@@ -1108,7 +1108,7 @@ void IMergeTreeDataPart::remove(bool keep_s3) const
+     if (isProjectionPart())
+     {
+         LOG_WARNING(storage.log, "Projection part {} should be removed by its parent {}.", name, parent_part->name);
+-        projectionRemove(parent_part->getFullRelativePath());
++        projectionRemove(parent_part->getFullRelativePath(), keep_s3);
+         return;
+     }
+ 
+@@ -1158,7 +1158,7 @@ void IMergeTreeDataPart::remove(bool keep_s3) const
+     std::unordered_set<String> projection_directories;
+     for (const auto & [p_name, projection_part] : projection_parts)
+     {
+-        projection_part->projectionRemove(to);
++        projection_part->projectionRemove(to, keep_s3);
+         projection_directories.emplace(p_name + ".proj");
+     }
+ 
+@@ -1207,7 +1207,7 @@ void IMergeTreeDataPart::remove(bool keep_s3) const
+ }
+ 
+ 
+-void IMergeTreeDataPart::projectionRemove(const String & parent_to) const
++void IMergeTreeDataPart::projectionRemove(const String & parent_to, bool keep_s3) const
+ {
+     String to = parent_to + "/" + relative_path;
+     auto disk = volume->getDisk();
+@@ -1219,7 +1219,7 @@ void IMergeTreeDataPart::projectionRemove(const String & parent_to) const
+             "Cannot quickly remove directory {} by removing files; fallback to recursive removal. Reason: checksums.txt is missing",
+             fullPath(disk, to));
+         /// If the part is not completely written, we cannot use fast path by listing files.
+-        disk->removeRecursive(to + "/");
++        disk->removeSharedRecursive(to + "/", keep_s3);
+     }
+     else
+     {
+@@ -1232,17 +1232,17 @@ void IMergeTreeDataPart::projectionRemove(const String & parent_to) const
+     #    pragma GCC diagnostic ignored "-Wunused-variable"
+     #endif
+             for (const auto & [file, _] : checksums.files)
+-                disk->removeFile(to + "/" + file);
++                disk->removeSharedFile(to + "/" + file, keep_s3);
+     #if !defined(__clang__)
+     #    pragma GCC diagnostic pop
+     #endif
+ 
+             for (const auto & file : {"checksums.txt", "columns.txt"})
+-                disk->removeFile(to + "/" + file);
+-            disk->removeFileIfExists(to + "/" + DEFAULT_COMPRESSION_CODEC_FILE_NAME);
+-            disk->removeFileIfExists(to + "/" + DELETE_ON_DESTROY_MARKER_FILE_NAME);
++                disk->removeSharedFile(to + "/" + file, keep_s3);
++            disk->removeSharedFileIfExists(to + "/" + DEFAULT_COMPRESSION_CODEC_FILE_NAME, keep_s3);
++            disk->removeSharedFileIfExists(to + "/" + DELETE_ON_DESTROY_MARKER_FILE_NAME, keep_s3);
+ 
+-            disk->removeDirectory(to);
++            disk->removeSharedRecursive(to, keep_s3);
+         }
+         catch (...)
+         {
+@@ -1250,7 +1250,7 @@ void IMergeTreeDataPart::projectionRemove(const String & parent_to) const
+ 
+             LOG_ERROR(storage.log, "Cannot quickly remove directory {} by removing files; fallback to recursive removal. Reason: {}", fullPath(disk, to), getCurrentExceptionMessage(false));
+ 
+-            disk->removeRecursive(to + "/");
++            disk->removeSharedRecursive(to + "/", keep_s3);
+          }
+      }
+  }
+diff --git a/src/Storages/MergeTree/IMergeTreeDataPart.h b/src/Storages/MergeTree/IMergeTreeDataPart.h
+index 5f12498c08cf..a8a49680dd7d 100644
+--- a/src/Storages/MergeTree/IMergeTreeDataPart.h
++++ b/src/Storages/MergeTree/IMergeTreeDataPart.h
+@@ -130,7 +130,7 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+ 
+     void remove(bool keep_s3 = false) const;
+ 
+-    void projectionRemove(const String & parent_to) const;
++    void projectionRemove(const String & parent_to, bool keep_s3 = false) const;
+ 
+     /// Initialize columns (from columns.txt if exists, or create from column files if not).
+     /// Load checksums from checksums.txt if exists. Load index if required.
+@@ -199,18 +199,21 @@ class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPar
+     /// Frozen by ALTER TABLE ... FREEZE ... It is used for information purposes in system.parts table.
+     mutable std::atomic<bool> is_frozen {false};
+ 
++    /// Flag for keep S3 data when zero-copy replication over S3 turned on.
++    mutable bool keep_s3_on_delete = false;
++
+     /**
+      * Part state is a stage of its lifetime. States are ordered and state of a part could be increased only.
+      * Part state should be modified under data_parts mutex.
+      *
+      * Possible state transitions:
+-     * Temporary -> Precommitted:   we are trying to commit a fetched, inserted or merged part to active set
+-     * Precommitted -> Outdated:    we could not add a part to active set and are doing a rollback (for example it is duplicated part)
+-     * Precommitted -> Committed:   we successfully committed a part to active dataset
+-     * Precommitted -> Outdated:    a part was replaced by a covering part or DROP PARTITION
+-     * Outdated -> Deleting:        a cleaner selected this part for deletion
+-     * Deleting -> Outdated:        if an ZooKeeper error occurred during the deletion, we will retry deletion
+-     * Committed -> DeleteOnDestroy if part was moved to another disk
++     * Temporary -> Precommitted:    we are trying to commit a fetched, inserted or merged part to active set
++     * Precommitted -> Outdated:     we could not add a part to active set and are doing a rollback (for example it is duplicated part)
++     * Precommitted -> Committed:    we successfully committed a part to active dataset
++     * Precommitted -> Outdated:     a part was replaced by a covering part or DROP PARTITION
++     * Outdated -> Deleting:         a cleaner selected this part for deletion
++     * Deleting -> Outdated:         if an ZooKeeper error occurred during the deletion, we will retry deletion
++     * Committed -> DeleteOnDestroy: if part was moved to another disk
+      */
+     enum class State
+     {
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 41adca37c609..dc7ecc2166d7 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -2726,6 +2726,22 @@ void MergeTreeData::swapActivePart(MergeTreeData::DataPartPtr part_copy)
+             if (active_part_it == data_parts_by_info.end())
+                 throw Exception("Cannot swap part '" + part_copy->name + "', no such active part.", ErrorCodes::NO_SUCH_DATA_PART);
+ 
++            /// We do not check allow_s3_zero_copy_replication here because data may be shared
++            /// when allow_s3_zero_copy_replication turned on and off again
++
++            original_active_part->keep_s3_on_delete = false;
++
++            if (original_active_part->volume->getDisk()->getType() == DiskType::Type::S3)
++            {
++                if (part_copy->volume->getDisk()->getType() == DiskType::Type::S3
++                        && original_active_part->getUniqueId() == part_copy->getUniqueId())
++                {   /// May be when several volumes use the same S3 storage
++                    original_active_part->keep_s3_on_delete = true;
++                }
++                else
++                    original_active_part->keep_s3_on_delete = !unlockSharedData(*original_active_part);
++            }
++
+             modifyPartState(original_active_part, DataPartState::DeleteOnDestroy);
+             data_parts_indexes.erase(active_part_it);
+ 

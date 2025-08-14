@@ -1,0 +1,113 @@
+diff --git a/src/Processors/Executors/ExecutionThreadContext.h b/src/Processors/Executors/ExecutionThreadContext.h
+index eb048f8ab091..deacd0380fa1 100644
+--- a/src/Processors/Executors/ExecutionThreadContext.h
++++ b/src/Processors/Executors/ExecutionThreadContext.h
+@@ -43,6 +43,14 @@ class ExecutionThreadContext
+     const bool profile_processors;
+     const bool trace_processors;
+ 
++    /// There is a performance optimization that schedules a task to the current thread, avoiding global task queue.
++    /// Optimization decreases contention on global task queue but may cause starvation.
++    /// See 01104_distributed_numbers_test.sql
++    /// This constant tells us that we should skip the optimization
++    /// if it was applied more than `max_scheduled_local_tasks` in a row.
++    constexpr static size_t max_scheduled_local_tasks = 128;
++    size_t num_scheduled_local_tasks = 0;
++
+     void wait(std::atomic_bool & finished);
+     void wakeUp();
+ 
+diff --git a/src/Processors/Executors/ExecutorTasks.cpp b/src/Processors/Executors/ExecutorTasks.cpp
+index e61d225a968c..ec1fc539884a 100644
+--- a/src/Processors/Executors/ExecutorTasks.cpp
++++ b/src/Processors/Executors/ExecutorTasks.cpp
+@@ -53,6 +53,17 @@ void ExecutorTasks::tryGetTask(ExecutionThreadContext & context)
+     {
+         std::unique_lock lock(mutex);
+ 
++    #if defined(OS_LINUX)
++        if (num_threads == 1)
++        {
++            if (auto res = async_task_queue.tryGetReadyTask(lock))
++            {
++                context.setTask(static_cast<ExecutingGraph::Node *>(res.data));
++                return;
++            }
++        }
++    #endif
++
+         /// Try get async task assigned to this thread or any other task from queue.
+         if (auto * async_task = context.tryPopAsyncTask())
+         {
+@@ -109,11 +120,15 @@ void ExecutorTasks::pushTasks(Queue & queue, Queue & async_queue, ExecutionThrea
+     context.setTask(nullptr);
+ 
+     /// Take local task from queue if has one.
+-    if (!queue.empty() && !context.hasAsyncTasks())
++    if (!queue.empty() && !context.hasAsyncTasks()
++        && context.num_scheduled_local_tasks < context.max_scheduled_local_tasks)
+     {
++        ++context.num_scheduled_local_tasks;
+         context.setTask(queue.front());
+         queue.pop();
+     }
++    else
++        context.num_scheduled_local_tasks = 0;
+ 
+     if (!queue.empty() || !async_queue.empty())
+     {
+diff --git a/src/Processors/Executors/PollingQueue.cpp b/src/Processors/Executors/PollingQueue.cpp
+index 40f968621b17..4bc0372dfbe0 100644
+--- a/src/Processors/Executors/PollingQueue.cpp
++++ b/src/Processors/Executors/PollingQueue.cpp
+@@ -65,7 +65,7 @@ static std::string dumpTasks(const std::unordered_map<std::uintptr_t, PollingQue
+     return res.str();
+ }
+ 
+-PollingQueue::TaskData PollingQueue::wait(std::unique_lock<std::mutex> & lock)
++PollingQueue::TaskData PollingQueue::getTask(std::unique_lock<std::mutex> & lock, int timeout)
+ {
+     if (is_finished)
+         return {};
+@@ -74,10 +74,13 @@ PollingQueue::TaskData PollingQueue::wait(std::unique_lock<std::mutex> & lock)
+ 
+     epoll_event event;
+     event.data.ptr = nullptr;
+-    epoll.getManyReady(1, &event, -1);
++    size_t num_events = epoll.getManyReady(1, &event, timeout);
+ 
+     lock.lock();
+ 
++    if (num_events == 0)
++        return {};
++
+     if (event.data.ptr == pipe_fd)
+         return {};
+ 
+diff --git a/src/Processors/Executors/PollingQueue.h b/src/Processors/Executors/PollingQueue.h
+index 100d762b7319..d709b7c92019 100644
+--- a/src/Processors/Executors/PollingQueue.h
++++ b/src/Processors/Executors/PollingQueue.h
+@@ -31,6 +31,8 @@ class PollingQueue
+     std::atomic_bool is_finished = false;
+     std::unordered_map<std::uintptr_t, TaskData> tasks;
+ 
++    TaskData getTask(std::unique_lock<std::mutex> & lock, int timeout);
++
+ public:
+     PollingQueue();
+     ~PollingQueue();
+@@ -44,7 +46,12 @@ class PollingQueue
+     /// Wait for any descriptor. If no descriptors in queue, blocks.
+     /// Returns ptr which was inserted into queue or nullptr if finished was called.
+     /// Lock is unlocked during waiting.
+-    TaskData wait(std::unique_lock<std::mutex> & lock);
++    TaskData wait(std::unique_lock<std::mutex> & lock) { return getTask(lock, -1); }
++
++    /// Get any ready descriptor.
++    /// Returns nullptr if no descriptor is ready or if finished was called.
++    /// Does not block.
++    TaskData tryGetReadyTask(std::unique_lock<std::mutex> & lock) { return getTask(lock, 0); }
+ 
+     /// Interrupt waiting.
+     void finish();

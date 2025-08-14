@@ -1,0 +1,1218 @@
+diff --git a/src/Dictionaries/DictionaryHelpers.h b/src/Dictionaries/DictionaryHelpers.h
+index 55027aa88538..1478518dee4c 100644
+--- a/src/Dictionaries/DictionaryHelpers.h
++++ b/src/Dictionaries/DictionaryHelpers.h
+@@ -7,6 +7,8 @@
+ #include <Columns/ColumnString.h>
+ #include <Columns/ColumnVector.h>
+ #include <Columns/ColumnArray.h>
++#include <Columns/ColumnsNumber.h>
++#include <Columns/ColumnNullable.h>
+ #include <DataStreams/IBlockInputStream.h>
+ #include <DataTypes/DataTypesDecimal.h>
+ #include <DataTypes/DataTypeArray.h>
+@@ -284,6 +286,8 @@ class DictionaryAttributeColumnProvider
+   *
+   * If default_values_column is null then attribute_default_value will be used.
+   * If default_values_column is not null in constructor than this column values will be used as default values.
++  *
++  * For nullable dictionary attribute isNullAt method is provided.
+  */
+ template <typename DictionaryAttributeType>
+ class DictionaryDefaultValueExtractor
+@@ -293,22 +297,40 @@ class DictionaryDefaultValueExtractor
+ public:
+     using DefaultValueType = DictionaryValueType<DictionaryAttributeType>;
+ 
+-    explicit DictionaryDefaultValueExtractor(DictionaryAttributeType attribute_default_value, ColumnPtr default_values_column_ = nullptr)
+-        : default_value(std::move(attribute_default_value))
++    explicit DictionaryDefaultValueExtractor(
++        Field attribute_default_value,
++        ColumnPtr default_values_column_)
+     {
++        if (default_values_column_ != nullptr &&
++            isColumnConst(*default_values_column_))
++        {
++            attribute_default_value = (*default_values_column_)[0];
++            default_values_column_ = nullptr;
++        }
++
+         if (default_values_column_ == nullptr)
++        {
+             use_attribute_default_value = true;
++
++            if (attribute_default_value.isNull())
++                default_value_is_null = true;
++            else
++                default_value = attribute_default_value.get<NearestFieldType<DictionaryAttributeType>>();
++        }
+         else
+         {
+-            if (const auto * const default_col = checkAndGetColumn<DefaultColumnType>(*default_values_column_))
++            const IColumn * default_values_column_ptr = default_values_column_.get();
++
++            if (const ColumnNullable * nullable_column = typeid_cast<const ColumnNullable *>(default_values_column_.get()))
+             {
+-                default_values_column = default_col;
+-                use_attribute_default_value = false;
++                default_values_column_ptr = nullable_column->getNestedColumnPtr().get();
++                is_null_map = &nullable_column->getNullMapColumn();
+             }
+-            else if (const auto * const default_col_const = checkAndGetColumnConst<DefaultColumnType>(default_values_column_.get()))
++
++            if (const auto * const default_col = checkAndGetColumn<DefaultColumnType>(default_values_column_ptr))
+             {
+-                default_value = default_col_const->template getValue<DictionaryAttributeType>();
+-                use_attribute_default_value = true;
++                default_values_column = default_col;
++                use_attribute_default_value = false;
+             }
+             else
+                 throw Exception(ErrorCodes::TYPE_MISMATCH, "Type of default column is not the same as dictionary attribute type.");
+@@ -332,10 +354,24 @@ class DictionaryDefaultValueExtractor
+         else
+             return default_values_column->getData()[row];
+     }
++
++    bool isNullAt(size_t row)
++    {
++        if (default_value_is_null)
++            return true;
++
++        if (is_null_map)
++            return is_null_map->getData()[row];
++
++        return false;
++    }
++
+ private:
+-    DictionaryAttributeType default_value;
++    DictionaryAttributeType default_value {};
+     const DefaultColumnType * default_values_column = nullptr;
++    const ColumnUInt8 * is_null_map = nullptr;
+     bool use_attribute_default_value = false;
++    bool default_value_is_null = false;
+ };
+ 
+ template <DictionaryKeyType key_type>
+diff --git a/src/Dictionaries/DictionaryStructure.cpp b/src/Dictionaries/DictionaryStructure.cpp
+index a6de85f83f54..c280a2b94de6 100644
+--- a/src/Dictionaries/DictionaryStructure.cpp
++++ b/src/Dictionaries/DictionaryStructure.cpp
+@@ -373,6 +373,7 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+ 
+         const auto type_string = config.getString(prefix + "type");
+         const auto initial_type = DataTypeFactory::instance().get(type_string);
++        const auto initial_type_serialization = initial_type->getDefaultSerialization();
+         bool is_nullable = initial_type->isNullable();
+ 
+         auto non_nullable_type = removeNullable(initial_type);
+@@ -385,20 +386,19 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+         Field null_value;
+         if (allow_null_values)
+         {
+-            /// TODO: Fix serialization for nullable type.
+             const auto null_value_string = config.getString(prefix + "null_value");
+ 
+             try
+             {
+                 if (null_value_string.empty())
+                 {
+-                    null_value = non_nullable_type->getDefault();
++                    null_value = initial_type->getDefault();
+                 }
+                 else
+                 {
+                     ReadBufferFromString null_value_buffer{null_value_string};
+-                    auto column_with_null_value = non_nullable_type->createColumn();
+-                    non_nullable_type->getDefaultSerialization()->deserializeTextEscaped(*column_with_null_value, null_value_buffer, format_settings);
++                    auto column_with_null_value = initial_type->createColumn();
++                    initial_type_serialization->deserializeWholeText(*column_with_null_value, null_value_buffer, format_settings);
+                     null_value = (*column_with_null_value)[0];
+                 }
+             }
+@@ -428,6 +428,7 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+             name,
+             underlying_type,
+             initial_type,
++            initial_type_serialization,
+             expression,
+             null_value,
+             hierarchical,
+diff --git a/src/Dictionaries/DictionaryStructure.h b/src/Dictionaries/DictionaryStructure.h
+index 9509aa97ce04..3ea640d77e8c 100644
+--- a/src/Dictionaries/DictionaryStructure.h
++++ b/src/Dictionaries/DictionaryStructure.h
+@@ -75,6 +75,7 @@ struct DictionaryAttribute final
+     const std::string name;
+     const AttributeUnderlyingType underlying_type;
+     const DataTypePtr type;
++    const SerializationPtr type_serialization;
+     const std::string expression;
+     const Field null_value;
+     const bool hierarchical;
+diff --git a/src/Dictionaries/ExternalQueryBuilder.cpp b/src/Dictionaries/ExternalQueryBuilder.cpp
+index 1fc5d160bb0f..0c1dced2cdda 100644
+--- a/src/Dictionaries/ExternalQueryBuilder.cpp
++++ b/src/Dictionaries/ExternalQueryBuilder.cpp
+@@ -358,8 +358,7 @@ void ExternalQueryBuilder::composeKeyCondition(const Columns & key_columns, cons
+         /// key_i=value_i
+         writeQuoted(key_description.name, out);
+         writeString("=", out);
+-        auto serialization = key_description.type->getDefaultSerialization();
+-        serialization->serializeTextQuoted(*key_columns[i], row, out, format_settings);
++        key_description.type_serialization->serializeTextQuoted(*key_columns[i], row, out, format_settings);
+     }
+ }
+ 
+@@ -416,7 +415,7 @@ void ExternalQueryBuilder::composeKeyTuple(const Columns & key_columns, const si
+             writeString(", ", out);
+ 
+         first = false;
+-        auto serialization = (*dict_struct.key)[i].type->getDefaultSerialization();
++        auto serialization = (*dict_struct.key)[i].type_serialization;
+         serialization->serializeTextQuoted(*key_columns[i], row, out, format_settings);
+     }
+ 
+diff --git a/src/Dictionaries/FlatDictionary.cpp b/src/Dictionaries/FlatDictionary.cpp
+index 0a95165de4e6..5f359846c8a6 100644
+--- a/src/Dictionaries/FlatDictionary.cpp
++++ b/src/Dictionaries/FlatDictionary.cpp
+@@ -63,6 +63,16 @@ ColumnPtr FlatDictionary::getColumn(
+     size_t attribute_index = dict_struct.attribute_name_to_index.find(attribute_name)->second;
+     const auto & attribute = attributes[attribute_index];
+ 
++    bool is_attribute_nullable = attribute.is_nullable_set.has_value();
++    ColumnUInt8::MutablePtr col_null_map_to;
++    ColumnUInt8::Container * vec_null_map_to = nullptr;
++
++    if (is_attribute_nullable)
++    {
++        col_null_map_to = ColumnUInt8::create(size, false);
++        vec_null_map_to = &col_null_map_to->getData();
++    }
++
+     auto type_call = [&](const auto & dictionary_attribute_type)
+     {
+         using Type = std::decay_t<decltype(dictionary_attribute_type)>;
+@@ -70,9 +80,7 @@ ColumnPtr FlatDictionary::getColumn(
+         using ValueType = DictionaryValueType<AttributeType>;
+         using ColumnProvider = DictionaryAttributeColumnProvider<AttributeType>;
+ 
+-        const auto & attribute_null_value = std::get<ValueType>(attribute.null_values);
+-        AttributeType null_value = static_cast<AttributeType>(attribute_null_value);
+-        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(std::move(null_value), default_values_column);
++        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(dictionary_attribute.null_value, default_values_column);
+ 
+         auto column = ColumnProvider::getColumn(dictionary_attribute, size);
+ 
+@@ -80,31 +88,53 @@ ColumnPtr FlatDictionary::getColumn(
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
++            getItemsImpl<ValueType, false>(
+                 attribute,
+                 ids,
+-                [&](const size_t, const Array & value) { out->insert(value); },
++                [&](size_t, const Array & value, bool) { out->insert(value); },
+                 default_value_extractor);
+         }
+         else if constexpr (std::is_same_v<ValueType, StringRef>)
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                ids,
+-                [&](const size_t, const StringRef value) { out->insertData(value.data, value.size); },
+-                default_value_extractor);
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    ids,
++                    [&](size_t row, const StringRef value, bool is_null)
++                    {
++                        (*vec_null_map_to)[row] = is_null;
++                        out->insertData(value.data, value.size);
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    ids,
++                    [&](size_t, const StringRef value, bool) { out->insertData(value.data, value.size); },
++                    default_value_extractor);
+         }
+         else
+         {
+             auto & out = column->getData();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                ids,
+-                [&](const size_t row, const auto value) { out[row] = value; },
+-                default_value_extractor);
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    ids,
++                    [&](size_t row, const auto value, bool is_null)
++                    {
++                        (*vec_null_map_to)[row] = is_null;
++                        out[row] = value;
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    ids,
++                    [&](size_t row, const auto value, bool) { out[row] = value; },
++                    default_value_extractor);
+         }
+ 
+         result = std::move(column);
+@@ -112,21 +142,8 @@ ColumnPtr FlatDictionary::getColumn(
+ 
+     callOnDictionaryAttributeType(attribute.type, type_call);
+ 
+-    if (attribute.nullable_set)
+-    {
+-        ColumnUInt8::MutablePtr col_null_map_to = ColumnUInt8::create(size, false);
+-        ColumnUInt8::Container & vec_null_map_to = col_null_map_to->getData();
+-
+-        for (size_t row = 0; row < ids.size(); ++row)
+-        {
+-            auto id = ids[row];
+-
+-            if (attribute.nullable_set->find(id) != nullptr)
+-                vec_null_map_to[row] = true;
+-        }
+-
+-        result = ColumnNullable::create(result, std::move(col_null_map_to));
+-    }
++    if (attribute.is_nullable_set)
++        result = ColumnNullable::create(std::move(result), std::move(col_null_map_to));
+ 
+     return result;
+ }
+@@ -161,9 +178,10 @@ ColumnPtr FlatDictionary::getHierarchy(ColumnPtr key_column, const DataTypePtr &
+     const auto & keys = getColumnVectorData(this, key_column, keys_backup_storage);
+ 
+     size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
++    const auto & dictionary_attribute = dict_struct.attributes[hierarchical_attribute_index];
+     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
+ 
+-    const UInt64 null_value = std::get<UInt64>(hierarchical_attribute.null_values);
++    const UInt64 null_value = dictionary_attribute.null_value.get<UInt64>();
+     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
+ 
+     auto is_key_valid_func = [&, this](auto & key) { return key < loaded_keys.size() && loaded_keys[key]; };
+@@ -198,9 +216,10 @@ ColumnUInt8::Ptr FlatDictionary::isInHierarchy(
+     const auto & keys_in = getColumnVectorData(this, in_key_column, keys_in_backup_storage);
+ 
+     size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
++    const auto & dictionary_attribute = dict_struct.attributes[hierarchical_attribute_index];
+     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
+ 
+-    const UInt64 null_value = std::get<UInt64>(hierarchical_attribute.null_values);
++    const UInt64 null_value = dictionary_attribute.null_value.get<UInt64>();
+     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
+ 
+     auto is_key_valid_func = [&, this](auto & key) { return key < loaded_keys.size() && loaded_keys[key]; };
+@@ -260,7 +279,7 @@ void FlatDictionary::createAttributes()
+     attributes.reserve(size);
+ 
+     for (const auto & attribute : dict_struct.attributes)
+-        attributes.push_back(createAttribute(attribute, attribute.null_value));
++        attributes.push_back(createAttribute(attribute));
+ }
+ 
+ void FlatDictionary::blockToAttributes(const Block & block)
+@@ -388,10 +407,10 @@ void FlatDictionary::calculateBytesAllocated()
+         bytes_allocated += update_field_loaded_block->allocatedBytes();
+ }
+ 
+-FlatDictionary::Attribute FlatDictionary::createAttribute(const DictionaryAttribute & dictionary_attribute, const Field & null_value)
++FlatDictionary::Attribute FlatDictionary::createAttribute(const DictionaryAttribute & dictionary_attribute)
+ {
+-    auto nullable_set = dictionary_attribute.is_nullable ? std::make_optional<NullableSet>() : std::optional<NullableSet>{};
+-    Attribute attribute{dictionary_attribute.underlying_type, std::move(nullable_set), {}, {}, {}};
++    auto is_nullable_set = dictionary_attribute.is_nullable ? std::make_optional<NullableSet>() : std::optional<NullableSet>{};
++    Attribute attribute{dictionary_attribute.underlying_type, std::move(is_nullable_set), {}, {}};
+ 
+     auto type_call = [&](const auto & dictionary_attribute_type)
+     {
+@@ -400,17 +419,9 @@ FlatDictionary::Attribute FlatDictionary::createAttribute(const DictionaryAttrib
+         using ValueType = DictionaryValueType<AttributeType>;
+ 
+         if constexpr (std::is_same_v<ValueType, StringRef>)
+-        {
+             attribute.string_arena = std::make_unique<Arena>();
+-            const String & string = null_value.get<String>();
+-            const char * string_in_arena = attribute.string_arena->insert(string.data(), string.size());
+-            attribute.null_values.emplace<StringRef>(string_in_arena, string.size());
+-        }
+-        else
+-            attribute.null_values = ValueType(null_value.get<NearestFieldType<ValueType>>());
+ 
+-        const auto & null_value_ref = std::get<ValueType>(attribute.null_values);
+-        attribute.container.emplace<ContainerType<ValueType>>(configuration.initial_array_size, null_value_ref);
++        attribute.container.emplace<ContainerType<ValueType>>(configuration.initial_array_size, ValueType());
+     };
+ 
+     callOnDictionaryAttributeType(dictionary_attribute.underlying_type, type_call);
+@@ -418,7 +429,7 @@ FlatDictionary::Attribute FlatDictionary::createAttribute(const DictionaryAttrib
+     return attribute;
+ }
+ 
+-template <typename AttributeType, typename ValueSetter, typename DefaultValueExtractor>
++template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+ void FlatDictionary::getItemsImpl(
+     const Attribute & attribute,
+     const PaddedPODArray<UInt64> & keys,
+@@ -436,11 +447,20 @@ void FlatDictionary::getItemsImpl(
+ 
+         if (key < loaded_keys.size() && loaded_keys[key])
+         {
+-            set_value(row, container[key]);
++            if constexpr (is_nullable)
++                set_value(row, container[key], attribute.is_nullable_set->find(key) != nullptr);
++            else
++                set_value(row, container[key], false);
++
+             ++keys_found;
+         }
+         else
+-            set_value(row, default_value_extractor[row]);
++        {
++            if constexpr (is_nullable)
++                set_value(row, default_value_extractor[row], default_value_extractor.isNullAt(row));
++            else
++                set_value(row, default_value_extractor[row], false);
++        }
+     }
+ 
+     query_count.fetch_add(rows, std::memory_order_relaxed);
+@@ -464,9 +484,9 @@ void FlatDictionary::resize(Attribute & attribute, UInt64 key)
+         loaded_keys.resize(elements_count, false);
+ 
+         if constexpr (std::is_same_v<T, Array>)
+-            container.resize(elements_count, std::get<T>(attribute.null_values));
++            container.resize(elements_count, T{});
+         else
+-            container.resize_fill(elements_count, std::get<T>(attribute.null_values));
++            container.resize_fill(elements_count, T{});
+     }
+ }
+ 
+@@ -495,11 +515,11 @@ void FlatDictionary::setAttributeValue(Attribute & attribute, const UInt64 key,
+ 
+         resize<ValueType>(attribute, key);
+ 
+-        if (attribute.nullable_set)
++        if (attribute.is_nullable_set)
+         {
+             if (value.isNull())
+             {
+-                attribute.nullable_set->insert(key);
++                attribute.is_nullable_set->insert(key);
+                 loaded_keys[key] = true;
+                 return;
+             }
+diff --git a/src/Dictionaries/FlatDictionary.h b/src/Dictionaries/FlatDictionary.h
+index ec725bcdda2d..053eda72b37b 100644
+--- a/src/Dictionaries/FlatDictionary.h
++++ b/src/Dictionaries/FlatDictionary.h
+@@ -5,15 +5,13 @@
+ #include <vector>
+ #include <optional>
+ 
++#include <ext/range.h>
++#include <ext/size.h>
++
+ #include <Common/HashTable/HashSet.h>
+ #include <Common/Arena.h>
+-#include <Columns/ColumnDecimal.h>
+-#include <Columns/ColumnString.h>
+-#include <Columns/ColumnArray.h>
+ #include <DataTypes/IDataType.h>
+ #include <Core/Block.h>
+-#include <ext/range.h>
+-#include <ext/size.h>
+ 
+ #include "DictionaryStructure.h"
+ #include "IDictionary.h"
+@@ -113,31 +111,7 @@ class FlatDictionary final : public IDictionary
+     struct Attribute final
+     {
+         AttributeUnderlyingType type;
+-        std::optional<NullableSet> nullable_set;
+-
+-        std::variant<
+-            UInt8,
+-            UInt16,
+-            UInt32,
+-            UInt64,
+-            UInt128,
+-            UInt256,
+-            Int8,
+-            Int16,
+-            Int32,
+-            Int64,
+-            Int128,
+-            Int256,
+-            Decimal32,
+-            Decimal64,
+-            Decimal128,
+-            Decimal256,
+-            Float32,
+-            Float64,
+-            UUID,
+-            StringRef,
+-            Array>
+-            null_values;
++        std::optional<NullableSet> is_nullable_set;
+ 
+         std::variant<
+             ContainerType<UInt8>,
+@@ -173,9 +147,9 @@ class FlatDictionary final : public IDictionary
+ 
+     void calculateBytesAllocated();
+ 
+-    Attribute createAttribute(const DictionaryAttribute& attribute, const Field & null_value);
++    Attribute createAttribute(const DictionaryAttribute & attribute);
+ 
+-    template <typename AttributeType, typename ValueSetter, typename DefaultValueExtractor>
++    template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+     void getItemsImpl(
+         const Attribute & attribute,
+         const PaddedPODArray<UInt64> & keys,
+diff --git a/src/Dictionaries/HashedDictionary.cpp b/src/Dictionaries/HashedDictionary.cpp
+index fd070c4df33c..f8ca71a9dcba 100644
+--- a/src/Dictionaries/HashedDictionary.cpp
++++ b/src/Dictionaries/HashedDictionary.cpp
+@@ -75,6 +75,8 @@ ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getColumn(
+     const size_t attribute_index = dict_struct.attribute_name_to_index.find(attribute_name)->second;
+     auto & attribute = attributes[attribute_index];
+ 
++    bool is_attribute_nullable = attribute.is_nullable_set.has_value();
++
+     ColumnUInt8::MutablePtr col_null_map_to;
+     ColumnUInt8::Container * vec_null_map_to = nullptr;
+     if (attribute.is_nullable_set)
+@@ -90,9 +92,7 @@ ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getColumn(
+         using ValueType = DictionaryValueType<AttributeType>;
+         using ColumnProvider = DictionaryAttributeColumnProvider<AttributeType>;
+ 
+-        const auto & attribute_null_value = std::get<ValueType>(attribute.null_values);
+-        AttributeType null_value = static_cast<AttributeType>(attribute_null_value);
+-        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(std::move(null_value), default_values_column);
++        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(dictionary_attribute.null_value, default_values_column);
+ 
+         auto column = ColumnProvider::getColumn(dictionary_attribute, size);
+ 
+@@ -100,44 +100,53 @@ ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getColumn(
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
++            getItemsImpl<ValueType, false>(
+                 attribute,
+                 extractor,
+-                [&](const size_t, const Array & value) { out->insert(value); },
+-                [&](const size_t)
+-                {
+-                },
++                [&](const size_t, const Array & value, bool) { out->insert(value); },
+                 default_value_extractor);
+         }
+         else if constexpr (std::is_same_v<ValueType, StringRef>)
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                extractor,
+-                [&](const size_t, const StringRef value) { out->insertData(value.data, value.size); },
+-                [&](const size_t row)
+-                {
+-                    out->insertDefault();
+-                    (*vec_null_map_to)[row] = true;
+-                },
+-                default_value_extractor);
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    extractor,
++                    [&](size_t row, const StringRef value, bool is_null)
++                    {
++                        (*vec_null_map_to)[row] = is_null;
++                        out->insertData(value.data, value.size);
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    extractor,
++                    [&](size_t, const StringRef value, bool) { out->insertData(value.data, value.size); },
++                    default_value_extractor);
+         }
+         else
+         {
+             auto & out = column->getData();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                extractor,
+-                [&](const size_t row, const auto value) { return out[row] = value; },
+-                [&](const size_t row)
+-                {
+-                    out[row] = ValueType();
+-                    (*vec_null_map_to)[row] = true;
+-                },
+-                default_value_extractor);
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    extractor,
++                    [&](size_t row, const auto value, bool is_null)
++                    {
++                        (*vec_null_map_to)[row] = is_null;
++                        out[row] = value;
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    extractor,
++                    [&](size_t row, const auto value, bool) { out[row] = value; },
++                    default_value_extractor);
+         }
+ 
+         result = std::move(column);
+@@ -145,8 +154,8 @@ ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getColumn(
+ 
+     callOnDictionaryAttributeType(attribute.type, type_call);
+ 
+-    if (attribute.is_nullable_set)
+-        result = ColumnNullable::create(result, std::move(col_null_map_to));
++    if (is_attribute_nullable)
++        result = ColumnNullable::create(std::move(result), std::move(col_null_map_to));
+ 
+     return result;
+ }
+@@ -343,23 +352,7 @@ void HashedDictionary<dictionary_key_type, sparse>::createAttributes()
+ 
+             auto is_nullable_set = dictionary_attribute.is_nullable ? std::make_optional<NullableSet>() : std::optional<NullableSet>{};
+             std::unique_ptr<Arena> string_arena = std::is_same_v<AttributeType, String> ? std::make_unique<Arena>() : nullptr;
+-
+-            ValueType default_value;
+-
+-            if constexpr (std::is_same_v<ValueType, StringRef>)
+-            {
+-                string_arena = std::make_unique<Arena>();
+-
+-                const auto & string_null_value = dictionary_attribute.null_value.template get<String>();
+-                const size_t string_null_value_size = string_null_value.size();
+-
+-                const char * string_in_arena = string_arena->insert(string_null_value.data(), string_null_value_size);
+-                default_value = {string_in_arena, string_null_value_size};
+-            }
+-            else
+-                default_value = dictionary_attribute.null_value.template get<NearestFieldType<ValueType>>();
+-
+-            Attribute attribute{dictionary_attribute.underlying_type, std::move(is_nullable_set), default_value, CollectionType<ValueType>(), std::move(string_arena)};
++            Attribute attribute{dictionary_attribute.underlying_type, std::move(is_nullable_set), CollectionType<ValueType>(), std::move(string_arena)};
+             attributes.emplace_back(std::move(attribute));
+         };
+ 
+@@ -509,19 +502,16 @@ void HashedDictionary<dictionary_key_type, sparse>::resize(size_t added_rows)
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type, bool sparse>
+-template <typename AttributeType, typename ValueSetter, typename NullableValueSetter, typename DefaultValueExtractor>
++template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+ void HashedDictionary<dictionary_key_type, sparse>::getItemsImpl(
+     const Attribute & attribute,
+     DictionaryKeysExtractor<dictionary_key_type> & keys_extractor,
+     ValueSetter && set_value [[maybe_unused]],
+-    NullableValueSetter && set_nullable_value [[maybe_unused]],
+     DefaultValueExtractor & default_value_extractor) const
+ {
+     const auto & attribute_container = std::get<CollectionType<AttributeType>>(attribute.container);
+     const size_t keys_size = keys_extractor.getKeysSize();
+ 
+-    bool is_attribute_nullable = attribute.is_nullable_set.has_value();
+-
+     size_t keys_found = 0;
+ 
+     for (size_t key_index = 0; key_index < keys_size; ++key_index)
+@@ -532,15 +522,18 @@ void HashedDictionary<dictionary_key_type, sparse>::getItemsImpl(
+ 
+         if (it != attribute_container.end())
+         {
+-            set_value(key_index, getValueFromCell(it));
++            set_value(key_index, getValueFromCell(it), false);
+             ++keys_found;
+         }
+         else
+         {
+-            if (is_attribute_nullable && attribute.is_nullable_set->find(key) != nullptr)
+-                set_nullable_value(key_index);
++            if constexpr (is_nullable)
++            {
++                bool is_value_nullable = (attribute.is_nullable_set->find(key) != nullptr) || default_value_extractor.isNullAt(key_index);
++                set_value(key_index, default_value_extractor[key_index], is_value_nullable);
++            }
+             else
+-                set_value(key_index, default_value_extractor[key_index]);
++                set_value(key_index, default_value_extractor[key_index], false);
+         }
+ 
+         keys_extractor.rollbackCurrentKey();
+diff --git a/src/Dictionaries/HashedDictionary.h b/src/Dictionaries/HashedDictionary.h
+index 9a67c9d39012..7213eb616c8b 100644
+--- a/src/Dictionaries/HashedDictionary.h
++++ b/src/Dictionaries/HashedDictionary.h
+@@ -12,9 +12,6 @@
+ #include <Common/HashTable/HashSet.h>
+ #include <Core/Block.h>
+ 
+-#include <Columns/ColumnDecimal.h>
+-#include <Columns/ColumnString.h>
+-
+ #include <Dictionaries/DictionaryStructure.h>
+ #include <Dictionaries/IDictionary.h>
+ #include <Dictionaries/IDictionarySource.h>
+@@ -56,7 +53,7 @@ class HashedDictionary final : public IDictionary
+         else if constexpr (dictionary_key_type == DictionaryKeyType::simple && !sparse)
+             return "Hashed";
+         else if constexpr (dictionary_key_type == DictionaryKeyType::complex && sparse)
+-            return "ComplexKeySpareseHashed";
++            return "ComplexKeySparseHashed";
+         else
+             return "ComplexKeyHashed";
+     }
+@@ -153,30 +150,6 @@ class HashedDictionary final : public IDictionary
+         AttributeUnderlyingType type;
+         std::optional<NullableSet> is_nullable_set;
+ 
+-        std::variant<
+-            UInt8,
+-            UInt16,
+-            UInt32,
+-            UInt64,
+-            UInt128,
+-            UInt256,
+-            Int8,
+-            Int16,
+-            Int32,
+-            Int64,
+-            Int128,
+-            Int256,
+-            Decimal32,
+-            Decimal64,
+-            Decimal128,
+-            Decimal256,
+-            Float32,
+-            Float64,
+-            UUID,
+-            StringRef,
+-            Array>
+-            null_values;
+-
+         std::variant<
+             CollectionType<UInt8>,
+             CollectionType<UInt16>,
+@@ -214,12 +187,11 @@ class HashedDictionary final : public IDictionary
+ 
+     void calculateBytesAllocated();
+ 
+-    template <typename AttributeType, typename ValueSetter, typename NullableValueSetter, typename DefaultValueExtractor>
++    template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+     void getItemsImpl(
+         const Attribute & attribute,
+         DictionaryKeysExtractor<dictionary_key_type> & keys_extractor,
+         ValueSetter && set_value,
+-        NullableValueSetter && set_nullable_value,
+         DefaultValueExtractor & default_value_extractor) const;
+ 
+     template <typename GetContainerFunc>
+diff --git a/src/Dictionaries/IPAddressDictionary.cpp b/src/Dictionaries/IPAddressDictionary.cpp
+index 222664615384..946ba6866f0e 100644
+--- a/src/Dictionaries/IPAddressDictionary.cpp
++++ b/src/Dictionaries/IPAddressDictionary.cpp
+@@ -205,7 +205,6 @@ IPAddressDictionary::IPAddressDictionary(
+     , logger(&Poco::Logger::get("IPAddressDictionary"))
+ {
+     createAttributes();
+-
+     loadData();
+     calculateBytesAllocated();
+ }
+diff --git a/src/Dictionaries/RangeHashedDictionary.cpp b/src/Dictionaries/RangeHashedDictionary.cpp
+index 584fba5ee8de..5d1603f4c520 100644
+--- a/src/Dictionaries/RangeHashedDictionary.cpp
++++ b/src/Dictionaries/RangeHashedDictionary.cpp
+@@ -110,9 +110,11 @@ ColumnPtr RangeHashedDictionary::getColumn(
+     auto range_column_storage_type = std::make_shared<DataTypeInt64>();
+     modified_key_columns[1] = castColumnAccurate(column_to_cast, range_column_storage_type);
+ 
++    bool is_attribute_nullable = attribute.is_nullable;
++
+     ColumnUInt8::MutablePtr col_null_map_to;
+     ColumnUInt8::Container * vec_null_map_to = nullptr;
+-    if (attribute.is_nullable)
++    if (is_attribute_nullable)
+     {
+         col_null_map_to = ColumnUInt8::create(keys_size, false);
+         vec_null_map_to = &col_null_map_to->getData();
+@@ -125,9 +127,7 @@ ColumnPtr RangeHashedDictionary::getColumn(
+         using ValueType = DictionaryValueType<AttributeType>;
+         using ColumnProvider = DictionaryAttributeColumnProvider<AttributeType>;
+ 
+-        const auto & attribute_null_value = std::get<ValueType>(attribute.null_values);
+-        AttributeType null_value = static_cast<AttributeType>(attribute_null_value);
+-        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(std::move(null_value), default_values_column);
++        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(dictionary_attribute.null_value, default_values_column);
+ 
+         auto column = ColumnProvider::getColumn(dictionary_attribute, keys_size);
+ 
+@@ -135,10 +135,10 @@ ColumnPtr RangeHashedDictionary::getColumn(
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
++            getItemsImpl<ValueType, false>(
+                 attribute,
+                 modified_key_columns,
+-                [&](const size_t, const Array & value, bool)
++                [&](size_t, const Array & value, bool)
+                 {
+                     out->insert(value);
+                 },
+@@ -148,33 +148,49 @@ ColumnPtr RangeHashedDictionary::getColumn(
+         {
+             auto * out = column.get();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                modified_key_columns,
+-                [&](const size_t row, const StringRef value, bool is_null)
+-                {
+-                    if (attribute.is_nullable)
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    modified_key_columns,
++                    [&](size_t row, const StringRef value, bool is_null)
++                    {
+                         (*vec_null_map_to)[row] = is_null;
+-
+-                    out->insertData(value.data, value.size);
+-                },
+-                default_value_extractor);
++                        out->insertData(value.data, value.size);
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    modified_key_columns,
++                    [&](size_t, const StringRef value, bool)
++                    {
++                        out->insertData(value.data, value.size);
++                    },
++                    default_value_extractor);
+         }
+         else
+         {
+             auto & out = column->getData();
+ 
+-            getItemsImpl<ValueType>(
+-                attribute,
+-                modified_key_columns,
+-                [&](const size_t row, const auto value, bool is_null)
+-                {
+-                    if (attribute.is_nullable)
++            if (is_attribute_nullable)
++                getItemsImpl<ValueType, true>(
++                    attribute,
++                    modified_key_columns,
++                    [&](size_t row, const auto value, bool is_null)
++                    {
+                         (*vec_null_map_to)[row] = is_null;
+-
+-                    out[row] = value;
+-                },
+-                default_value_extractor);
++                        out[row] = value;
++                    },
++                    default_value_extractor);
++            else
++                getItemsImpl<ValueType, false>(
++                    attribute,
++                    modified_key_columns,
++                    [&](size_t row, const auto value, bool)
++                    {
++                        out[row] = value;
++                    },
++                    default_value_extractor);
+         }
+ 
+         result = std::move(column);
+@@ -182,10 +198,8 @@ ColumnPtr RangeHashedDictionary::getColumn(
+ 
+     callOnDictionaryAttributeType(attribute.type, type_call);
+ 
+-    if (attribute.is_nullable)
+-    {
+-        result = ColumnNullable::create(result, std::move(col_null_map_to));
+-    }
++    if (is_attribute_nullable)
++        result = ColumnNullable::create(std::move(result), std::move(col_null_map_to));
+ 
+     return result;
+ }
+@@ -274,7 +288,7 @@ void RangeHashedDictionary::createAttributes()
+     for (const auto & attribute : dict_struct.attributes)
+     {
+         attribute_index_by_name.emplace(attribute.name, attributes.size());
+-        attributes.push_back(createAttribute(attribute, attribute.null_value));
++        attributes.push_back(createAttribute(attribute));
+ 
+         if (attribute.hierarchical)
+             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Hierarchical attributes not supported by {} dictionary.",
+@@ -364,41 +378,28 @@ void RangeHashedDictionary::calculateBytesAllocated()
+     }
+ }
+ 
+-template <typename T>
+-void RangeHashedDictionary::createAttributeImpl(Attribute & attribute, const Field & null_value)
+-{
+-    attribute.null_values = T(null_value.get<T>());
+-    attribute.maps = std::make_unique<Collection<T>>();
+-}
+-
+-template <>
+-void RangeHashedDictionary::createAttributeImpl<String>(Attribute & attribute, const Field & null_value)
+-{
+-    attribute.string_arena = std::make_unique<Arena>();
+-    const String & string = null_value.get<String>();
+-    const char * string_in_arena = attribute.string_arena->insert(string.data(), string.size());
+-    attribute.null_values.emplace<StringRef>(string_in_arena, string.size());
+-    attribute.maps = std::make_unique<Collection<StringRef>>();
+-}
+-
+-RangeHashedDictionary::Attribute
+-RangeHashedDictionary::createAttribute(const DictionaryAttribute & attribute, const Field & null_value)
++RangeHashedDictionary::Attribute RangeHashedDictionary::createAttribute(const DictionaryAttribute & dictionary_attribute)
+ {
+-    Attribute attr{attribute.underlying_type, attribute.is_nullable, {}, {}, {}};
++    Attribute attribute{dictionary_attribute.underlying_type, dictionary_attribute.is_nullable, {}, {}};
+ 
+     auto type_call = [&](const auto &dictionary_attribute_type)
+     {
+         using Type = std::decay_t<decltype(dictionary_attribute_type)>;
+         using AttributeType = typename Type::AttributeType;
+-        createAttributeImpl<AttributeType>(attr, null_value);
++        using ValueType = DictionaryValueType<AttributeType>;
++
++        if constexpr (std::is_same_v<AttributeType, String>)
++            attribute.string_arena = std::make_unique<Arena>();
++
++        attribute.maps = std::make_unique<Collection<ValueType>>();
+     };
+ 
+-    callOnDictionaryAttributeType(attribute.underlying_type, type_call);
++    callOnDictionaryAttributeType(dictionary_attribute.underlying_type, type_call);
+ 
+-    return attr;
++    return attribute;
+ }
+ 
+-template <typename AttributeType, typename ValueSetter, typename DefaultValueExtractor>
++template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+ void RangeHashedDictionary::getItemsImpl(
+     const Attribute & attribute,
+     const Columns & key_columns,
+@@ -435,20 +436,26 @@ void RangeHashedDictionary::getItemsImpl(
+                 ++keys_found;
+                 auto & value = val_it->value;
+ 
+-                if (value.has_value())
+-                    set_value(row, *value, false);
++                if constexpr (is_nullable)
++                {
++                    if (value.has_value())
++                        set_value(row, *value, false);
++                    else
++                        set_value(row, default_value_extractor[row], true);
++                }
+                 else
+-                    set_value(row, default_value_extractor[row], true);
+-            }
+-            else
+-            {
+-                set_value(row, default_value_extractor[row], false);
++                {
++                    set_value(row, *value, false);
++                }
++
++                continue;
+             }
+         }
++
++        if constexpr (is_nullable)
++            set_value(row, default_value_extractor[row], default_value_extractor.isNullAt(row));
+         else
+-        {
+             set_value(row, default_value_extractor[row], false);
+-        }
+     }
+ 
+     query_count.fetch_add(ids.size(), std::memory_order_relaxed);
+diff --git a/src/Dictionaries/RangeHashedDictionary.h b/src/Dictionaries/RangeHashedDictionary.h
+index 50888873c3cf..0dd9c41fd71a 100644
+--- a/src/Dictionaries/RangeHashedDictionary.h
++++ b/src/Dictionaries/RangeHashedDictionary.h
+@@ -107,29 +107,6 @@ class RangeHashedDictionary final : public IDictionary
+         AttributeUnderlyingType type;
+         bool is_nullable;
+ 
+-        std::variant<
+-            UInt8,
+-            UInt16,
+-            UInt32,
+-            UInt64,
+-            UInt128,
+-            UInt256,
+-            Int8,
+-            Int16,
+-            Int32,
+-            Int64,
+-            Int128,
+-            Int256,
+-            Decimal32,
+-            Decimal64,
+-            Decimal128,
+-            Decimal256,
+-            Float32,
+-            Float64,
+-            UUID,
+-            StringRef,
+-            Array>
+-            null_values;
+         std::variant<
+             Ptr<UInt8>,
+             Ptr<UInt16>,
+@@ -165,12 +142,9 @@ class RangeHashedDictionary final : public IDictionary
+ 
+     void calculateBytesAllocated();
+ 
+-    template <typename T>
+-    static void createAttributeImpl(Attribute & attribute, const Field & null_value);
+-
+-    static Attribute createAttribute(const DictionaryAttribute& attribute, const Field & null_value);
++    static Attribute createAttribute(const DictionaryAttribute & dictionary_attribute);
+ 
+-    template <typename AttributeType, typename ValueSetter, typename DefaultValueExtractor>
++    template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+     void getItemsImpl(
+         const Attribute & attribute,
+         const Columns & key_columns,
+diff --git a/src/Functions/FunctionsExternalDictionaries.h b/src/Functions/FunctionsExternalDictionaries.h
+index 89c76f930614..1c07de7808c4 100644
+--- a/src/Functions/FunctionsExternalDictionaries.h
++++ b/src/Functions/FunctionsExternalDictionaries.h
+@@ -283,6 +283,7 @@ class FunctionDictGetNoType final : public IFunction
+     size_t getNumberOfArguments() const override { return 0; }
+ 
+     bool useDefaultImplementationForConstants() const final { return true; }
++    bool useDefaultImplementationForNulls() const final { return false; }
+     ColumnNumbers getArgumentsThatAreAlwaysConstant() const final { return {0, 1}; }
+ 
+     bool isDeterministic() const override { return false; }
+@@ -392,27 +393,9 @@ class FunctionDictGetNoType final : public IFunction
+                     arguments.size() + 1);
+ 
+             const auto & column_before_cast = arguments[current_arguments_index];
+-
+-            if (const DataTypeTuple * type_tuple = typeid_cast<const DataTypeTuple *>(column_before_cast.type.get()))
+-            {
+-                const DataTypes & nested_types = type_tuple->getElements();
+-
+-                for (const auto & nested_type : nested_types)
+-                    if (nested_type->isNullable())
+-                        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                            "Wrong argument for function {} default values column nullable is not supported",
+-                            getName());
+-            }
+-            else if (column_before_cast.type->isNullable())
+-                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                    "Wrong argument for function {} default values column nullable is not supported",
+-                    getName());
+-
+-            auto result_type_no_nullable = removeNullable(result_type);
+-
+             ColumnWithTypeAndName column_to_cast = {column_before_cast.column->convertToFullColumnIfConst(), column_before_cast.type, column_before_cast.name};
+ 
+-            auto result = castColumnAccurate(column_to_cast, result_type_no_nullable);
++            auto result = castColumnAccurate(column_to_cast, result_type);
+ 
+             if (attribute_names.size() > 1)
+             {
+@@ -453,26 +436,13 @@ class FunctionDictGetNoType final : public IFunction
+                      getName(),
+                      key_col_with_type.type->getName());
+ 
+-            if (attribute_names.size() > 1)
+-            {
+-                const auto & result_tuple_type = assert_cast<const DataTypeTuple &>(*result_type);
+-
+-                Columns result_columns = dictionary->getColumns(
+-                    attribute_names,
+-                    result_tuple_type.getElements(),
+-                    {key_column},
+-                    {std::make_shared<DataTypeUInt64>()},
+-                    default_cols);
+-
+-                result = ColumnTuple::create(std::move(result_columns));
+-            }
+-            else
+-                result = dictionary->getColumn(
+-                    attribute_names[0],
+-                    result_type,
+-                    {key_column},
+-                    {std::make_shared<DataTypeUInt64>()},
+-                    default_cols.front());
++            result = executeDictionaryRequest(
++                dictionary,
++                attribute_names,
++                {key_column},
++                {std::make_shared<DataTypeUInt64>()},
++                result_type,
++                default_cols);
+         }
+         else if (dictionary_key_type == DictionaryKeyType::complex)
+         {
+@@ -486,36 +456,16 @@ class FunctionDictGetNoType final : public IFunction
+             /// Functions in external dictionaries_loader only support full-value (not constant) columns with keys.
+             ColumnPtr key_column_full = key_col_with_type.column->convertToFullColumnIfConst();
+ 
+-            if (!isTuple(key_col_with_type.type))
+-                throw Exception(
+-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                    "Third argument of function {} must be tuple when dictionary is complex. Actual type {}.",
+-                    getName(),
+-                    key_col_with_type.type->getName());
+-
+             const auto & key_columns = typeid_cast<const ColumnTuple &>(*key_column_full).getColumnsCopy();
+             const auto & key_types = static_cast<const DataTypeTuple &>(*key_col_with_type.type).getElements();
+ 
+-            if (attribute_names.size() > 1)
+-            {
+-                const auto & result_tuple_type = assert_cast<const DataTypeTuple &>(*result_type);
+-
+-                Columns result_columns = dictionary->getColumns(
+-                    attribute_names,
+-                    result_tuple_type.getElements(),
+-                    key_columns,
+-                    key_types,
+-                    default_cols);
+-
+-                result = ColumnTuple::create(std::move(result_columns));
+-            }
+-            else
+-                result = dictionary->getColumn(
+-                    attribute_names[0],
+-                    result_type,
+-                    key_columns,
+-                    key_types,
+-                    default_cols.front());
++            result = executeDictionaryRequest(
++                dictionary,
++                attribute_names,
++                key_columns,
++                key_types,
++                result_type,
++                default_cols);
+         }
+         else if (dictionary_key_type == DictionaryKeyType::range)
+         {
+@@ -526,26 +476,13 @@ class FunctionDictGetNoType final : public IFunction
+                      getName(),
+                      key_col_with_type.type->getName());
+ 
+-            if (attribute_names.size() > 1)
+-            {
+-                const auto & result_tuple_type = assert_cast<const DataTypeTuple &>(*result_type);
+-
+-                Columns result_columns = dictionary->getColumns(
+-                    attribute_names,
+-                    result_tuple_type.getElements(),
+-                    {key_column, range_col},
+-                    {std::make_shared<DataTypeUInt64>(), range_col_type},
+-                    default_cols);
+-
+-                result = ColumnTuple::create(std::move(result_columns));
+-            }
+-            else
+-                result = dictionary->getColumn(
+-                    attribute_names[0],
+-                    result_type,
+-                    {key_column, range_col},
+-                    {std::make_shared<DataTypeUInt64>(), range_col_type},
+-                    default_cols.front());
++            result = executeDictionaryRequest(
++                dictionary,
++                attribute_names,
++                {key_column, range_col},
++                {std::make_shared<DataTypeUInt64>(), range_col_type},
++                result_type,
++                default_cols);
+         }
+         else
+             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown dictionary identifier type");
+@@ -555,6 +492,40 @@ class FunctionDictGetNoType final : public IFunction
+ 
+ private:
+ 
++    ColumnPtr executeDictionaryRequest(
++        std::shared_ptr<const IDictionary> & dictionary,
++        const Strings & attribute_names,
++        const Columns & key_columns,
++        const DataTypes & key_types,
++        const DataTypePtr & result_type,
++        const Columns & default_cols) const
++    {
++        ColumnPtr result;
++
++        if (attribute_names.size() > 1)
++        {
++            const auto & result_tuple_type = assert_cast<const DataTypeTuple &>(*result_type);
++
++            Columns result_columns = dictionary->getColumns(
++                attribute_names,
++                result_tuple_type.getElements(),
++                key_columns,
++                key_types,
++                default_cols);
++
++            result = ColumnTuple::create(std::move(result_columns));
++        }
++        else
++            result = dictionary->getColumn(
++                attribute_names[0],
++                result_type,
++                key_columns,
++                key_types,
++                default_cols.front());
++
++        return result;
++    }
++
+     Strings getAttributeNamesFromColumn(const ColumnPtr & column, const DataTypePtr & type) const
+     {
+         Strings attribute_names;

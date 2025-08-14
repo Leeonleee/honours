@@ -1,0 +1,265 @@
+diff --git a/src/AggregateFunctions/AggregateFunctionQuantile.cpp b/src/AggregateFunctions/AggregateFunctionQuantile.cpp
+index e8d86a03ff17..62c8a41b614b 100644
+--- a/src/AggregateFunctions/AggregateFunctionQuantile.cpp
++++ b/src/AggregateFunctions/AggregateFunctionQuantile.cpp
+@@ -52,6 +52,9 @@ template <typename Value, bool float_return> using FuncQuantilesTDigest = Aggreg
+ template <typename Value, bool float_return> using FuncQuantileTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, false>;
+ template <typename Value, bool float_return> using FuncQuantilesTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, true>;
+ 
++template <typename Value, bool float_return> using FuncQuantileBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantileBFloat16, false, std::conditional_t<float_return, Float64, void>, false>;
++template <typename Value, bool float_return> using FuncQuantilesBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantilesBFloat16, false, std::conditional_t<float_return, Float64, void>, true>;
++
+ 
+ template <template <typename, bool> class Function>
+ static constexpr bool supportDecimal()
+@@ -156,6 +159,9 @@ void registerAggregateFunctionsQuantile(AggregateFunctionFactory & factory)
+     factory.registerFunction(NameQuantileTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantileTDigestWeighted>);
+     factory.registerFunction(NameQuantilesTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantilesTDigestWeighted>);
+ 
++    factory.registerFunction(NameQuantileBFloat16::name, createAggregateFunctionQuantile<FuncQuantileBFloat16>);
++    factory.registerFunction(NameQuantilesBFloat16::name, createAggregateFunctionQuantile<FuncQuantilesBFloat16>);
++
+     /// 'median' is an alias for 'quantile'
+     factory.registerAlias("median", NameQuantile::name);
+     factory.registerAlias("medianDeterministic", NameQuantileDeterministic::name);
+@@ -167,6 +173,7 @@ void registerAggregateFunctionsQuantile(AggregateFunctionFactory & factory)
+     factory.registerAlias("medianTimingWeighted", NameQuantileTimingWeighted::name);
+     factory.registerAlias("medianTDigest", NameQuantileTDigest::name);
+     factory.registerAlias("medianTDigestWeighted", NameQuantileTDigestWeighted::name);
++    factory.registerAlias("medianBFloat16", NameQuantileBFloat16::name);
+ }
+ 
+ }
+diff --git a/src/AggregateFunctions/AggregateFunctionQuantile.h b/src/AggregateFunctions/AggregateFunctionQuantile.h
+index 209784361dd4..502905e8b48e 100644
+--- a/src/AggregateFunctions/AggregateFunctionQuantile.h
++++ b/src/AggregateFunctions/AggregateFunctionQuantile.h
+@@ -9,6 +9,7 @@
+ #include <AggregateFunctions/QuantileExactWeighted.h>
+ #include <AggregateFunctions/QuantileTiming.h>
+ #include <AggregateFunctions/QuantileTDigest.h>
++#include <AggregateFunctions/QuantileBFloat16Histogram.h>
+ 
+ #include <AggregateFunctions/IAggregateFunction.h>
+ #include <AggregateFunctions/QuantilesCommon.h>
+@@ -228,4 +229,7 @@ struct NameQuantileTDigestWeighted { static constexpr auto name = "quantileTDige
+ struct NameQuantilesTDigest { static constexpr auto name = "quantilesTDigest"; };
+ struct NameQuantilesTDigestWeighted { static constexpr auto name = "quantilesTDigestWeighted"; };
+ 
++struct NameQuantileBFloat16 { static constexpr auto name = "quantileBFloat16"; };
++struct NameQuantilesBFloat16 { static constexpr auto name = "quantilesBFloat16"; };
++
+ }
+diff --git a/src/AggregateFunctions/QuantileBFloat16Histogram.h b/src/AggregateFunctions/QuantileBFloat16Histogram.h
+new file mode 100644
+index 000000000000..559a87a55915
+--- /dev/null
++++ b/src/AggregateFunctions/QuantileBFloat16Histogram.h
+@@ -0,0 +1,207 @@
++#pragma once
++
++#include <IO/ReadBuffer.h>
++#include <IO/WriteBuffer.h>
++#include <Common/HashTable/HashMap.h>
++#include <common/types.h>
++#include <ext/bit_cast.h>
++
++
++namespace DB
++{
++
++/** `bfloat16` is a 16-bit floating point data type that is the same as the corresponding most significant 16 bits of the `float`.
++  * https://en.wikipedia.org/wiki/Bfloat16_floating-point_format
++  *
++  * To calculate quantile, simply convert input value to 16 bit (convert to float, then take the most significant 16 bits),
++  * and calculate the histogram of these values.
++  *
++  * Hash table is the preferred way to store histogram, because the number of distinct values is small:
++  * ```
++  * SELECT uniq(bfloat)
++  * FROM
++  * (
++  *     SELECT
++  *         number,
++  *         toFloat32(number) AS f,
++  *         bitShiftRight(bitAnd(reinterpretAsUInt32(reinterpretAsFixedString(f)), 4294901760) AS cut, 16),
++  *         reinterpretAsFloat32(reinterpretAsFixedString(cut)) AS bfloat
++  *     FROM numbers(100000000)
++  * )
++  *
++  * ┌─uniq(bfloat)─┐
++  * │         2623 │
++  * └──────────────┘
++  * ```
++  * (when increasing the range of values 1000 times, the number of distinct bfloat16 values increases just by 1280).
++  *
++  * Then calculate quantile from the histogram.
++  *
++  * This sketch is very simple and rough. Its relative precision is constant 1 / 256 = 0.390625%.
++  */
++template <typename Value>
++struct QuantileBFloat16Histogram
++{
++    using BFloat16 = UInt16;
++    using Weight = UInt64;
++
++    /// Make automatic memory for 16 elements to avoid allocations for small states.
++    /// The usage of trivial hash is ok, because we effectively take logarithm of the values and pathological cases are unlikely.
++    using Data = HashMapWithStackMemory<BFloat16, Weight, TrivialHash, 4>;
++
++    Data data;
++
++    void add(const Value & x)
++    {
++        add(x, 1);
++    }
++
++    void add(const Value & x, Weight w)
++    {
++        if (!isNaN(x))
++            data[toBFloat16(x)] += w;
++    }
++
++    void merge(const QuantileBFloat16Histogram & rhs)
++    {
++        for (const auto & pair : rhs.data)
++            data[pair.getKey()] += pair.getMapped();
++    }
++
++    void serialize(WriteBuffer & buf) const
++    {
++        data.write(buf);
++    }
++
++    void deserialize(ReadBuffer & buf)
++    {
++        data.read(buf);
++    }
++
++    Value get(Float64 level) const
++    {
++        return getImpl<Value>(level);
++    }
++
++    void getMany(const Float64 * levels, const size_t * indices, size_t size, Value * result) const
++    {
++        getManyImpl(levels, indices, size, result);
++    }
++
++    Float64 getFloat(Float64 level) const
++    {
++        return getImpl<Float64>(level);
++    }
++
++    void getManyFloat(const Float64 * levels, const size_t * indices, size_t size, Float64 * result) const
++    {
++        getManyImpl(levels, indices, size, result);
++    }
++
++private:
++    /// Take the most significant 16 bits of the floating point number.
++    BFloat16 toBFloat16(const Value & x) const
++    {
++        return ext::bit_cast<UInt32>(static_cast<Float32>(x)) >> 16;
++    }
++
++    /// Put the bits into most significant 16 bits of the floating point number and fill other bits with zeros.
++    Float32 toFloat32(const BFloat16 & x) const
++    {
++        return ext::bit_cast<Float32>(x << 16);
++    }
++
++    using Pair = PairNoInit<Float32, Weight>;
++
++    template <typename T>
++    T getImpl(Float64 level) const
++    {
++        size_t size = data.size();
++
++        if (0 == size)
++            return std::numeric_limits<T>::quiet_NaN();
++
++        std::unique_ptr<Pair[]> array_holder(new Pair[size]);
++        Pair * array = array_holder.get();
++
++        Float64 sum_weight = 0;
++        Pair * arr_it = array;
++        for (const auto & pair : data)
++        {
++            sum_weight += pair.getMapped();
++            *arr_it = {toFloat32(pair.getKey()), pair.getMapped()};
++            ++arr_it;
++        }
++
++        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
++
++        Float64 threshold = std::ceil(sum_weight * level);
++        Float64 accumulated = 0;
++
++        for (const Pair * p = array; p != (array + size); ++p)
++        {
++            accumulated += p->second;
++
++            if (accumulated >= threshold)
++                return p->first;
++        }
++
++        return array[size - 1].first;
++    }
++
++    template <typename T>
++    void getManyImpl(const Float64 * levels, const size_t * indices, size_t num_levels, T * result) const
++    {
++        size_t size = data.size();
++
++        if (0 == size)
++        {
++            for (size_t i = 0; i < num_levels; ++i)
++                result[i] = std::numeric_limits<T>::quiet_NaN();
++
++            return;
++        }
++
++        std::unique_ptr<Pair[]> array_holder(new Pair[size]);
++        Pair * array = array_holder.get();
++
++        Float64 sum_weight = 0;
++        Pair * arr_it = array;
++        for (const auto & pair : data)
++        {
++            sum_weight += pair.getMapped();
++            *arr_it = {toFloat32(pair.getKey()), pair.getMapped()};
++            ++arr_it;
++        }
++
++        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
++
++        size_t level_index = 0;
++        Float64 accumulated = 0;
++        Float64 threshold = std::ceil(sum_weight * levels[indices[level_index]]);
++
++        for (const Pair * p = array; p != (array + size); ++p)
++        {
++            accumulated += p->second;
++
++            while (accumulated >= threshold)
++            {
++                result[indices[level_index]] = p->first;
++                ++level_index;
++
++                if (level_index == num_levels)
++                    return;
++
++                threshold = std::ceil(sum_weight * levels[indices[level_index]]);
++            }
++        }
++
++        while (level_index < num_levels)
++        {
++            result[indices[level_index]] = array[size - 1].first;
++            ++level_index;
++        }
++    }
++};
++
++}

@@ -1,0 +1,357 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index cdb828840bda..39d7b1d0e5b7 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -1541,7 +1541,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+         /// We load temporary database first, because projections need it.
+         database_catalog.initializeAndLoadTemporaryDatabase();
+         loadMetadataSystem(global_context);
+-        maybeConvertOrdinaryDatabaseToAtomic(global_context, DatabaseCatalog::instance().getSystemDatabase());
++        maybeConvertSystemDatabase(global_context);
+         /// After attaching system databases we can initialize system log.
+         global_context->initializeSystemLogs();
+         global_context->setSystemZooKeeperLogAfterInitializationIfNeeded();
+@@ -1555,6 +1555,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
+         database_catalog.loadMarkedAsDroppedTables();
+         /// Then, load remaining databases
+         loadMetadata(global_context, default_database);
++        convertDatabasesEnginesIfNeed(global_context);
+         startupSystemTables();
+         database_catalog.loadDatabases();
+         /// After loading validate that default database exists
+diff --git a/src/Databases/DatabaseOrdinary.cpp b/src/Databases/DatabaseOrdinary.cpp
+index 18b702223829..b008b13143a5 100644
+--- a/src/Databases/DatabaseOrdinary.cpp
++++ b/src/Databases/DatabaseOrdinary.cpp
+@@ -198,6 +198,7 @@ void DatabaseOrdinary::loadTablesMetadata(ContextPtr local_context, ParsedTables
+                 if (fs::exists(full_path.string() + detached_suffix))
+                 {
+                     const std::string table_name = unescapeForFileName(file_name.substr(0, file_name.size() - 4));
++                    permanently_detached_tables.push_back(table_name);
+                     LOG_DEBUG(log, "Skipping permanently detached table {}.", backQuote(table_name));
+                     return;
+                 }
+diff --git a/src/Databases/DatabaseOrdinary.h b/src/Databases/DatabaseOrdinary.h
+index 6e524ae18b0c..78a48adf9ec2 100644
+--- a/src/Databases/DatabaseOrdinary.h
++++ b/src/Databases/DatabaseOrdinary.h
+@@ -36,6 +36,8 @@ class DatabaseOrdinary : public DatabaseOnDisk
+         const StorageID & table_id,
+         const StorageInMemoryMetadata & metadata) override;
+ 
++    Strings getNamesOfPermanentlyDetachedTables() const override { return permanently_detached_tables; }
++
+ protected:
+     virtual void commitAlterTable(
+         const StorageID & table_id,
+@@ -43,6 +45,8 @@ class DatabaseOrdinary : public DatabaseOnDisk
+         const String & table_metadata_path,
+         const String & statement,
+         ContextPtr query_context);
++
++    Strings permanently_detached_tables;
+ };
+ 
+ }
+diff --git a/src/Databases/IDatabase.h b/src/Databases/IDatabase.h
+index 72155bc818c4..99ce0b51d547 100644
+--- a/src/Databases/IDatabase.h
++++ b/src/Databases/IDatabase.h
+@@ -223,6 +223,13 @@ class IDatabase : public std::enable_shared_from_this<IDatabase>
+         throw Exception("There is no DETACH TABLE PERMANENTLY query for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
++    /// Returns list of table names that were permanently detached.
++    /// This list may not be updated in runtime and may be filled only on server startup
++    virtual Strings getNamesOfPermanentlyDetachedTables() const
++    {
++        throw Exception("Cannot get names of permanently detached tables for Database" + getEngineName(), ErrorCodes::NOT_IMPLEMENTED);
++    }
++
+     /// Rename the table and possibly move the table to another database.
+     virtual void renameTable(
+         ContextPtr /*context*/,
+diff --git a/src/Interpreters/loadMetadata.cpp b/src/Interpreters/loadMetadata.cpp
+index 15d4f7929f87..be380043ddc3 100644
+--- a/src/Interpreters/loadMetadata.cpp
++++ b/src/Interpreters/loadMetadata.cpp
+@@ -1,7 +1,5 @@
+ #include <Common/ThreadPool.h>
+ 
+-#include <Poco/DirectoryIterator.h>
+-
+ #include <Parsers/ParserCreateQuery.h>
+ #include <Parsers/ASTCreateQuery.h>
+ #include <Parsers/parseQuery.h>
+@@ -13,6 +11,7 @@
+ 
+ #include <Databases/DatabaseOrdinary.h>
+ #include <Databases/TablesLoader.h>
++#include <Storages/StorageMaterializedView.h>
+ 
+ #include <IO/ReadBufferFromFile.h>
+ #include <IO/ReadHelpers.h>
+@@ -211,17 +210,12 @@ static void loadSystemDatabaseImpl(ContextMutablePtr context, const String & dat
+     }
+ }
+ 
+-static void convertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database)
++static void convertOrdinaryDatabaseToAtomic(Poco::Logger * log, ContextMutablePtr context, const DatabasePtr & database,
++                                            const String & name, const String tmp_name)
+ {
+     /// It's kind of C++ script that creates temporary database with Atomic engine,
+     /// moves all tables to it, drops old database and then renames new one to old name.
+ 
+-    Poco::Logger * log = &Poco::Logger::get("loadMetadata");
+-
+-    String name = database->getDatabaseName();
+-
+-    String tmp_name = fmt::format(".tmp_convert.{}.{}", name, thread_local_rng());
+-
+     String name_quoted = backQuoteIfNeed(name);
+     String tmp_name_quoted = backQuoteIfNeed(tmp_name);
+ 
+@@ -235,19 +229,34 @@ static void convertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const Dat
+     assert(tmp_database->getEngineName() == "Atomic");
+ 
+     size_t num_tables = 0;
++    std::unordered_set<String> inner_mv_tables;
+     for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
+     {
+         ++num_tables;
+         auto id = iterator->table()->getStorageID();
+         id.database_name = tmp_name;
++        /// We need some uuid for checkTableCanBeRenamed
++        id.uuid = UUIDHelpers::generateV4();
+         iterator->table()->checkTableCanBeRenamed(id);
++        if (const auto * mv = dynamic_cast<const StorageMaterializedView *>(iterator->table().get()))
++        {
++            /// We should not rename inner tables of MVs, because MVs are responsible for renaming it...
++            if (mv->hasInnerTable())
++                inner_mv_tables.emplace(mv->getTargetTable()->getStorageID().table_name);
++        }
+     }
+ 
+-    LOG_INFO(log, "Will move {} tables to {}", num_tables, tmp_name_quoted);
++    LOG_INFO(log, "Will move {} tables to {} (including {} inner tables of MVs)", num_tables, tmp_name_quoted, inner_mv_tables.size());
+ 
+     for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
+     {
+         auto id = iterator->table()->getStorageID();
++        if (inner_mv_tables.contains(id.table_name))
++        {
++            LOG_DEBUG(log, "Do not rename {}, because it will be renamed together with MV", id.getNameForLogs());
++            continue;
++        }
++
+         String qualified_quoted_name = id.getFullTableName();
+         id.database_name = tmp_name;
+         String tmp_qualified_quoted_name = id.getFullTableName();
+@@ -264,6 +273,7 @@ static void convertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const Dat
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "Database {} is not empty after moving tables", name_quoted);
+ 
+     String drop_query = fmt::format("DROP DATABASE {}", name_quoted);
++    context->setSetting("force_remove_data_recursively_on_drop", false);
+     res = executeQuery(drop_query, context, true);
+     executeTrivialBlockIO(res, context);
+     res = {};
+@@ -275,31 +285,54 @@ static void convertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const Dat
+     LOG_INFO(log, "Finished database engine conversion of {}", name_quoted);
+ }
+ 
+-void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database)
++/// Converts database with Ordinary engine to Atomic. Does nothing if database is not Ordinary.
++/// Can be called only during server startup when there are no queries from users.
++static void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const String & database_name, bool tables_started)
+ {
+-    if (database->getEngineName() != "Ordinary")
++    Poco::Logger * log = &Poco::Logger::get("loadMetadata");
++
++    auto database = DatabaseCatalog::instance().getDatabase(database_name);
++    if (!database)
++    {
++        LOG_WARNING(log, "Database {} not found (while trying to convert it from Ordinary to Atomic)", database_name);
+         return;
++    }
+ 
+-    if (context->getSettingsRef().allow_deprecated_database_ordinary)
++    if (database->getEngineName() != "Ordinary")
+         return;
+ 
++    Strings permanently_detached_tables = database->getNamesOfPermanentlyDetachedTables();
++    if (!permanently_detached_tables.empty())
++    {
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot automatically convert database {} from Ordinary to Atomic, "
++                        "because it contains permanently detached tables ({}) that were not loaded during startup. "
++                        "Attach these tables, so server will load and convert them",
++                        database_name, fmt::join(permanently_detached_tables, ", "));
++    }
++
++    String tmp_name = fmt::format(".tmp_convert.{}.{}", database_name, thread_local_rng());
++
+     try
+     {
+-        /// It's not quite correct to run DDL queries while database is not started up.
+-        startupSystemTables();
++        if (!tables_started)
++        {
++            /// It's not quite correct to run DDL queries while database is not started up.
++            ThreadPool pool;
++            DatabaseCatalog::instance().getSystemDatabase()->startupTables(pool, /* force_restore */ true, /* force_attach */ true);
++        }
+ 
+         auto local_context = Context::createCopy(context);
+         local_context->setSetting("check_table_dependencies", false);
+-        convertOrdinaryDatabaseToAtomic(local_context, database);
++        convertOrdinaryDatabaseToAtomic(log, local_context, database, database_name, tmp_name);
+ 
+-        auto new_database = DatabaseCatalog::instance().getDatabase(DatabaseCatalog::SYSTEM_DATABASE);
++        auto new_database = DatabaseCatalog::instance().getDatabase(database_name);
+         UUID db_uuid = new_database->getUUID();
+         std::vector<UUID> tables_uuids;
+         for (auto iterator = new_database->getTablesIterator(context); iterator->isValid(); iterator->next())
+             tables_uuids.push_back(iterator->uuid());
+ 
+         /// Reload database just in case (and update logger name)
+-        String detach_query = fmt::format("DETACH DATABASE {}", backQuoteIfNeed(DatabaseCatalog::SYSTEM_DATABASE));
++        String detach_query = fmt::format("DETACH DATABASE {}", backQuoteIfNeed(database_name));
+         auto res = executeQuery(detach_query, context, true);
+         executeTrivialBlockIO(res, context);
+         res = {};
+@@ -310,23 +343,54 @@ void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const Datab
+         for (const auto & uuid : tables_uuids)
+             DatabaseCatalog::instance().removeUUIDMappingFinally(uuid);
+ 
+-        loadSystemDatabaseImpl(context, DatabaseCatalog::SYSTEM_DATABASE, "Atomic");
++        String path = context->getPath() + "metadata/" + escapeForFileName(database_name);
++        /// force_restore_data is needed to re-create metadata symlinks
++        loadDatabase(context, database_name, path, /* force_restore_data */ true);
++
+         TablesLoader::Databases databases =
+         {
+-            {DatabaseCatalog::SYSTEM_DATABASE, DatabaseCatalog::instance().getSystemDatabase()},
++            {database_name, DatabaseCatalog::instance().getDatabase(database_name)},
+         };
+         TablesLoader loader{context, databases, /* force_restore */ true, /* force_attach */ true};
+         loader.loadTables();
+ 
+-        /// Will startup tables usual way
++        /// Startup tables if they were started before conversion and detach/attach
++        if (tables_started)
++            loader.startupTables();
+     }
+     catch (Exception & e)
+     {
+-        e.addMessage("While trying to convert {} to Atomic", database->getDatabaseName());
++        e.addMessage("Exception while trying to convert database {} from Ordinary to Atomic. It may be in some intermediate state."
++            "You can finish conversion manually by moving the rest tables from {} to {} (using RENAME TABLE)"
++            "and executing DROP DATABASE {} and RENAME DATABASE {} TO {}.",
++            database_name, database_name, tmp_name, database_name, tmp_name, database_name);
+         throw;
+     }
+ }
+ 
++void maybeConvertSystemDatabase(ContextMutablePtr context)
++{
++    /// TODO remove this check, convert system database unconditionally
++    if (context->getSettingsRef().allow_deprecated_database_ordinary)
++        return;
++
++    maybeConvertOrdinaryDatabaseToAtomic(context, DatabaseCatalog::SYSTEM_DATABASE, /* tables_started */ false);
++}
++
++void convertDatabasesEnginesIfNeed(ContextMutablePtr context)
++{
++    auto convert_flag_path = fs::path(context->getFlagsPath()) / "convert_ordinary_to_atomic";
++    if (!fs::exists(convert_flag_path))
++        return;
++
++    LOG_INFO(&Poco::Logger::get("loadMetadata"), "Found convert_ordinary_to_atomic file in flags directory, "
++                                                 "will try to convert all Ordinary databases to Atomic");
++    fs::remove(convert_flag_path);
++
++    for (const auto & [name, _] : DatabaseCatalog::instance().getDatabases())
++        if (name != DatabaseCatalog::SYSTEM_DATABASE)
++            maybeConvertOrdinaryDatabaseToAtomic(context, name, /* tables_started */ true);
++}
+ 
+ void startupSystemTables()
+ {
+diff --git a/src/Interpreters/loadMetadata.h b/src/Interpreters/loadMetadata.h
+index 8dc332defc53..b229a2b4c314 100644
+--- a/src/Interpreters/loadMetadata.h
++++ b/src/Interpreters/loadMetadata.h
+@@ -19,8 +19,10 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
+ /// so we startup system tables after all databases are loaded.
+ void startupSystemTables();
+ 
+-/// Converts database with Ordinary engine to Atomic. Does nothing if database is not Ordinary.
+-/// Can be called only during server startup when there are no queries from users.
+-void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const DatabasePtr & database);
++/// Converts `system` database from Ordinary to Atomic (if needed)
++void maybeConvertSystemDatabase(ContextMutablePtr context);
++
++/// Converts all databases (except system) from Ordinary to Atomic if convert_ordinary_to_atomic flag exists
++void convertDatabasesEnginesIfNeed(ContextMutablePtr context);
+ 
+ }
+diff --git a/src/Storages/StorageLog.cpp b/src/Storages/StorageLog.cpp
+index ccb88992732d..c6bc55fd620e 100644
+--- a/src/Storages/StorageLog.cpp
++++ b/src/Storages/StorageLog.cpp
+@@ -729,6 +729,7 @@ void StorageLog::rename(const String & new_path_to_table_data, const StorageID &
+ {
+     assert(table_path != new_path_to_table_data);
+     {
++        disk->createDirectories(new_path_to_table_data);
+         disk->moveDirectory(table_path, new_path_to_table_data);
+ 
+         table_path = new_path_to_table_data;
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 90b516320008..cb77458502f6 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -5261,9 +5261,28 @@ void StorageReplicatedMergeTree::checkTableCanBeRenamed(const StorageID & new_na
+         return;
+ 
+     if (renaming_restrictions == RenamingRestrictions::DO_NOT_ALLOW)
+-        throw Exception("Cannot rename Replicated table, because zookeeper_path contains implicit 'database' or 'table' macro. "
+-                        "We cannot rename path in ZooKeeper, so path may become inconsistent with table name. If you really want to rename table, "
+-                        "you should edit metadata file first and restart server or reattach the table.", ErrorCodes::NOT_IMPLEMENTED);
++    {
++        auto old_name = getStorageID();
++        bool is_server_startup = Context::getGlobalContextInstance()->getApplicationType() == Context::ApplicationType::SERVER
++            && !Context::getGlobalContextInstance()->isServerCompletelyStarted();
++        bool move_to_atomic = old_name.uuid == UUIDHelpers::Nil && new_name.uuid != UUIDHelpers::Nil;
++
++        bool likely_converting_ordinary_to_atomic = is_server_startup && move_to_atomic;
++        if (likely_converting_ordinary_to_atomic)
++        {
++            LOG_INFO(log, "Table {} should not be renamed, because zookeeper_path contains implicit 'database' or 'table' macro. "
++                          "We cannot rename path in ZooKeeper, so path may become inconsistent with table name. "
++                          "However, we allow renaming while converting Ordinary database to Atomic, because all tables will be renamed back",
++                          old_name.getNameForLogs());
++            return;
++        }
++
++        throw Exception(
++            "Cannot rename Replicated table, because zookeeper_path contains implicit 'database' or 'table' macro. "
++            "We cannot rename path in ZooKeeper, so path may become inconsistent with table name. If you really want to rename table, "
++            "you should edit metadata file first and restart server or reattach the table.",
++            ErrorCodes::NOT_IMPLEMENTED);
++    }
+ 
+     assert(renaming_restrictions == RenamingRestrictions::ALLOW_PRESERVING_UUID);
+     if (!new_name.hasUUID() && getStorageID().hasUUID())
+diff --git a/src/Storages/StorageStripeLog.cpp b/src/Storages/StorageStripeLog.cpp
+index e3f477936db0..0ecbdb0db100 100644
+--- a/src/Storages/StorageStripeLog.cpp
++++ b/src/Storages/StorageStripeLog.cpp
+@@ -320,6 +320,7 @@ void StorageStripeLog::rename(const String & new_path_to_table_data, const Stora
+ {
+     assert(table_path != new_path_to_table_data);
+     {
++        disk->createDirectories(new_path_to_table_data);
+         disk->moveDirectory(table_path, new_path_to_table_data);
+ 
+         table_path = new_path_to_table_data;

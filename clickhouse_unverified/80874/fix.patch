@@ -1,0 +1,977 @@
+diff --git a/docs/en/sql-reference/statements/system.md b/docs/en/sql-reference/statements/system.md
+index 6cfc637ba2ba..4ad4d94f7e34 100644
+--- a/docs/en/sql-reference/statements/system.md
++++ b/docs/en/sql-reference/statements/system.md
+@@ -160,12 +160,13 @@ If a tag is specified, only query cache entries with the specified tag are delet
+ 
+ Clears cache for schemas loaded from [`format_schema_path`](../../operations/server-configuration-parameters/settings.md#format_schema_path).
+ 
+-Supported formats:
+-
+-- Protobuf
++Supported targets:
++- Protobuf: Removes imported Protobuf message definitions from memory.
++- Files: Deletes cached schema files stored locally in the [`format_schema_path`](../../operations/server-configuration-parameters/settings.md#format_schema_path), generated when `format_schema_source` is set to `query`.
++Note: If no target is specified, both caches are cleared.
+ 
+ ```sql
+-SYSTEM DROP FORMAT SCHEMA CACHE [FOR Protobuf]
++SYSTEM DROP FORMAT SCHEMA CACHE [FOR Protobuf/Files]
+ ```
+ 
+ ## FLUSH LOGS {#flush-logs}
+diff --git a/src/Core/FormatFactorySettings.h b/src/Core/FormatFactorySettings.h
+index e0896a01b09e..022194d20c57 100644
+--- a/src/Core/FormatFactorySettings.h
++++ b/src/Core/FormatFactorySettings.h
+@@ -1081,8 +1081,29 @@ Path of the file used to record errors while reading text formats (CSV, TSV).
+ Method to write Errors to text output.
+ )", 0) \
+     \
++    DECLARE(String, format_schema_source, "file", R"(
++Define the source of `format_schema`.
++Possible values:
++- 'file' (default):: The `format_schema` is the name of a schema file located in the `format_schemas` directory.
++- 'string': The `format_schema` is the literal content of the schema.
++- 'query': The `format_schema` is a query to retrieve the schema.
++When `format_schema_source` is set to 'query', the following conditions apply:
++- The query must return exactly one value: a single row with a single string column.
++- The result of the query is treated as the schema content.
++- This result is cached locally in the `format_schemas` directory.
++- You can clear the local cache using the command: `SYSTEM DROP FORMAT SCHEMA CACHE FOR Files`.
++- Once cached, identical queries are not executed to fetch the schema again until the cache is explicitly cleared
++- In addition to local cache files, Protobuf messages are also cached in memory. Even after clearing the local cache files, the in-memory cache must be cleared using `SYSTEM DROP FORMAT SCHEMA CACHE [FOR Protobuf]` to fully refresh the schema.
++- Run the query `SYSTEM DROP FORMAT SCHEMA CACHE` to clear the cache for both cache files and Protobuf messages schemas at once.
++)", 0) \
+     DECLARE(String, format_schema, "", R"(
+ This parameter is useful when you are using formats that require a schema definition, such as [Cap'n Proto](https://capnproto.org/) or [Protobuf](https://developers.google.com/protocol-buffers/). The value depends on the format.
++)", 0) \
++    DECLARE(String, format_schema_message_name, "", R"(
++Define the name of the required message in the schema defined in `format_schema`.
++To maintain compatibility with the legacy format_schema format (`file_name:message_name`):
++- If `format_schema_message_name` is not specified, the message name is inferred from the `message_name` part of the legacy `format_schema` value.
++- If `format_schema_message_name` is specified while using the legacy format, an error will be raised.
+ )", 0) \
+     DECLARE(String, format_template_resultset, "", R"(
+ Path to file which contains format string for result set (for Template format)
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index edba38ed5dcd..c01d5fdbd221 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -69,7 +69,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+         /// Note: please check if the key already exists to prevent duplicate entries.
+         addSettingsChanges(settings_changes_history, "25.7",
+         {
+-
++            {"format_schema_source", "file", "file", "New setting"},
++            {"format_schema_message_name", "", "", "New setting"},
+         });
+         addSettingsChanges(settings_changes_history, "25.6",
+         {
+diff --git a/src/Formats/FormatFactory.cpp b/src/Formats/FormatFactory.cpp
+index 41d944819fc2..8b85e48acfc6 100644
+--- a/src/Formats/FormatFactory.cpp
++++ b/src/Formats/FormatFactory.cpp
+@@ -246,7 +246,9 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
+     format_settings.regexp.escaping_rule = settings[Setting::format_regexp_escaping_rule];
+     format_settings.regexp.regexp = settings[Setting::format_regexp];
+     format_settings.regexp.skip_unmatched = settings[Setting::format_regexp_skip_unmatched];
++    format_settings.schema.format_schema_source = settings[Setting::format_schema_source];
+     format_settings.schema.format_schema = settings[Setting::format_schema];
++    format_settings.schema.format_schema_message_name = settings[Setting::format_schema_message_name];
+     format_settings.schema.format_schema_path = context->getFormatSchemaPath();
+     format_settings.schema.is_server = context->hasGlobalContext() && (context->getGlobalContext()->getApplicationType() == Context::ApplicationType::SERVER);
+     format_settings.schema.output_format_schema = settings[Setting::output_format_schema];
+diff --git a/src/Formats/FormatSchemaInfo.cpp b/src/Formats/FormatSchemaInfo.cpp
+index caa89fb7d0f8..801c2d3f2a55 100644
+--- a/src/Formats/FormatSchemaInfo.cpp
++++ b/src/Formats/FormatSchemaInfo.cpp
+@@ -1,13 +1,30 @@
++#include <filesystem>
+ #include <Formats/FormatSchemaInfo.h>
++
++#include <fcntl.h>
++
++#include <Columns/ColumnConst.h>
++#include <Columns/ColumnString.h>
++#include <Core/Block.h>
++#include <Disks/IO/WriteBufferFromTemporaryFile.h>
++#include <Formats/FormatSettings.h>
++#include <IO/WriteHelpers.h>
+ #include <Interpreters/Context.h>
++#include <Interpreters/InterpreterSelectQuery.h>
++#include <Interpreters/QueryFlags.h>
++#include <Interpreters/SelectQueryOptions.h>
++#include <Parsers/ParserSelectQuery.h>
++#include <Parsers/parseQuery.h>
++#include <Processors/Executors/PullingPipelineExecutor.h>
++#include <boost/algorithm/hex.hpp>
++#include <Common/CurrentThread.h>
+ #include <Common/Exception.h>
++#include <Common/Logger.h>
++#include <Common/OpenSSLHelpers.h>
++#include <Common/SipHash.h>
++#include <Common/atomicRename.h>
+ #include <Common/filesystemHelpers.h>
+-#include <Core/Block.h>
+-#include <Disks/IO/WriteBufferFromTemporaryFile.h>
+-
+-#include <filesystem>
+-
+-
++#include <Common/logger_useful.h>
+ namespace DB
+ {
+ namespace ErrorCodes
+@@ -15,7 +32,6 @@ namespace ErrorCodes
+     extern const int BAD_ARGUMENTS;
+ }
+ 
+-namespace fs = std::filesystem;
+ 
+ namespace
+ {
+@@ -30,47 +46,259 @@ namespace
+ }
+ 
+ 
+-FormatSchemaInfo::FormatSchemaInfo(const String & format_schema, const String & format, bool require_message, bool is_server, const std::string & format_schema_path)
++FormatSchemaInfo::FormatSchemaInfo(
++    const String & format_schema_source,
++    const String & format_schema,
++    const String & format_schema_message_name,
++    const String & format,
++    bool require_message,
++    bool is_server,
++    const String & format_schema_path)
++    : message_name(format_schema_message_name)
++    , log(getLogger("FormatSchemaInfo"))
+ {
++    if (format_schema_source.empty())
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The format_schema_source setting should be set");
++
+     if (format_schema.empty())
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "The format {} requires a schema. The corresponding setting should be set", format);
+ 
++    if (!require_message && !message_name.empty())
++    {
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "format_schema_message_name is specified {} when not required", message_name);
++    }
++
++    auto default_schema_directory = [&format_schema_path]()
++    {
++        static const String str = fs::canonical(format_schema_path) / "";
++        return str;
++    };
++
++    if (format_schema_source == FormatSettings::FORMAT_SCHEMA_SOURCE_FILE)
++    {
++        handleSchemaFile(format_schema, format, require_message, is_server, default_schema_directory());
++        return;
++    }
++
++    if (format_schema_source == FormatSettings::FORMAT_SCHEMA_SOURCE_STRING)
++    {
++        handleSchemaContent(format_schema, format, is_server, default_schema_directory());
++        return;
++    }
++
++    if (format_schema_source == FormatSettings::FORMAT_SCHEMA_SOURCE_QUERY)
++    {
++        handleSchemaSourceQuery(format_schema, format, is_server, default_schema_directory());
++        return;
++    }
++
++    throw Exception(
++        ErrorCodes::BAD_ARGUMENTS,
++        "Invalid format_schema_source setting. Possible value: '{}', '{}', '{}', actual '{}'",
++        FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++        FormatSettings::FORMAT_SCHEMA_SOURCE_STRING,
++        FormatSettings::FORMAT_SCHEMA_SOURCE_QUERY,
++        format_schema_source);
++}
++
++FormatSchemaInfo::FormatSchemaInfo(const FormatSettings & settings, const String & format, bool require_message)
++    : FormatSchemaInfo(
++          settings.schema.format_schema_source,
++          settings.schema.format_schema,
++          settings.schema.format_schema_message_name,
++          format,
++          require_message,
++          settings.schema.is_server,
++          settings.schema.format_schema_path)
++{
++}
++
++void FormatSchemaInfo::handleSchemaFile(
++    const String & format_schema, const String & format, bool require_message, bool is_server, const String & format_schema_path)
++{
+     String default_file_extension = getFormatSchemaDefaultFileExtension(format);
+ 
+     fs::path path;
++    verifySchemaFileName(format_schema, require_message, path);
++    processSchemaFile(path, default_file_extension, is_server, format_schema_path);
++}
++
++void FormatSchemaInfo::verifySchemaFileName(const String & format_schema, bool require_message, fs::path & path)
++{
++    size_t colon_pos = format_schema.find(':');
++    String format_schema_file_name;
++    String format_schema_message_name;
++    if (colon_pos != String::npos)
++    {
++        if (!message_name.empty())
++            throw Exception(
++                ErrorCodes::BAD_ARGUMENTS,
++                "Require message is already defined in `format_schema_message_name` and should not be defined in 'format_schema'");
++
++        format_schema_file_name = format_schema.substr(0, colon_pos);
++        format_schema_message_name = format_schema.substr(colon_pos + 1);
++    }
++    else
++    {
++        format_schema_file_name = format_schema;
++    }
++
+     if (require_message)
+     {
+-        size_t colon_pos = format_schema.find(':');
+-        if ((colon_pos == String::npos) || (colon_pos == 0) || (colon_pos == format_schema.length() - 1))
+-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                    "Format schema requires the 'format_schema' setting to have the 'schema_file:message_name' format{}. Got '{}'",
+-                    (default_file_extension.empty() ? "" : ", e.g. 'schema." + default_file_extension + ":Message'"), format_schema);
+-        path = fs::path(format_schema.substr(0, colon_pos));
++        if (message_name.empty() && format_schema_message_name.empty())
++            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected 'format_schema_message_name' setting");
++
++        if (message_name.empty())
++            message_name = format_schema_message_name;
++
++        path = fs::path(format_schema_file_name);
+         String filename = path.has_filename() ? path.filename() : path.parent_path().filename();
+         if (filename.empty())
+-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                "Format schema requires the 'format_schema' setting to have the 'schema_file:message_name' format{}. Got '{}'",
+-                (default_file_extension.empty() ? "" : ", e.g. 'schema." + default_file_extension + ":Message'"), format_schema);
+-
+-        message_name = format_schema.substr(colon_pos + 1);
++            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid file name in 'format_schema' setting");
+     }
+     else
+     {
+-        path = fs::path(format_schema);
++        path = fs::path(format_schema_file_name);
+         if (!path.has_filename())
+             path = path.parent_path() / "";
+     }
++}
+ 
+-    auto default_schema_directory = [&format_schema_path]()
++void FormatSchemaInfo::handleSchemaContent(const String & content, const String & format, bool is_server, const String & format_schema_path)
++{
++    String default_file_extension = getFormatSchemaDefaultFileExtension(format);
++    auto file_name = generateSchemaFileName(content, default_file_extension);
++    auto cached_file_path = fs::path(CACHE_DIR_NAME) / file_name;
++    auto file_path = fs::path(format_schema_path) / cached_file_path;
++    if (fs::exists(file_path))
+     {
+-        static const String str = fs::canonical(format_schema_path) / "";
+-        return str;
+-    };
++        LOG_DEBUG(log, "Cached file exists '{}', skip storing schema file", file_path.string());
++    }
++    else
++    {
++        storeSchemaOnDisk(/*file_path=*/file_path, /*content=*/content);
++    }
++    processSchemaFile(cached_file_path, default_file_extension, is_server, format_schema_path);
++}
++
++void FormatSchemaInfo::handleSchemaSourceQuery(
++    const String & format_schema, const String & format, bool is_server, const String & format_schema_path)
++{
++    String default_file_extension = getFormatSchemaDefaultFileExtension(format);
++    auto file_name = generateSchemaFileName(format_schema, default_file_extension);
++    auto cached_file_path = fs::path(CACHE_DIR_NAME) / file_name;
++    auto file_path = fs::path(format_schema_path) / cached_file_path;
++    if (fs::exists(file_path))
++    {
++        LOG_DEBUG(log, "Cached file exists '{}' for query '{}', skip querying schema", file_path.string(), format_schema);
++    }
++    else
++    {
++        auto content = querySchema(format_schema);
++        storeSchemaOnDisk(/*file_path=*/file_path, /*content=*/content);
++    }
++    processSchemaFile(cached_file_path, default_file_extension, is_server, format_schema_path);
++}
++
++String FormatSchemaInfo::querySchema(const String & query)
++{
++    auto current_query_context = CurrentThread::get().getQueryContext();
++    if (!current_query_context)
++        current_query_context = Context::getGlobalContextInstance();
++
++    ParserSelectQuery parser;
++    ASTPtr select_ast = parseQuery(parser, query, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
++
++    auto query_context = Context::createCopy(current_query_context);
++    InterpreterSelectQuery interpreter(select_ast, query_context, SelectQueryOptions().setInternal());
++    BlockIO io = interpreter.execute();
++
++    PullingPipelineExecutor executor(io.pipeline);
++
++    Block block;
++    std::optional<String> result;
++    while (executor.pull(block))
++    {
++        if (result.has_value())
++            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected the schema query result to have one row");
++        if (block.columns() != 1)
++            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected the schema query result to have one column");
++
++        auto & column = block.getByPosition(0).column;
++        if (const auto * col_str = typeid_cast<const ColumnString *>(column.get()))
++        {
++            result = col_str->getDataAt(0).toString();
++            continue;
++        }
++
++        if (const auto * col_const = typeid_cast<const ColumnConst *>(column.get()))
++        {
++            if (const auto * col_str_const = typeid_cast<const ColumnString *>(col_const->getDataColumnPtr().get()))
++            {
++                result = col_str_const->getDataAt(0).toString();
++                continue;
++            }
++        }
+ 
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected the schema query result to have one String column");
++    }
++    if (!result.has_value())
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Schema query result is empty");
++
++    return *result;
++}
++
++void FormatSchemaInfo::storeSchemaOnDisk(const fs::path & file_path, const String & content)
++{
++    if (!file_path.has_filename() || file_path.filename().empty())
++        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid file path {}", file_path.string());
++
++    if (fs::exists(file_path))
++    {
++        LOG_DEBUG(log, "Cache file {} existed, skip storing", file_path.string());
++        return;
++    }
++
++    LOG_INFO(log, "Storing schema to {}", file_path.string());
++    auto dir_path = file_path.parent_path();
++    if (!fs::exists(dir_path))
++    {
++        fs::create_directory(dir_path);
++    }
++
++    auto temp_path = fs::path(file_path.string() + ".tmp");
++
++    try
++    {
++        WriteBufferFromFile out(temp_path, content.size(), O_WRONLY | O_CREAT | O_EXCL);
++        writeString(content, out);
++        out.next();
++        out.sync();
++        out.close();
++
++        if (fs::exists(file_path))
++            DB::renameExchange(temp_path, file_path);
++        else
++            DB::renameNoReplace(temp_path, file_path);
++
++        fs::remove(temp_path);
++    }
++    catch (...)
++    {
++        fs::remove(temp_path);
++        tryLogCurrentException("FormatSchemaInfo", "Unable to store schema file " + file_path.string() + " on disk");
++        if (!fs::exists(file_path))
++            throw;
++    }
++}
++
++void FormatSchemaInfo::processSchemaFile(
++    fs::path path, const String & default_file_extension, bool is_server, const String & format_schema_path)
++{
+     if (!path.has_extension() && !default_file_extension.empty())
+         path = path.parent_path() / (path.stem().string() + '.' + default_file_extension);
+ 
+-    fs::path default_schema_directory_path(default_schema_directory());
++    fs::path default_schema_directory_path(format_schema_path);
+     if (path.is_absolute())
+     {
+         if (is_server)
+@@ -78,15 +306,19 @@ FormatSchemaInfo::FormatSchemaInfo(const String & format_schema, const String &
+         schema_path = path.filename();
+         schema_directory = path.parent_path() / "";
+     }
+-    else if (path.has_parent_path() && !fs::weakly_canonical(default_schema_directory_path / path).string().starts_with(fs::weakly_canonical(default_schema_directory_path).string()))
++    else if (
++        path.has_parent_path()
++        && !fs::weakly_canonical(default_schema_directory_path / path)
++                .string()
++                .starts_with(fs::weakly_canonical(default_schema_directory_path).string()))
+     {
+         if (is_server)
+             throw Exception(
+                 ErrorCodes::BAD_ARGUMENTS,
+                 "Path in the 'format_schema' setting shouldn't go outside the 'format_schema_path' directory: {} ({} not in {})",
+-                default_schema_directory(),
++                format_schema_path,
+                 path.string(),
+-                default_schema_directory());
++                format_schema_path);
+         path = default_schema_directory_path / path;
+         schema_path = path.filename();
+         schema_directory = path.parent_path() / "";
+@@ -94,14 +326,32 @@ FormatSchemaInfo::FormatSchemaInfo(const String & format_schema, const String &
+     else
+     {
+         schema_path = path;
+-        schema_directory = default_schema_directory();
++        schema_directory = format_schema_path;
+     }
+ }
+ 
+-FormatSchemaInfo::FormatSchemaInfo(const FormatSettings & settings, const String & format, bool require_message)
+-    : FormatSchemaInfo(
+-        settings.schema.format_schema, format, require_message, settings.schema.is_server, settings.schema.format_schema_path)
++String FormatSchemaInfo::generateSchemaFileName(const String & hashing_content, const String & file_extention)
+ {
++#if USE_SSL
++    String content_hash_hex;
++    auto hash = encodeSHA256(hashing_content);
++    content_hash_hex.resize(hash.size() * 2);
++    boost::algorithm::hex(hash.begin(), hash.end(), content_hash_hex.data());
++#else
++    String content_hash_hex = getHexUIntLowercase(sipHash64(hashing_content));
++#endif
++
++    static constexpr size_t CONTENT_SAMPLE_MAX_LEN = 32;
++    size_t content_sample_len = std::min(CONTENT_SAMPLE_MAX_LEN, hashing_content.size());
++
++    String content_sample;
++    content_sample.resize(content_sample_len * 2);
++    boost::algorithm::hex(content_sample.begin(), content_sample.begin() + content_sample_len, content_sample.data());
++
++    if (file_extention.empty())
++        return fmt::format("{}-{}", content_sample, content_hash_hex);
++    else
++        return fmt::format("{}-{}.{}", content_sample, content_hash_hex, file_extention);
+ }
+ 
+ template <typename SchemaGenerator>
+@@ -162,7 +412,14 @@ MaybeAutogeneratedFormatSchemaInfo<SchemaGenerator>::MaybeAutogeneratedFormatSch
+     SchemaGenerator::writeSchema(buf, "Message", header.getNamesAndTypesList());
+     buf.finalize();
+ 
+-    schema_info = std::make_unique<FormatSchemaInfo>(schema_path + ":Message", format, true, settings.schema.is_server, settings.schema.format_schema_path);
++    schema_info = std::make_unique<FormatSchemaInfo>(
++        /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++        /*format_schema=*/schema_path,
++        /*format_schema_message_name=*/"Message",
++        /*format=*/format,
++        /*require_message=*/true,
++        /*is_server*/ settings.schema.is_server,
++        /*format_schema_path=*/settings.schema.format_schema_path);
+ }
+ 
+ template <typename SchemaGenerator>
+diff --git a/src/Formats/FormatSchemaInfo.h b/src/Formats/FormatSchemaInfo.h
+index 6b4ebf99aabc..fedfd3064983 100644
+--- a/src/Formats/FormatSchemaInfo.h
++++ b/src/Formats/FormatSchemaInfo.h
+@@ -1,22 +1,36 @@
+ #pragma once
+ 
+-#include <base/types.h>
+ #include <Formats/StructureToCapnProtoSchema.h>
+ #include <Formats/StructureToProtobufSchema.h>
++#include <base/types.h>
++#include <Common/Macros.h>
++
++#include <filesystem>
+ 
+ namespace DB
+ {
+ class Context;
+ class Block;
+ struct FormatSettings;
++namespace fs = std::filesystem;
++
+ 
+ /// Extracts information about where the format schema file is from passed context and keep it.
+ class FormatSchemaInfo
+ {
+ public:
+-    FormatSchemaInfo(const String & format_schema, const String & format, bool require_message, bool is_server, const std::string & format_schema_path);
++    FormatSchemaInfo(
++        const String & format_schema_source,
++        const String & format_schema,
++        const String & format_schema_message_name,
++        const String & format,
++        bool require_message,
++        bool is_server,
++        const String & format_schema_path);
+     FormatSchemaInfo(const FormatSettings & settings, const String & format, bool require_message);
+ 
++    inline static const String CACHE_DIR_NAME = "__cache__";
++
+     /// Returns path to the schema file.
+     const String & schemaPath() const { return schema_path; }
+     String absoluteSchemaPath() const { return schema_directory + schema_path; }
+@@ -28,9 +42,22 @@ class FormatSchemaInfo
+     const String & messageName() const { return message_name; }
+ 
+ private:
++    void handleSchemaFile(
++        const String & format_schema, const String & format, bool require_message, bool is_server, const String & format_schema_path);
++    void verifySchemaFileName(const String & format_schema, bool require_message, fs::path & path);
++    void handleSchemaContent(const String & content, const String & format, bool is_server, const String & format_schema_path);
++    void handleSchemaSourceQuery(const String & format_schema, const String & format, bool is_server, const String & format_schema_path);
++    String querySchema(const String & query);
++    void storeSchemaOnDisk(const fs::path & file_path, const String & content);
++    void processSchemaFile(fs::path path, const String & default_file_extension, bool is_server, const String & format_schema_path);
++
++    static String generateSchemaFileName(const String & hashing_content, const String & file_extention);
++
+     String schema_path;
+     String schema_directory;
+     String message_name;
++
++    LoggerPtr log;
+ };
+ 
+ 
+diff --git a/src/Formats/FormatSettings.h b/src/Formats/FormatSettings.h
+index 060f0c768fd2..cd1dcf7de329 100644
+--- a/src/Formats/FormatSettings.h
++++ b/src/Formats/FormatSettings.h
+@@ -46,6 +46,10 @@ struct FormatSettings
+     bool try_infer_datetimes_only_datetime64 = false;
+     bool try_infer_exponent_floats = false;
+ 
++    inline static const String FORMAT_SCHEMA_SOURCE_FILE = "file";
++    inline static const String FORMAT_SCHEMA_SOURCE_STRING = "string";
++    inline static const String FORMAT_SCHEMA_SOURCE_QUERY = "query";
++
+     enum class DateTimeInputFormat : uint8_t
+     {
+         Basic,        /// Default format for fast parsing: YYYY-MM-DD hh:mm:ss (ISO-8601 without fractional part and timezone) or NNNNNNNNNN unix timestamp.
+@@ -384,7 +388,9 @@ struct FormatSettings
+ 
+     struct
+     {
++        std::string format_schema_source = FORMAT_SCHEMA_SOURCE_FILE;
+         std::string format_schema;
++        std::string format_schema_message_name;
+         std::string format_schema_path;
+         bool is_server = false;
+         std::string output_format_schema;
+diff --git a/src/Interpreters/InterpreterSystemQuery.cpp b/src/Interpreters/InterpreterSystemQuery.cpp
+index 31300963d988..e1857aa29fe1 100644
+--- a/src/Interpreters/InterpreterSystemQuery.cpp
++++ b/src/Interpreters/InterpreterSystemQuery.cpp
+@@ -1,76 +1,79 @@
+-#include <Interpreters/InterpreterFactory.h>
+-#include <Interpreters/InterpreterSystemQuery.h>
+-#include <Common/DNSResolver.h>
+-#include <Common/ActionLock.h>
+-#include <Common/typeid_cast.h>
+-#include <Common/getNumberOfCPUCoresToUse.h>
+-#include <Common/SymbolIndex.h>
+-#include <Common/ThreadPool.h>
+-#include <Common/escapeForFileName.h>
+-#include <Common/ShellCommand.h>
+-#include <Common/CurrentMetrics.h>
+-#include <Common/FailPoint.h>
+-#include <Common/PageCache.h>
+-#include <Common/HostResolvePool.h>
++#include <algorithm>
++#include <csignal>
++#include <filesystem>
++#include <unistd.h>
++#include <Access/AccessControl.h>
++#include <Access/Common/AllowedClientHosts.h>
++#include <Access/ContextAccess.h>
++#include <BridgeHelper/CatBoostLibraryBridgeHelper.h>
+ #include <Core/ServerSettings.h>
+ #include <Core/Settings.h>
+-#include <Interpreters/Cache/FileCacheFactory.h>
++#include <DataTypes/DataTypeString.h>
++#include <Databases/DatabaseReplicated.h>
++#include <Disks/ObjectStorages/IMetadataStorage.h>
++#include <Formats/FormatSchemaInfo.h>
++#include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
++#include <Interpreters/ActionLocksManager.h>
++#include <Interpreters/AsynchronousInsertLog.h>
++#include <Interpreters/AsynchronousInsertQueue.h>
++#include <Interpreters/AsynchronousMetricLog.h>
++#include <Interpreters/BackupLog.h>
+ #include <Interpreters/Cache/FileCache.h>
++#include <Interpreters/Cache/FileCacheFactory.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/DatabaseCatalog.h>
+-#include <Interpreters/ExternalDictionariesLoader.h>
+-#include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
+ #include <Interpreters/EmbeddedDictionaries.h>
+-#include <Interpreters/ActionLocksManager.h>
++#include <Interpreters/ExternalDictionariesLoader.h>
++#include <Interpreters/FilesystemCacheLog.h>
+ #include <Interpreters/InterpreterCreateQuery.h>
++#include <Interpreters/InterpreterFactory.h>
+ #include <Interpreters/InterpreterRenameQuery.h>
+-#include <Interpreters/executeDDLQueryOnCluster.h>
++#include <Interpreters/InterpreterSystemQuery.h>
++#include <Interpreters/JIT/CompiledExpressionCache.h>
++#include <Interpreters/MetricLog.h>
++#include <Interpreters/OpenTelemetrySpanLog.h>
++#include <Interpreters/ProcessorsProfileLog.h>
+ #include <Interpreters/QueryThreadLog.h>
+ #include <Interpreters/QueryViewsLog.h>
+ #include <Interpreters/SessionLog.h>
+-#include <Interpreters/TraceLog.h>
+ #include <Interpreters/TextLog.h>
+-#include <Interpreters/MetricLog.h>
+-#include <Interpreters/AsynchronousMetricLog.h>
+-#include <Interpreters/OpenTelemetrySpanLog.h>
+-#include <Interpreters/ZooKeeperLog.h>
+-#include <Interpreters/FilesystemCacheLog.h>
+-#include <Interpreters/TransactionsInfoLog.h>
+-#include <Interpreters/ProcessorsProfileLog.h>
+-#include <Interpreters/AsynchronousInsertLog.h>
+-#include <Interpreters/BackupLog.h>
+-#include <Interpreters/JIT/CompiledExpressionCache.h>
++#include <Interpreters/TraceLog.h>
+ #include <Interpreters/TransactionLog.h>
+-#include <Interpreters/AsynchronousInsertQueue.h>
+-#include <BridgeHelper/CatBoostLibraryBridgeHelper.h>
+-#include <Access/AccessControl.h>
+-#include <Access/ContextAccess.h>
+-#include <Access/Common/AllowedClientHosts.h>
+-#include <Databases/DatabaseReplicated.h>
+-#include <DataTypes/DataTypeString.h>
+-#include <Disks/ObjectStorages/IMetadataStorage.h>
+-#include <Storages/StorageDistributed.h>
+-#include <Storages/StorageReplicatedMergeTree.h>
++#include <Interpreters/TransactionsInfoLog.h>
++#include <Interpreters/ZooKeeperLog.h>
++#include <Interpreters/executeDDLQueryOnCluster.h>
++#include <Parsers/ASTCreateQuery.h>
++#include <Parsers/ASTSetQuery.h>
++#include <Parsers/ASTSystemQuery.h>
++#include <Processors/Sources/SourceFromSingleChunk.h>
+ #include <Storages/Freeze.h>
++#include <Storages/MaterializedView/RefreshTask.h>
++#include <Storages/ObjectStorage/Azure/Configuration.h>
++#include <Storages/ObjectStorage/HDFS/Configuration.h>
++#include <Storages/ObjectStorage/S3/Configuration.h>
++#include <Storages/ObjectStorage/StorageObjectStorage.h>
++#include <Storages/StorageDistributed.h>
+ #include <Storages/StorageFactory.h>
+ #include <Storages/StorageFile.h>
+ #include <Storages/StorageMaterializedView.h>
++#include <Storages/StorageReplicatedMergeTree.h>
+ #include <Storages/StorageURL.h>
+-#include <Storages/ObjectStorage/StorageObjectStorage.h>
+-#include <Storages/ObjectStorage/S3/Configuration.h>
+-#include <Storages/ObjectStorage/HDFS/Configuration.h>
+-#include <Storages/ObjectStorage/Azure/Configuration.h>
+-#include <Storages/MaterializedView/RefreshTask.h>
+ #include <Storages/System/StorageSystemFilesystemCache.h>
+-#include <Parsers/ASTSystemQuery.h>
+-#include <Parsers/ASTCreateQuery.h>
+-#include <Parsers/ASTSetQuery.h>
+-#include <Processors/Sources/SourceFromSingleChunk.h>
+-#include <Common/ThreadFuzzer.h>
+ #include <base/coverage.h>
+-#include <csignal>
+-#include <algorithm>
+-#include <unistd.h>
++#include <Common/ActionLock.h>
++#include <Common/CurrentMetrics.h>
++#include <Common/DNSResolver.h>
++#include <Common/FailPoint.h>
++#include <Common/HostResolvePool.h>
++#include <Common/PageCache.h>
++#include <Common/ShellCommand.h>
++#include <Common/SymbolIndex.h>
++#include <Common/ThreadFuzzer.h>
++#include <Common/ThreadPool.h>
++#include <Common/escapeForFileName.h>
++#include <Common/getNumberOfCPUCoresToUse.h>
++#include <Common/logger_useful.h>
++#include <Common/typeid_cast.h>
+ 
+ #if USE_PROTOBUF
+ #include <Formats/ProtobufSchemas.h>
+@@ -578,13 +581,30 @@ BlockIO InterpreterSystemQuery::execute()
+             getContext()->checkAccess(AccessType::SYSTEM_DROP_FORMAT_SCHEMA_CACHE);
+             std::unordered_set<String> caches_to_drop;
+             if (query.schema_cache_format.empty())
+-                caches_to_drop = {"Protobuf"};
++                caches_to_drop = {"Protobuf", "Files"};
+             else
+                 caches_to_drop = {query.schema_cache_format};
+ #if USE_PROTOBUF
+             if (caches_to_drop.contains("Protobuf"))
+                 ProtobufSchemas::instance().clear();
+ #endif
++            if (caches_to_drop.contains("Files"))
++            {
++                fs::path format_schema_cached_dir = fs::path(system_context->getFormatSchemaPath()) / FormatSchemaInfo::CACHE_DIR_NAME;
++                if (fs::exists(format_schema_cached_dir))
++                {
++                    size_t count = 0;
++                    for (const auto & entry : fs::directory_iterator(format_schema_cached_dir))
++                    {
++                        if (entry.is_regular_file())
++                        {
++                            fs::remove(entry.path());
++                            count++;
++                        }
++                    }
++                    LOG_INFO(log, "Cleared format schema cache files {}", count);
++                }
++            }
+             break;
+         }
+         case Type::RELOAD_DICTIONARY:
+diff --git a/src/Parsers/CommonParsers.h b/src/Parsers/CommonParsers.h
+index ef6bd1154618..e4db7beb9d4e 100644
+--- a/src/Parsers/CommonParsers.h
++++ b/src/Parsers/CommonParsers.h
+@@ -83,7 +83,7 @@ namespace DB
+     MR_MACROS(CHARACTER, "CHARACTER") \
+     MR_MACROS(CHECK_ALL_TABLES, "CHECK ALL TABLES") \
+     MR_MACROS(CHECK_TABLE, "CHECK TABLE") \
+-    MR_MACROS(CHECK_GRANT, "CHECK GRANT")\
++    MR_MACROS(CHECK_GRANT, "CHECK GRANT") \
+     MR_MACROS(CHECK, "CHECK") \
+     MR_MACROS(CLEANUP, "CLEANUP") \
+     MR_MACROS(CLEAR_COLUMN, "CLEAR COLUMN") \
+@@ -393,6 +393,7 @@ namespace DB
+     MR_MACROS(PROFILES, "PROFILES") \
+     MR_MACROS(PROJECTION, "PROJECTION") \
+     MR_MACROS(PROTOBUF, "Protobuf") \
++    MR_MACROS(FILES, "Files") \
+     MR_MACROS(PULL, "PULL") \
+     MR_MACROS(Q, "Q") \
+     MR_MACROS(QQ, "QQ") \
+@@ -457,7 +458,7 @@ namespace DB
+     MR_MACROS(SET_ROLE_DEFAULT, "SET ROLE DEFAULT") \
+     MR_MACROS(SET_ROLE, "SET ROLE") \
+     MR_MACROS(SET_TRANSACTION_SNAPSHOT, "SET TRANSACTION SNAPSHOT") \
+-    MR_MACROS(SET, "SET")                    \
++    MR_MACROS(SET, "SET") \
+     MR_MACROS(SETTING, "SETTING") \
+     MR_MACROS(SETTINGS, "SETTINGS") \
+     MR_MACROS(SHOW_ACCESS, "SHOW ACCESS") \
+@@ -562,7 +563,7 @@ namespace DB
+     MR_MACROS(YY, "YY") \
+     MR_MACROS(YYYY, "YYYY") \
+     MR_MACROS(ZKPATH, "ZKPATH") \
+-    MR_MACROS(STALENESS, "STALENESS") \
++    MR_MACROS(STALENESS, "STALENESS")
+ 
+ /// The list of keywords where underscore is intentional
+ #define APPLY_FOR_PARSER_KEYWORDS_WITH_UNDERSCORES(MR_MACROS) \
+diff --git a/src/Parsers/ParserSystemQuery.cpp b/src/Parsers/ParserSystemQuery.cpp
+index 195fe6937733..62e8cc5cfdc4 100644
+--- a/src/Parsers/ParserSystemQuery.cpp
++++ b/src/Parsers/ParserSystemQuery.cpp
+@@ -582,7 +582,8 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected &
+             {
+                 if (ParserKeyword{Keyword::PROTOBUF}.ignore(pos, expected))
+                     res->schema_cache_format = toStringView(Keyword::PROTOBUF);
+-
++                else if (ParserKeyword{Keyword::FILES}.ignore(pos, expected))
++                    res->schema_cache_format = toStringView(Keyword::FILES);
+                 else
+                     return false;
+             }
+diff --git a/src/Processors/Formats/Impl/CapnProtoRowInputFormat.cpp b/src/Processors/Formats/Impl/CapnProtoRowInputFormat.cpp
+index 12bb5aef1688..106c68ecf37b 100644
+--- a/src/Processors/Formats/Impl/CapnProtoRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/CapnProtoRowInputFormat.cpp
+@@ -121,11 +121,13 @@ CapnProtoSchemaReader::CapnProtoSchemaReader(const FormatSettings & format_setti
+ NamesAndTypesList CapnProtoSchemaReader::readSchema()
+ {
+     auto schema_info = FormatSchemaInfo(
+-        format_settings.schema.format_schema,
+-        "CapnProto",
+-        true,
+-        format_settings.schema.is_server,
+-        format_settings.schema.format_schema_path);
++        /*format_schema_source=*/format_settings.schema.format_schema_source,
++        /*format_schema=*/format_settings.schema.format_schema,
++        /*format_schema_message_name=*/format_settings.schema.format_schema_message_name,
++        /*format=*/"CapnProto",
++        /*require_message=*/true,
++        /*is_server=*/format_settings.schema.is_server,
++        /*format_schema_path=*/format_settings.schema.format_schema_path);
+ 
+     auto schema_parser = CapnProtoSchemaParser();
+     auto schema = schema_parser.getMessageSchema(schema_info);
+diff --git a/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp b/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp
+index 4f8105a3c5b0..ec6d3411f093 100644
+--- a/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp
++++ b/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp
+@@ -87,7 +87,13 @@ size_t ProtobufListInputFormat::countRows(size_t max_block_size)
+ 
+ ProtobufListSchemaReader::ProtobufListSchemaReader(const FormatSettings & format_settings)
+     : schema_info(
+-        format_settings.schema.format_schema, "Protobuf", true, format_settings.schema.is_server, format_settings.schema.format_schema_path)
++          /*format_schema_source=*/format_settings.schema.format_schema_source,
++          /*format_schema=*/format_settings.schema.format_schema,
++          /*format_schema_message_name=*/format_settings.schema.format_schema_message_name,
++          /*format=*/"Protobuf",
++          /*require_message=*/true,
++          /*is_server=*/format_settings.schema.is_server,
++          /*format_schema_path=*/format_settings.schema.format_schema_path)
+     , skip_unsupported_fields(format_settings.protobuf.skip_fields_with_unsupported_types_in_schema_inference)
+     , google_protos_path(format_settings.protobuf.google_protos_path)
+ {
+diff --git a/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp b/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
+index e7454e2951e5..2e03f0ce283f 100644
+--- a/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
+@@ -125,7 +125,13 @@ void registerInputFormatProtobuf(FormatFactory & factory)
+ 
+ ProtobufSchemaReader::ProtobufSchemaReader(const FormatSettings & format_settings)
+     : schema_info(
+-        format_settings.schema.format_schema, "Protobuf", true, format_settings.schema.is_server, format_settings.schema.format_schema_path)
++          /*format_schema_source=*/format_settings.schema.format_schema_source,
++          /*format_schema=*/format_settings.schema.format_schema,
++          /*format_schema_message_name=*/format_settings.schema.format_schema_message_name,
++          /*format=*/"Protobuf",
++          /*require_message=*/true,
++          /*is_server=*/format_settings.schema.is_server,
++          /*format_schema_path=*/format_settings.schema.format_schema_path)
+     , skip_unsupported_fields(format_settings.protobuf.skip_fields_with_unsupported_types_in_schema_inference)
+     , google_protos_path(format_settings.protobuf.google_protos_path)
+ {
+diff --git a/src/Processors/Formats/Impl/TemplateBlockOutputFormat.cpp b/src/Processors/Formats/Impl/TemplateBlockOutputFormat.cpp
+index f68a82eb73e8..9280ba95ec7e 100644
+--- a/src/Processors/Formats/Impl/TemplateBlockOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/TemplateBlockOutputFormat.cpp
+@@ -1,9 +1,10 @@
+-#include <Processors/Formats/Impl/TemplateBlockOutputFormat.h>
+-#include <Formats/FormatFactory.h>
+-#include <Formats/EscapingRuleUtils.h>
+ #include <Columns/IColumn.h>
+-#include <IO/WriteHelpers.h>
+ #include <DataTypes/DataTypesNumber.h>
++#include <Formats/EscapingRuleUtils.h>
++#include <Formats/FormatFactory.h>
++#include <Formats/FormatSettings.h>
++#include <IO/WriteHelpers.h>
++#include <Processors/Formats/Impl/TemplateBlockOutputFormat.h>
+ #include <Processors/Port.h>
+ 
+ 
+@@ -228,9 +229,15 @@ void registerOutputFormatTemplate(FormatFactory & factory)
+         {
+             /// Read format string from file
+             resultset_format = ParsedTemplateFormatString(
+-                    FormatSchemaInfo(settings.template_settings.resultset_format, "Template", false,
+-                            settings.schema.is_server, settings.schema.format_schema_path),
+-                    idx_resultset_by_name);
++                FormatSchemaInfo(
++                    /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++                    /*format_schema=*/settings.template_settings.resultset_format,
++                    /*format_schema_message_name=*/"",
++                    /*format=*/"Template",
++                    /*require_message=*/false,
++                    /*is_server=*/settings.schema.is_server,
++                    /*format_schema_path=*/settings.schema.format_schema_path),
++                idx_resultset_by_name);
+             if (!settings.template_settings.resultset_format_template.empty())
+             {
+                 throw Exception(DB::ErrorCodes::INVALID_TEMPLATE_FORMAT, "Expected either format_template_resultset or format_template_resultset_format, but not both");
+@@ -250,8 +257,14 @@ void registerOutputFormatTemplate(FormatFactory & factory)
+         else
+         {
+             row_format = ParsedTemplateFormatString(
+-                FormatSchemaInfo(settings.template_settings.row_format, "Template", false,
+-                        settings.schema.is_server, settings.schema.format_schema_path),
++                FormatSchemaInfo(
++                    /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++                    /*format_schema=*/settings.template_settings.row_format,
++                    /*format_schema_message_name=*/"",
++                    /*format=*/"Template",
++                    /*require_message=*/false,
++                    /*is_server=*/settings.schema.is_server,
++                    /*format_schema_path=*/settings.schema.format_schema_path),
+                 idx_row_by_name);
+             if (!settings.template_settings.row_format_template.empty())
+             {
+@@ -266,12 +279,15 @@ void registerOutputFormatTemplate(FormatFactory & factory)
+         if (settings.template_settings.resultset_format.empty())
+             return true;
+         auto resultset_format = ParsedTemplateFormatString(
+-            FormatSchemaInfo(settings.template_settings.resultset_format, "Template", false,
+-                             settings.schema.is_server, settings.schema.format_schema_path),
+-            [&](const String & partName)
+-            {
+-                return static_cast<size_t>(TemplateBlockOutputFormat::stringToResultsetPart(partName));
+-            });
++            FormatSchemaInfo(
++                /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++                /*format_schema=*/settings.template_settings.resultset_format,
++                /*format_schema_message_name=*/"",
++                /*format=*/"Template",
++                /*require_message=*/false,
++                /*is_server=*/settings.schema.is_server,
++                /*format_schema_path=*/settings.schema.format_schema_path),
++            [&](const String & partName) { return static_cast<size_t>(TemplateBlockOutputFormat::stringToResultsetPart(partName)); });
+         return resultset_format.delimiters.empty() || resultset_format.delimiters.back().empty();
+     });
+ }
+diff --git a/src/Processors/Formats/Impl/TemplateRowInputFormat.cpp b/src/Processors/Formats/Impl/TemplateRowInputFormat.cpp
+index f5edfb7c9d4d..69eea8a2e36a 100644
+--- a/src/Processors/Formats/Impl/TemplateRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/TemplateRowInputFormat.cpp
+@@ -545,8 +545,14 @@ static ParsedTemplateFormatString fillResultSetFormat(const FormatSettings & set
+     {
+         /// Read format string from file
+         resultset_format = ParsedTemplateFormatString(
+-            FormatSchemaInfo(settings.template_settings.resultset_format, "Template", false,
+-                             settings.schema.is_server, settings.schema.format_schema_path),
++            FormatSchemaInfo(
++                /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++                /*format_schema=*/settings.template_settings.resultset_format,
++                /*format_schema_message_name=*/"",
++                /*format=*/"Template",
++                /*require_message=*/false,
++                /*is_server=*/settings.schema.is_server,
++                /*format_schema_path=*/settings.schema.format_schema_path),
+             [&](const String & partName) -> std::optional<size_t>
+             {
+                 if (partName == "data")
+@@ -561,8 +567,15 @@ static ParsedTemplateFormatString fillRowFormat(const FormatSettings & settings,
+ {
+     return ParsedTemplateFormatString(
+         FormatSchemaInfo(
+-            settings.template_settings.row_format, "Template", false, settings.schema.is_server, settings.schema.format_schema_path),
+-        idx_getter, allow_indexes);
++            /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
++            /*format_schema=*/settings.template_settings.row_format,
++            /*format_schema_message_name=*/"",
++            /*format=*/"Template",
++            /*require_message=*/false,
++            /*is_server=*/settings.schema.is_server,
++            /*format_schema_path=*/settings.schema.format_schema_path),
++        idx_getter,
++        allow_indexes);
+ }
+ 
+ void registerInputFormatTemplate(FormatFactory & factory)

@@ -1,0 +1,663 @@
+diff --git a/src/Analyzer/Passes/RegexpFunctionRewritePass.cpp b/src/Analyzer/Passes/RegexpFunctionRewritePass.cpp
+new file mode 100644
+index 000000000000..860c3fb71d29
+--- /dev/null
++++ b/src/Analyzer/Passes/RegexpFunctionRewritePass.cpp
+@@ -0,0 +1,220 @@
++#include <Analyzer/Passes/RegexpFunctionRewritePass.h>
++
++#include <AggregateFunctions/AggregateFunctionFactory.h>
++#include <AggregateFunctions/IAggregateFunction.h>
++#include <Analyzer/ConstantNode.h>
++#include <Analyzer/FunctionNode.h>
++#include <Analyzer/InDepthQueryTreeVisitor.h>
++#include <Analyzer/Utils.h>
++#include <Common/OptimizedRegularExpression.h>
++#include <Core/Settings.h>
++#include <DataTypes/DataTypeString.h>
++#include <Functions/FunctionFactory.h>
++#include <Interpreters/Context.h>
++
++namespace DB
++{
++
++namespace Setting
++{
++    extern const SettingsBool optimize_rewrite_regexp_functions;
++}
++
++namespace
++{
++
++class RegexpFunctionRewriteVisitor : public InDepthQueryTreeVisitorWithContext<RegexpFunctionRewriteVisitor>
++{
++public:
++    using Base = InDepthQueryTreeVisitorWithContext<RegexpFunctionRewriteVisitor>;
++    using Base::Base;
++
++    void enterImpl(QueryTreeNodePtr & node)
++    {
++        if (!getSettings()[Setting::optimize_rewrite_regexp_functions])
++            return;
++
++        auto * function_node = node->as<FunctionNode>();
++        if (!function_node || !function_node->isOrdinaryFunction() || !isString(function_node->getResultType()))
++            return;
++
++        /// If a regular expression without alternatives starts with ^ or ends with an unescaped $, rewrite
++        /// replaceRegexpAll with replaceRegexpOne.
++        if (function_node->getFunctionName() == "replaceRegexpAll" || Poco::toLower(function_node->getFunctionName()) == "regexp_replace")
++        {
++            if (!handleReplaceRegexpAll(*function_node))
++                return;
++
++            /// After optimization, function_node might now be "replaceRegexpOne", so continue processing
++        }
++
++        /// If a replaceRegexpOne function has a regexp that matches entire haystack, and a replacement of nothing other
++        /// than \1 and some subpatterns in the regexp, or \0 and no subpatterns in the regexp, rewrite it with extract.
++        if (function_node->getFunctionName() == "replaceRegexpOne")
++        {
++            if (!handleReplaceRegexpOne(*function_node))
++                return;
++
++            /// After optimization, function_node might now be "extract", so continue processing
++        }
++
++        /// If an extract function has a regexp with some subpatterns and the regexp starts with ^.* or ending with an
++        /// unescaped .*$, remove this prefix and/or suffix.
++        if (function_node->getFunctionName() == "extract")
++            handleExtract(*function_node);
++    }
++
++private:
++    /// Returns true if the character at pos is unescaped
++    bool isUnescaped(const std::string & str, size_t pos)
++    {
++        if (pos == 0 || pos >= str.size())
++            return true;
++
++        size_t backslash_count = 0;
++        for (ssize_t i = static_cast<ssize_t>(pos) - 1; i >= 0 && str[i] == '\\'; --i)
++            ++backslash_count;
++
++        return backslash_count % 2 == 0;
++    }
++
++    bool handleReplaceRegexpAll(FunctionNode & function_node)
++    {
++        auto & function_node_arguments_nodes = function_node.getArguments().getNodes();
++        if (function_node_arguments_nodes.size() != 3)
++            return false;
++
++        const auto * constant_node = function_node_arguments_nodes[1]->as<ConstantNode>();
++        if (!constant_node)
++            return false;
++
++        if (auto constant_type = constant_node->getResultType(); !isString(constant_type))
++            return false;
++
++        String regexp = constant_node->getValue().safeGet<String>();
++        if (regexp.empty())
++            return false;
++
++        bool starts_with_caret = regexp.front() == '^';
++        bool ends_with_unescaped_dollar = false;
++
++        if (!regexp.empty() && regexp.back() == '$')
++            ends_with_unescaped_dollar = isUnescaped(regexp, regexp.size() - 1);
++
++        if (!starts_with_caret && !ends_with_unescaped_dollar)
++            return false;
++
++        /// Analyze the regular expression to detect presence of alternatives (e.g., 'a|b'). If any alternatives are
++        /// found, return false to indicate the regexp is not suitable for optimization.
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(regexp);
++        if (!result.alternatives.empty())
++            return false;
++
++        resolveOrdinaryFunctionNodeByName(function_node, "replaceRegexpOne", getContext());
++        return true;
++    }
++
++    bool handleReplaceRegexpOne(FunctionNode & function_node)
++    {
++        auto & function_node_arguments_nodes = function_node.getArguments().getNodes();
++        if (function_node_arguments_nodes.size() != 3)
++            return false;
++
++        const auto * constant_node = function_node_arguments_nodes[2]->as<ConstantNode>();
++        if (!constant_node)
++            return false;
++
++        if (auto constant_type = constant_node->getResultType(); !isString(constant_type))
++            return false;
++
++        String replacement = constant_node->getValue().safeGet<String>();
++        bool replacement_zero = replacement == "\\0";
++        bool replacement_one = replacement == "\\1";
++        if (!replacement_zero && !replacement_one)
++            return false;
++
++        const auto * regexp_node = function_node_arguments_nodes[1]->as<ConstantNode>();
++        if (!regexp_node)
++            return false;
++
++        if (auto regexp_type = regexp_node->getResultType(); !isString(regexp_type))
++            return false;
++
++        String regexp = regexp_node->getValue().safeGet<String>();
++
++        /// Currently only look for ^...$ patterns without alternatives.
++        bool starts_with_caret = regexp.front() == '^';
++        if (!starts_with_caret)
++            return false;
++
++        bool ends_with_unescaped_dollar = false;
++        if (!regexp.empty() && regexp.back() == '$')
++            ends_with_unescaped_dollar = isUnescaped(regexp, regexp.size() - 1);
++
++        if (!ends_with_unescaped_dollar)
++            return false;
++
++        /// Analyze the regular expression to detect presence of alternatives (e.g., 'a|b'). If any alternatives are
++        /// found, return false to indicate the regexp is not suitable for optimization.
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(regexp);
++        if (!result.alternatives.empty())
++            return false;
++
++        if ((replacement_one && result.has_capture) || (replacement_zero && !result.has_capture))
++        {
++            function_node_arguments_nodes.resize(2);
++            resolveOrdinaryFunctionNodeByName(function_node, "extract", getContext());
++            return true;
++        }
++
++        return false;
++    }
++
++    void handleExtract(FunctionNode & function_node)
++    {
++        auto & function_node_arguments_nodes = function_node.getArguments().getNodes();
++        if (function_node_arguments_nodes.size() != 2)
++            return;
++
++        const auto * constant_node = function_node_arguments_nodes[1]->as<ConstantNode>();
++        if (!constant_node)
++            return;
++
++        if (auto constant_type = constant_node->getResultType(); !isString(constant_type))
++            return;
++
++        String regexp = constant_node->getValue().safeGet<String>();
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(regexp);
++        if (!result.has_capture)
++            return;
++
++        /// For simplicity, this optimization ignores alternations and only considers anchoring at the start or end of the pattern.
++        bool starts_with_caret_dot_star = regexp.starts_with("^.*") && !regexp.starts_with("^.*?");
++        bool ends_with_unescaped_dot_star_dollar = false;
++
++        if (regexp.size() >= 3 && regexp.ends_with(".*$"))
++        {
++            size_t dot_pos = regexp.size() - 3;
++            ends_with_unescaped_dot_star_dollar = isUnescaped(regexp, dot_pos);
++        }
++
++        if (starts_with_caret_dot_star || ends_with_unescaped_dot_star_dollar)
++        {
++            if (starts_with_caret_dot_star)
++                regexp = regexp.substr(3);
++            if (ends_with_unescaped_dot_star_dollar && regexp.ends_with(".*$"))
++                regexp = regexp.substr(0, regexp.size() - 3);
++            function_node_arguments_nodes[1] = std::make_shared<ConstantNode>(std::move(regexp));
++        }
++    }
++};
++
++}
++
++void RegexpFunctionRewritePass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
++{
++    RegexpFunctionRewriteVisitor visitor(context);
++    visitor.visit(query_tree_node);
++}
++
++}
+diff --git a/src/Analyzer/Passes/RegexpFunctionRewritePass.h b/src/Analyzer/Passes/RegexpFunctionRewritePass.h
+new file mode 100644
+index 000000000000..c034d82c3165
+--- /dev/null
++++ b/src/Analyzer/Passes/RegexpFunctionRewritePass.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <Analyzer/IQueryTreePass.h>
++
++namespace DB
++{
++
++/// 1. If a regular expression without alternatives starts with ^ or ends with an unescaped $, rewrite replaceRegexpAll
++/// with replaceRegexpOne.
++///
++/// 2. If a replaceRegexpOne function has a regexp that matches entire haystack, and a replacement of nothing other than
++/// \1 and some subpatterns in the regexp, or \0 and no subpatterns in the regexp, rewrite it with extract.
++///
++/// 3. If an extract function has a regexp with some subpatterns and the regexp starts with ^.* or ending with an
++/// unescaped .*$, remove this prefix and/or suffix.
++class RegexpFunctionRewritePass final : public IQueryTreePass
++{
++public:
++    String getName() override { return "RegexpFunctionRewrite"; }
++
++    String getDescription() override { return "Rewrite regexp related functions into more efficient forms."; }
++
++    void run(QueryTreeNodePtr & query_tree_node, ContextPtr context) override;
++
++};
++
++}
+diff --git a/src/Analyzer/QueryTreePassManager.cpp b/src/Analyzer/QueryTreePassManager.cpp
+index af01ff69a482..a818ad348020 100644
+--- a/src/Analyzer/QueryTreePassManager.cpp
++++ b/src/Analyzer/QueryTreePassManager.cpp
+@@ -40,6 +40,7 @@
+ #include <Analyzer/Passes/OrderByLimitByDuplicateEliminationPass.h>
+ #include <Analyzer/Passes/OrderByTupleEliminationPass.h>
+ #include <Analyzer/Passes/QueryAnalysisPass.h>
++#include <Analyzer/Passes/RegexpFunctionRewritePass.h>
+ #include <Analyzer/Passes/RemoveUnusedProjectionColumnsPass.h>
+ #include <Analyzer/Passes/RewriteAggregateFunctionWithIfPass.h>
+ #include <Analyzer/Passes/RewriteSumFunctionWithSumAndCountPass.h>
+@@ -263,6 +264,7 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
+     manager.addPass(std::make_unique<FunctionToSubcolumnsPass>());
+ 
+     manager.addPass(std::make_unique<ConvertLogicalExpressionToCNFPass>());
++    manager.addPass(std::make_unique<RegexpFunctionRewritePass>());
+ 
+     manager.addPass(std::make_unique<RewriteSumFunctionWithSumAndCountPass>());
+     manager.addPass(std::make_unique<CountDistinctPass>());
+diff --git a/src/Common/OptimizedRegularExpression.cpp b/src/Common/OptimizedRegularExpression.cpp
+index dbba8b5c8cf9..3ed95a7e85a7 100644
+--- a/src/Common/OptimizedRegularExpression.cpp
++++ b/src/Common/OptimizedRegularExpression.cpp
+@@ -68,6 +68,7 @@ const char * analyzeImpl(
+     const char * pos,
+     Literal & required_substring,
+     bool & is_trivial,
++    bool & has_capture,
+     Literals & global_alternatives)
+ {
+     checkStackSize();
+@@ -85,6 +86,7 @@ const char * analyzeImpl(
+     bool is_first_call = begin == regexp.data();
+     int depth = 0;
+     is_trivial = true;
++    has_capture = false;
+     bool is_prefix = true;
+     required_substring.clear();
+     bool has_alternative_on_depth_0 = false;
+@@ -244,6 +246,8 @@ const char * analyzeImpl(
+                 is_trivial = false;
+                 if (!in_square_braces)
+                 {
++                    bool is_non_capturing_group = false;
++
+                     /// it means flag negation
+                     /// there are various possible flags
+                     /// actually only imsU are supported by re2
+@@ -271,6 +275,7 @@ const char * analyzeImpl(
+                         /// if this group only contains flags, we have nothing to do.
+                         if (*pos == ')')
+                         {
++                            has_capture = true;
+                             ++pos;
+                             break;
+                         }
+@@ -278,20 +283,25 @@ const char * analyzeImpl(
+                     /// (?:regex) means non-capturing parentheses group
+                     else if (pos + 2 < end && pos[1] == '?' && pos[2] == ':')
+                     {
++                        is_non_capturing_group = true;
+                         pos += 2;
+                     }
+                     else if (pos + 3 < end && pos[1] == '?' && (pos[2] == '<' || pos[2] == '\'' || (pos[2] == 'P' && pos[3] == '<')))
+                     {
++                        has_capture = true;
+                         pos = skipNameCapturingGroup(pos, pos[2] == 'P' ? 3: 2, end);
+                     }
+                     Literal group_required_substr;
+                     bool group_is_trival = true;
++                    bool group_has_capture;
+                     Literals group_alters;
+-                    pos = analyzeImpl(regexp, pos + 1, group_required_substr, group_is_trival, group_alters);
++                    pos = analyzeImpl(regexp, pos + 1, group_required_substr, group_is_trival, group_has_capture, group_alters);
+                     /// pos should be ')', if not, then it is not a valid regular expression
+                     if (pos == end)
+                         return pos;
+ 
++                    has_capture = !is_non_capturing_group;
++
+                     /// For ()? or ()* or (){0,1}, we can just ignore the whole group.
+                     if ((pos + 1 < end && (pos[1] == '?' || pos[1] == '*')) ||
+                         (pos + 2 < end && pos[1] == '{' && pos[2] == '0'))
+@@ -423,10 +433,14 @@ const char * analyzeImpl(
+         /// compare the quality of required substring and alternatives and choose the better one.
+         if (global_alternatives.empty() || shortest_literal_length(global_alternatives) < required_substring.literal.size())
+             global_alternatives = {required_substring};
+-        Literals next_alternatives;
+         /// this two vals are useless, xxx|xxx cannot be trivial nor prefix.
++        Literals next_alternatives;
+         bool next_is_trivial = true;
+-        pos = analyzeImpl(regexp, pos, required_substring, next_is_trivial, next_alternatives);
++        bool next_has_capture;
++        pos = analyzeImpl(regexp, pos, required_substring, next_is_trivial, next_has_capture, next_alternatives);
++
++        /// has_capture is true when all alternatives have captures
++        has_capture &= next_has_capture;
+         /// For xxx|xxx|xxx, we only combine the alternatives and return a empty required_substring.
+         if (next_alternatives.empty() || shortest_literal_length(next_alternatives) < required_substring.literal.size())
+         {
+@@ -450,41 +464,37 @@ const char * analyzeImpl(
+ }
+ }
+ 
+-void OptimizedRegularExpression::analyze(
+-        std::string_view regexp_,
+-        std::string & required_substring,
+-        bool & is_trivial,
+-        bool & required_substring_is_prefix,
+-        std::vector<std::string> & alternatives)
++RegexpAnalysisResult OptimizedRegularExpression::analyze(std::string_view regexp_)
+ try
+ {
++    RegexpAnalysisResult r;
+     Literals alternative_literals;
+     Literal required_literal;
+-    analyzeImpl(regexp_, regexp_.data(), required_literal, is_trivial, alternative_literals); // NOLINT
+-    required_substring = std::move(required_literal.literal);
+-    required_substring_is_prefix = required_literal.prefix;
++    analyzeImpl(regexp_, regexp_.data(), required_literal, r.is_trivial, r.has_capture, alternative_literals); // NOLINT
++    r.required_substring = std::move(required_literal.literal);
++    r.required_substring_is_prefix = required_literal.prefix;
+     for (auto & lit : alternative_literals)
+-        alternatives.push_back(std::move(lit.literal));
++        r.alternatives.push_back(std::move(lit.literal));
++    return r;
+ }
+ catch (...)
+ {
+-    required_substring = "";
+-    is_trivial = false;
+-    required_substring_is_prefix = false;
+-    alternatives.clear();
+-    LOG_ERROR(getLogger("OptimizeRegularExpression"), "Analyze RegularExpression failed, got error: {}", DB::getCurrentExceptionMessage(false));
++    LOG_ERROR(
++        getLogger("OptimizeRegularExpression"), "Analyze RegularExpression failed, got error: {}", DB::getCurrentExceptionMessage(false));
++    return {};
+ }
+ 
+ OptimizedRegularExpression::OptimizedRegularExpression(const std::string & regexp_, int options)
+ {
+-    std::vector<std::string> alternatives_dummy; /// this vector extracts patterns a,b,c from pattern (a|b|c). for now it's not used.
+-    analyze(regexp_, required_substring, is_trivial, required_substring_is_prefix, alternatives_dummy);
+-
+-
+     /// Just three following options are supported
+     if (options & (~(RE_CASELESS | RE_NO_CAPTURE | RE_DOT_NL)))
+         throw DB::Exception(DB::ErrorCodes::CANNOT_COMPILE_REGEXP, "OptimizedRegularExpression: Unsupported option.");
+ 
++    RegexpAnalysisResult result = analyze(regexp_);
++    required_substring = result.required_substring;
++    is_trivial = result.is_trivial;
++    has_capture = result.has_capture;
++    required_substring_is_prefix = result.required_substring_is_prefix;
+     is_case_insensitive = options & RE_CASELESS;
+     bool is_no_capture = options & RE_NO_CAPTURE;
+     bool is_dot_nl = options & RE_DOT_NL;
+@@ -543,10 +553,10 @@ OptimizedRegularExpression::OptimizedRegularExpression(const std::string & regex
+ }
+ 
+ OptimizedRegularExpression::OptimizedRegularExpression(OptimizedRegularExpression && rhs) noexcept
+-    : is_trivial(rhs.is_trivial)
++    : required_substring(std::move(rhs.required_substring))
++    , is_trivial(rhs.is_trivial)
+     , required_substring_is_prefix(rhs.required_substring_is_prefix)
+     , is_case_insensitive(rhs.is_case_insensitive)
+-    , required_substring(std::move(rhs.required_substring))
+     , re2(std::move(rhs.re2))
+     , number_of_subpatterns(rhs.number_of_subpatterns)
+ {
+diff --git a/src/Common/OptimizedRegularExpression.h b/src/Common/OptimizedRegularExpression.h
+index b3b4b9497b5c..24cbf43003a4 100644
+--- a/src/Common/OptimizedRegularExpression.h
++++ b/src/Common/OptimizedRegularExpression.h
+@@ -35,6 +35,15 @@ namespace OptimizedRegularExpressionDetails
+     };
+ }
+ 
++struct RegexpAnalysisResult
++{
++    std::string required_substring;
++    bool is_trivial = false;
++    bool has_capture = false;
++    bool required_substring_is_prefix = false;
++    std::vector<std::string> alternatives;
++};
++
+ class OptimizedRegularExpression
+ {
+ public:
+@@ -91,18 +100,14 @@ class OptimizedRegularExpression
+ 
+     /// analyze function will extract the longest string literal or multiple alternative string literals from regexp for pre-checking if
+     /// a string contains the string literal(s). If not, we can tell this string can never match the regexp.
+-    static void analyze(
+-        std::string_view regexp_,
+-        std::string & required_substring,
+-        bool & is_trivial,
+-        bool & required_substring_is_prefix,
+-        std::vector<std::string> & alternatives);
++    static RegexpAnalysisResult analyze(std::string_view regexp_);
+ 
+ private:
++    std::string required_substring;
+     bool is_trivial;
++    bool has_capture;
+     bool required_substring_is_prefix;
+     bool is_case_insensitive;
+-    std::string required_substring;
+     std::optional<DB::ASCIICaseSensitiveStringSearcher> case_sensitive_substring_searcher;
+     std::optional<DB::ASCIICaseInsensitiveStringSearcher> case_insensitive_substring_searcher;
+     std::unique_ptr<re2::RE2> re2;
+diff --git a/src/Core/Settings.cpp b/src/Core/Settings.cpp
+index a52266a8fdd1..eea5ed705897 100644
+--- a/src/Core/Settings.cpp
++++ b/src/Core/Settings.cpp
+@@ -5040,6 +5040,9 @@ Supported only with the analyzer (`enable_analyzer = 1`).
+ )", 0) \
+     DECLARE(Bool, optimize_rewrite_array_exists_to_has, false, R"(
+ Rewrite arrayExists() functions to has() when logically equivalent. For example, arrayExists(x -> x = 1, arr) can be rewritten to has(arr, 1)
++)", 0) \
++    DECLARE(Bool, optimize_rewrite_regexp_functions, true, R"(
++Rewrite regular expression related functions into simpler and more efficient forms
+ )", 0) \
+     DECLARE(UInt64, insert_shard_id, 0, R"(
+ If not `0`, specifies the shard of [Distributed](/engines/table-engines/special/distributed) table into which the data will be inserted synchronously.
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index cdcc3f7310ff..4343f6927ec6 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -41,6 +41,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+         /// Note: please check if the key already exists to prevent duplicate entries.
+         addSettingsChanges(settings_changes_history, "25.8",
+         {
++            {"optimize_rewrite_regexp_functions", false, true, "A new setting"},
+             {"max_joined_block_size_bytes", 0, 4 * 1024 * 1024, "New setting"},
+             {"azure_max_single_part_upload_size", 100 * 1024 * 1024, 32 * 1024 * 1024, "Align with S3"},
+             {"azure_max_redirects", 10, 10, "New setting"},
+diff --git a/src/Dictionaries/RegExpTreeDictionary.cpp b/src/Dictionaries/RegExpTreeDictionary.cpp
+index b59e0a5e3f74..665d9049ccf8 100644
+--- a/src/Dictionaries/RegExpTreeDictionary.cpp
++++ b/src/Dictionaries/RegExpTreeDictionary.cpp
+@@ -246,30 +246,26 @@ void RegExpTreeDictionary::initRegexNodes(Block & block)
+         regex_nodes.emplace(id, node);
+ 
+ #if USE_VECTORSCAN
+-        String required_substring;
+-        bool is_trivial;
+-        bool required_substring_is_prefix;
+-        std::vector<std::string> alternatives;
+-
++        RegexpAnalysisResult result;
+         if (use_vectorscan)
+-            OptimizedRegularExpression::analyze(regex, required_substring, is_trivial, required_substring_is_prefix, alternatives);
++            result = OptimizedRegularExpression::analyze(regex);
+ 
+-        for (auto & alter : alternatives)
++        for (auto & alter : result.alternatives)
+         {
+             if (alter.size() < 3)
+             {
+-                alternatives.clear();
++                result.alternatives.clear();
+                 break;
+             }
+         }
+-        if (!required_substring.empty())
++        if (!result.required_substring.empty())
+         {
+-            simple_regexps.push_back(required_substring);
++            simple_regexps.push_back(result.required_substring);
+             regexp_ids.push_back(id);
+         }
+-        else if (!alternatives.empty())
++        else if (!result.alternatives.empty())
+         {
+-            for (auto & alternative : alternatives)
++            for (auto & alternative : result.alternatives)
+             {
+                 simple_regexps.push_back(alternative);
+                 regexp_ids.push_back(id);
+diff --git a/src/Functions/ReplaceRegexpImpl.h b/src/Functions/ReplaceRegexpImpl.h
+index b5572d2eaa43..03f85da6184e 100644
+--- a/src/Functions/ReplaceRegexpImpl.h
++++ b/src/Functions/ReplaceRegexpImpl.h
+@@ -110,13 +110,8 @@ struct ReplaceRegexpImpl
+             return false;
+ 
+         checkSubstitutions(replacement, num_captures);
+-
+-        String required_substring;
+-        bool is_trivial;
+-        bool required_substring_is_prefix;
+-        std::vector<String> alternatives;
+-        OptimizedRegularExpression::analyze(needle, required_substring, is_trivial, required_substring_is_prefix, alternatives);
+-        return is_trivial && required_substring_is_prefix && required_substring == needle;
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(needle);
++        return result.is_trivial && result.required_substring_is_prefix && result.required_substring == needle;
+     }
+ 
+     static void processString(
+@@ -227,7 +222,7 @@ struct ReplaceRegexpImpl
+         /// pattern analysis incurs some cost too.
+         if (canFallbackToStringReplacement(needle, replacement, searcher, num_captures))
+         {
+-            auto convertTrait = [](ReplaceRegexpTraits::Replace first_or_all)
++            auto convert_trait = [](ReplaceRegexpTraits::Replace first_or_all)
+             {
+                 switch (first_or_all)
+                 {
+@@ -235,7 +230,8 @@ struct ReplaceRegexpImpl
+                     case ReplaceRegexpTraits::Replace::All:   return ReplaceStringTraits::Replace::All;
+                 }
+             };
+-            ReplaceStringImpl<Name, convertTrait(replace)>::vectorConstantConstant(haystack_data, haystack_offsets, needle, replacement, res_data, res_offsets, input_rows_count);
++            ReplaceStringImpl<Name, convert_trait(replace)>::vectorConstantConstant(
++                haystack_data, haystack_offsets, needle, replacement, res_data, res_offsets, input_rows_count);
+             return;
+         }
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
+index 3d168704ea69..9080553ccda6 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
+@@ -637,22 +637,18 @@ bool MergeTreeConditionBloomFilterText::traverseTreeEquals(
+         out.bloom_filter = std::make_unique<BloomFilter>(params);
+ 
+         auto & value = const_value.safeGet<String>();
+-        String required_substring;
+-        bool dummy_is_trivial;
+-        bool dummy_required_substring_is_prefix;
+-        std::vector<String> alternatives;
+-        OptimizedRegularExpression::analyze(value, required_substring, dummy_is_trivial, dummy_required_substring_is_prefix, alternatives);
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(value);
+ 
+-        if (required_substring.empty() && alternatives.empty())
++        if (result.required_substring.empty() && result.alternatives.empty())
+             return false;
+ 
+         /// out.set_bloom_filters means alternatives exist
+         /// out.bloom_filter means required_substring exists
+-        if (!alternatives.empty())
++        if (!result.alternatives.empty())
+         {
+             std::vector<std::vector<BloomFilter>> bloom_filters;
+             bloom_filters.emplace_back();
+-            for (const auto & alternative : alternatives)
++            for (const auto & alternative : result.alternatives)
+             {
+                 bloom_filters.back().emplace_back(params);
+                 token_extractor->substringToBloomFilter(alternative.data(), alternative.size(), bloom_filters.back().back(), false, false);
+@@ -660,7 +656,10 @@ bool MergeTreeConditionBloomFilterText::traverseTreeEquals(
+             out.set_bloom_filters = std::move(bloom_filters);
+         }
+         else
+-            token_extractor->substringToBloomFilter(required_substring.data(), required_substring.size(), *out.bloom_filter, false, false);
++        {
++            token_extractor->substringToBloomFilter(
++                result.required_substring.data(), result.required_substring.size(), *out.bloom_filter, false, false);
++        }
+ 
+         return true;
+     }
+diff --git a/src/Storages/MergeTree/MergeTreeIndexGin.cpp b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+index 7ac9b348ed57..bc102b43cfa2 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexGin.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+@@ -557,22 +557,17 @@ bool MergeTreeIndexConditionGin::traverseASTEquals(
+         out.function = RPNElement::FUNCTION_MATCH;
+ 
+         const auto & value = const_value.safeGet<String>();
+-        String required_substring;
+-        bool dummy_is_trivial;
+-        bool dummy_required_substring_is_prefix;
+-        std::vector<String> alternatives;
+-        OptimizedRegularExpression::analyze(value, required_substring, dummy_is_trivial, dummy_required_substring_is_prefix, alternatives);
+-
+-        if (required_substring.empty() && alternatives.empty())
++        RegexpAnalysisResult result = OptimizedRegularExpression::analyze(value);
++        if (result.required_substring.empty() && result.alternatives.empty())
+             return false;
+ 
+         /// out.set_gin_filters means alternatives exist
+         /// out.gin_filter means required_substring exists
+-        if (!alternatives.empty())
++        if (!result.alternatives.empty())
+         {
+             std::vector<GinFilters> gin_filters;
+             gin_filters.emplace_back();
+-            for (const auto & alternative : alternatives)
++            for (const auto & alternative : result.alternatives)
+             {
+                 gin_filters.back().emplace_back();
+                 token_extractor->substringToGinFilter(alternative.data(), alternative.size(), gin_filters.back().back(), false, false);
+@@ -582,7 +577,7 @@ bool MergeTreeIndexConditionGin::traverseASTEquals(
+         else
+         {
+             out.gin_filter = std::make_unique<GinFilter>();
+-            token_extractor->substringToGinFilter(required_substring.data(), required_substring.size(), *out.gin_filter, false, false);
++            token_extractor->substringToGinFilter(result.required_substring.data(), result.required_substring.size(), *out.gin_filter, false, false);
+         }
+ 
+         return true;

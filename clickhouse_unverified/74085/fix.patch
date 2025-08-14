@@ -1,0 +1,1083 @@
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.cpp b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+index 58841d27477d..940b1c646978 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.cpp
++++ b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+@@ -3507,7 +3507,8 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
+             SizeLimits size_limits_for_set = {settings[Setting::max_rows_in_set], settings[Setting::max_bytes_in_set], settings[Setting::set_overflow_mode]};
+ 
+             auto hash = function_arguments[1]->getTreeHash();
+-            auto future_set = std::make_shared<FutureSetFromTuple>(hash, std::move(result_block), settings[Setting::transform_null_in], size_limits_for_set);
++            auto ast = function_arguments[1]->toAST();
++            auto future_set = std::make_shared<FutureSetFromTuple>(hash, std::move(ast), std::move(result_block), settings[Setting::transform_null_in], size_limits_for_set);
+ 
+             /// Create constant set column for constant folding
+ 
+diff --git a/src/Core/Settings.cpp b/src/Core/Settings.cpp
+index 2904781bf07f..b482d2efa021 100644
+--- a/src/Core/Settings.cpp
++++ b/src/Core/Settings.cpp
+@@ -2919,6 +2919,9 @@ Allow push predicate to final subquery.
+ )", 0) \
+     DECLARE(Bool, allow_push_predicate_when_subquery_contains_with, true, R"(
+ Allows push predicate when subquery contains WITH clause
++)", 0) \
++    DECLARE(Bool, allow_push_predicate_ast_for_distributed_subqueries, true, R"(
++Allows push predicate on AST level for distributed subqueries with enabled anlyzer
+ )", 0) \
+     \
+     DECLARE(UInt64, low_cardinality_max_dictionary_size, 8192, R"(
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index 51b261ffeb57..cf2949d60fa9 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -85,6 +85,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+             {"output_format_orc_writer_time_zone_name", "GMT", "GMT", "The time zone name for ORC writer, the default ORC writer's time zone is GMT."},
+             {"output_format_pretty_highlight_trailing_spaces", false, true, "A new setting."},
+             {"allow_experimental_bfloat16_type", false, true, "Add new BFloat16 type"},
++            {"allow_push_predicate_ast_for_distributed_subqueries", false, true, "A new setting"},
+             {"output_format_pretty_squash_consecutive_ms", 0, 50, "Add new setting"},
+             {"output_format_pretty_squash_max_wait_ms", 0, 1000, "Add new setting"},
+             {"output_format_pretty_max_column_name_width_cut_to", 0, 24, "A new setting"},
+diff --git a/src/Interpreters/ActionsVisitor.cpp b/src/Interpreters/ActionsVisitor.cpp
+index c83e619f001e..6f44af9b62ec 100644
+--- a/src/Interpreters/ActionsVisitor.cpp
++++ b/src/Interpreters/ActionsVisitor.cpp
+@@ -484,7 +484,7 @@ FutureSetPtr makeExplicitSet(
+     else
+         block = createBlockForSet(left_arg_type, right_arg, set_element_types, context);
+ 
+-    return prepared_sets.addFromTuple(set_key, std::move(block), context->getSettingsRef());
++    return prepared_sets.addFromTuple(set_key, right_arg_func, std::move(block), context->getSettingsRef());
+ }
+ 
+ class ScopeStack::Index
+@@ -1490,7 +1490,7 @@ FutureSetPtr ActionsMatcher::makeSet(const ASTFunction & node, Data & data, bool
+                     return set;
+ 
+                 if (StorageSet * storage_set = dynamic_cast<StorageSet *>(table.get()))
+-                    return data.prepared_sets->addFromStorage(set_key, storage_set->getSet(), table_id);
++                    return data.prepared_sets->addFromStorage(set_key, right_in_operand, storage_set->getSet(), table_id);
+             }
+ 
+             if (!data.getContext()->isGlobalContext())
+@@ -1520,7 +1520,7 @@ FutureSetPtr ActionsMatcher::makeSet(const ASTFunction & node, Data & data, bool
+         }
+ 
+         return data.prepared_sets->addFromSubquery(
+-            set_key, std::move(source), nullptr, std::move(external_table_set), data.getContext()->getSettingsRef());
++            set_key, right_in_operand, std::move(source), nullptr, std::move(external_table_set), data.getContext()->getSettingsRef());
+     }
+ 
+     const auto & last_actions = data.actions_stack.getLastActions();
+diff --git a/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp b/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
+index 237a652269c0..e902d921a9a6 100644
+--- a/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
++++ b/src/Interpreters/ClusterProxy/SelectStreamFactory.cpp
+@@ -172,14 +172,16 @@ void SelectStreamFactory::createForShardImpl(
+     auto emplace_remote_stream = [&](bool lazy = false, time_t local_delay = 0)
+     {
+         Block shard_header;
++        PlannerContextPtr planner_context;
+         if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
+-            shard_header = InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree, context, SelectQueryOptions(processed_stage).analyze());
++            std::tie(shard_header, planner_context) = InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext(query_tree, context, SelectQueryOptions(processed_stage).analyze());
+         else
+             shard_header = header;
+ 
+         remote_shards.emplace_back(Shard{
+             .query = query_ast,
+             .query_tree = query_tree,
++            .planner_context = planner_context,
+             .main_table = main_table,
+             .header = shard_header,
+             .has_missing_objects = has_missing_objects,
+diff --git a/src/Interpreters/ClusterProxy/SelectStreamFactory.h b/src/Interpreters/ClusterProxy/SelectStreamFactory.h
+index 2e7b2445c6bb..1ad73a97de07 100644
+--- a/src/Interpreters/ClusterProxy/SelectStreamFactory.h
++++ b/src/Interpreters/ClusterProxy/SelectStreamFactory.h
+@@ -28,6 +28,10 @@ struct StorageID;
+ 
+ class PreparedSets;
+ using PreparedSetsPtr = std::shared_ptr<PreparedSets>;
++
++class PlannerContext;
++using PlannerContextPtr = std::shared_ptr<PlannerContext>;
++
+ namespace ClusterProxy
+ {
+ 
+@@ -52,6 +56,7 @@ class SelectStreamFactory
+         /// Query and header may be changed depending on shard.
+         ASTPtr query;
+         QueryTreeNodePtr query_tree;
++        PlannerContextPtr planner_context;
+ 
+         /// Used to check the table existence on remote node
+         StorageID main_table;
+diff --git a/src/Interpreters/GlobalSubqueriesVisitor.h b/src/Interpreters/GlobalSubqueriesVisitor.h
+index bfbc6152b380..cbf3f77373a4 100644
+--- a/src/Interpreters/GlobalSubqueriesVisitor.h
++++ b/src/Interpreters/GlobalSubqueriesVisitor.h
+@@ -179,7 +179,7 @@ class GlobalSubqueriesMatcher
+                 std::unique_ptr<QueryPlan> source = std::make_unique<QueryPlan>();
+                 interpreter->buildQueryPlan(*source);
+ 
+-                auto future_set = prepared_sets->addFromSubquery(set_key, std::move(source), std::move(external_storage), nullptr, getContext()->getSettingsRef());
++                auto future_set = prepared_sets->addFromSubquery(set_key, ast, std::move(source), std::move(external_storage), nullptr, getContext()->getSettingsRef());
+                 external_storage_holder->future_set = std::move(future_set);
+             }
+             else
+diff --git a/src/Interpreters/InterpreterSelectQueryAnalyzer.cpp b/src/Interpreters/InterpreterSelectQueryAnalyzer.cpp
+index 412cf55775c7..ef753502139e 100644
+--- a/src/Interpreters/InterpreterSelectQueryAnalyzer.cpp
++++ b/src/Interpreters/InterpreterSelectQueryAnalyzer.cpp
+@@ -206,7 +206,7 @@ Block InterpreterSelectQueryAnalyzer::getSampleBlock(const ASTPtr & query,
+     return interpreter.getSampleBlock();
+ }
+ 
+-Block InterpreterSelectQueryAnalyzer::getSampleBlock(const QueryTreeNodePtr & query_tree,
++std::pair<Block, PlannerContextPtr> InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext(const QueryTreeNodePtr & query_tree,
+     const ContextPtr & context,
+     const SelectQueryOptions & select_query_options)
+ {
+@@ -214,7 +214,14 @@ Block InterpreterSelectQueryAnalyzer::getSampleBlock(const QueryTreeNodePtr & qu
+     select_query_options_copy.only_analyze = true;
+     InterpreterSelectQueryAnalyzer interpreter(query_tree, context, select_query_options_copy);
+ 
+-    return interpreter.getSampleBlock();
++    return interpreter.getSampleBlockAndPlannerContext();
++}
++
++Block InterpreterSelectQueryAnalyzer::getSampleBlock(const QueryTreeNodePtr & query_tree,
++    const ContextPtr & context,
++    const SelectQueryOptions & select_query_options)
++{
++    return getSampleBlockAndPlannerContext(query_tree, context, select_query_options).first;
+ }
+ 
+ Block InterpreterSelectQueryAnalyzer::getSampleBlock()
+@@ -223,6 +230,12 @@ Block InterpreterSelectQueryAnalyzer::getSampleBlock()
+     return planner.getQueryPlan().getCurrentHeader();
+ }
+ 
++std::pair<Block, PlannerContextPtr> InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext()
++{
++    planner.buildQueryPlanIfNeeded();
++    return {planner.getQueryPlan().getCurrentHeader(), planner.getPlannerContext()};
++}
++
+ BlockIO InterpreterSelectQueryAnalyzer::execute()
+ {
+     auto pipeline_builder = buildQueryPipeline();
+diff --git a/src/Interpreters/InterpreterSelectQueryAnalyzer.h b/src/Interpreters/InterpreterSelectQueryAnalyzer.h
+index 73c524cbe282..7e3f0ed121da 100644
+--- a/src/Interpreters/InterpreterSelectQueryAnalyzer.h
++++ b/src/Interpreters/InterpreterSelectQueryAnalyzer.h
+@@ -42,6 +42,7 @@ class InterpreterSelectQueryAnalyzer : public IInterpreter
+     }
+ 
+     Block getSampleBlock();
++    std::pair<Block, PlannerContextPtr> getSampleBlockAndPlannerContext();
+ 
+     static Block getSampleBlock(const ASTPtr & query,
+         const ContextPtr & context,
+@@ -51,6 +52,10 @@ class InterpreterSelectQueryAnalyzer : public IInterpreter
+         const ContextPtr & context_,
+         const SelectQueryOptions & select_query_options = {});
+ 
++    static std::pair<Block, PlannerContextPtr> getSampleBlockAndPlannerContext(const QueryTreeNodePtr & query_tree,
++        const ContextPtr & context_,
++        const SelectQueryOptions & select_query_options = {});
++
+     BlockIO execute() override;
+ 
+     QueryPlan & getQueryPlan();
+diff --git a/src/Interpreters/PredicateRewriteVisitor.h b/src/Interpreters/PredicateRewriteVisitor.h
+index d2b9ece9306a..0bfae8aa560e 100644
+--- a/src/Interpreters/PredicateRewriteVisitor.h
++++ b/src/Interpreters/PredicateRewriteVisitor.h
+@@ -32,6 +32,8 @@ class PredicateRewriteVisitorData : WithContext
+         bool optimize_final_,
+         bool optimize_with_);
+ 
++    bool rewriteSubquery(ASTSelectQuery & subquery, const Names & inner_columns);
++
+ private:
+     const ASTs & predicates;
+     const TableWithColumnNamesAndTypes & table_columns;
+@@ -44,8 +46,6 @@ class PredicateRewriteVisitorData : WithContext
+ 
+     void visit(ASTSelectIntersectExceptQuery & intersect_except_query, ASTPtr &);
+ 
+-    bool rewriteSubquery(ASTSelectQuery & subquery, const Names & inner_columns);
+-
+     void visitInternalSelect(size_t index, ASTSelectQuery & select_node, ASTPtr & node);
+ };
+ 
+diff --git a/src/Interpreters/PreparedSets.cpp b/src/Interpreters/PreparedSets.cpp
+index 7642c642169c..b465558dfa3b 100644
+--- a/src/Interpreters/PreparedSets.cpp
++++ b/src/Interpreters/PreparedSets.cpp
+@@ -59,8 +59,8 @@ static bool equals(const DataTypes & lhs, const DataTypes & rhs)
+ }
+ 
+ 
+-FutureSetFromStorage::FutureSetFromStorage(Hash hash_, SetPtr set_, std::optional<StorageID> storage_id_)
+-    : hash(hash_), storage_id(std::move(storage_id_)), set(std::move(set_)) {}
++FutureSetFromStorage::FutureSetFromStorage(Hash hash_, ASTPtr ast_, SetPtr set_, std::optional<StorageID> storage_id_)
++    : hash(hash_), ast(std::move(ast_)), storage_id(std::move(storage_id_)), set(std::move(set_)) {}
+ SetPtr FutureSetFromStorage::get() const { return set; }
+ FutureSet::Hash FutureSetFromStorage::getHash() const { return hash; }
+ DataTypes FutureSetFromStorage::getTypes() const { return set->getElementsTypes(); }
+@@ -72,9 +72,9 @@ SetPtr FutureSetFromStorage::buildOrderedSetInplace(const ContextPtr &)
+ 
+ 
+ FutureSetFromTuple::FutureSetFromTuple(
+-    Hash hash_, ColumnsWithTypeAndName block,
++    Hash hash_, ASTPtr ast_, ColumnsWithTypeAndName block,
+     bool transform_null_in, SizeLimits size_limits)
+-    : hash(hash_)
++    : hash(hash_), ast(std::move(ast_))
+ {
+     ColumnsWithTypeAndName header = block;
+     for (auto & elem : header)
+@@ -138,13 +138,14 @@ SetPtr FutureSetFromTuple::buildOrderedSetInplace(const ContextPtr & context)
+ 
+ FutureSetFromSubquery::FutureSetFromSubquery(
+     Hash hash_,
++    ASTPtr ast_,
+     std::unique_ptr<QueryPlan> source_,
+     StoragePtr external_table_,
+     std::shared_ptr<FutureSetFromSubquery> external_table_set_,
+     bool transform_null_in,
+     SizeLimits size_limits,
+     size_t max_size_for_index)
+-    : hash(hash_), external_table(std::move(external_table_)), external_table_set(std::move(external_table_set_)), source(std::move(source_))
++    : hash(hash_), ast(std::move(ast_)), external_table(std::move(external_table_)), external_table_set(std::move(external_table_set_)), source(std::move(source_))
+ {
+     set_and_key = std::make_shared<SetAndKey>();
+     set_and_key->key = PreparedSets::toString(hash_, {});
+@@ -155,11 +156,12 @@ FutureSetFromSubquery::FutureSetFromSubquery(
+ 
+ FutureSetFromSubquery::FutureSetFromSubquery(
+     Hash hash_,
++    ASTPtr ast_,
+     QueryTreeNodePtr query_tree_,
+     bool transform_null_in,
+     SizeLimits size_limits,
+     size_t max_size_for_index)
+-    : hash(hash_), query_tree(std::move(query_tree_))
++    : hash(hash_), ast(std::move(ast_)), query_tree(std::move(query_tree_))
+ {
+     set_and_key = std::make_shared<SetAndKey>();
+     set_and_key->key = PreparedSets::toString(hash_, {});
+@@ -182,6 +184,8 @@ void FutureSetFromSubquery::setQueryPlan(std::unique_ptr<QueryPlan> source_)
+     set_and_key->set->setHeader(source->getCurrentHeader().getColumnsWithTypeAndName());
+ }
+ 
++void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_) { external_table = std::move(external_table_); }
++
+ DataTypes FutureSetFromSubquery::getTypes() const
+ {
+     return set_and_key->set->getElementsTypes();
+@@ -297,11 +301,11 @@ String PreparedSets::toString(const PreparedSets::Hash & key, const DataTypes &
+     return buf.str();
+ }
+ 
+-FutureSetFromTuplePtr PreparedSets::addFromTuple(const Hash & key, ColumnsWithTypeAndName block, const Settings & settings)
++FutureSetFromTuplePtr PreparedSets::addFromTuple(const Hash & key, ASTPtr ast, ColumnsWithTypeAndName block, const Settings & settings)
+ {
+     auto size_limits = getSizeLimitsForSet(settings);
+     auto from_tuple = std::make_shared<FutureSetFromTuple>(
+-        key, std::move(block),
++        key, std::move(ast), std::move(block),
+         settings[Setting::transform_null_in], size_limits);
+ 
+     const auto & set_types = from_tuple->getTypes();
+@@ -315,9 +319,9 @@ FutureSetFromTuplePtr PreparedSets::addFromTuple(const Hash & key, ColumnsWithTy
+     return from_tuple;
+ }
+ 
+-FutureSetFromStoragePtr PreparedSets::addFromStorage(const Hash & key, SetPtr set_, StorageID storage_id)
++FutureSetFromStoragePtr PreparedSets::addFromStorage(const Hash & key, ASTPtr ast, SetPtr set_, StorageID storage_id)
+ {
+-    auto from_storage = std::make_shared<FutureSetFromStorage>(key, std::move(set_), std::move(storage_id));
++    auto from_storage = std::make_shared<FutureSetFromStorage>(key, std::move(ast), std::move(set_), std::move(storage_id));
+     auto [it, inserted] = sets_from_storage.emplace(key, from_storage);
+ 
+     if (!inserted)
+@@ -328,6 +332,7 @@ FutureSetFromStoragePtr PreparedSets::addFromStorage(const Hash & key, SetPtr se
+ 
+ FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+     const Hash & key,
++    ASTPtr ast,
+     std::unique_ptr<QueryPlan> source,
+     StoragePtr external_table,
+     FutureSetFromSubqueryPtr external_table_set,
+@@ -335,7 +340,7 @@ FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+ {
+     auto size_limits = getSizeLimitsForSet(settings);
+     auto from_subquery = std::make_shared<FutureSetFromSubquery>(
+-        key, std::move(source), std::move(external_table), std::move(external_table_set),
++        key, std::move(ast), std::move(source), std::move(external_table), std::move(external_table_set),
+         settings[Setting::transform_null_in], size_limits, settings[Setting::use_index_for_in_with_subqueries_max_values]);
+ 
+     auto [it, inserted] = sets_from_subqueries.emplace(key, from_subquery);
+@@ -348,12 +353,13 @@ FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+ 
+ FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+     const Hash & key,
++    ASTPtr ast,
+     QueryTreeNodePtr query_tree,
+     const Settings & settings)
+ {
+     auto size_limits = getSizeLimitsForSet(settings);
+     auto from_subquery = std::make_shared<FutureSetFromSubquery>(
+-        key, std::move(query_tree),
++        key, std::move(ast), std::move(query_tree),
+         settings[Setting::transform_null_in], size_limits, settings[Setting::use_index_for_in_with_subqueries_max_values]);
+ 
+     auto [it, inserted] = sets_from_subqueries.emplace(key, from_subquery);
+diff --git a/src/Interpreters/PreparedSets.h b/src/Interpreters/PreparedSets.h
+index 1e973d5ae8b4..2899aa81f1a0 100644
+--- a/src/Interpreters/PreparedSets.h
++++ b/src/Interpreters/PreparedSets.h
+@@ -56,6 +56,8 @@ class FutureSet
+ 
+     using Hash = CityHash_v1_0_2::uint128;
+     virtual Hash getHash() const = 0;
++
++    virtual ASTPtr getSourceAST() const = 0;
+ };
+ 
+ using FutureSetPtr = std::shared_ptr<FutureSet>;
+@@ -65,16 +67,18 @@ using FutureSetPtr = std::shared_ptr<FutureSet>;
+ class FutureSetFromStorage final : public FutureSet
+ {
+ public:
+-    explicit FutureSetFromStorage(Hash hash_, SetPtr set_, std::optional<StorageID> storage_id);
++    explicit FutureSetFromStorage(Hash hash_, ASTPtr ast_, SetPtr set_, std::optional<StorageID> storage_id);
+ 
+     SetPtr get() const override;
+     DataTypes getTypes() const override;
+     SetPtr buildOrderedSetInplace(const ContextPtr &) override;
+     Hash getHash() const override;
++    ASTPtr getSourceAST() const override { return ast; }
+ 
+     const std::optional<StorageID> & getStorageID() const { return storage_id; }
+ private:
+     Hash hash;
++    ASTPtr ast;
+     std::optional<StorageID> storage_id;
+     SetPtr set;
+ };
+@@ -86,16 +90,18 @@ using FutureSetFromStoragePtr = std::shared_ptr<FutureSetFromStorage>;
+ class FutureSetFromTuple final : public FutureSet
+ {
+ public:
+-    FutureSetFromTuple(Hash hash_, ColumnsWithTypeAndName block, bool transform_null_in, SizeLimits size_limits);
++    FutureSetFromTuple(Hash hash_, ASTPtr ast_, ColumnsWithTypeAndName block, bool transform_null_in, SizeLimits size_limits);
+ 
+     SetPtr get() const override { return set; }
+     SetPtr buildOrderedSetInplace(const ContextPtr & context) override;
+ 
+     DataTypes getTypes() const override;
+     Hash getHash() const override;
++    ASTPtr getSourceAST() const override { return ast; }
+     Columns getKeyColumns();
+ private:
+     Hash hash;
++    ASTPtr ast;
+     SetPtr set;
+     SetKeyColumns set_key_columns;
+ };
+@@ -119,6 +125,7 @@ class FutureSetFromSubquery final : public FutureSet
+ public:
+     FutureSetFromSubquery(
+         Hash hash_,
++        ASTPtr ast_,
+         std::unique_ptr<QueryPlan> source_,
+         StoragePtr external_table_,
+         std::shared_ptr<FutureSetFromSubquery> external_table_set_,
+@@ -128,6 +135,7 @@ class FutureSetFromSubquery final : public FutureSet
+ 
+     FutureSetFromSubquery(
+         Hash hash_,
++        ASTPtr ast_,
+         QueryTreeNodePtr query_tree_,
+         bool transform_null_in,
+         SizeLimits size_limits,
+@@ -138,6 +146,7 @@ class FutureSetFromSubquery final : public FutureSet
+     SetPtr get() const override;
+     DataTypes getTypes() const override;
+     Hash getHash() const override;
++    ASTPtr getSourceAST() const override { return ast; }
+     SetPtr buildOrderedSetInplace(const ContextPtr & context) override;
+ 
+     std::unique_ptr<QueryPlan> build(const ContextPtr & context);
+@@ -145,12 +154,14 @@ class FutureSetFromSubquery final : public FutureSet
+ 
+     QueryTreeNodePtr detachQueryTree() { return std::move(query_tree); }
+     void setQueryPlan(std::unique_ptr<QueryPlan> source_);
++    void setExternalTable(StoragePtr external_table_);
+ 
+     const QueryPlan * getQueryPlan() const { return source.get(); }
+     QueryPlan * getQueryPlan() { return source.get(); }
+ 
+ private:
+     Hash hash;
++    ASTPtr ast;
+     SetAndKeyPtr set_and_key;
+     StoragePtr external_table;
+     std::shared_ptr<FutureSetFromSubquery> external_table_set;
+@@ -176,11 +187,12 @@ class PreparedSets
+     using SetsFromStorage = std::unordered_map<Hash, FutureSetFromStoragePtr, Hashing>;
+     using SetsFromSubqueries = std::unordered_map<Hash, FutureSetFromSubqueryPtr, Hashing>;
+ 
+-    FutureSetFromStoragePtr addFromStorage(const Hash & key, SetPtr set_, StorageID storage_id);
+-    FutureSetFromTuplePtr addFromTuple(const Hash & key, ColumnsWithTypeAndName block, const Settings & settings);
++    FutureSetFromStoragePtr addFromStorage(const Hash & key, ASTPtr ast, SetPtr set_, StorageID storage_id);
++    FutureSetFromTuplePtr addFromTuple(const Hash & key, ASTPtr ast, ColumnsWithTypeAndName block, const Settings & settings);
+ 
+     FutureSetFromSubqueryPtr addFromSubquery(
+         const Hash & key,
++        ASTPtr ast,
+         std::unique_ptr<QueryPlan> source,
+         StoragePtr external_table,
+         FutureSetFromSubqueryPtr external_table_set,
+@@ -188,6 +200,7 @@ class PreparedSets
+ 
+     FutureSetFromSubqueryPtr addFromSubquery(
+         const Hash & key,
++        ASTPtr ast,
+         QueryTreeNodePtr query_tree,
+         const Settings & settings);
+ 
+diff --git a/src/Planner/CollectSets.cpp b/src/Planner/CollectSets.cpp
+index 4308c69523bc..39ec930845f0 100644
+--- a/src/Planner/CollectSets.cpp
++++ b/src/Planner/CollectSets.cpp
+@@ -69,8 +69,8 @@ class CollectSetsVisitor : public ConstInDepthQueryTreeVisitor<CollectSetsVisito
+             auto set_key = in_second_argument->getTreeHash();
+             if (sets.findStorage(set_key))
+                 return;
+-
+-            sets.addFromStorage(set_key, storage_set->getSet(), second_argument_table->getStorageID());
++            auto ast = in_second_argument->toAST();
++            sets.addFromStorage(set_key, std::move(ast), storage_set->getSet(), second_argument_table->getStorageID());
+         }
+         else if (const auto * constant_node = in_second_argument->as<ConstantNode>())
+         {
+@@ -92,7 +92,8 @@ class CollectSetsVisitor : public ConstInDepthQueryTreeVisitor<CollectSetsVisito
+             if (sets.findTuple(set_key, set_element_types))
+                 return;
+ 
+-            sets.addFromTuple(set_key, std::move(set), settings);
++            auto ast = in_second_argument->toAST();
++            sets.addFromTuple(set_key, std::move(ast), std::move(set), settings);
+         }
+         else if (in_second_argument_node_type == QueryTreeNodeType::QUERY ||
+             in_second_argument_node_type == QueryTreeNodeType::UNION ||
+@@ -106,7 +107,8 @@ class CollectSetsVisitor : public ConstInDepthQueryTreeVisitor<CollectSetsVisito
+             if (in_second_argument->as<TableNode>())
+                 subquery_to_execute = buildSubqueryToReadColumnsFromTableExpression(subquery_to_execute, planner_context.getQueryContext());
+ 
+-            sets.addFromSubquery(set_key, std::move(subquery_to_execute), settings);
++            auto ast = in_second_argument->toAST();
++            sets.addFromSubquery(set_key, std::move(ast), std::move(subquery_to_execute), settings);
+         }
+         else
+         {
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyConditionAndLimit.cpp b/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyConditionAndLimit.cpp
+index 490b79fbf8d3..ce36c7bddb43 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyConditionAndLimit.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyConditionAndLimit.cpp
+@@ -11,7 +11,7 @@ void optimizePrimaryKeyConditionAndLimit(const Stack & stack)
+ {
+     const auto & frame = stack.back();
+ 
+-    auto * source_step_with_filter = dynamic_cast<SourceStepWithFilter *>(frame.node->step.get());
++    auto * source_step_with_filter = dynamic_cast<SourceStepWithFilterBase *>(frame.node->step.get());
+     if (!source_step_with_filter)
+         return;
+ 
+diff --git a/src/Processors/QueryPlan/ReadFromRemote.cpp b/src/Processors/QueryPlan/ReadFromRemote.cpp
+index 28bf865a7b79..ba10ee8ab34c 100644
+--- a/src/Processors/QueryPlan/ReadFromRemote.cpp
++++ b/src/Processors/QueryPlan/ReadFromRemote.cpp
+@@ -1,5 +1,8 @@
+ #include <Processors/QueryPlan/ReadFromRemote.h>
+ 
++#include <Analyzer/QueryNode.h>
++#include <Analyzer/Utils.h>
++#include <Planner/PlannerActionsVisitor.h>
+ #include <DataTypes/DataTypesNumber.h>
+ #include <DataTypes/DataTypeString.h>
+ #include <Processors/QueryPlan/QueryPlan.h>
+@@ -8,7 +11,10 @@
+ #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+ #include <QueryPipeline/RemoteQueryExecutor.h>
+ #include <Parsers/ASTSelectQuery.h>
++#include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Parsers/ASTExplainQuery.h>
++#include <Parsers/ASTFunction.h>
++#include <Parsers/ASTIdentifier.h>
+ #include <Parsers/formatAST.h>
+ #include <Processors/Sources/RemoteSource.h>
+ #include <Processors/Sources/DelayedSource.h>
+@@ -16,6 +22,13 @@
+ #include <Processors/Transforms/MaterializingTransform.h>
+ #include <Processors/Executors/PullingPipelineExecutor.h>
+ #include <Interpreters/ActionsDAG.h>
++#include <Interpreters/PredicateRewriteVisitor.h>
++#include <Interpreters/JoinedTables.h>
++#include <Interpreters/PreparedSets.h>
++#include <Interpreters/DatabaseCatalog.h>
++#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
++#include <Columns/ColumnConst.h>
++#include <Columns/ColumnSet.h>
+ #include <Columns/ColumnString.h>
+ #include <Common/logger_useful.h>
+ #include <Common/checkStackSize.h>
+@@ -23,8 +36,9 @@
+ #include <Core/Settings.h>
+ #include <Client/ConnectionPool.h>
+ #include <Client/ConnectionPoolWithFailover.h>
++#include <Functions/IFunction.h>
++#include <Functions/FunctionsMiscellaneous.h>
+ #include <QueryPipeline/QueryPipelineBuilder.h>
+-#include <Parsers/ASTFunction.h>
+ 
+ #include <fmt/format.h>
+ 
+@@ -39,6 +53,9 @@ namespace Setting
+     extern const SettingsSeconds max_execution_time;
+     extern const SettingsNonZeroUInt64 max_parallel_replicas;
+     extern const SettingsUInt64 parallel_replicas_mark_segment_size;
++    extern const SettingsBool allow_push_predicate_when_subquery_contains_with;
++    extern const SettingsBool enable_optimize_predicate_expression_to_final_subquery;
++    extern const SettingsBool allow_push_predicate_ast_for_distributed_subqueries;
+ }
+ 
+ namespace ErrorCodes
+@@ -125,7 +142,7 @@ ReadFromRemote::ReadFromRemote(
+     UInt32 shard_count_,
+     std::shared_ptr<const StorageLimitsList> storage_limits_,
+     const String & cluster_name_)
+-    : ISourceStep(std::move(header_))
++    : SourceStepWithFilterBase(std::move(header_))
+     , shards(std::move(shards_))
+     , stage(stage_)
+     , main_table(std::move(main_table_))
+@@ -151,6 +168,251 @@ void ReadFromRemote::enforceAggregationInOrder()
+     DB::enforceAggregationInOrder(stage, *context);
+ }
+ 
++ASTSelectQuery & getSelectQuery(ASTPtr ast)
++{
++    if (const auto * explain = ast->as<ASTExplainQuery>())
++        ast = explain->getExplainedQuery();
++
++    return ast->as<ASTSelectQuery &>();
++}
++
++/// This is an attempt to convert filters (pushed down from the plan optimizations) from ActionsDAG back to AST.
++/// It should not be needed after we send a full plan for distributed queries.
++static ASTPtr tryBuildAdditionalFilterAST(
++    const ActionsDAG & dag,
++    const std::unordered_set<std::string> & projection_names,
++    const std::unordered_map<std::string, QueryTreeNodePtr> & execution_name_to_projection_query_tree,
++    Tables * external_tables,
++    const ContextPtr & context)
++{
++    std::unordered_map<const ActionsDAG::Node *, ASTPtr> node_to_ast;
++
++    struct Frame
++    {
++        const ActionsDAG::Node * node;
++        size_t next_child = 0;
++    };
++    std::stack<Frame> stack;
++    stack.push({dag.getOutputs().front()});
++    while (!stack.empty())
++    {
++        auto & frame = stack.top();
++        const auto * node = frame.node;
++
++        if (node_to_ast.contains(node))
++        {
++            stack.pop();
++            continue;
++        }
++
++        /// Labmdas are not supported (converting back to AST is complicated).
++        /// We have two cases here cause function with no capture can be constant-folded.
++        if (WhichDataType(node->result_type).isFunction()
++            || (node->type == ActionsDAG::ActionType::FUNCTION
++                && typeid_cast<const FunctionCapture *>(node->function_base.get())))
++        {
++            node_to_ast[node] = nullptr;
++            stack.pop();
++            continue;
++        }
++
++        /// Support for IN. The stored AST from the Set is taken.
++        if (WhichDataType(node->result_type).isSet())
++        {
++            auto maybe_set = node->column;
++            if (const auto * col_const = typeid_cast<const ColumnConst *>(maybe_set.get()))
++                maybe_set = col_const->getDataColumnPtr();
++
++            if (const auto * col_set = typeid_cast<const ColumnSet *>(maybe_set.get()))
++                node_to_ast[node] = col_set->getData()->getSourceAST();
++
++            stack.pop();
++            continue;
++        }
++
++        if (node->column && isColumnConst(*node->column))
++        {
++            auto literal = std::make_shared<ASTLiteral>((*node->column)[0]);
++            node_to_ast[node] = std::move(literal);
++            stack.pop();
++            continue;
++        }
++
++        if (frame.next_child < node->children.size())
++        {
++            stack.push({node->children[frame.next_child]});
++            ++frame.next_child;
++            continue;
++        }
++
++        stack.pop();
++        auto & res = node_to_ast[node];
++
++        if (node->type == ActionsDAG::ActionType::INPUT)
++        {
++            /// The column name can be taken from the projection name, or from the projection expression.
++            /// It depends on the predicate and query stage.
++
++            if (projection_names.contains(node->result_name))
++            {
++                /// The input name matches the projection name. Example:
++                /// SELECT x FROM (SELECT number + 1 AS x FROM remote('127.0.0.2', numbers(3))) WHERE x = 1
++                /// In this case, ReadFromRemote has header `x UInt64` and filter DAG has input column with name `x`.
++                /// Here, filter is applied to the whole query, and checking for projection name is reasonable.
++                res = std::make_shared<ASTIdentifier>(node->result_name);
++            }
++            else
++            {
++                /// The input name matches the execution name of the projection. Example:
++                /// SELECT x, y FROM (
++                ///     SELECT number + 1 AS x, sum(number) AS y FROM remote('127.0.0.{1,2}', numbers(3)) GROUP BY x
++                /// ) WHERE x = 1
++                /// In this case, ReadFromRemote has `plus(__table1.number, 1_UInt8) UInt64` in header,
++                /// and filter DAG has input column with name `plus(__table1.number, 1_UInt8)`.
++                /// Here, filter is pushed down before the aggregation, and projection name can't be used.
++                /// However, we can match the input with the execution name of projection query tree.
++                /// Note: this may not cover all the cases.
++                auto it = execution_name_to_projection_query_tree.find(node->result_name);
++                if (it != execution_name_to_projection_query_tree.end())
++                    /// Append full expression as an AST.
++                    /// We rely on plan optimization that the result is (expected to be) valid.
++                    res = it->second->toAST();
++            }
++        }
++
++        if (node->type == ActionsDAG::ActionType::ALIAS)
++            res = node_to_ast[node->children.at(0)];
++
++        if (node->type != ActionsDAG::ActionType::FUNCTION)
++            continue;
++
++        if (!node->function_base->isDeterministic() || node->function_base->isStateful())
++            continue;
++
++        bool has_all_args = true;
++        ASTs arguments;
++        for (const auto * child : node->children)
++        {
++            auto ast = node_to_ast[child];
++            if (!ast)
++                has_all_args = false;
++            else
++                arguments.push_back(std::move(ast));
++        }
++
++        /// Allow to skip children only for AND function.
++        auto func_name = node->function_base->getName();
++        bool is_function_and = func_name == "and";
++        if (!has_all_args && !is_function_and)
++            continue;
++
++        if (is_function_and && arguments.empty())
++            continue;
++
++        /// and() with 1 arg is not allowed. Make it AND(condition, 1)
++        if (is_function_and && arguments.size() == 1)
++            arguments.push_back(std::make_shared<ASTLiteral>(Field(1)));
++
++        /// Support for GLOBAL IN.
++        if (external_tables && isNameOfGlobalInFunction(func_name))
++        {
++            const auto * second_arg = node->children.at(1);
++            auto maybe_set = second_arg->column;
++            if (const auto * col_const = typeid_cast<const ColumnConst *>(maybe_set.get()))
++                maybe_set = col_const->getDataColumnPtr();
++
++            if (const auto * col_set = typeid_cast<const ColumnSet *>(maybe_set.get()))
++            {
++                auto future_set = col_set->getData();
++                if (auto * set_from_subquery = typeid_cast<FutureSetFromSubquery *>(future_set.get()))
++                {
++                    const auto temporary_table_name = fmt::format("_data_{}", toString(set_from_subquery->getHash()));
++
++                    auto & external_table = (*external_tables)[temporary_table_name];
++                    if (!external_table)
++                    {
++                        /// Here we create a new temporary table and attach it to the FutureSetFromSubquery.
++                        /// At the moment FutureSet is created, temporary table will be filled.
++                        /// This should happen because filter expression on initiator needs the set as well,
++                        /// and it should be built before sending the external tables.
++
++                        auto header = InterpreterSelectQueryAnalyzer::getSampleBlock(set_from_subquery->getSourceAST(), context);
++                        NamesAndTypesList columns = header.getNamesAndTypesList();
++
++                        auto external_storage_holder = TemporaryTableHolder(
++                            context,
++                            ColumnsDescription{columns},
++                            ConstraintsDescription{},
++                            nullptr /*query*/,
++                            true /*create_for_global_subquery*/);
++
++                        external_table = external_storage_holder.getTable();
++                        set_from_subquery->setExternalTable(external_table);
++                    }
++
++                    node_to_ast[second_arg] = std::make_shared<ASTIdentifier>(temporary_table_name);
++                }
++            }
++        }
++
++        auto function = makeASTFunction(node->function_base->getName(), std::move(arguments));
++        res = std::move(function);
++    }
++
++    return node_to_ast[dag.getOutputs().front()];
++}
++
++static void addFilters(
++    Tables * external_tables,
++    const ContextMutablePtr & context,
++    const ASTPtr & query_ast,
++    const QueryTreeNodePtr & query_tree,
++    const PlannerContextPtr & planner_context,
++    const ActionsDAG & pushed_down_filters)
++{
++    if (!query_tree || !planner_context)
++        return;
++
++    const auto & settings = context->getSettingsRef();
++    if (!settings[Setting::allow_push_predicate_ast_for_distributed_subqueries])
++        return;
++
++    const auto * query_node = query_tree->as<QueryNode>();
++    if (!query_node)
++        return;
++
++    /// We are building a set with projection names and a map with execution names here.
++    /// They are needed to substitute inputs in ActionsDAG. See comment in tryBuildAdditionalFilterAST.
++
++    std::unordered_set<std::string> projection_names;
++    for (const auto & col : query_node->getProjectionColumns())
++        projection_names.insert(col.name);
++
++    std::unordered_map<std::string, QueryTreeNodePtr> execution_name_to_projection_query_tree;
++    for (const auto & node : query_node->getProjection())
++        execution_name_to_projection_query_tree[calculateActionNodeName(node, *planner_context)] = node;
++
++    ASTPtr predicate = tryBuildAdditionalFilterAST(pushed_down_filters, projection_names, execution_name_to_projection_query_tree, external_tables, context);
++    if (!predicate)
++        return;
++
++    JoinedTables joined_tables(context, getSelectQuery(query_ast), false, false);
++    joined_tables.resolveTables();
++    const auto & tables_with_columns = joined_tables.tablesWithColumns();
++
++    /// Case with JOIN is not supported so far.
++    if (tables_with_columns.size() != 1)
++        return;
++
++    bool optimize_final = settings[Setting::enable_optimize_predicate_expression_to_final_subquery];
++    bool optimize_with = settings[Setting::allow_push_predicate_when_subquery_contains_with];
++
++    ASTs predicates{predicate};
++    PredicateRewriteVisitor::Data data(context, predicates, tables_with_columns.front(), optimize_final, optimize_with);
++
++    data.rewriteSubquery(getSelectQuery(query_ast), tables_with_columns.front().columns.getNames());
++}
++
+ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStreamFactory::Shard & shard, const Header & out_header)
+ {
+     bool add_agg_info = stage == QueryProcessingStage::WithMergeableState;
+@@ -166,13 +428,19 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStream
+         add_extremes = context->getSettingsRef()[Setting::extremes];
+     }
+ 
++    std::shared_ptr<const ActionsDAG> pushed_down_filters;
++    if (filter_actions_dag)
++        pushed_down_filters = std::make_shared<const ActionsDAG>(filter_actions_dag->clone());
++
+     auto lazily_create_stream = [
+             my_shard = shard, my_shard_count = shard_count, query = shard.query, header = shard.header,
+             my_context = context, my_throttler = throttler,
+             my_main_table = main_table, my_table_func_ptr = table_func_ptr,
+             my_scalars = scalars, my_external_tables = external_tables,
+             my_stage = stage, local_delay = shard.local_delay,
+-            add_agg_info, add_totals, add_extremes, async_read, async_query_sending]() mutable
++            add_agg_info, add_totals, add_extremes, async_read, async_query_sending,
++            query_tree = shard.query_tree, planner_context = shard.planner_context,
++            pushed_down_filters]() mutable
+         -> QueryPipelineBuilder
+     {
+         auto current_settings = my_context->getSettingsRef();
+@@ -218,6 +486,12 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStream
+         for (auto & try_result : try_results)
+             connections.emplace_back(std::move(try_result.entry));
+ 
++        /// For the lazy case we are ignoring external tables.
++        /// This is because the set could be build before the lambda call,
++        /// and the temporary table which we are about to send would be empty.
++        /// So that GLOBAL IN would work as local IN in the pushed-down predicate.
++        if (pushed_down_filters)
++            addFilters(nullptr, my_context, query, query_tree, planner_context, *pushed_down_filters);
+         String query_string = formattedAST(query);
+ 
+         my_scalars["_shard_num"] = Block{
+@@ -235,14 +509,6 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStream
+     addConvertingActions(pipes.back(), out_header, shard.has_missing_objects);
+ }
+ 
+-ASTSelectQuery & getSelectQuery(ASTPtr ast)
+-{
+-    if (const auto * explain = ast->as<ASTExplainQuery>())
+-        ast = explain->getExplainedQuery();
+-
+-    return ast->as<ASTSelectQuery &>();
+-}
+-
+ void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::SelectStreamFactory::Shard & shard, const Header & out_header)
+ {
+     bool add_agg_info = stage == QueryProcessingStage::WithMergeableState;
+@@ -327,6 +593,9 @@ void ReadFromRemote::addPipe(Pipes & pipes, const ClusterProxy::SelectStreamFact
+     }
+     else
+     {
++        if (filter_actions_dag)
++            addFilters(&external_tables, context, shard.query, shard.query_tree, shard.planner_context, *filter_actions_dag);
++
+         const String query_string = formattedAST(shard.query);
+ 
+         auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
+diff --git a/src/Processors/QueryPlan/ReadFromRemote.h b/src/Processors/QueryPlan/ReadFromRemote.h
+index 65d6b48c97f3..035a4bcb81af 100644
+--- a/src/Processors/QueryPlan/ReadFromRemote.h
++++ b/src/Processors/QueryPlan/ReadFromRemote.h
+@@ -1,5 +1,5 @@
+ #pragma once
+-#include <Processors/QueryPlan/ISourceStep.h>
++#include <Processors/QueryPlan/SourceStepWithFilter.h>
+ #include <Core/QueryProcessingStage.h>
+ #include <Client/IConnections.h>
+ #include <Storages/IStorage_fwd.h>
+@@ -17,7 +17,7 @@ using ParallelReplicasReadingCoordinatorPtr = std::shared_ptr<ParallelReplicasRe
+ 
+ /// Reading step from remote servers.
+ /// Unite query results from several shards.
+-class ReadFromRemote final : public ISourceStep
++class ReadFromRemote final : public SourceStepWithFilterBase
+ {
+ public:
+     /// @param main_table_ if Shards contains main_table then this parameter will be ignored
+diff --git a/src/Processors/QueryPlan/SetsSerialization.cpp b/src/Processors/QueryPlan/SetsSerialization.cpp
+index 87939522b952..3a3e83c718d0 100644
+--- a/src/Processors/QueryPlan/SetsSerialization.cpp
++++ b/src/Processors/QueryPlan/SetsSerialization.cpp
+@@ -208,7 +208,7 @@ static void makeSetsFromStorage(std::list<QueryPlanAndSets::SetFromStorage> sets
+         if (!storage_set)
+             throw Exception(ErrorCodes::INCORRECT_DATA, "Table {} is not a StorageSet", set.storage_name);
+ 
+-        auto future_set = std::make_shared<FutureSetFromStorage>(set.hash, storage_set->getSet(), table_node->getStorageID());
++        auto future_set = std::make_shared<FutureSetFromStorage>(set.hash, nullptr, storage_set->getSet(), table_node->getStorageID());
+         for (auto * column : set.columns)
+             column->setData(future_set);
+     }
+@@ -222,7 +222,7 @@ static void makeSetsFromTuple(std::list<QueryPlanAndSets::SetFromTuple> sets, co
+         SizeLimits size_limits = PreparedSets::getSizeLimitsForSet(settings);
+         bool transform_null_in = settings[Setting::transform_null_in];
+ 
+-        auto future_set = std::make_shared<FutureSetFromTuple>(set.hash, std::move(set.set_columns), transform_null_in, size_limits);
++        auto future_set = std::make_shared<FutureSetFromTuple>(set.hash, nullptr, std::move(set.set_columns), transform_null_in, size_limits);
+         for (auto * column : set.columns)
+             column->setData(future_set);
+     }
+@@ -246,7 +246,7 @@ static void makeSetsFromSubqueries(QueryPlan & plan, std::list<QueryPlanAndSets:
+         size_t max_size_for_index = settings[Setting::use_index_for_in_with_subqueries_max_values];
+ 
+         auto future_set = std::make_shared<FutureSetFromSubquery>(
+-            set.hash, std::make_unique<QueryPlan>(std::move(subquery_plan)),
++            set.hash, nullptr, std::make_unique<QueryPlan>(std::move(subquery_plan)),
+             nullptr, nullptr,
+             transform_null_in, size_limits, max_size_for_index);
+ 
+diff --git a/src/Processors/QueryPlan/SourceStepWithFilter.cpp b/src/Processors/QueryPlan/SourceStepWithFilter.cpp
+index f55d5ccddce3..ad4b54dc260c 100644
+--- a/src/Processors/QueryPlan/SourceStepWithFilter.cpp
++++ b/src/Processors/QueryPlan/SourceStepWithFilter.cpp
+@@ -77,6 +77,11 @@ Block SourceStepWithFilter::applyPrewhereActions(Block block, const PrewhereInfo
+     return block;
+ }
+ 
++void SourceStepWithFilterBase::applyFilters(ActionDAGNodes added_filter_nodes)
++{
++    filter_actions_dag = ActionsDAG::buildFilterActionsDAG(added_filter_nodes.nodes, {});
++}
++
+ void SourceStepWithFilter::applyFilters(ActionDAGNodes added_filter_nodes)
+ {
+     filter_actions_dag = ActionsDAG::buildFilterActionsDAG(added_filter_nodes.nodes, query_info.buildNodeNameToInputNodeColumn());
+diff --git a/src/Processors/QueryPlan/SourceStepWithFilter.h b/src/Processors/QueryPlan/SourceStepWithFilter.h
+index a650cdc3211e..4718ad78947f 100644
+--- a/src/Processors/QueryPlan/SourceStepWithFilter.h
++++ b/src/Processors/QueryPlan/SourceStepWithFilter.h
+@@ -8,43 +8,17 @@
+ namespace DB
+ {
+ 
+-/** Source step that can use filters and limit for more efficient pipeline initialization.
+-  * Filters must be added before pipeline initialization.
+-  * Limit must be set before pipeline initialization.
+-  */
+-class SourceStepWithFilter : public ISourceStep
++class SourceStepWithFilterBase : public ISourceStep
+ {
+ public:
+     using Base = ISourceStep;
+     using Base::Base;
+ 
+-    SourceStepWithFilter(
+-        Header output_header_,
+-        const Names & column_names_,
+-        const SelectQueryInfo & query_info_,
+-        const StorageSnapshotPtr & storage_snapshot_,
+-        const ContextPtr & context_)
++    explicit SourceStepWithFilterBase(Header output_header_)
+         : ISourceStep(std::move(output_header_))
+-        , required_source_columns(column_names_)
+-        , query_info(query_info_)
+-        , prewhere_info(query_info.prewhere_info)
+-        , storage_snapshot(storage_snapshot_)
+-        , context(context_)
+     {
+     }
+ 
+-    const std::optional<ActionsDAG> & getFilterActionsDAG() const { return filter_actions_dag; }
+-    std::optional<ActionsDAG> detachFilterActionsDAG() { return std::move(filter_actions_dag); }
+-
+-    const SelectQueryInfo & getQueryInfo() const { return query_info; }
+-    const PrewhereInfoPtr & getPrewhereInfo() const { return prewhere_info; }
+-    ContextPtr getContext() const { return context; }
+-    const StorageSnapshotPtr & getStorageSnapshot() const { return storage_snapshot; }
+-
+-    bool isQueryWithFinal() const { return query_info.isFinal(); }
+-
+-    const Names & requiredSourceColumns() const { return required_source_columns; }
+-
+     void addFilter(ActionsDAG filter_dag, std::string column_name)
+     {
+         filter_nodes.nodes.push_back(&filter_dag.findInOutputs(column_name));
+@@ -67,6 +41,56 @@ class SourceStepWithFilter : public ISourceStep
+     }
+ 
+     virtual void applyFilters(ActionDAGNodes added_filter_nodes);
++    virtual PrewhereInfoPtr getPrewhereInfo() const { return nullptr; }
++
++    const std::optional<ActionsDAG> & getFilterActionsDAG() const { return filter_actions_dag; }
++    std::optional<ActionsDAG> detachFilterActionsDAG() { return std::move(filter_actions_dag); }
++
++private:
++    /// Will be cleared after applyFilters() is called.
++    ActionDAGNodes filter_nodes;
++    std::vector<ActionsDAG> filter_dags;
++
++protected:
++    std::optional<size_t> limit;
++    std::optional<ActionsDAG> filter_actions_dag;
++};
++
++/** Source step that can use filters and limit for more efficient pipeline initialization.
++  * Filters must be added before pipeline initialization.
++  * Limit must be set before pipeline initialization.
++  */
++class SourceStepWithFilter : public SourceStepWithFilterBase
++{
++public:
++    using Base = SourceStepWithFilterBase;
++    using Base::Base;
++
++    SourceStepWithFilter(
++        Header output_header_,
++        const Names & column_names_,
++        const SelectQueryInfo & query_info_,
++        const StorageSnapshotPtr & storage_snapshot_,
++        const ContextPtr & context_)
++        : SourceStepWithFilterBase(std::move(output_header_))
++        , required_source_columns(column_names_)
++        , query_info(query_info_)
++        , prewhere_info(query_info.prewhere_info)
++        , storage_snapshot(storage_snapshot_)
++        , context(context_)
++    {
++    }
++
++    const SelectQueryInfo & getQueryInfo() const { return query_info; }
++    PrewhereInfoPtr getPrewhereInfo() const override { return prewhere_info; }
++    ContextPtr getContext() const { return context; }
++    const StorageSnapshotPtr & getStorageSnapshot() const { return storage_snapshot; }
++
++    bool isQueryWithFinal() const { return query_info.isFinal(); }
++
++    const Names & requiredSourceColumns() const { return required_source_columns; }
++
++    void applyFilters(ActionDAGNodes added_filter_nodes) override;
+ 
+     virtual void updatePrewhereInfo(const PrewhereInfoPtr & prewhere_info_value);
+ 
+@@ -82,14 +106,6 @@ class SourceStepWithFilter : public ISourceStep
+     PrewhereInfoPtr prewhere_info;
+     StorageSnapshotPtr storage_snapshot;
+     ContextPtr context;
+-    std::optional<size_t> limit;
+-
+-    std::optional<ActionsDAG> filter_actions_dag;
+-
+-private:
+-    /// Will be cleared after applyFilters() is called.
+-    ActionDAGNodes filter_nodes;
+-    std::vector<ActionsDAG> filter_dags;
+ };
+ 
+ }
+diff --git a/utils/check-style/experimental_settings_ignore.txt b/utils/check-style/experimental_settings_ignore.txt
+index 0bd9f5bc4f4d..2502cdfff4ac 100644
+--- a/utils/check-style/experimental_settings_ignore.txt
++++ b/utils/check-style/experimental_settings_ignore.txt
+@@ -45,6 +45,7 @@ allow_nondeterministic_optimize_skip_unused_shards
+ allow_prefetched_read_pool_for_local_filesystem
+ allow_prefetched_read_pool_for_remote_filesystem
+ allow_push_predicate_when_subquery_contains_with
++allow_push_predicate_ast_for_distributed_subqueries
+ allow_settings_after_format_in_insert
+ allow_statistic_optimize
+ allow_statistics_optimize

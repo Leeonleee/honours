@@ -1,0 +1,158 @@
+diff --git a/src/AggregateFunctions/AggregateFunctionForEach.h b/src/AggregateFunctions/AggregateFunctionForEach.h
+index 19f2994d3f1b..ee4a168ccebe 100644
+--- a/src/AggregateFunctions/AggregateFunctionForEach.h
++++ b/src/AggregateFunctions/AggregateFunctionForEach.h
+@@ -247,6 +247,11 @@ class AggregateFunctionForEach final : public IAggregateFunctionDataHelper<Aggre
+     {
+         return true;
+     }
++
++    bool isState() const override
++    {
++        return nested_func->isState();
++    }
+ };
+ 
+ 
+diff --git a/src/AggregateFunctions/AggregateFunctionNull.cpp b/src/AggregateFunctions/AggregateFunctionNull.cpp
+index b8fbad53350d..b65b4aba447b 100644
+--- a/src/AggregateFunctions/AggregateFunctionNull.cpp
++++ b/src/AggregateFunctions/AggregateFunctionNull.cpp
+@@ -2,6 +2,7 @@
+ #include <AggregateFunctions/AggregateFunctionNull.h>
+ #include <AggregateFunctions/AggregateFunctionNothing.h>
+ #include <AggregateFunctions/AggregateFunctionCount.h>
++#include <AggregateFunctions/AggregateFunctionState.h>
+ #include <AggregateFunctions/AggregateFunctionCombinatorFactory.h>
+ #include "registerAggregateFunctions.h"
+ 
+@@ -71,6 +72,19 @@ class AggregateFunctionCombinatorNull final : public IAggregateFunctionCombinato
+         if (auto adapter = nested_function->getOwnNullAdapter(nested_function, arguments, params))
+             return adapter;
+ 
++        /// If applied to aggregate function with -State combinator, we apply -Null combinator to it's nested_function instead of itself.
++        /// Because Nullable AggregateFunctionState does not make sense and ruins the logic of managing aggregate function states.
++
++        if (const AggregateFunctionState * function_state = typeid_cast<const AggregateFunctionState *>(nested_function.get()))
++        {
++            auto transformed_nested_function = transformAggregateFunction(function_state->getNestedFunction(), properties, arguments, params);
++
++            return std::make_shared<AggregateFunctionState>(
++                transformed_nested_function,
++                transformed_nested_function->getArgumentTypes(),
++                transformed_nested_function->getParameters());
++        }
++
+         bool return_type_is_nullable = !properties.returns_default_when_only_null && nested_function->getReturnType()->canBeInsideNullable();
+         bool serialize_flag = return_type_is_nullable || properties.returns_default_when_only_null;
+ 
+diff --git a/src/AggregateFunctions/IAggregateFunction.h b/src/AggregateFunctions/IAggregateFunction.h
+index eb9c560af98a..25d8580a923a 100644
+--- a/src/AggregateFunctions/IAggregateFunction.h
++++ b/src/AggregateFunctions/IAggregateFunction.h
+@@ -122,8 +122,9 @@ class IAggregateFunction
+         throw Exception("Method predictValues is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
+-    /** Returns true for aggregate functions of type -State.
++    /** Returns true for aggregate functions of type -State
+       * They are executed as other aggregate functions, but not finalized (return an aggregation state that can be combined with another).
++      * Also returns true when the final value of this aggregate function contains State of other aggregate function inside.
+       */
+     virtual bool isState() const { return false; }
+ 
+diff --git a/src/Columns/ColumnAggregateFunction.cpp b/src/Columns/ColumnAggregateFunction.cpp
+index 915dd7530c49..4b9dcc8d04e7 100644
+--- a/src/Columns/ColumnAggregateFunction.cpp
++++ b/src/Columns/ColumnAggregateFunction.cpp
+@@ -85,6 +85,20 @@ void ColumnAggregateFunction::addArena(ConstArenaPtr arena_)
+     foreign_arenas.push_back(arena_);
+ }
+ 
++namespace
++{
++
++ConstArenas concatArenas(const ConstArenas & array, ConstArenaPtr arena)
++{
++    ConstArenas result = array;
++    if (arena)
++        result.push_back(std::move(arena));
++
++    return result;
++}
++
++}
++
+ MutableColumnPtr ColumnAggregateFunction::convertToValues(MutableColumnPtr column)
+ {
+     /** If the aggregate function returns an unfinalized/unfinished state,
+@@ -121,19 +135,27 @@ MutableColumnPtr ColumnAggregateFunction::convertToValues(MutableColumnPtr colum
+     auto & func = column_aggregate_func.func;
+     auto & data = column_aggregate_func.data;
+ 
+-    if (const AggregateFunctionState *function_state = typeid_cast<const AggregateFunctionState *>(func.get()))
+-    {
+-        auto res = column_aggregate_func.createView();
+-        res->set(function_state->getNestedFunction());
+-        res->data.assign(data.begin(), data.end());
+-        return res;
+-    }
+-
++    /// insertResultInto may invalidate states, so we must unshare ownership of them
+     column_aggregate_func.ensureOwnership();
+ 
+     MutableColumnPtr res = func->getReturnType()->createColumn();
+     res->reserve(data.size());
+ 
++    /// If there are references to states in final column, we must hold their ownership
++    /// by holding arenas and source.
++
++    auto callback = [&](auto & subcolumn)
++    {
++        if (auto * aggregate_subcolumn = typeid_cast<ColumnAggregateFunction *>(subcolumn.get()))
++        {
++            aggregate_subcolumn->foreign_arenas = concatArenas(column_aggregate_func.foreign_arenas, column_aggregate_func.my_arena);
++            aggregate_subcolumn->src = column_aggregate_func.getPtr();
++        }
++    };
++
++    callback(res);
++    res->forEachSubcolumn(callback);
++
+     for (auto * val : data)
+         func->insertResultInto(val, *res, &column_aggregate_func.createOrGetArena());
+ 
+@@ -629,20 +651,6 @@ void ColumnAggregateFunction::getExtremes(Field & min, Field & max) const
+     max = serialized;
+ }
+ 
+-namespace
+-{
+-
+-ConstArenas concatArenas(const ConstArenas & array, ConstArenaPtr arena)
+-{
+-    ConstArenas result = array;
+-    if (arena)
+-        result.push_back(std::move(arena));
+-
+-    return result;
+-}
+-
+-}
+-
+ ColumnAggregateFunction::MutablePtr ColumnAggregateFunction::createView() const
+ {
+     auto res = create(func, concatArenas(foreign_arenas, my_arena));
+diff --git a/src/Functions/FunctionsBitmap.cpp b/src/Functions/FunctionsBitmap.cpp
+index c94566b04b09..72652288872c 100644
+--- a/src/Functions/FunctionsBitmap.cpp
++++ b/src/Functions/FunctionsBitmap.cpp
+@@ -1,7 +1,6 @@
+ #include <Functions/FunctionFactory.h>
+ 
+-// TODO include this last because of a broken roaring header. See the comment
+-// inside.
++// TODO include this last because of a broken roaring header. See the comment inside.
+ #include <Functions/FunctionsBitmap.h>
+ 
+ 

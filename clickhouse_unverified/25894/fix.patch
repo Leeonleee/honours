@@ -1,0 +1,517 @@
+diff --git a/src/Interpreters/HashJoin.cpp b/src/Interpreters/HashJoin.cpp
+index 1d112a7c5484..323c821c4424 100644
+--- a/src/Interpreters/HashJoin.cpp
++++ b/src/Interpreters/HashJoin.cpp
+@@ -27,6 +27,7 @@
+ #include <Core/ColumnNumbers.h>
+ #include <Common/typeid_cast.h>
+ #include <Common/assert_cast.h>
++
+ namespace DB
+ {
+ 
+@@ -289,13 +290,11 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
+         if (table_join->getDictionaryReader())
+         {
+             assert(disjuncts_num == 1);
+-            LOG_DEBUG(log, "Performing join over dict");
+             data->type = Type::DICT;
+ 
+             data->maps.resize(disjuncts_num);
+             std::get<MapsOne>(data->maps[0]).create(Type::DICT);
+-            key_sizes.resize(1);
+-            chooseMethod(key_columns, key_sizes[0]); /// init key_sizes
++            chooseMethod(kind, key_columns, key_sizes.emplace_back()); /// init key_sizes
+         }
+         else if (strictness == ASTTableJoin::Strictness::Asof)
+         {
+@@ -321,13 +320,13 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
+             /// Therefore, add it back in such that it can be extracted appropriately from the full stored
+             /// key_columns and key_sizes
+             auto & asof_key_sizes = key_sizes.emplace_back();
+-            data->type = chooseMethod(key_columns, asof_key_sizes);
++            data->type = chooseMethod(kind, key_columns, asof_key_sizes);
+             asof_key_sizes.push_back(asof_size);
+         }
+         else
+         {
+             /// Choose data structure to use for JOIN.
+-            auto current_join_method = chooseMethod(key_columns, key_sizes.emplace_back());
++            auto current_join_method = chooseMethod(kind, key_columns, key_sizes.emplace_back());
+             if (data->type == Type::EMPTY)
+                 data->type = current_join_method;
+             else if (data->type != current_join_method)
+@@ -337,14 +336,20 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
+ 
+     for (auto & maps : data->maps)
+         dataMapInit(maps);
++
++    LOG_DEBUG(log, "Join type: {}, kind: {}, strictness: {}", data->type, kind, strictness);
+ }
+ 
+-HashJoin::Type HashJoin::chooseMethod(const ColumnRawPtrs & key_columns, Sizes & key_sizes)
++HashJoin::Type HashJoin::chooseMethod(ASTTableJoin::Kind kind, const ColumnRawPtrs & key_columns, Sizes & key_sizes)
+ {
+     size_t keys_size = key_columns.size();
+ 
+     if (keys_size == 0)
+-        return Type::CROSS;
++    {
++        if (isCrossOrComma(kind))
++            return Type::CROSS;
++        return Type::EMPTY;
++    }
+ 
+     bool all_fixed = true;
+     size_t keys_bytes = 0;
+@@ -446,6 +451,23 @@ class KeyGetterForDict
+     std::vector<size_t> positions;
+ };
+ 
++/// Dummy key getter, always find nothing, used for JOIN ON NULL
++template <typename Mapped>
++class KeyGetterEmpty
++{
++public:
++    struct MappedType
++    {
++        using mapped_type = Mapped;
++    };
++
++    using FindResult = ColumnsHashing::columns_hashing_impl::FindResultImpl<Mapped, true>;
++
++    KeyGetterEmpty() = default;
++
++    FindResult findKey(MappedType, size_t, const Arena &) { return FindResult(); }
++};
++
+ template <HashJoin::Type type, typename Value, typename Mapped>
+ struct KeyGetterForTypeImpl;
+ 
+@@ -723,8 +745,6 @@ Block HashJoin::structureRightBlock(const Block & block) const
+ 
+ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
+ {
+-    if (empty())
+-        throw Exception("Logical error: HashJoin was not initialized", ErrorCodes::LOGICAL_ERROR);
+     if (overDictionary())
+         throw Exception("Logical error: insert into hash-map in HashJoin over dictionary", ErrorCodes::LOGICAL_ERROR);
+ 
+@@ -1373,12 +1393,28 @@ IColumn::Filter switchJoinRightColumns(
+     constexpr bool is_asof_join = STRICTNESS == ASTTableJoin::Strictness::Asof;
+     switch (type)
+     {
++        case HashJoin::Type::EMPTY:
++        {
++            if constexpr (!is_asof_join)
++            {
++                using KeyGetter = KeyGetterEmpty<typename Maps::MappedType>;
++                std::vector<KeyGetter> key_getter_vector;
++                key_getter_vector.emplace_back();
++
++                using MapTypeVal = typename KeyGetter::MappedType;
++                std::vector<const MapTypeVal *> a_map_type_vector;
++                a_map_type_vector.emplace_back();
++                return joinRightColumnsSwitchNullability<KIND, STRICTNESS, KeyGetter>(
++                        std::move(key_getter_vector), a_map_type_vector, added_columns, used_flags);
++            }
++            throw Exception(ErrorCodes::UNSUPPORTED_JOIN_KEYS, "Unsupported JOIN keys. Type: {}", type);
++        }
+     #define M(TYPE) \
+         case HashJoin::Type::TYPE: \
+             {                                                           \
+             using MapTypeVal = const typename std::remove_reference_t<decltype(Maps::TYPE)>::element_type; \
+             using KeyGetter = typename KeyGetterForType<HashJoin::Type::TYPE, MapTypeVal>::Type; \
+-            std::vector<const MapTypeVal*> a_map_type_vector(mapv.size()); \
++            std::vector<const MapTypeVal *> a_map_type_vector(mapv.size()); \
+             std::vector<KeyGetter> key_getter_vector;                     \
+             for (size_t d = 0; d < added_columns.join_on_keys.size(); ++d)                   \
+             {       \
+@@ -1393,7 +1429,7 @@ IColumn::Filter switchJoinRightColumns(
+     #undef M
+ 
+         default:
+-            throw Exception("Unsupported JOIN keys. Type: " + toString(static_cast<UInt32>(type)), ErrorCodes::UNSUPPORTED_JOIN_KEYS);
++            throw Exception(ErrorCodes::UNSUPPORTED_JOIN_KEYS, "Unsupported JOIN keys (type: {})", type);
+     }
+ }
+ 
+@@ -1828,7 +1864,7 @@ class NotJoinedHash final : public NotJoinedBlocks::RightColumnsFiller
+ {
+ public:
+     NotJoinedHash(const HashJoin & parent_, UInt64 max_block_size_)
+-        : parent(parent_), max_block_size(max_block_size_)
++        : parent(parent_), max_block_size(max_block_size_), current_block_start(0)
+     {}
+ 
+     Block getEmptyBlock() override { return parent.savedBlockSample().cloneEmpty(); }
+@@ -1836,13 +1872,20 @@ class NotJoinedHash final : public NotJoinedBlocks::RightColumnsFiller
+     size_t fillColumns(MutableColumns & columns_right) override
+     {
+         size_t rows_added = 0;
+-        auto fill_callback = [&](auto, auto strictness, auto & map)
++        if (unlikely(parent.data->type == HashJoin::Type::EMPTY))
++        {
++            rows_added = fillColumnsFromData(parent.data->blocks, columns_right);
++        }
++        else
+         {
+-            rows_added = fillColumnsFromMap<strictness>(map, columns_right);
+-        };
++            auto fill_callback = [&](auto, auto strictness, auto & map)
++            {
++                rows_added = fillColumnsFromMap<strictness>(map, columns_right);
++            };
+ 
+-        if (!joinDispatch(parent.kind, parent.strictness, parent.data->maps.front(), fill_callback))
+-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown JOIN strictness '{}' (must be on of: ANY, ALL, ASOF)", parent.strictness);
++            if (!joinDispatch(parent.kind, parent.strictness, parent.data->maps.front(), fill_callback))
++                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown JOIN strictness '{}' (must be on of: ANY, ALL, ASOF)", parent.strictness);
++        }
+ 
+         if constexpr (!multiple_disjuncts)
+         {
+@@ -1856,10 +1899,48 @@ class NotJoinedHash final : public NotJoinedBlocks::RightColumnsFiller
+     const HashJoin & parent;
+     UInt64 max_block_size;
+ 
++    size_t current_block_start;
++
+     std::any position;
+     std::optional<HashJoin::BlockNullmapList::const_iterator> nulls_position;
+     std::optional<BlocksList::const_iterator> used_position;
+ 
++    size_t fillColumnsFromData(const BlocksList & blocks, MutableColumns & columns_right)
++    {
++        if (!position.has_value())
++            position = std::make_any<BlocksList::const_iterator>(blocks.begin());
++
++        auto & block_it = std::any_cast<BlocksList::const_iterator &>(position);
++        auto end = blocks.end();
++
++        size_t rows_added = 0;
++        for (; block_it != end; ++block_it)
++        {
++            size_t rows_from_block = std::min<size_t>(max_block_size - rows_added, block_it->rows() - current_block_start);
++            for (size_t j = 0; j < columns_right.size(); ++j)
++            {
++                const auto & col = block_it->getByPosition(j).column;
++                columns_right[j]->insertRangeFrom(*col, current_block_start, rows_from_block);
++            }
++            rows_added += rows_from_block;
++
++            if (rows_added >= max_block_size)
++            {
++                /// How many rows have been read
++                current_block_start += rows_from_block;
++                if (block_it->rows() <= current_block_start)
++                {
++                    /// current block was fully read
++                    ++block_it;
++                    current_block_start = 0;
++                }
++                break;
++            }
++            current_block_start = 0;
++        }
++        return rows_added;
++    }
++
+     template <ASTTableJoin::Strictness STRICTNESS, typename Maps>
+     size_t fillColumnsFromMap(const Maps & maps, MutableColumns & columns_keys_and_right)
+     {
+@@ -1871,8 +1952,7 @@ class NotJoinedHash final : public NotJoinedBlocks::RightColumnsFiller
+             APPLY_FOR_JOIN_VARIANTS(M)
+         #undef M
+             default:
+-                throw Exception("Unsupported JOIN keys. Type: " + toString(static_cast<UInt32>(parent.data->type)),
+-                                ErrorCodes::UNSUPPORTED_JOIN_KEYS);
++                throw Exception(ErrorCodes::UNSUPPORTED_JOIN_KEYS, "Unsupported JOIN keys (type: {})", parent.data->type)   ;
+         }
+ 
+         __builtin_unreachable();
+diff --git a/src/Interpreters/HashJoin.h b/src/Interpreters/HashJoin.h
+index f41f63a6a55a..50c8b2c55ee6 100644
+--- a/src/Interpreters/HashJoin.h
++++ b/src/Interpreters/HashJoin.h
+@@ -231,6 +231,7 @@ class HashJoin : public IJoin
+     template <typename Mapped>
+     struct MapsTemplate
+     {
++        using MappedType = Mapped;
+         std::unique_ptr<FixedHashMap<UInt8, Mapped>>                  key8;
+         std::unique_ptr<FixedHashMap<UInt16, Mapped>>                 key16;
+         std::unique_ptr<HashMap<UInt32, Mapped, HashCRC32<UInt32>>>   key32;
+@@ -411,7 +412,7 @@ class HashJoin : public IJoin
+ 
+     void joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) const;
+ 
+-    static Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & key_sizes);
++    static Type chooseMethod(ASTTableJoin::Kind kind, const ColumnRawPtrs & key_columns, Sizes & key_sizes);
+ 
+     bool empty() const;
+     bool overDictionary() const;
+diff --git a/src/Interpreters/TableJoin.cpp b/src/Interpreters/TableJoin.cpp
+index ad16cc5af7f1..e657bf38e494 100644
+--- a/src/Interpreters/TableJoin.cpp
++++ b/src/Interpreters/TableJoin.cpp
+@@ -108,6 +108,16 @@ TableJoin::TableJoin(const Settings & settings, VolumePtr tmp_volume_)
+ {
+ }
+ 
++void TableJoin::resetKeys()
++{
++    clauses.clear();
++
++    key_asts_left.clear();
++    key_asts_right.clear();
++    left_type_map.clear();
++    right_type_map.clear();
++}
++
+ void TableJoin::resetCollected()
+ {
+     clauses.clear();
+@@ -224,6 +234,13 @@ Names TableJoin::requiredJoinedNames() const
+     for (const auto & joined_column : columns_added_by_join)
+         required_columns_set.insert(joined_column.name);
+ 
++    /*
++     * In case of `SELECT count() FROM ... JOIN .. ON NULL` required columns set for right table is empty.
++     * But we have to get at least one column from right table to know the number of rows.
++     */
++    if (required_columns_set.empty() && !columns_from_joined_table.empty())
++        return {columns_from_joined_table.begin()->name};
++
+     return Names(required_columns_set.begin(), required_columns_set.end());
+ }
+ 
+@@ -352,9 +369,7 @@ bool TableJoin::sameStrictnessAndKind(ASTTableJoin::Strictness strictness_, ASTT
+ 
+ bool TableJoin::oneDisjunct() const
+ {
+-    if (!isCrossOrComma(kind()))
+-        assert(!clauses.empty());
+-    return clauses.size() <= 1;
++    return clauses.size() == 1;
+ }
+ 
+ bool TableJoin::allowMergeJoin() const
+@@ -650,4 +665,10 @@ void TableJoin::assertHasOneOnExpr() const
+     }
+ }
+ 
++void TableJoin::resetToCross()
++{
++    this->resetKeys();
++    this->table_join.kind = ASTTableJoin::Kind::Cross;
++}
++
+ }
+diff --git a/src/Interpreters/TableJoin.h b/src/Interpreters/TableJoin.h
+index 7cd53442ffd7..956fed99fb87 100644
+--- a/src/Interpreters/TableJoin.h
++++ b/src/Interpreters/TableJoin.h
+@@ -48,7 +48,6 @@ enum class JoinTableSide
+ 
+ class TableJoin
+ {
+-
+ public:
+     using NameToTypeMap = std::unordered_map<String, DataTypePtr>;
+ 
+@@ -285,6 +284,10 @@ class TableJoin
+     Block getRequiredRightKeys(const Block & right_table_keys, std::vector<String> & keys_sources) const;
+ 
+     String renamedRightColumnName(const String & name) const;
++
++    void resetKeys();
++    void resetToCross();
++
+     std::unordered_map<String, String> leftToRightKeyRemap() const;
+ 
+     void setStorageJoin(std::shared_ptr<StorageJoin> storage);
+diff --git a/src/Interpreters/TreeRewriter.cpp b/src/Interpreters/TreeRewriter.cpp
+index 571958a1f79b..ef8446eb4b94 100644
+--- a/src/Interpreters/TreeRewriter.cpp
++++ b/src/Interpreters/TreeRewriter.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <Core/Settings.h>
+ #include <Core/NamesAndTypes.h>
+ 
+@@ -22,6 +23,7 @@
+ #include <Interpreters/getTableExpressions.h>
+ #include <Interpreters/TreeOptimizer.h>
+ #include <Interpreters/replaceAliasColumnsInQuery.h>
++#include <Interpreters/evaluateConstantExpression.h>
+ #include <Interpreters/PredicateExpressionsOptimizer.h>
+ 
+ #include <Parsers/ASTExpressionList.h>
+@@ -33,6 +35,8 @@
+ 
+ #include <DataTypes/NestedUtils.h>
+ #include <DataTypes/DataTypeNullable.h>
++#include <DataTypes/DataTypeLowCardinality.h>
++#include <DataTypes/DataTypesNumber.h>
+ 
+ #include <IO/WriteHelpers.h>
+ #include <Storages/IStorage.h>
+@@ -564,9 +568,68 @@ void setJoinStrictness(ASTSelectQuery & select_query, JoinStrictness join_defaul
+     out_table_join = table_join;
+ }
+ 
++/// Evaluate expression and return boolean value if it can be interpreted as bool.
++/// Only UInt8 or NULL are allowed.
++/// Returns `false` for 0 or NULL values, `true` for any non-negative value.
++std::optional<bool> tryEvaluateConstCondition(ASTPtr expr, ContextPtr context)
++{
++    if (!expr)
++        return {};
++
++    Field eval_res;
++    DataTypePtr eval_res_type;
++    try
++    {
++        std::tie(eval_res, eval_res_type) = evaluateConstantExpression(expr, context);
++    }
++    catch (DB::Exception &)
++    {
++        /// not a constant expression
++        return {};
++    }
++    /// UInt8, maybe Nullable, maybe LowCardinality, and NULL are allowed
++    eval_res_type = removeNullable(removeLowCardinality(eval_res_type));
++    if (auto which = WhichDataType(eval_res_type); !which.isUInt8() && !which.isNothing())
++        return {};
++
++    if (eval_res.isNull())
++        return false;
++
++    UInt8 res = eval_res.template safeGet<UInt8>();
++    return res > 0;
++}
++
++bool tryJoinOnConst(TableJoin & analyzed_join, ASTPtr & on_expression, ContextPtr context)
++{
++    bool join_on_value;
++    if (auto eval_const_res = tryEvaluateConstCondition(on_expression, context))
++        join_on_value = *eval_const_res;
++    else
++        return false;
++
++    if (!analyzed_join.forceHashJoin())
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++                        "JOIN ON constant ({}) supported only with join algorithm 'hash'",
++                        queryToString(on_expression));
++
++    on_expression = nullptr;
++    if (join_on_value)
++    {
++        LOG_DEBUG(&Poco::Logger::get("TreeRewriter"), "Join on constant executed as cross join");
++        analyzed_join.resetToCross();
++    }
++    else
++    {
++        LOG_DEBUG(&Poco::Logger::get("TreeRewriter"), "Join on constant executed as empty join");
++        analyzed_join.resetKeys();
++    }
++
++    return true;
++}
++
+ /// Find the columns that are obtained by JOIN.
+-void collectJoinedColumns(TableJoin & analyzed_join, const ASTTableJoin & table_join,
+-                          const TablesWithColumns & tables, const Aliases & aliases)
++void collectJoinedColumns(TableJoin & analyzed_join, ASTTableJoin & table_join,
++                          const TablesWithColumns & tables, const Aliases & aliases, ContextPtr context)
+ {
+     assert(tables.size() >= 2);
+ 
+@@ -599,29 +662,41 @@ void collectJoinedColumns(TableJoin & analyzed_join, const ASTTableJoin & table_
+             assert(analyzed_join.oneDisjunct());
+         }
+ 
+-        if (analyzed_join.getClauses().empty())
+-                throw DB::Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+-                                    "Cannot get JOIN keys from JOIN ON section: '{}'",
+-                                    queryToString(table_join.on_expression));
++        auto check_keys_empty = [] (auto e) { return e.key_names_left.empty(); };
+ 
+-        for (const auto & onexpr : analyzed_join.getClauses())
++        /// All clauses should to have keys or be empty simultaneously
++        bool all_keys_empty = std::all_of(analyzed_join.getClauses().begin(), analyzed_join.getClauses().end(), check_keys_empty);
++        if (all_keys_empty)
++        {
++            /// Try join on constant (cross or empty join) or fail
++            if (is_asof)
++                throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
++                                "Cannot get JOIN keys from JOIN ON section: {}", queryToString(table_join.on_expression));
++
++            bool join_on_const_ok = tryJoinOnConst(analyzed_join, table_join.on_expression, context);
++            if (!join_on_const_ok)
++                throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
++                                "Cannot get JOIN keys from JOIN ON section: {}", queryToString(table_join.on_expression));
++        }
++        else
+         {
+-            if (onexpr.key_names_left.empty())
++            bool any_keys_empty = std::any_of(analyzed_join.getClauses().begin(), analyzed_join.getClauses().end(), check_keys_empty);
++
++            if (any_keys_empty)
+                 throw DB::Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+                                     "Cannot get JOIN keys from JOIN ON section: '{}'",
+                                     queryToString(table_join.on_expression));
+-        }
+ 
+-        if (is_asof)
+-        {
+-            if (!analyzed_join.oneDisjunct())
+-                throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "ASOF join doesn't support multiple ORs for keys in JOIN ON section");
+-            data.asofToJoinKeys();
+-        }
+-
+-        if (!analyzed_join.oneDisjunct() && !analyzed_join.forceHashJoin())
+-            throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Only `hash` join supports multiple ORs for keys in JOIN ON section");
++            if (is_asof)
++            {
++                if (!analyzed_join.oneDisjunct())
++                    throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "ASOF join doesn't support multiple ORs for keys in JOIN ON section");
++                data.asofToJoinKeys();
++            }
+ 
++            if (!analyzed_join.oneDisjunct() && !analyzed_join.forceHashJoin())
++                throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Only `hash` join supports multiple ORs for keys in JOIN ON section");
++        }
+     }
+ }
+ 
+@@ -1052,7 +1127,7 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
+ 
+     auto * table_join_ast = select_query->join() ? select_query->join()->table_join->as<ASTTableJoin>() : nullptr;
+     if (table_join_ast && tables_with_columns.size() >= 2)
+-        collectJoinedColumns(*result.analyzed_join, *table_join_ast, tables_with_columns, result.aliases);
++        collectJoinedColumns(*result.analyzed_join, *table_join_ast, tables_with_columns, result.aliases, getContext());
+ 
+     result.aggregates = getAggregates(query, *select_query);
+     result.window_function_asts = getWindowFunctions(query, *select_query);
+diff --git a/src/Interpreters/join_common.cpp b/src/Interpreters/join_common.cpp
+index bf5d30437ec1..f123435b5fed 100644
+--- a/src/Interpreters/join_common.cpp
++++ b/src/Interpreters/join_common.cpp
+@@ -580,11 +580,10 @@ NotJoinedBlocks::NotJoinedBlocks(std::unique_ptr<RightColumnsFiller> filler_,
+     }
+ 
+     if (column_indices_left.size() + column_indices_right.size() + same_result_keys.size() != result_sample_block.columns())
+-        throw Exception("Error in columns mapping in RIGHT|FULL JOIN. Left: " + toString(column_indices_left.size()) +
+-                        ", right: " + toString(column_indices_right.size()) +
+-                        ", same: " + toString(same_result_keys.size()) +
+-                        ", result: " + toString(result_sample_block.columns()),
+-                        ErrorCodes::LOGICAL_ERROR);
++        throw Exception(ErrorCodes::LOGICAL_ERROR,
++                        "Error in columns mapping in RIGHT|FULL JOIN. Left: {}, right: {}, same: {}, result: {}",
++                        column_indices_left.size(), column_indices_right.size(),
++                        same_result_keys.size(), result_sample_block.columns());
+ }
+ 
+ void NotJoinedBlocks::setRightIndex(size_t right_pos, size_t result_position)

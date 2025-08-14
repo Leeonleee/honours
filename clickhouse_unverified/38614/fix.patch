@@ -1,0 +1,1165 @@
+diff --git a/src/Common/CurrentThread.cpp b/src/Common/CurrentThread.cpp
+index e54b2c8abe4e..a176a19673b4 100644
+--- a/src/Common/CurrentThread.cpp
++++ b/src/Common/CurrentThread.cpp
+@@ -40,7 +40,7 @@ ThreadStatus & CurrentThread::get()
+ 
+ ProfileEvents::Counters & CurrentThread::getProfileEvents()
+ {
+-    return current_thread ? current_thread->performance_counters : ProfileEvents::global_counters;
++    return current_thread ? *current_thread->current_performance_counters : ProfileEvents::global_counters;
+ }
+ 
+ void CurrentThread::updateProgressIn(const Progress & value)
+diff --git a/src/Common/CurrentThread.h b/src/Common/CurrentThread.h
+index cbe60365798d..c07b34acae3a 100644
+--- a/src/Common/CurrentThread.h
++++ b/src/Common/CurrentThread.h
+@@ -92,7 +92,7 @@ class CurrentThread
+     static void detachQueryIfNotDetached();
+ 
+     /// Initializes query with current thread as master thread in constructor, and detaches it in destructor
+-    struct QueryScope
++    struct QueryScope : private boost::noncopyable
+     {
+         explicit QueryScope(ContextMutablePtr query_context);
+         explicit QueryScope(ContextPtr query_context);
+diff --git a/src/Common/ProfileEventsScope.cpp b/src/Common/ProfileEventsScope.cpp
+new file mode 100644
+index 000000000000..92f75f4f5b0f
+--- /dev/null
++++ b/src/Common/ProfileEventsScope.cpp
+@@ -0,0 +1,32 @@
++#include <Common/ProfileEventsScope.h>
++
++namespace DB
++{
++
++
++ProfileEventsScope::ProfileEventsScope()
++    : performance_counters_holder(std::make_unique<ProfileEvents::Counters>())
++    , performance_counters_scope(performance_counters_holder.get())
++    , previous_counters_scope(CurrentThread::get().attachProfileCountersScope(performance_counters_scope))
++{
++}
++
++ProfileEventsScope::ProfileEventsScope(ProfileEvents::Counters * performance_counters_scope_)
++    : performance_counters_scope(performance_counters_scope_)
++    , previous_counters_scope(CurrentThread::get().attachProfileCountersScope(performance_counters_scope))
++{
++}
++
++std::shared_ptr<ProfileEvents::Counters::Snapshot> ProfileEventsScope::getSnapshot()
++{
++    return std::make_shared<ProfileEvents::Counters::Snapshot>(performance_counters_scope->getPartiallyAtomicSnapshot());
++}
++
++ProfileEventsScope::~ProfileEventsScope()
++{
++    /// Restore previous performance counters
++    CurrentThread::get().attachProfileCountersScope(previous_counters_scope);
++}
++
++
++}
+diff --git a/src/Common/ProfileEventsScope.h b/src/Common/ProfileEventsScope.h
+new file mode 100644
+index 000000000000..0444531d02b0
+--- /dev/null
++++ b/src/Common/ProfileEventsScope.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <Common/ProfileEvents.h>
++#include <Common/CurrentThread.h>
++
++namespace DB
++{
++
++/// Use specific performance counters for current thread in the current scope.
++class ProfileEventsScope : private boost::noncopyable
++{
++public:
++    /// Counters are owned by this object.
++    ProfileEventsScope();
++
++    /// Shared counters are stored outside.
++    /// Useful when we calculate metrics entering into some scope several times.
++    explicit ProfileEventsScope(ProfileEvents::Counters * performance_counters_scope_);
++
++    std::shared_ptr<ProfileEvents::Counters::Snapshot> getSnapshot();
++
++    ~ProfileEventsScope();
++
++private:
++    /// If set, then performance_counters_scope is owned by this object.
++    /// Otherwise, counters are passed to the constructor from outside.
++    std::unique_ptr<ProfileEvents::Counters> performance_counters_holder;
++
++    ProfileEvents::Counters * performance_counters_scope;
++    ProfileEvents::Counters * previous_counters_scope;
++};
++
++
++}
++
+diff --git a/src/Common/ThreadStatus.h b/src/Common/ThreadStatus.h
+index 69c5732ddb6e..20550a633121 100644
+--- a/src/Common/ThreadStatus.h
++++ b/src/Common/ThreadStatus.h
+@@ -124,6 +124,10 @@ class ThreadStatus : public boost::noncopyable
+ 
+     /// TODO: merge them into common entity
+     ProfileEvents::Counters performance_counters{VariableContext::Thread};
++
++    /// Points to performance_counters by default.
++    /// Could be changed to point to another object to calculate performance counters for some narrow scope.
++    ProfileEvents::Counters * current_performance_counters{&performance_counters};
+     MemoryTracker memory_tracker{VariableContext::Thread};
+ 
+     /// Small amount of untracked memory (per thread atomic-less counter)
+@@ -139,6 +143,7 @@ class ThreadStatus : public boost::noncopyable
+     Deleter deleter;
+ 
+ protected:
++    /// Group of threads, to which this thread attached
+     ThreadGroupStatusPtr thread_group;
+ 
+     std::atomic<int> thread_state{ThreadState::DetachedFromQuery};
+@@ -244,6 +249,10 @@ class ThreadStatus : public boost::noncopyable
+     /// Attaches slave thread to existing thread group
+     void attachQuery(const ThreadGroupStatusPtr & thread_group_, bool check_detached = true);
+ 
++    /// Returns pointer to the current profile counters to restore them back.
++    /// Note: consequent call with new scope will detach previous scope.
++    ProfileEvents::Counters * attachProfileCountersScope(ProfileEvents::Counters * performance_counters_scope);
++
+     InternalTextLogsQueuePtr getInternalTextLogsQueue() const
+     {
+         return thread_state == Died ? nullptr : logs_queue_ptr.lock();
+diff --git a/src/Interpreters/PartLog.cpp b/src/Interpreters/PartLog.cpp
+index 4a1349680fd8..376501967839 100644
+--- a/src/Interpreters/PartLog.cpp
++++ b/src/Interpreters/PartLog.cpp
+@@ -11,6 +11,9 @@
+ #include <Storages/MergeTree/MergeTreeData.h>
+ #include <Interpreters/PartLog.h>
+ #include <Interpreters/Context.h>
++#include <Interpreters/ProfileEventsExt.h>
++#include <Common/ProfileEvents.h>
++#include <DataTypes/DataTypeMap.h>
+ 
+ #include <Common/CurrentThread.h>
+ 
+@@ -121,6 +124,17 @@ NamesAndTypesList PartLogElement::getNamesAndTypes()
+         /// Is there an error during the execution or commit
+         {"error", std::make_shared<DataTypeUInt16>()},
+         {"exception", std::make_shared<DataTypeString>()},
++
++        {"ProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
++    };
++}
++
++NamesAndAliases PartLogElement::getNamesAndAliases()
++{
++    return
++    {
++        {"ProfileEvents.Names", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapKeys(ProfileEvents)"},
++        {"ProfileEvents.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())}, "mapValues(ProfileEvents)"},
+     };
+ }
+ 
+@@ -163,18 +177,20 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
+ 
+     columns[i++]->insert(error);
+     columns[i++]->insert(exception);
+-}
+ 
+-
+-bool PartLog::addNewPart(
+-    ContextPtr current_context, const MutableDataPartPtr & part, UInt64 elapsed_ns, const ExecutionStatus & execution_status)
+-{
+-    return addNewParts(current_context, {part}, elapsed_ns, execution_status);
++    if (profile_counters)
++    {
++        auto * column = columns[i++].get();
++        ProfileEvents::dumpToMapColumn(*profile_counters, column, true);
++    }
++    else
++    {
++        columns[i++]->insertDefault();
++    }
+ }
+ 
+-
+ bool PartLog::addNewParts(
+-    ContextPtr current_context, const PartLog::MutableDataPartsVector & parts, UInt64 elapsed_ns, const ExecutionStatus & execution_status)
++    ContextPtr current_context, const PartLog::PartLogEntries & parts, const ExecutionStatus & execution_status)
+ {
+     if (parts.empty())
+         return true;
+@@ -183,15 +199,17 @@ bool PartLog::addNewParts(
+ 
+     try
+     {
+-        auto table_id = parts.front()->storage.getStorageID();
++        auto table_id = parts.front().part->storage.getStorageID();
+         part_log = current_context->getPartLog(table_id.database_name); // assume parts belong to the same table
+         if (!part_log)
+             return false;
+ 
+         auto query_id = CurrentThread::getQueryId();
+ 
+-        for (const auto & part : parts)
++        for (const auto & part_log_entry : parts)
+         {
++            const auto & part = part_log_entry.part;
++
+             PartLogElement elem;
+ 
+             if (!query_id.empty())
+@@ -204,7 +222,7 @@ bool PartLog::addNewParts(
+             const auto time_now = std::chrono::system_clock::now();
+             elem.event_time = timeInSeconds(time_now);
+             elem.event_time_microseconds = timeInMicroseconds(time_now);
+-            elem.duration_ms = elapsed_ns / 1000000;
++            elem.duration_ms = part_log_entry.elapsed_ns / 1000000;
+ 
+             elem.database_name = table_id.database_name;
+             elem.table_name = table_id.table_name;
+@@ -221,6 +239,8 @@ bool PartLog::addNewParts(
+             elem.error = static_cast<UInt16>(execution_status.code);
+             elem.exception = execution_status.message;
+ 
++            elem.profile_counters = part_log_entry.profile_counters;
++
+             part_log->add(elem);
+         }
+     }
+@@ -233,4 +253,21 @@ bool PartLog::addNewParts(
+     return true;
+ }
+ 
++bool PartLog::addNewPart(ContextPtr context, const PartLog::PartLogEntry & part, const ExecutionStatus & execution_status)
++{
++    return addNewParts(context, {part}, execution_status);
++}
++
++
++PartLog::PartLogEntries PartLog::createPartLogEntries(const MutableDataPartsVector & parts, UInt64 elapsed_ns, ProfileCountersSnapshotPtr profile_counters)
++{
++    PartLogEntries part_log_entries;
++    part_log_entries.reserve(parts.size());
++
++    for (const auto & part : parts)
++        part_log_entries.emplace_back(part, elapsed_ns, profile_counters);
++
++    return part_log_entries;
++}
++
+ }
+diff --git a/src/Interpreters/PartLog.h b/src/Interpreters/PartLog.h
+index 392e76d85d12..843792d03a9a 100644
+--- a/src/Interpreters/PartLog.h
++++ b/src/Interpreters/PartLog.h
+@@ -8,6 +8,10 @@
+ #include <Storages/MergeTree/MergeType.h>
+ #include <Storages/MergeTree/MergeAlgorithm.h>
+ 
++namespace ProfileEvents
++{
++    class Counters;
++}
+ 
+ namespace DB
+ {
+@@ -81,13 +85,15 @@ struct PartLogElement
+     UInt16 error = 0;
+     String exception;
+ 
++    std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters;
++
+     static std::string name() { return "PartLog"; }
+ 
+     static MergeReasonType getMergeReasonType(MergeType merge_type);
+     static PartMergeAlgorithm getMergeAlgorithm(MergeAlgorithm merge_algorithm_);
+ 
+     static NamesAndTypesList getNamesAndTypes();
+-    static NamesAndAliases getNamesAndAliases() { return {}; }
++    static NamesAndAliases getNamesAndAliases();
+     void appendToBlock(MutableColumns & columns) const;
+     static const char * getCustomColumnList() { return nullptr; }
+ };
+@@ -103,11 +109,37 @@ class PartLog : public SystemLog<PartLogElement>
+     using MutableDataPartPtr = std::shared_ptr<IMergeTreeDataPart>;
+     using MutableDataPartsVector = std::vector<MutableDataPartPtr>;
+ 
++    using ProfileCountersSnapshotPtr = std::shared_ptr<ProfileEvents::Counters::Snapshot>;
++
+ public:
++    struct PartLogEntry
++    {
++        std::shared_ptr<IMergeTreeDataPart> part;
++        ProfileCountersSnapshotPtr profile_counters;
++        UInt64 elapsed_ns;
++
++        PartLogEntry(std::shared_ptr<IMergeTreeDataPart> part_, UInt64 elapsed_ns_)
++            : part(std::move(part_)), elapsed_ns(elapsed_ns_)
++        {
++        }
++
++        PartLogEntry(std::shared_ptr<IMergeTreeDataPart> part_, UInt64 elapsed_ns_, ProfileCountersSnapshotPtr profile_counters_)
++            : part(std::move(part_))
++            , profile_counters(std::move(profile_counters_))
++            , elapsed_ns(elapsed_ns_)
++        {
++        }
++    };
++
++    using PartLogEntries = std::vector<PartLogEntry>;
++
++    static PartLogEntries createPartLogEntries(const MutableDataPartsVector & parts, UInt64 elapsed_ns, ProfileCountersSnapshotPtr profile_counters = {});
++
+     /// Add a record about creation of new part.
+-    static bool addNewPart(ContextPtr context, const MutableDataPartPtr & part, UInt64 elapsed_ns,
++    static bool addNewPart(ContextPtr context, const PartLogEntry & part,
+                            const ExecutionStatus & execution_status = {});
+-    static bool addNewParts(ContextPtr context, const MutableDataPartsVector & parts, UInt64 elapsed_ns,
++
++    static bool addNewParts(ContextPtr context, const PartLogEntries & parts,
+                             const ExecutionStatus & execution_status = {});
+ };
+ 
+diff --git a/src/Interpreters/ThreadStatusExt.cpp b/src/Interpreters/ThreadStatusExt.cpp
+index 816b03f3a0e0..84400fc37118 100644
+--- a/src/Interpreters/ThreadStatusExt.cpp
++++ b/src/Interpreters/ThreadStatusExt.cpp
+@@ -161,6 +161,23 @@ void ThreadStatus::attachQuery(const ThreadGroupStatusPtr & thread_group_, bool
+     setupState(thread_group_);
+ }
+ 
++ProfileEvents::Counters * ThreadStatus::attachProfileCountersScope(ProfileEvents::Counters * performance_counters_scope)
++{
++    ProfileEvents::Counters * prev_counters = current_performance_counters;
++
++    if (current_performance_counters == performance_counters_scope)
++        /// Allow to attach the same scope multiple times
++        return prev_counters;
++
++    /// Avoid cycles when exiting local scope and attaching back to current thread counters
++    if (performance_counters_scope != &performance_counters)
++        performance_counters_scope->setParent(&performance_counters);
++
++    current_performance_counters = performance_counters_scope;
++
++    return prev_counters;
++}
++
+ void ThreadStatus::initPerformanceCounters()
+ {
+     performance_counters_finalized = false;
+diff --git a/src/Storages/MergeTree/MergeFromLogEntryTask.cpp b/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
+index 2d2013bd6485..a4e5b1f05751 100644
+--- a/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
++++ b/src/Storages/MergeTree/MergeFromLogEntryTask.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <Common/logger_useful.h>
+ #include <Common/ProfileEvents.h>
++#include <Common/ProfileEventsScope.h>
+ #include <Storages/StorageReplicatedMergeTree.h>
+ 
+ namespace ProfileEvents
+@@ -289,9 +290,10 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
+ 
+     return {true, true, [this, stopwatch = *stopwatch_ptr] (const ExecutionStatus & execution_status)
+     {
++        auto profile_counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(profile_counters.getPartiallyAtomicSnapshot());
+         storage.writePartLog(
+             PartLogElement::MERGE_PARTS, execution_status, stopwatch.elapsed(),
+-            entry.new_part_name, part, parts, merge_mutate_entry.get());
++            entry.new_part_name, part, parts, merge_mutate_entry.get(), std::move(profile_counters_snapshot));
+     }};
+ }
+ 
+diff --git a/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp b/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
+index 9f24839f1e16..855b93dc90ee 100644
+--- a/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
++++ b/src/Storages/MergeTree/MergePlainMergeTreeTask.cpp
+@@ -3,6 +3,7 @@
+ #include <Storages/MergeTree/MergeTreeData.h>
+ #include <Storages/StorageMergeTree.h>
+ #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
++#include <Common/ProfileEventsScope.h>
+ 
+ namespace DB
+ {
+@@ -27,6 +28,9 @@ void MergePlainMergeTreeTask::onCompleted()
+ 
+ bool MergePlainMergeTreeTask::executeStep()
+ {
++    /// Metrics will be saved in the thread_group.
++    ProfileEventsScope profile_events_scope(&profile_counters);
++
+     /// Make out memory tracker a parent of current thread memory tracker
+     MemoryTrackerThreadSwitcherPtr switcher;
+     if (merge_list_entry)
+@@ -85,6 +89,7 @@ void MergePlainMergeTreeTask::prepare()
+ 
+     write_part_log = [this] (const ExecutionStatus & execution_status)
+     {
++        auto profile_counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(profile_counters.getPartiallyAtomicSnapshot());
+         merge_task.reset();
+         storage.writePartLog(
+             PartLogElement::MERGE_PARTS,
+@@ -93,7 +98,8 @@ void MergePlainMergeTreeTask::prepare()
+             future_part->name,
+             new_part,
+             future_part->parts,
+-            merge_list_entry.get());
++            merge_list_entry.get(),
++            std::move(profile_counters_snapshot));
+     };
+ 
+     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
+diff --git a/src/Storages/MergeTree/MergePlainMergeTreeTask.h b/src/Storages/MergeTree/MergePlainMergeTreeTask.h
+index d84db36bac2a..eb659bf38ec8 100644
+--- a/src/Storages/MergeTree/MergePlainMergeTreeTask.h
++++ b/src/Storages/MergeTree/MergePlainMergeTreeTask.h
+@@ -6,6 +6,7 @@
+ #include <Storages/MergeTree/MergeMutateSelectedEntry.h>
+ #include <Interpreters/MergeTreeTransactionHolder.h>
+ 
++
+ namespace DB
+ {
+ 
+@@ -46,7 +47,6 @@ class MergePlainMergeTreeTask : public IExecutableTask
+     }
+ 
+ private:
+-
+     void prepare();
+     void finish();
+ 
+@@ -82,6 +82,8 @@ class MergePlainMergeTreeTask : public IExecutableTask
+ 
+     MergeTreeTransactionHolder txn_holder;
+     MergeTreeTransactionPtr txn;
++
++    ProfileEvents::Counters profile_counters;
+ };
+ 
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeBackgroundExecutor.h b/src/Storages/MergeTree/MergeTreeBackgroundExecutor.h
+index 5c1178a1bc1d..cf4d4b08c4d5 100644
+--- a/src/Storages/MergeTree/MergeTreeBackgroundExecutor.h
++++ b/src/Storages/MergeTree/MergeTreeBackgroundExecutor.h
+@@ -17,6 +17,7 @@
+ #include <base/defines.h>
+ #include <Storages/MergeTree/IExecutableTask.h>
+ 
++
+ namespace DB
+ {
+ namespace ErrorCodes
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index c3c4cd3082de..d13452c291ea 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -10,6 +10,7 @@
+ #include <Common/escapeForFileName.h>
+ #include <Common/Increment.h>
+ #include <Common/noexcept_scope.h>
++#include <Common/ProfileEventsScope.h>
+ #include <Common/quoteString.h>
+ #include <Common/scope_guard_safe.h>
+ #include <Common/SimpleIncrement.h>
+@@ -7280,7 +7281,8 @@ void MergeTreeData::writePartLog(
+     const String & new_part_name,
+     const DataPartPtr & result_part,
+     const DataPartsVector & source_parts,
+-    const MergeListEntry * merge_entry)
++    const MergeListEntry * merge_entry,
++    std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters)
+ try
+ {
+     auto table_id = getStorageID();
+@@ -7342,6 +7344,15 @@ try
+         part_log_elem.peak_memory_usage = (*merge_entry)->memory_tracker.getPeak();
+     }
+ 
++    if (profile_counters)
++    {
++        part_log_elem.profile_counters = profile_counters;
++    }
++    else
++    {
++        LOG_WARNING(log, "Profile counters are not set");
++    }
++
+     part_log->add(part_log_elem);
+ }
+ catch (...)
+@@ -7477,6 +7488,7 @@ bool MergeTreeData::moveParts(const CurrentlyMovingPartsTaggerPtr & moving_tagge
+     {
+         Stopwatch stopwatch;
+         MutableDataPartPtr cloned_part;
++        ProfileEventsScope profile_events_scope;
+ 
+         auto write_part_log = [&](const ExecutionStatus & execution_status)
+         {
+@@ -7487,7 +7499,8 @@ bool MergeTreeData::moveParts(const CurrentlyMovingPartsTaggerPtr & moving_tagge
+                 moving_part.part->name,
+                 cloned_part,
+                 {moving_part.part},
+-                nullptr);
++                nullptr,
++                profile_events_scope.getSnapshot());
+         };
+ 
+         // Register in global moves list (StorageSystemMoves)
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index 34bc3d24d663..10ba0045826b 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -1298,7 +1298,8 @@ class MergeTreeData : public IStorage, public WithMutableContext
+         const String & new_part_name,
+         const DataPartPtr & result_part,
+         const DataPartsVector & source_parts,
+-        const MergeListEntry * merge_entry);
++        const MergeListEntry * merge_entry,
++        std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters);
+ 
+     /// If part is assigned to merge or mutation (possibly replicated)
+     /// Should be overridden by children, because they can have different
+diff --git a/src/Storages/MergeTree/MergeTreeSink.cpp b/src/Storages/MergeTree/MergeTreeSink.cpp
+index 99f6b1855e44..1e607767f867 100644
+--- a/src/Storages/MergeTree/MergeTreeSink.cpp
++++ b/src/Storages/MergeTree/MergeTreeSink.cpp
+@@ -3,6 +3,7 @@
+ #include <Storages/StorageMergeTree.h>
+ #include <Interpreters/PartLog.h>
+ #include <DataTypes/ObjectUtils.h>
++#include <Common/ProfileEventsScope.h>
+ 
+ namespace ProfileEvents
+ {
+@@ -47,6 +48,7 @@ struct MergeTreeSink::DelayedChunk
+         MergeTreeDataWriter::TemporaryPart temp_part;
+         UInt64 elapsed_ns;
+         String block_dedup_token;
++        ProfileEvents::Counters part_counters;
+     };
+ 
+     std::vector<Partition> partitions;
+@@ -70,12 +72,18 @@ void MergeTreeSink::consume(Chunk chunk)
+ 
+     for (auto & current_block : part_blocks)
+     {
+-        Stopwatch watch;
+-        String block_dedup_token;
++        ProfileEvents::Counters part_counters;
+ 
+-        auto temp_part = storage.writer.writeTempPart(current_block, metadata_snapshot, context);
++        UInt64 elapsed_ns = 0;
++        MergeTreeDataWriter::TemporaryPart temp_part;
+ 
+-        UInt64 elapsed_ns = watch.elapsed();
++        {
++            ProfileEventsScope scoped_attach(&part_counters);
++
++            Stopwatch watch;
++            temp_part = storage.writer.writeTempPart(current_block, metadata_snapshot, context);
++            elapsed_ns = watch.elapsed();
++        }
+ 
+         /// If optimize_on_insert setting is true, current_block could become empty after merge
+         /// and we didn't create part.
+@@ -85,6 +93,7 @@ void MergeTreeSink::consume(Chunk chunk)
+         if (!support_parallel_write && temp_part.part->getDataPartStorage().supportParallelWrite())
+             support_parallel_write = true;
+ 
++        String block_dedup_token;
+         if (storage.getDeduplicationLog())
+         {
+             const String & dedup_token = settings.insert_deduplication_token;
+@@ -119,7 +128,8 @@ void MergeTreeSink::consume(Chunk chunk)
+         {
+             .temp_part = std::move(temp_part),
+             .elapsed_ns = elapsed_ns,
+-            .block_dedup_token = std::move(block_dedup_token)
++            .block_dedup_token = std::move(block_dedup_token),
++            .part_counters = std::move(part_counters),
+         });
+     }
+ 
+@@ -135,6 +145,8 @@ void MergeTreeSink::finishDelayedChunk()
+ 
+     for (auto & partition : delayed_chunk->partitions)
+     {
++        ProfileEventsScope scoped_attach(&partition.part_counters);
++
+         partition.temp_part.finalize();
+ 
+         auto & part = partition.temp_part.part;
+@@ -168,7 +180,8 @@ void MergeTreeSink::finishDelayedChunk()
+         /// Part can be deduplicated, so increment counters and add to part log only if it's really added
+         if (added)
+         {
+-            PartLog::addNewPart(storage.getContext(), part, partition.elapsed_ns);
++            auto counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(partition.part_counters.getPartiallyAtomicSnapshot());
++            PartLog::addNewPart(storage.getContext(), PartLog::PartLogEntry(part, partition.elapsed_ns, counters_snapshot));
+             storage.incrementInsertedPartsProfileEvent(part->getType());
+ 
+             /// Initiate async merge - it will be done if it's good time for merge and if there are space in 'background_pool'.
+diff --git a/src/Storages/MergeTree/MutateFromLogEntryTask.cpp b/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
+index b83c058f7fd3..4428f6c2bced 100644
+--- a/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
++++ b/src/Storages/MergeTree/MutateFromLogEntryTask.cpp
+@@ -184,9 +184,10 @@ ReplicatedMergeMutateTaskBase::PrepareResult MutateFromLogEntryTask::prepare()
+ 
+     return {true, true, [this] (const ExecutionStatus & execution_status)
+     {
++        auto profile_counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(profile_counters.getPartiallyAtomicSnapshot());
+         storage.writePartLog(
+             PartLogElement::MUTATE_PART, execution_status, stopwatch_ptr->elapsed(),
+-            entry.new_part_name, new_part, future_mutated_part->parts, merge_mutate_entry.get());
++            entry.new_part_name, new_part, future_mutated_part->parts, merge_mutate_entry.get(), std::move(profile_counters_snapshot));
+     }};
+ }
+ 
+diff --git a/src/Storages/MergeTree/MutatePlainMergeTreeTask.cpp b/src/Storages/MergeTree/MutatePlainMergeTreeTask.cpp
+index 76ba921b705b..9bd0f148d6cd 100644
+--- a/src/Storages/MergeTree/MutatePlainMergeTreeTask.cpp
++++ b/src/Storages/MergeTree/MutatePlainMergeTreeTask.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <Storages/StorageMergeTree.h>
+ #include <Interpreters/TransactionLog.h>
++#include <Common/ProfileEventsScope.h>
+ 
+ namespace DB
+ {
+@@ -38,6 +39,7 @@ void MutatePlainMergeTreeTask::prepare()
+ 
+     write_part_log = [this] (const ExecutionStatus & execution_status)
+     {
++        auto profile_counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(profile_counters.getPartiallyAtomicSnapshot());
+         mutate_task.reset();
+         storage.writePartLog(
+             PartLogElement::MUTATE_PART,
+@@ -46,7 +48,8 @@ void MutatePlainMergeTreeTask::prepare()
+             future_part->name,
+             new_part,
+             future_part->parts,
+-            merge_list_entry.get());
++            merge_list_entry.get(),
++            std::move(profile_counters_snapshot));
+     };
+ 
+     fake_query_context = Context::createCopy(storage.getContext());
+@@ -58,8 +61,12 @@ void MutatePlainMergeTreeTask::prepare()
+             time(nullptr), fake_query_context, merge_mutate_entry->txn, merge_mutate_entry->tagger->reserved_space, table_lock_holder);
+ }
+ 
++
+ bool MutatePlainMergeTreeTask::executeStep()
+ {
++    /// Metrics will be saved in the local profile_counters.
++    ProfileEventsScope profile_events_scope(&profile_counters);
++
+     /// Make out memory tracker a parent of current thread memory tracker
+     MemoryTrackerThreadSwitcherPtr switcher;
+     if (merge_list_entry)
+@@ -123,5 +130,4 @@ bool MutatePlainMergeTreeTask::executeStep()
+     return false;
+ }
+ 
+-
+ }
+diff --git a/src/Storages/MergeTree/MutatePlainMergeTreeTask.h b/src/Storages/MergeTree/MutatePlainMergeTreeTask.h
+index e2b019c08ce5..ae2ac039543e 100644
+--- a/src/Storages/MergeTree/MutatePlainMergeTreeTask.h
++++ b/src/Storages/MergeTree/MutatePlainMergeTreeTask.h
+@@ -9,6 +9,7 @@
+ #include <Storages/MutationCommands.h>
+ #include <Storages/MergeTree/MergeMutateSelectedEntry.h>
+ 
++
+ namespace DB
+ {
+ 
+@@ -76,6 +77,8 @@ class MutatePlainMergeTreeTask : public IExecutableTask
+ 
+     ContextMutablePtr fake_query_context;
+     MutateTaskPtr mutate_task;
++
++    ProfileEvents::Counters profile_counters;
+ };
+ 
+ 
+diff --git a/src/Storages/MergeTree/MutateTask.cpp b/src/Storages/MergeTree/MutateTask.cpp
+index 4a7224b0722b..43cf3d950b2b 100644
+--- a/src/Storages/MergeTree/MutateTask.cpp
++++ b/src/Storages/MergeTree/MutateTask.cpp
+@@ -20,6 +20,7 @@
+ #include <Storages/MutationCommands.h>
+ #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
+ #include <boost/algorithm/string/replace.hpp>
++#include <Common/ProfileEventsScope.h>
+ 
+ 
+ namespace CurrentMetrics
+@@ -898,6 +899,7 @@ class MergeProjectionPartsTask : public IExecutableTask
+         /// Need execute again
+         return true;
+     }
++
+ private:
+     String name;
+     MergeTreeData::MutableDataPartsVector parts;
+@@ -1253,6 +1255,7 @@ class MutateAllPartColumnsTask : public IExecutableTask
+     std::unique_ptr<PartMergerWriter> part_merger_writer_task;
+ };
+ 
++
+ class MutateSomePartColumnsTask : public IExecutableTask
+ {
+ public:
+diff --git a/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.cpp b/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.cpp
+index a22aab8d6cef..9ce7eb426668 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <Storages/StorageReplicatedMergeTree.h>
+ #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
++#include <Common/ProfileEventsScope.h>
+ 
+ 
+ namespace DB
+@@ -29,6 +30,9 @@ void ReplicatedMergeMutateTaskBase::onCompleted()
+ 
+ bool ReplicatedMergeMutateTaskBase::executeStep()
+ {
++    /// Metrics will be saved in the local profile_counters.
++    ProfileEventsScope profile_events_scope(&profile_counters);
++
+     std::exception_ptr saved_exception;
+ 
+     bool retryable_error = false;
+@@ -83,7 +87,6 @@ bool ReplicatedMergeMutateTaskBase::executeStep()
+         saved_exception = std::current_exception();
+     }
+ 
+-
+     if (!retryable_error && saved_exception)
+     {
+         std::lock_guard lock(storage.queue.state_mutex);
+diff --git a/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.h b/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.h
+index d8495d35d90e..d9a1cbff166b 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.h
++++ b/src/Storages/MergeTree/ReplicatedMergeMutateTaskBase.h
+@@ -5,6 +5,7 @@
+ #include <Storages/MergeTree/IExecutableTask.h>
+ #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
+ 
++
+ namespace DB
+ {
+ 
+@@ -59,9 +60,10 @@ class ReplicatedMergeMutateTaskBase : public IExecutableTask
+     MergeList::EntryPtr merge_mutate_entry{nullptr};
+     Poco::Logger * log;
+     StorageReplicatedMergeTree & storage;
++    /// ProfileEvents for current part will be stored here
++    ProfileEvents::Counters profile_counters;
+ 
+ private:
+-
+     enum class CheckExistingPartResult
+     {
+         PART_EXISTS,
+@@ -69,7 +71,7 @@ class ReplicatedMergeMutateTaskBase : public IExecutableTask
+     };
+ 
+     CheckExistingPartResult checkExistingPart();
+-    bool executeImpl() ;
++    bool executeImpl();
+ 
+     enum class State
+     {
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeSink.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeSink.cpp
+index ee192966758a..31fd99f0aa1b 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeSink.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeSink.cpp
+@@ -2,6 +2,7 @@
+ #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
+ #include <Storages/MergeTree/ReplicatedMergeTreeSink.h>
+ #include <Interpreters/PartLog.h>
++#include <Common/ProfileEventsScope.h>
+ #include <Common/SipHash.h>
+ #include <Common/ZooKeeper/KeeperException.h>
+ #include <Common/ThreadFuzzer.h>
+@@ -48,14 +49,21 @@ struct ReplicatedMergeTreeSinkImpl<async_insert>::DelayedChunk
+         BlockIDsType block_id;
+         BlockWithPartition block_with_partition;
+         std::unordered_map<String, std::vector<size_t>> block_id_to_offset_idx;
++        ProfileEvents::Counters part_counters;
+ 
+         Partition() = default;
+-        Partition(Poco::Logger * log_, MergeTreeDataWriter::TemporaryPart && temp_part_, UInt64 elapsed_ns_, BlockIDsType && block_id_, BlockWithPartition && block_)
++        Partition(Poco::Logger * log_,
++                  MergeTreeDataWriter::TemporaryPart && temp_part_,
++                  UInt64 elapsed_ns_,
++                  BlockIDsType && block_id_,
++                  BlockWithPartition && block_,
++                  ProfileEvents::Counters && part_counters_)
+             : log(log_),
+               temp_part(std::move(temp_part_)),
+               elapsed_ns(elapsed_ns_),
+               block_id(std::move(block_id_)),
+-              block_with_partition(std::move(block_))
++              block_with_partition(std::move(block_)),
++              part_counters(std::move(part_counters_))
+         {
+                 initBlockIDMap();
+         }
+@@ -186,8 +194,9 @@ std::vector<Int64> testSelfDeduplicate(std::vector<Int64> data, std::vector<size
+     Block block({ColumnWithTypeAndName(std::move(column), DataTypePtr(new DataTypeInt64()), "a")});
+ 
+     BlockWithPartition block1(std::move(block), Row(), std::move(offsets));
++    ProfileEvents::Counters profile_counters;
+     ReplicatedMergeTreeSinkImpl<true>::DelayedChunk::Partition part(
+-        &Poco::Logger::get("testSelfDeduplicate"), MergeTreeDataWriter::TemporaryPart(), 0, std::move(hashes), std::move(block1));
++        &Poco::Logger::get("testSelfDeduplicate"), MergeTreeDataWriter::TemporaryPart(), 0, std::move(hashes), std::move(block1), std::move(profile_counters));
+ 
+     part.filterSelfDuplicate();
+ 
+@@ -411,6 +420,9 @@ void ReplicatedMergeTreeSinkImpl<async_insert>::consume(Chunk chunk)
+     {
+         Stopwatch watch;
+ 
++        ProfileEvents::Counters part_counters;
++        auto profile_events_scope = std::make_unique<ProfileEventsScope>(&part_counters);
++
+         /// Write part to the filesystem under temporary name. Calculate a checksum.
+ 
+         auto temp_part = storage.writer.writeTempPart(current_block, metadata_snapshot, context);
+@@ -452,6 +464,7 @@ void ReplicatedMergeTreeSinkImpl<async_insert>::consume(Chunk chunk)
+             LOG_DEBUG(log, "Wrote block with {} rows{}", current_block.block.rows(), quorumLogMessage(replicas_num));
+         }
+ 
++        profile_events_scope.reset();
+         UInt64 elapsed_ns = watch.elapsed();
+ 
+         size_t max_insert_delayed_streams_for_parallel_write = DEFAULT_DELAYED_STREAMS_FOR_PARALLEL_WRITE;
+@@ -472,12 +485,14 @@ void ReplicatedMergeTreeSinkImpl<async_insert>::consume(Chunk chunk)
+             partitions = DelayedPartitions{};
+         }
+ 
++
+         partitions.emplace_back(DelayedPartition(
+             log,
+             std::move(temp_part),
+             elapsed_ns,
+             std::move(block_id),
+-            std::move(current_block)
++            std::move(current_block),
++            std::move(part_counters) /// profile_events_scope must be reset here.
+         ));
+     }
+ 
+@@ -503,6 +518,8 @@ void ReplicatedMergeTreeSinkImpl<false>::finishDelayedChunk(const ZooKeeperWithF
+ 
+     for (auto & partition : delayed_chunk->partitions)
+     {
++        ProfileEventsScope scoped_attach(&partition.part_counters);
++
+         partition.temp_part.finalize();
+ 
+         auto & part = partition.temp_part.part;
+@@ -515,12 +532,14 @@ void ReplicatedMergeTreeSinkImpl<false>::finishDelayedChunk(const ZooKeeperWithF
+ 
+             /// Set a special error code if the block is duplicate
+             int error = (deduplicate && part->is_duplicate) ? ErrorCodes::INSERT_WAS_DEDUPLICATED : 0;
+-            PartLog::addNewPart(storage.getContext(), part, partition.elapsed_ns, ExecutionStatus(error));
++            auto counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(partition.part_counters.getPartiallyAtomicSnapshot());
++            PartLog::addNewPart(storage.getContext(), PartLog::PartLogEntry(part, partition.elapsed_ns, counters_snapshot), ExecutionStatus(error));
+             storage.incrementInsertedPartsProfileEvent(part->getType());
+         }
+         catch (...)
+         {
+-            PartLog::addNewPart(storage.getContext(), part, partition.elapsed_ns, ExecutionStatus::fromCurrentException("", true));
++            auto counters_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(partition.part_counters.getPartiallyAtomicSnapshot());
++            PartLog::addNewPart(storage.getContext(), PartLog::PartLogEntry(part, partition.elapsed_ns, counters_snapshot), ExecutionStatus::fromCurrentException("", true));
+             throw;
+         }
+     }
+@@ -579,16 +598,17 @@ void ReplicatedMergeTreeSinkImpl<async_insert>::writeExistingPart(MergeTreeData:
+     size_t replicas_num = checkQuorumPrecondition(zookeeper);
+ 
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
+ 
+     try
+     {
+         part->version.setCreationTID(Tx::PrehistoricTID, nullptr);
+         commitPart(zookeeper, part, BlockIDsType(), replicas_num, true);
+-        PartLog::addNewPart(storage.getContext(), part, watch.elapsed());
++        PartLog::addNewPart(storage.getContext(), PartLog::PartLogEntry(part, watch.elapsed(), profile_events_scope.getSnapshot()));
+     }
+     catch (...)
+     {
+-        PartLog::addNewPart(storage.getContext(), part, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++        PartLog::addNewPart(storage.getContext(), PartLog::PartLogEntry(part, watch.elapsed(), profile_events_scope.getSnapshot()), ExecutionStatus::fromCurrentException("", true));
+         throw;
+     }
+ }
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 125322281d00..9e98946baebc 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -8,6 +8,7 @@
+ #include <Backups/BackupEntriesCollector.h>
+ #include <Databases/IDatabase.h>
+ #include <Common/escapeForFileName.h>
++#include <Common/ProfileEventsScope.h>
+ #include <Common/typeid_cast.h>
+ #include <Common/ThreadPool.h>
+ #include <Interpreters/InterpreterAlterQuery.h>
+@@ -1608,6 +1609,7 @@ void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, Cont
+         waitForOutdatedPartsToBeLoaded();
+ 
+         Stopwatch watch;
++        ProfileEventsScope profile_events_scope;
+ 
+         auto txn = query_context->getCurrentTransaction();
+         MergeTreeData::Transaction transaction(*this, txn.get());
+@@ -1628,7 +1630,7 @@ void StorageMergeTree::truncate(const ASTPtr &, const StorageMetadataPtr &, Cont
+             auto new_data_parts = createEmptyDataParts(*this, future_parts, txn);
+             renameAndCommitEmptyParts(new_data_parts, transaction);
+ 
+-            PartLog::addNewParts(query_context, new_data_parts, watch.elapsed());
++            PartLog::addNewParts(query_context, PartLog::createPartLogEntries(new_data_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+ 
+             LOG_INFO(log, "Truncated table with {} parts by replacing them with new empty {} parts. With txn {}",
+                      parts.size(), future_parts.size(),
+@@ -1650,6 +1652,7 @@ void StorageMergeTree::dropPart(const String & part_name, bool detach, ContextPt
+         auto merge_blocker = stopMergesAndWait();
+ 
+         Stopwatch watch;
++        ProfileEventsScope profile_events_scope;
+ 
+         /// It's important to create it outside of lock scope because
+         /// otherwise it can lock parts in destructor and deadlock is possible.
+@@ -1681,7 +1684,7 @@ void StorageMergeTree::dropPart(const String & part_name, bool detach, ContextPt
+                 auto new_data_parts = createEmptyDataParts(*this, future_parts, txn);
+                 renameAndCommitEmptyParts(new_data_parts, transaction);
+ 
+-                PartLog::addNewParts(query_context, new_data_parts, watch.elapsed());
++                PartLog::addNewParts(query_context, PartLog::createPartLogEntries(new_data_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+ 
+                 const auto * op = detach ? "Detached" : "Dropped";
+                 LOG_INFO(log, "{} {} part by replacing it with new empty {} part. With txn {}",
+@@ -1707,6 +1710,7 @@ void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, Cont
+         auto merge_blocker = stopMergesAndWait();
+ 
+         Stopwatch watch;
++        ProfileEventsScope profile_events_scope;
+ 
+         /// It's important to create it outside of lock scope because
+         /// otherwise it can lock parts in destructor and deadlock is possible.
+@@ -1746,7 +1750,7 @@ void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, Cont
+             auto new_data_parts = createEmptyDataParts(*this, future_parts, txn);
+             renameAndCommitEmptyParts(new_data_parts, transaction);
+ 
+-            PartLog::addNewParts(query_context, new_data_parts, watch.elapsed());
++            PartLog::addNewParts(query_context, PartLog::createPartLogEntries(new_data_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+ 
+             const auto * op = detach ? "Detached" : "Dropped";
+             LOG_INFO(log, "{} partition with {} parts by replacing them with new empty {} parts. With txn {}",
+@@ -1814,6 +1818,8 @@ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, con
+     auto my_metadata_snapshot = getInMemoryMetadataPtr();
+ 
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
++
+     MergeTreeData & src_data = checkStructureAndGetMergeTreeData(source_table, source_metadata_snapshot, my_metadata_snapshot);
+     String partition_id = getPartitionIDFromQuery(partition, local_context);
+ 
+@@ -1878,11 +1884,12 @@ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, con
+                 removePartsInRangeFromWorkingSet(local_context->getCurrentTransaction().get(), drop_range, data_parts_lock);
+         }
+ 
+-        PartLog::addNewParts(getContext(), dst_parts, watch.elapsed());
++        /// Note: same elapsed time and profile events for all parts is used
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+     }
+     catch (...)
+     {
+-        PartLog::addNewParts(getContext(), dst_parts, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
+         throw;
+     }
+ }
+@@ -1909,6 +1916,7 @@ void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const
+     auto dest_metadata_snapshot = dest_table->getInMemoryMetadataPtr();
+     auto metadata_snapshot = getInMemoryMetadataPtr();
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
+ 
+     MergeTreeData & src_data = dest_table_storage->checkStructureAndGetMergeTreeData(*this, metadata_snapshot, dest_metadata_snapshot);
+     String partition_id = getPartitionIDFromQuery(partition, local_context);
+@@ -1961,11 +1969,12 @@ void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const
+ 
+         clearOldPartsFromFilesystem();
+ 
+-        PartLog::addNewParts(getContext(), dst_parts, watch.elapsed());
++        /// Note: same elapsed time and profile events for all parts is used
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+     }
+     catch (...)
+     {
+-        PartLog::addNewParts(getContext(), dst_parts, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
+         throw;
+     }
+ }
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 0fb3e25ee85b..e2844431e342 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -2,8 +2,10 @@
+ 
+ #include <cstddef>
+ #include <ranges>
+-#include "Common/hex.h"
++
++#include <Common/hex.h>
+ #include <Common/Macros.h>
++#include <Common/ProfileEventsScope.h>
+ #include <Common/StringUtils/StringUtils.h>
+ #include <Common/ZooKeeper/KeeperException.h>
+ #include <Common/ZooKeeper/Types.h>
+@@ -1592,6 +1594,8 @@ bool StorageReplicatedMergeTree::executeLogEntry(LogEntry & entry)
+ 
+     if (entry.type == LogEntry::ATTACH_PART)
+     {
++        ProfileEventsScope profile_events_scope;
++
+         if (MutableDataPartPtr part = attachPartHelperFoundValidPart(entry))
+         {
+             LOG_TRACE(log, "Found valid local part for {}, preparing the transaction", part->name);
+@@ -1603,7 +1607,8 @@ bool StorageReplicatedMergeTree::executeLogEntry(LogEntry & entry)
+             checkPartChecksumsAndCommit(transaction, part);
+ 
+             writePartLog(PartLogElement::Type::NEW_PART, {}, 0 /** log entry is fake so we don't measure the time */,
+-                part->name, part, {} /** log entry is fake so there are no initial parts */, nullptr);
++                part->name, part, {} /** log entry is fake so there are no initial parts */, nullptr,
++                profile_events_scope.getSnapshot());
+ 
+             return true;
+         }
+@@ -1947,6 +1952,8 @@ void StorageReplicatedMergeTree::executeDropRange(const LogEntry & entry)
+ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
+ {
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
++
+     auto & entry_replace = *entry.replace_range_entry;
+     LOG_DEBUG(log, "Executing log entry {} to replace parts range {} with {} parts from {}.{}",
+               entry.znode_name, entry_replace.drop_range_part_name, entry_replace.new_part_names.size(),
+@@ -2339,11 +2346,11 @@ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
+             }
+         }
+ 
+-        PartLog::addNewParts(getContext(), res_parts, watch.elapsed());
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(res_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+     }
+     catch (...)
+     {
+-        PartLog::addNewParts(getContext(), res_parts, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++        PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(res_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
+ 
+         for (const auto & res_part : res_parts)
+             unlockSharedData(*res_part);
+@@ -4004,12 +4011,14 @@ bool StorageReplicatedMergeTree::fetchPart(
+     Stopwatch stopwatch;
+     MutableDataPartPtr part;
+     DataPartsVector replaced_parts;
++    ProfileEventsScope profile_events_scope;
+ 
+     auto write_part_log = [&] (const ExecutionStatus & execution_status)
+     {
+         writePartLog(
+             PartLogElement::DOWNLOAD_PART, execution_status, stopwatch.elapsed(),
+-            part_name, part, replaced_parts, nullptr);
++            part_name, part, replaced_parts, nullptr,
++            profile_events_scope.getSnapshot());
+     };
+ 
+     DataPartPtr part_to_clone;
+@@ -4240,12 +4249,14 @@ MutableDataPartStoragePtr StorageReplicatedMergeTree::fetchExistsPart(
+     Stopwatch stopwatch;
+     MutableDataPartPtr part;
+     DataPartsVector replaced_parts;
++    ProfileEventsScope profile_events_scope;
+ 
+     auto write_part_log = [&] (const ExecutionStatus & execution_status)
+     {
+         writePartLog(
+             PartLogElement::DOWNLOAD_PART, execution_status, stopwatch.elapsed(),
+-            part_name, part, replaced_parts, nullptr);
++            part_name, part, replaced_parts, nullptr,
++            profile_events_scope.getSnapshot());
+     };
+ 
+     std::function<MutableDataPartPtr()> get_part;
+@@ -6878,6 +6889,8 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
+     auto metadata_snapshot = getInMemoryMetadataPtr();
+ 
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
++
+     MergeTreeData & src_data = checkStructureAndGetMergeTreeData(source_table, source_metadata_snapshot, metadata_snapshot);
+     String partition_id = getPartitionIDFromQuery(partition, query_context);
+ 
+@@ -7054,11 +7067,11 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
+                     parts_to_remove = removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, data_parts_lock);
+             }
+ 
+-            PartLog::addNewParts(getContext(), dst_parts, watch.elapsed());
++            PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+         }
+         catch (...)
+         {
+-            PartLog::addNewParts(getContext(), dst_parts, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++            PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
+             for (const auto & dst_part : dst_parts)
+                 unlockSharedData(*dst_part);
+ 
+@@ -7113,6 +7126,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
+     auto metadata_snapshot = getInMemoryMetadataPtr();
+ 
+     Stopwatch watch;
++    ProfileEventsScope profile_events_scope;
++
+     MergeTreeData & src_data = dest_table_storage->checkStructureAndGetMergeTreeData(*this, metadata_snapshot, dest_metadata_snapshot);
+     auto src_data_id = src_data.getStorageID();
+     String partition_id = getPartitionIDFromQuery(partition, query_context);
+@@ -7283,11 +7298,11 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
+                 transaction.commit(&src_data_parts_lock);
+             }
+ 
+-            PartLog::addNewParts(getContext(), dst_parts, watch.elapsed());
++            PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
+         }
+         catch (...)
+         {
+-            PartLog::addNewParts(getContext(), dst_parts, watch.elapsed(), ExecutionStatus::fromCurrentException("", true));
++            PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
+ 
+             for (const auto & dst_part : dst_parts)
+                 dest_table_storage->unlockSharedData(*dst_part);

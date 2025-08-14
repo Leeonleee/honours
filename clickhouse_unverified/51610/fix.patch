@@ -1,0 +1,210 @@
+diff --git a/src/Processors/QueryPlan/Optimizations/Optimizations.h b/src/Processors/QueryPlan/Optimizations/Optimizations.h
+index 2b934ec440bc..bc47413cbb50 100644
+--- a/src/Processors/QueryPlan/Optimizations/Optimizations.h
++++ b/src/Processors/QueryPlan/Optimizations/Optimizations.h
+@@ -14,6 +14,9 @@ namespace QueryPlanOptimizations
+ void optimizeTreeFirstPass(const QueryPlanOptimizationSettings & settings, QueryPlan::Node & root, QueryPlan::Nodes & nodes);
+ /// Second pass is used to apply read-in-order and attach a predicate to PK.
+ void optimizeTreeSecondPass(const QueryPlanOptimizationSettings & optimization_settings, QueryPlan::Node & root, QueryPlan::Nodes & nodes);
++/// Third pass is used to apply filters such as key conditions and skip indexes to the storages that support them.
++/// After that it add CreateSetsStep for the subqueries that has not be used in the filters.
++void optimizeTreeThirdPass(QueryPlan::Node & root, QueryPlan::Nodes & nodes);
+ 
+ /// Optimization (first pass) is a function applied to QueryPlan::Node.
+ /// It can read and update subtree of specified node.
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyCondition.cpp b/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyCondition.cpp
+index 5ef786ff9751..e98386a6ee9f 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyCondition.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizePrimaryKeyCondition.cpp
+@@ -28,8 +28,6 @@ void optimizePrimaryKeyCondition(const Stack & stack)
+         else
+             break;
+     }
+-
+-    source_step_with_filter->onAddFilterFinish();
+ }
+ 
+ }
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizeTree.cpp b/src/Processors/QueryPlan/Optimizations/optimizeTree.cpp
+index d620170e29c2..e788918703e7 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizeTree.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizeTree.cpp
+@@ -167,7 +167,6 @@ void optimizeTreeSecondPass(const QueryPlanOptimizationSettings & optimization_s
+         optimizePrewhere(stack, nodes);
+         optimizePrimaryKeyCondition(stack);
+         enableMemoryBoundMerging(*stack.back().node, nodes);
+-        addPlansForSets(*stack.back().node, nodes);
+ 
+         stack.pop_back();
+     }
+@@ -178,5 +177,35 @@ void optimizeTreeSecondPass(const QueryPlanOptimizationSettings & optimization_s
+             "No projection is used when optimize_use_projections = 1 and force_optimize_projection = 1");
+ }
+ 
++void optimizeTreeThirdPass(QueryPlan::Node & root, QueryPlan::Nodes & nodes)
++{
++    Stack stack;
++    stack.push_back({.node = &root});
++
++    while (!stack.empty())
++    {
++        /// NOTE: frame cannot be safely used after stack was modified.
++        auto & frame = stack.back();
++
++        /// Traverse all children first.
++        if (frame.next_child < frame.node->children.size())
++        {
++            auto next_frame = Frame{.node = frame.node->children[frame.next_child]};
++            ++frame.next_child;
++            stack.push_back(next_frame);
++            continue;
++        }
++
++        if (auto * source_step_with_filter = dynamic_cast<SourceStepWithFilter *>(frame.node->step.get()))
++        {
++            source_step_with_filter->applyFilters();
++        }
++
++        addPlansForSets(*frame.node, nodes);
++
++        stack.pop_back();
++    }
++}
++
+ }
+ }
+diff --git a/src/Processors/QueryPlan/QueryPlan.cpp b/src/Processors/QueryPlan/QueryPlan.cpp
+index cb732e588558..687260441ff3 100644
+--- a/src/Processors/QueryPlan/QueryPlan.cpp
++++ b/src/Processors/QueryPlan/QueryPlan.cpp
+@@ -482,6 +482,7 @@ void QueryPlan::optimize(const QueryPlanOptimizationSettings & optimization_sett
+ 
+     QueryPlanOptimizations::optimizeTreeFirstPass(optimization_settings, *root, nodes);
+     QueryPlanOptimizations::optimizeTreeSecondPass(optimization_settings, *root, nodes);
++    QueryPlanOptimizations::optimizeTreeThirdPass(*root, nodes);
+ 
+     updateDataStreams(*root);
+ }
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index 1e21d13e2b18..e7bf1ce2edff 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -1299,13 +1299,10 @@ static void buildIndexes(
+     indexes->skip_indexes = std::move(skip_indexes);
+ }
+ 
+-void ReadFromMergeTree::onAddFilterFinish()
++void ReadFromMergeTree::applyFilters()
+ {
+-    if (!filter_nodes.nodes.empty())
+-    {
+-        auto filter_actions_dag = buildFilterDAG(context, prewhere_info, filter_nodes, query_info);
+-        buildIndexes(indexes, filter_actions_dag, data, context, query_info, metadata_for_reading);
+-    }
++    auto filter_actions_dag = buildFilterDAG(context, prewhere_info, filter_nodes, query_info);
++    buildIndexes(indexes, filter_actions_dag, data, context, query_info, metadata_for_reading);
+ }
+ 
+ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.h b/src/Processors/QueryPlan/ReadFromMergeTree.h
+index 06021cb1c5bf..3e3edd4dc5c9 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.h
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.h
+@@ -226,7 +226,7 @@ class ReadFromMergeTree final : public SourceStepWithFilter
+     size_t getNumStreams() const { return requested_num_streams; }
+     bool isParallelReadingEnabled() const { return read_task_callback != std::nullopt; }
+ 
+-    void onAddFilterFinish() override;
++    void applyFilters() override;
+ 
+ private:
+     static MergeTreeDataSelectAnalysisResultPtr selectRangesToReadImpl(
+diff --git a/src/Processors/QueryPlan/SourceStepWithFilter.h b/src/Processors/QueryPlan/SourceStepWithFilter.h
+index 34b6e3c6a7bb..dbaff06fde64 100644
+--- a/src/Processors/QueryPlan/SourceStepWithFilter.h
++++ b/src/Processors/QueryPlan/SourceStepWithFilter.h
+@@ -37,7 +37,8 @@ class SourceStepWithFilter : public ISourceStep
+         filter_dags.push_back(std::move(filter_dag));
+     }
+ 
+-    virtual void onAddFilterFinish() {}
++    /// Apply filters that can optimize reading from storage.
++    virtual void applyFilters() {}
+ 
+ protected:
+     std::vector<ActionsDAGPtr> filter_dags;
+diff --git a/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp b/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
+index 25a4579c73ea..1620ba98d589 100644
+--- a/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
++++ b/src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
+@@ -110,6 +110,9 @@ static void collectColumns(const RPNBuilderTreeNode & node, const NameSet & colu
+     if (node.isConstant())
+         return;
+ 
++    if (node.isSubqueryOrSet())
++        return;
++
+     if (!node.isFunction())
+     {
+         auto column_name = node.getColumnName();
+diff --git a/src/Storages/MergeTree/RPNBuilder.cpp b/src/Storages/MergeTree/RPNBuilder.cpp
+index 0b42111be457..a0c96c13d59f 100644
+--- a/src/Storages/MergeTree/RPNBuilder.cpp
++++ b/src/Storages/MergeTree/RPNBuilder.cpp
+@@ -181,6 +181,21 @@ bool RPNBuilderTreeNode::isConstant() const
+     }
+ }
+ 
++bool RPNBuilderTreeNode::isSubqueryOrSet() const
++{
++    if (ast_node)
++    {
++        return
++            typeid_cast<const ASTSubquery *>(ast_node) ||
++            typeid_cast<const ASTTableIdentifier *>(ast_node);
++    }
++    else
++    {
++        const auto * node_without_alias = getNodeWithoutAlias(dag_node);
++        return node_without_alias->result_type->getTypeId() == TypeIndex::Set;
++    }
++}
++
+ ColumnWithTypeAndName RPNBuilderTreeNode::getConstantColumn() const
+ {
+     if (!isConstant())
+diff --git a/src/Storages/MergeTree/RPNBuilder.h b/src/Storages/MergeTree/RPNBuilder.h
+index 6f624d93cd67..9eeb6deefd5e 100644
+--- a/src/Storages/MergeTree/RPNBuilder.h
++++ b/src/Storages/MergeTree/RPNBuilder.h
+@@ -98,6 +98,8 @@ class RPNBuilderTreeNode
+     /// Is node constant
+     bool isConstant() const;
+ 
++    bool isSubqueryOrSet() const;
++
+     /** Get constant as constant column.
+       * Node must be constant before calling these method, otherwise logical exception is thrown.
+       */
+diff --git a/src/Storages/System/StorageSystemZooKeeper.cpp b/src/Storages/System/StorageSystemZooKeeper.cpp
+index d361a4173c12..4d7f59b8ccdc 100644
+--- a/src/Storages/System/StorageSystemZooKeeper.cpp
++++ b/src/Storages/System/StorageSystemZooKeeper.cpp
+@@ -184,7 +184,7 @@ class ReadFromSystemZooKeeper final : public SourceStepWithFilter
+ 
+     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) override;
+ 
+-    void onAddFilterFinish() override;
++    void applyFilters() override;
+ 
+ private:
+     void fillData(MutableColumns & res_columns);
+@@ -421,7 +421,7 @@ static Paths extractPath(const ActionsDAG::NodeRawConstPtrs & filter_nodes, Cont
+ }
+ 
+ 
+-void ReadFromSystemZooKeeper::onAddFilterFinish()
++void ReadFromSystemZooKeeper::applyFilters()
+ {
+     paths = extractPath(getFilterNodes().nodes, context, context->getSettingsRef().allow_unrestricted_reads_from_keeper);
+ }

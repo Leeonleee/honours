@@ -1,0 +1,475 @@
+diff --git a/src/Interpreters/InterpreterAlterQuery.cpp b/src/Interpreters/InterpreterAlterQuery.cpp
+index 6294b31cc8cd..37eaecf9a900 100644
+--- a/src/Interpreters/InterpreterAlterQuery.cpp
++++ b/src/Interpreters/InterpreterAlterQuery.cpp
+@@ -137,7 +137,7 @@ BlockIO InterpreterAlterQuery::execute()
+         StorageInMemoryMetadata metadata = table->getInMemoryMetadata();
+         alter_commands.validate(metadata, context);
+         alter_commands.prepare(metadata);
+-        table->checkAlterIsPossible(alter_commands, context.getSettingsRef());
++        table->checkAlterIsPossible(alter_commands, context);
+         table->alter(alter_commands, context, alter_lock);
+     }
+ 
+diff --git a/src/Interpreters/InterpreterSelectQuery.h b/src/Interpreters/InterpreterSelectQuery.h
+index 1fff316e1d4d..2c563c0f9175 100644
+--- a/src/Interpreters/InterpreterSelectQuery.h
++++ b/src/Interpreters/InterpreterSelectQuery.h
+@@ -89,6 +89,8 @@ class InterpreterSelectQuery : public IInterpreterUnionOrSelectQuery
+ 
+     static void addEmptySourceToQueryPlan(QueryPlan & query_plan, const Block & source_header, const SelectQueryInfo & query_info);
+ 
++    Names getRequiredColumns() { return required_columns; }
++
+ private:
+     InterpreterSelectQuery(
+         const ASTPtr & query_ptr_,
+diff --git a/src/Storages/IStorage.cpp b/src/Storages/IStorage.cpp
+index 2400b0587ba6..5129d03cdee2 100644
+--- a/src/Storages/IStorage.cpp
++++ b/src/Storages/IStorage.cpp
+@@ -134,7 +134,7 @@ void IStorage::alter(const AlterCommands & params, const Context & context, Tabl
+ }
+ 
+ 
+-void IStorage::checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const
++void IStorage::checkAlterIsPossible(const AlterCommands & commands, const Context & /* context */) const
+ {
+     for (const auto & command : commands)
+     {
+@@ -182,6 +182,24 @@ Names IStorage::getAllRegisteredNames() const
+     return result;
+ }
+ 
++NameDependencies IStorage::getDependentViewsByColumn(const Context & context) const
++{
++    NameDependencies name_deps;
++    auto dependencies = DatabaseCatalog::instance().getDependencies(storage_id);
++    for (const auto & depend_id : dependencies)
++    {
++        auto depend_table = DatabaseCatalog::instance().getTable(depend_id, context);
++        if (depend_table->getInMemoryMetadataPtr()->select.inner_query)
++        {
++            const auto & select_query = depend_table->getInMemoryMetadataPtr()->select.inner_query;
++            auto required_columns = InterpreterSelectQuery(select_query, context, SelectQueryOptions{}.noModify()).getRequiredColumns();
++            for (const auto & col_name : required_columns)
++                name_deps[col_name].push_back(depend_id.table_name);
++        }
++    }
++    return name_deps;
++}
++
+ std::string PrewhereDAGInfo::dump() const
+ {
+     WriteBufferFromOwnString ss;
+diff --git a/src/Storages/IStorage.h b/src/Storages/IStorage.h
+index 1a27dbd637f0..4dfd2ca50f38 100644
+--- a/src/Storages/IStorage.h
++++ b/src/Storages/IStorage.h
+@@ -57,6 +57,8 @@ struct StreamLocalLimits;
+ class EnabledQuota;
+ struct SelectQueryInfo;
+ 
++using NameDependencies = std::unordered_map<String, std::vector<String>>;
++
+ struct ColumnSize
+ {
+     size_t marks = 0;
+@@ -173,8 +175,10 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+     virtual NamesAndTypesList getVirtuals() const;
+ 
+     Names getAllRegisteredNames() const override;
+-protected:
+ 
++    NameDependencies getDependentViewsByColumn(const Context & context) const;
++
++protected:
+     /// Returns whether the column is virtual - by default all columns are real.
+     /// Initially reserved virtual column name may be shadowed by real column.
+     bool isVirtualColumn(const String & column_name, const StorageMetadataPtr & metadata_snapshot) const;
+@@ -362,7 +366,7 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+     /** Checks that alter commands can be applied to storage. For example, columns can be modified,
+       * or primary key can be changes, etc.
+       */
+-    virtual void checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const;
++    virtual void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const;
+ 
+     /**
+       * Checks that mutation commands can be applied to storage.
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 2d841b98c599..292cd36e6962 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -4,12 +4,11 @@
+ #include <DataTypes/DataTypeDate.h>
+ #include <DataTypes/DataTypeDateTime.h>
+ #include <DataTypes/DataTypeEnum.h>
+-#include <DataTypes/DataTypeUUID.h>
+-#include <DataTypes/DataTypeNullable.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
++#include <DataTypes/DataTypeNullable.h>
++#include <DataTypes/DataTypeUUID.h>
+ #include <DataTypes/NestedUtils.h>
+ #include <Formats/FormatFactory.h>
+-#include <Processors/Formats/InputStreamFromInputFormat.h>
+ #include <Functions/FunctionFactory.h>
+ #include <Functions/IFunction.h>
+ #include <IO/ConcatReadBuffer.h>
+@@ -17,10 +16,11 @@
+ #include <IO/Operators.h>
+ #include <IO/ReadBufferFromMemory.h>
+ #include <IO/WriteBufferFromString.h>
++#include <Interpreters/Context.h>
+ #include <Interpreters/ExpressionAnalyzer.h>
++#include <Interpreters/InterpreterSelectQuery.h>
+ #include <Interpreters/PartLog.h>
+ #include <Interpreters/TreeRewriter.h>
+-#include <Interpreters/Context.h>
+ #include <Interpreters/inplaceBlockConversions.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTLiteral.h>
+@@ -30,10 +30,11 @@
+ #include <Parsers/ExpressionListParsers.h>
+ #include <Parsers/parseQuery.h>
+ #include <Parsers/queryToString.h>
++#include <Processors/Formats/InputStreamFromInputFormat.h>
+ #include <Storages/AlterCommands.h>
+ #include <Storages/MergeTree/MergeTreeData.h>
+-#include <Storages/MergeTree/MergeTreeDataPartInMemory.h>
+ #include <Storages/MergeTree/MergeTreeDataPartCompact.h>
++#include <Storages/MergeTree/MergeTreeDataPartInMemory.h>
+ #include <Storages/MergeTree/MergeTreeDataPartWide.h>
+ #include <Storages/MergeTree/MergeTreeSequentialSource.h>
+ #include <Storages/MergeTree/MergedBlockOutputStream.h>
+@@ -1407,12 +1408,14 @@ void checkVersionColumnTypesConversion(const IDataType * old_type, const IDataTy
+ 
+ }
+ 
+-void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const
++void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
+     /// Check that needed transformations can be applied to the list of columns without considering type conversions.
+     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
+     StorageInMemoryMetadata old_metadata = getInMemoryMetadata();
+ 
++    const auto & settings = context.getSettingsRef();
++
+     if (!settings.allow_non_metadata_alters)
+     {
+ 
+@@ -1484,6 +1487,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const S
+         old_types.emplace(column.name, column.type.get());
+ 
+     NamesAndTypesList columns_to_check_conversion;
++    auto name_deps = getDependentViewsByColumn(context);
+     for (const AlterCommand & command : commands)
+     {
+         /// Just validate partition expression
+@@ -1563,6 +1567,16 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const S
+                     "Trying to ALTER DROP key " + backQuoteIfNeed(command.column_name) + " column which is a part of key expression",
+                     ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
+             }
++
++            const auto & deps_mv = name_deps[command.column_name];
++            if (!deps_mv.empty())
++            {
++                throw Exception(
++                    "Trying to ALTER DROP column " + backQuoteIfNeed(command.column_name) + " which is referenced by materialized view "
++                        + toString(deps_mv),
++                    ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
++            }
++
+             dropped_columns.emplace(command.column_name);
+         }
+         else if (command.isRequireMutationStage(getInMemoryMetadata()))
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index f03f3f1dd8c2..70c78af7bdae 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -517,7 +517,7 @@ class MergeTreeData : public IStorage
+     /// - all type conversions can be done.
+     /// - columns corresponding to primary key, indices, sign, sampling expression and date are not affected.
+     /// If something is wrong, throws an exception.
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     /// Checks if the Mutation can be performed.
+     /// (currently no additional checks: always ok)
+diff --git a/src/Storages/StorageBuffer.cpp b/src/Storages/StorageBuffer.cpp
+index e28d5f4d6d1d..e99f26c1a309 100644
+--- a/src/Storages/StorageBuffer.cpp
++++ b/src/Storages/StorageBuffer.cpp
+@@ -58,6 +58,7 @@ namespace ErrorCodes
+     extern const int LOGICAL_ERROR;
+     extern const int INFINITE_LOOP;
+     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++    extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
+ }
+ 
+ 
+@@ -910,8 +911,9 @@ void StorageBuffer::reschedule()
+     flush_handle->scheduleAfter(std::min(min, max) * 1000);
+ }
+ 
+-void StorageBuffer::checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const
++void StorageBuffer::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
++    auto name_deps = getDependentViewsByColumn(context);
+     for (const auto & command : commands)
+     {
+         if (command.type != AlterCommand::Type::ADD_COLUMN && command.type != AlterCommand::Type::MODIFY_COLUMN
+@@ -919,6 +921,17 @@ void StorageBuffer::checkAlterIsPossible(const AlterCommands & commands, const S
+             throw Exception(
+                 "Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
+                 ErrorCodes::NOT_IMPLEMENTED);
++        if (command.type == AlterCommand::Type::DROP_COLUMN)
++        {
++            const auto & deps_mv = name_deps[command.column_name];
++            if (!deps_mv.empty())
++            {
++                throw Exception(
++                    "Trying to ALTER DROP column " + backQuoteIfNeed(command.column_name) + " which is referenced by materialized view "
++                        + toString(deps_mv),
++                    ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
++            }
++        }
+     }
+ }
+ 
+@@ -955,7 +968,7 @@ std::optional<UInt64> StorageBuffer::totalBytes(const Settings & /*settings*/) c
+ void StorageBuffer::alter(const AlterCommands & params, const Context & context, TableLockHolder &)
+ {
+     auto table_id = getStorageID();
+-    checkAlterIsPossible(params, context.getSettingsRef());
++    checkAlterIsPossible(params, context);
+     auto metadata_snapshot = getInMemoryMetadataPtr();
+ 
+     /// Flush all buffers to storages, so that no non-empty blocks of the old
+diff --git a/src/Storages/StorageBuffer.h b/src/Storages/StorageBuffer.h
+index 46907ca196bd..f6904ddb0e47 100644
+--- a/src/Storages/StorageBuffer.h
++++ b/src/Storages/StorageBuffer.h
+@@ -99,7 +99,7 @@ friend class BufferBlockOutputStream;
+ 
+     bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context, const StorageMetadataPtr & metadata_snapshot) const override;
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     /// The structure of the subordinate table is not checked and does not change.
+     void alter(const AlterCommands & params, const Context & context, TableLockHolder & table_lock_holder) override;
+diff --git a/src/Storages/StorageDistributed.cpp b/src/Storages/StorageDistributed.cpp
+index c08dc38fa2d9..ad904994e915 100644
+--- a/src/Storages/StorageDistributed.cpp
++++ b/src/Storages/StorageDistributed.cpp
+@@ -84,6 +84,7 @@ namespace ErrorCodes
+     extern const int TOO_MANY_ROWS;
+     extern const int UNABLE_TO_SKIP_UNUSED_SHARDS;
+     extern const int INVALID_SHARD_ID;
++    extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
+ }
+ 
+ namespace ActionLocks
+@@ -577,8 +578,9 @@ BlockOutputStreamPtr StorageDistributed::write(const ASTPtr &, const StorageMeta
+ }
+ 
+ 
+-void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const
++void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
++    auto name_deps = getDependentViewsByColumn(context);
+     for (const auto & command : commands)
+     {
+         if (command.type != AlterCommand::Type::ADD_COLUMN
+@@ -589,6 +591,17 @@ void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, co
+ 
+             throw Exception("Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
+                 ErrorCodes::NOT_IMPLEMENTED);
++        if (command.type == AlterCommand::DROP_COLUMN)
++        {
++            const auto & deps_mv = name_deps[command.column_name];
++            if (!deps_mv.empty())
++            {
++                throw Exception(
++                    "Trying to ALTER DROP column " + backQuoteIfNeed(command.column_name) + " which is referenced by materialized view "
++                        + toString(deps_mv),
++                    ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
++            }
++        }
+     }
+ }
+ 
+@@ -596,7 +609,7 @@ void StorageDistributed::alter(const AlterCommands & params, const Context & con
+ {
+     auto table_id = getStorageID();
+ 
+-    checkAlterIsPossible(params, context.getSettingsRef());
++    checkAlterIsPossible(params, context);
+     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
+     params.apply(new_metadata, context);
+     DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(context, table_id, new_metadata);
+diff --git a/src/Storages/StorageDistributed.h b/src/Storages/StorageDistributed.h
+index 4d3869f7c5c2..3980ea8244da 100644
+--- a/src/Storages/StorageDistributed.h
++++ b/src/Storages/StorageDistributed.h
+@@ -85,7 +85,7 @@ class StorageDistributed final : public ext::shared_ptr_helper<StorageDistribute
+     void rename(const String & new_path_to_table_data, const StorageID & new_table_id) override;
+     void renameOnDisk(const String & new_path_to_table_data);
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     /// in the sub-tables, you need to manually add and delete columns
+     /// the structure of the sub-table is not checked
+diff --git a/src/Storages/StorageMaterializedView.cpp b/src/Storages/StorageMaterializedView.cpp
+index 2d211c8061b8..4022529edaef 100644
+--- a/src/Storages/StorageMaterializedView.cpp
++++ b/src/Storages/StorageMaterializedView.cpp
+@@ -296,8 +296,9 @@ void StorageMaterializedView::alter(
+ }
+ 
+ 
+-void StorageMaterializedView::checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const
++void StorageMaterializedView::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
++    const auto & settings = context.getSettingsRef();
+     if (settings.allow_experimental_alter_materialized_view_structure)
+     {
+         for (const auto & command : commands)
+diff --git a/src/Storages/StorageMaterializedView.h b/src/Storages/StorageMaterializedView.h
+index 4b10cf7a9b5e..ccb56ec9fe54 100644
+--- a/src/Storages/StorageMaterializedView.h
++++ b/src/Storages/StorageMaterializedView.h
+@@ -54,7 +54,7 @@ class StorageMaterializedView final : public ext::shared_ptr_helper<StorageMater
+ 
+     void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     Pipe alterPartition(const StorageMetadataPtr & metadata_snapshot, const PartitionCommands & commands, const Context & context) override;
+ 
+diff --git a/src/Storages/StorageMerge.cpp b/src/Storages/StorageMerge.cpp
+index 91ebfaa3a278..46be91ba258b 100644
+--- a/src/Storages/StorageMerge.cpp
++++ b/src/Storages/StorageMerge.cpp
+@@ -37,6 +37,7 @@ namespace ErrorCodes
+     extern const int ILLEGAL_PREWHERE;
+     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+     extern const int SAMPLING_NOT_SUPPORTED;
++    extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
+ }
+ 
+ namespace
+@@ -472,8 +473,9 @@ DatabaseTablesIteratorPtr StorageMerge::getDatabaseIterator(const Context & cont
+ }
+ 
+ 
+-void StorageMerge::checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const
++void StorageMerge::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
++    auto name_deps = getDependentViewsByColumn(context);
+     for (const auto & command : commands)
+     {
+         if (command.type != AlterCommand::Type::ADD_COLUMN && command.type != AlterCommand::Type::MODIFY_COLUMN
+@@ -481,6 +483,17 @@ void StorageMerge::checkAlterIsPossible(const AlterCommands & commands, const Se
+             throw Exception(
+                 "Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
+                 ErrorCodes::NOT_IMPLEMENTED);
++        if (command.type == AlterCommand::Type::DROP_COLUMN)
++        {
++            const auto & deps_mv = name_deps[command.column_name];
++            if (!deps_mv.empty())
++            {
++                throw Exception(
++                    "Trying to ALTER DROP column " + backQuoteIfNeed(command.column_name) + " which is referenced by materialized view "
++                        + toString(deps_mv),
++                    ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/Storages/StorageMerge.h b/src/Storages/StorageMerge.h
+index 3ac251fbe521..eaffd34a3796 100644
+--- a/src/Storages/StorageMerge.h
++++ b/src/Storages/StorageMerge.h
+@@ -38,7 +38,7 @@ class StorageMerge final : public ext::shared_ptr_helper<StorageMerge>, public I
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     /// you need to add and remove columns in the sub-tables manually
+     /// the structure of sub-tables is not checked
+diff --git a/src/Storages/StorageNull.cpp b/src/Storages/StorageNull.cpp
+index f324d5028347..ed9a7fffc637 100644
+--- a/src/Storages/StorageNull.cpp
++++ b/src/Storages/StorageNull.cpp
+@@ -16,6 +16,7 @@ namespace ErrorCodes
+ {
+     extern const int NOT_IMPLEMENTED;
+     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++    extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
+ }
+ 
+ 
+@@ -35,8 +36,9 @@ void registerStorageNull(StorageFactory & factory)
+     });
+ }
+ 
+-void StorageNull::checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const
++void StorageNull::checkAlterIsPossible(const AlterCommands & commands, const Context & context) const
+ {
++    auto name_deps = getDependentViewsByColumn(context);
+     for (const auto & command : commands)
+     {
+         if (command.type != AlterCommand::Type::ADD_COLUMN && command.type != AlterCommand::Type::MODIFY_COLUMN
+@@ -44,6 +46,17 @@ void StorageNull::checkAlterIsPossible(const AlterCommands & commands, const Set
+             throw Exception(
+                 "Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
+                 ErrorCodes::NOT_IMPLEMENTED);
++        if (command.type == AlterCommand::DROP_COLUMN)
++        {
++            const auto & deps_mv = name_deps[command.column_name];
++            if (!deps_mv.empty())
++            {
++                throw Exception(
++                    "Trying to ALTER DROP column " + backQuoteIfNeed(command.column_name) + " which is referenced by materialized view "
++                        + toString(deps_mv),
++                    ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/Storages/StorageNull.h b/src/Storages/StorageNull.h
+index 7d3d15f1b0fe..943c056a5889 100644
+--- a/src/Storages/StorageNull.h
++++ b/src/Storages/StorageNull.h
+@@ -41,7 +41,7 @@ class StorageNull final : public ext::shared_ptr_helper<StorageNull>, public ISt
+         return std::make_shared<NullBlockOutputStream>(metadata_snapshot->getSampleBlock());
+     }
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const override;
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override;
+ 
+     void alter(const AlterCommands & params, const Context & context, TableLockHolder & table_lock_holder) override;
+ 
+diff --git a/src/Storages/StorageProxy.h b/src/Storages/StorageProxy.h
+index fed9dd04e765..0349319d8fae 100644
+--- a/src/Storages/StorageProxy.h
++++ b/src/Storages/StorageProxy.h
+@@ -97,9 +97,9 @@ class StorageProxy : public IStorage
+         IStorage::setInMemoryMetadata(getNested()->getInMemoryMetadata());
+     }
+ 
+-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const override
++    void checkAlterIsPossible(const AlterCommands & commands, const Context & context) const override
+     {
+-        getNested()->checkAlterIsPossible(commands, settings);
++        getNested()->checkAlterIsPossible(commands, context);
+     }
+ 
+     Pipe alterPartition(

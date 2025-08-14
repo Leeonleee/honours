@@ -1,0 +1,652 @@
+diff --git a/docs/en/sql-reference/table-functions/mergeTreeIndex.md b/docs/en/sql-reference/table-functions/mergeTreeIndex.md
+index 7a1db20ea5e9..59899dec4091 100644
+--- a/docs/en/sql-reference/table-functions/mergeTreeIndex.md
++++ b/docs/en/sql-reference/table-functions/mergeTreeIndex.md
+@@ -14,20 +14,21 @@ Represents the contents of index and marks files of MergeTree tables. It can be
+ ## Syntax {#syntax}
+ 
+ ```sql
+-mergeTreeIndex(database, table, [with_marks = true])
++mergeTreeIndex(database, table [, with_marks = true] [, with_minmax = true])
+ ```
+ 
+ ## Arguments {#arguments}
+ 
+-| Argument     | Description                                       |
+-|--------------|---------------------------------------------------|
+-| `database`   | The database name to read index and marks from.   |
+-| `table`      | The table name to read index and marks from.      |
+-| `with_marks` | Whether include columns with marks to the result. |
++| Argument      | Description                                       |
++|---------------|---------------------------------------------------|
++| `database`    | The database name to read index and marks from.   |
++| `table`       | The table name to read index and marks from.      |
++| `with_marks`  | Whether include columns with marks to the result. |
++| `with_minmax` | Whether include min-max index to the result.      |
+ 
+ ## Returned value {#returned_value}
+ 
+-A table object with columns with values of primary index of source table, columns with values of marks (if enabled) for all possible files in data parts of source table and virtual columns:
++A table object with columns with values of primary index and min-max index (if enabled) of source table, columns with values of marks (if enabled) for all possible files in data parts of source table and virtual columns:
+ 
+ - `part_name` - The name of data part.
+ - `mark_number` - The number of current mark in data part.
+diff --git a/src/Processors/TTL/TTLColumnAlgorithm.cpp b/src/Processors/TTL/TTLColumnAlgorithm.cpp
+index 4b8f6b6f9ba2..d454dc373181 100644
+--- a/src/Processors/TTL/TTLColumnAlgorithm.cpp
++++ b/src/Processors/TTL/TTLColumnAlgorithm.cpp
+@@ -42,9 +42,17 @@ void TTLColumnAlgorithm::execute(Block & block)
+     if (!isMinTTLExpired())
+         return;
+ 
+-    /// Later drop full column
++    auto & column_with_type = block.getByName(column_name);
++
++    /// Reset the column to its default state so that dependent skip indices or
++    /// projections can correctly recalculate using it.
+     if (isMaxTTLExpired() && !is_compact_part)
++    {
++        auto empty_column = column_with_type.column->cloneEmpty();
++        empty_column->insertManyDefaults(block.rows());
++        column_with_type.column = std::move(empty_column);
+         return;
++    }
+ 
+     auto default_column = executeExpressionAndGetColumn(default_expression, block, default_column_name);
+     if (default_column)
+@@ -52,7 +60,6 @@ void TTLColumnAlgorithm::execute(Block & block)
+ 
+     auto ttl_column = executeExpressionAndGetColumn(ttl_expressions.expression, block, description.result_column);
+ 
+-    auto & column_with_type = block.getByName(column_name);
+     const IColumn * values_column = column_with_type.column.get();
+     MutableColumnPtr result_column = values_column->cloneEmpty();
+     result_column->reserve(block.rows());
+diff --git a/src/Storages/MergeTree/Compaction/MergePredicates/MergeTreeMergePredicate.cpp b/src/Storages/MergeTree/Compaction/MergePredicates/MergeTreeMergePredicate.cpp
+index acccdf971aa6..588daddf5b08 100644
+--- a/src/Storages/MergeTree/Compaction/MergePredicates/MergeTreeMergePredicate.cpp
++++ b/src/Storages/MergeTree/Compaction/MergePredicates/MergeTreeMergePredicate.cpp
+@@ -40,8 +40,11 @@ std::expected<void, PreformattedMessage> MergeTreeMergePredicate::canMergeParts(
+     if (left.projection_names != right.projection_names)
+     {
+         return std::unexpected(PreformattedMessage::create(
+-            "Parts have different projection sets: {{}} in {} and {{}} in {}",
+-            fmt::join(left.projection_names, ", "), left.name, fmt::join(right.projection_names, ", "), right.name));
++            "Parts have different projection sets: {{{}}} in {} and {{{}}} in {}",
++            fmt::join(left.projection_names, ", "),
++            left.name,
++            fmt::join(right.projection_names, ", "),
++            right.name));
+     }
+ 
+     {
+diff --git a/src/Storages/MergeTree/MergeTask.cpp b/src/Storages/MergeTree/MergeTask.cpp
+index 902362e169ce..6d4d0b73746d 100644
+--- a/src/Storages/MergeTree/MergeTask.cpp
++++ b/src/Storages/MergeTree/MergeTask.cpp
+@@ -118,6 +118,7 @@ namespace MergeTreeSetting
+     extern const MergeTreeSettingsBool prewarm_mark_cache;
+     extern const MergeTreeSettingsBool use_const_adaptive_granularity;
+     extern const MergeTreeSettingsUInt64 max_merge_delayed_streams_for_parallel_write;
++    extern const MergeTreeSettingsBool ttl_only_drop_parts;
+ }
+ 
+ namespace ErrorCodes
+@@ -307,6 +308,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColu
+     if (key_columns.empty())
+         key_columns.emplace(global_ctx->storage_columns.front().name);
+ 
++    /// Recalculate the min-max index for partition columns if the merge might reduce rows.
++    if (global_ctx->merge_may_reduce_rows)
++    {
++        auto minmax_columns = MergeTreeData::getMinMaxColumnsNames(global_ctx->metadata_snapshot->getPartitionKey());
++        key_columns.insert(minmax_columns.begin(), minmax_columns.end());
++    }
++
+     const auto & skip_indexes = global_ctx->metadata_snapshot->getSecondaryIndices();
+ 
+     for (const auto & index : skip_indexes)
+@@ -446,10 +454,86 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
+     extendObjectColumns(global_ctx->storage_columns, object_columns, false);
+     global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(object_columns));
+ 
++    ctx->need_remove_expired_values = false;
++    ctx->force_ttl = false;
++    for (const auto & part : global_ctx->future_part->parts)
++    {
++        global_ctx->new_data_part->ttl_infos.update(part->ttl_infos);
++
++        if (global_ctx->metadata_snapshot->hasAnyTTL() && !part->checkAllTTLCalculated(global_ctx->metadata_snapshot))
++        {
++            LOG_INFO(ctx->log, "Some TTL values were not calculated for part {}. Will calculate them forcefully during merge.", part->name);
++            ctx->need_remove_expired_values = true;
++            ctx->force_ttl = true;
++        }
++    }
++
++    const auto & local_part_min_ttl = global_ctx->new_data_part->ttl_infos.part_min_ttl;
++    if (local_part_min_ttl && local_part_min_ttl <= global_ctx->time_of_merge)
++        ctx->need_remove_expired_values = true;
++
++    if (ctx->need_remove_expired_values && global_ctx->ttl_merges_blocker->isCancelled())
++    {
++        LOG_INFO(ctx->log, "Part {} has values with expired TTL, but merges with TTL are cancelled.", global_ctx->new_data_part->name);
++        ctx->need_remove_expired_values = false;
++    }
++
++    const auto & patch_parts = global_ctx->future_part->patch_parts;
++
++    /// Skip fully expired columns manually, since in case of
++    /// need_remove_expired_values is not set, TTLTransform will not be used,
++    /// and columns that had been removed by TTL (via TTLColumnAlgorithm) will
++    /// be added again with default values.
++    ///
++    /// Also note, that it is better to do this here, since in other places it
++    /// will be too late (i.e. they will be written, and we will burn CPU/disk
++    /// resources for this).
++    if (!ctx->need_remove_expired_values)
++    {
++        for (auto & [column_name, ttl] : global_ctx->new_data_part->ttl_infos.columns_ttl)
++        {
++            if (ttl.finished())
++            {
++                global_ctx->new_data_part->expired_columns.insert(column_name);
++                LOG_TRACE(ctx->log, "Adding expired column {} for part {}", column_name, global_ctx->new_data_part->name);
++            }
++        }
++    }
++
++    /// Determine whether projections and minmax indexes need to be updated during merge,
++    /// which typically happens when the number of rows may be reduced.
++    ///
++    /// This is necessary in cases such as TTL expiration, cleanup merges, deduplication,
++    /// or special merge modes like Collapsing/Replacing.
++    global_ctx->merge_may_reduce_rows =
++        ctx->need_remove_expired_values ||
++        !patch_parts.empty() ||
++        global_ctx->cleanup ||
++        global_ctx->deduplicate ||
++        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Collapsing ||
++        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Replacing ||
++        global_ctx->merging_params.mode == MergeTreeData::MergingParams::VersionedCollapsing;
++
+     prepareProjectionsToMergeAndRebuild();
+ 
+     extractMergingAndGatheringColumns();
+ 
++    const auto & expired_columns = global_ctx->new_data_part->expired_columns;
++    if (!expired_columns.empty())
++    {
++        auto part_serialization_infos = global_ctx->new_data_part->getSerializationInfos();
++        for (const auto & expired_column : expired_columns)
++            part_serialization_infos.erase(expired_column);
++
++        global_ctx->gathering_columns = global_ctx->gathering_columns.eraseNames(expired_columns);
++        global_ctx->merging_columns = global_ctx->merging_columns.eraseNames(expired_columns);
++        global_ctx->storage_columns = global_ctx->storage_columns.eraseNames(expired_columns);
++        global_ctx->new_data_part->setColumns(
++            global_ctx->storage_columns,
++            part_serialization_infos,
++            global_ctx->metadata_snapshot->getMetadataVersion());
++    }
++
+     global_ctx->new_data_part->uuid = global_ctx->future_part->uuid;
+     global_ctx->new_data_part->partition.assign(global_ctx->future_part->getPartition());
+     global_ctx->new_data_part->is_temp = global_ctx->parent_part == nullptr;
+@@ -459,17 +543,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
+     /// The blobs have to be removed along with the part, this temporary part owns them and does not share them yet.
+     global_ctx->new_data_part->remove_tmp_policy = IMergeTreeDataPart::BlobsRemovalPolicyForTemporaryParts::REMOVE_BLOBS;
+ 
+-    ctx->need_remove_expired_values = false;
+-    ctx->force_ttl = false;
+-
+     if (enabledBlockNumberColumn(global_ctx))
+         addGatheringColumn(global_ctx, BlockNumberColumn::name, BlockNumberColumn::type);
+ 
+     if (enabledBlockOffsetColumn(global_ctx))
+         addGatheringColumn(global_ctx, BlockOffsetColumn::name, BlockOffsetColumn::type);
+ 
+-    const auto & patch_parts = global_ctx->future_part->patch_parts;
+-
+     MergeTreeData::IMutationsSnapshot::Params params
+     {
+         .metadata_version = global_ctx->metadata_snapshot->getMetadataVersion(),
+@@ -506,15 +585,6 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
+ 
+     for (const auto & part : global_ctx->future_part->parts)
+     {
+-        global_ctx->new_data_part->ttl_infos.update(part->ttl_infos);
+-
+-        if (global_ctx->metadata_snapshot->hasAnyTTL() && !part->checkAllTTLCalculated(global_ctx->metadata_snapshot))
+-        {
+-            LOG_INFO(ctx->log, "Some TTL values were not calculated for part {}. Will calculate them forcefully during merge.", part->name);
+-            ctx->need_remove_expired_values = true;
+-            ctx->force_ttl = true;
+-        }
+-
+         if (!info_settings.isAlwaysDefault())
+         {
+             auto part_infos = part->getSerializationInfos();
+@@ -540,16 +610,6 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
+ 
+     global_ctx->new_data_part->setColumns(global_ctx->storage_columns, infos, global_ctx->metadata_snapshot->getMetadataVersion());
+ 
+-    const auto & local_part_min_ttl = global_ctx->new_data_part->ttl_infos.part_min_ttl;
+-    if (local_part_min_ttl && local_part_min_ttl <= global_ctx->time_of_merge)
+-        ctx->need_remove_expired_values = true;
+-
+-    if (ctx->need_remove_expired_values && global_ctx->ttl_merges_blocker->isCancelled())
+-    {
+-        LOG_INFO(ctx->log, "Part {} has values with expired TTL, but merges with TTL are cancelled.", global_ctx->new_data_part->name);
+-        ctx->need_remove_expired_values = false;
+-    }
+-
+     ctx->sum_input_rows_upper_bound = global_ctx->merge_list_element_ptr->total_rows_count;
+     ctx->sum_compressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_compressed;
+     ctx->sum_uncompressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
+@@ -615,43 +675,6 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
+     /// Merged stream will be created and available as merged_stream variable
+     createMergedStream();
+ 
+-    /// Skip fully expired columns manually, since in case of
+-    /// need_remove_expired_values is not set, TTLTransform will not be used,
+-    /// and columns that had been removed by TTL (via TTLColumnAlgorithm) will
+-    /// be added again with default values.
+-    ///
+-    /// Also note, that it is better to do this here, since in other places it
+-    /// will be too late (i.e. they will be written, and we will burn CPU/disk
+-    /// resources for this).
+-    if (!ctx->need_remove_expired_values)
+-    {
+-        auto part_serialization_infos = global_ctx->new_data_part->getSerializationInfos();
+-
+-        NameSet columns_to_remove;
+-        for (auto & [column_name, ttl] : global_ctx->new_data_part->ttl_infos.columns_ttl)
+-        {
+-            if (ttl.finished())
+-            {
+-                global_ctx->new_data_part->expired_columns.insert(column_name);
+-                LOG_TRACE(ctx->log, "Adding expired column {} for part {}", column_name, global_ctx->new_data_part->name);
+-                columns_to_remove.insert(column_name);
+-                part_serialization_infos.erase(column_name);
+-            }
+-        }
+-
+-        if (!columns_to_remove.empty())
+-        {
+-            global_ctx->gathering_columns = global_ctx->gathering_columns.eraseNames(columns_to_remove);
+-            global_ctx->merging_columns = global_ctx->merging_columns.eraseNames(columns_to_remove);
+-            global_ctx->storage_columns = global_ctx->storage_columns.eraseNames(columns_to_remove);
+-
+-            global_ctx->new_data_part->setColumns(
+-                global_ctx->storage_columns,
+-                part_serialization_infos,
+-                global_ctx->metadata_snapshot->getMetadataVersion());
+-        }
+-    }
+-
+     auto index_granularity_ptr = createMergeTreeIndexGranularity(
+         ctx->sum_input_rows_upper_bound,
+         ctx->sum_uncompressed_bytes_upper_bound,
+@@ -783,20 +806,25 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
+         && (mode == DeduplicateMergeProjectionMode::THROW || mode == DeduplicateMergeProjectionMode::DROP))
+         return;
+ 
+-    /// These merging modes may or may not reduce number of rows. It's not known until the horizontal stage is finished.
+-    const bool merge_may_reduce_rows =
+-        global_ctx->cleanup ||
+-        global_ctx->deduplicate ||
+-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Collapsing ||
+-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Replacing ||
+-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::VersionedCollapsing;
+-
+     const auto & projections = global_ctx->metadata_snapshot->getProjections();
+ 
+     for (const auto & projection : projections)
+     {
+-        /// Checking IGNORE here is just for compatibility.
+-        if (merge_may_reduce_rows && mode != DeduplicateMergeProjectionMode::IGNORE)
++        const auto & required_columns = projection.getRequiredColumns();
++        bool some_source_column_expired = std::any_of(
++            required_columns.begin(),
++            required_columns.end(),
++            [&](const String & name) { return global_ctx->new_data_part->expired_columns.contains(name); });
++
++        /// The IGNORE mode is checked here purely for backward compatibility.
++        /// However, if the projection contains `_parent_part_offset`, it must still be rebuilt,
++        /// since offset correctness cannot be ignored even in IGNORE mode.
++        if (global_ctx->merge_may_reduce_rows && (mode != DeduplicateMergeProjectionMode::IGNORE || projection.with_parent_part_offset))
++        {
++            global_ctx->projections_to_rebuild.push_back(&projection);
++            continue;
++        }
++        else if (some_source_column_expired && mode != DeduplicateMergeProjectionMode::IGNORE)
+         {
+             global_ctx->projections_to_rebuild.push_back(&projection);
+             continue;
+@@ -951,6 +979,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl() const
+         global_ctx->rows_written += block.rows();
+         const_cast<MergedBlockOutputStream &>(*global_ctx->to).write(block);
+ 
++        if (global_ctx->merge_may_reduce_rows)
++        {
++            global_ctx->new_data_part->minmax_idx->update(
++                block, MergeTreeData::getMinMaxColumnsNames(global_ctx->metadata_snapshot->getPartitionKey()));
++        }
++
+         calculateProjections(block);
+ 
+         UInt64 result_rows = 0;
+@@ -1316,14 +1350,17 @@ bool MergeTask::VerticalMergeStage::finalizeVerticalMergeForAllColumns() const
+ 
+ bool MergeTask::MergeProjectionsStage::mergeMinMaxIndexAndPrepareProjections() const
+ {
+-    for (const auto & part : global_ctx->future_part->parts)
++    if (!global_ctx->merge_may_reduce_rows)
+     {
+-        /// Skip empty parts,
+-        /// (that can be created in StorageReplicatedMergeTree::createEmptyPartInsteadOfLost())
+-        /// since they can incorrectly set min,
+-        /// that will be changed after one more merge/OPTIMIZE.
+-        if (!part->isEmpty())
+-            global_ctx->new_data_part->minmax_idx->merge(*part->minmax_idx);
++        for (const auto & part : global_ctx->future_part->parts)
++        {
++            /// Skip empty parts,
++            /// (that can be created in StorageReplicatedMergeTree::createEmptyPartInsteadOfLost())
++            /// since they can incorrectly set min,
++            /// that will be changed after one more merge/OPTIMIZE.
++            if (!part->isEmpty())
++                global_ctx->new_data_part->minmax_idx->merge(*part->minmax_idx);
++        }
+     }
+ 
+     /// Print overall profiling info. NOTE: it may duplicates previous messages
+@@ -1356,6 +1393,16 @@ bool MergeTask::MergeProjectionsStage::mergeMinMaxIndexAndPrepareProjections() c
+             projection_parts.front()->name,
+             projection_parts.back()->name);
+ 
++        /// Skip parts with empty parent parts.
++        chassert(global_ctx->future_part->parts.size() == projection_parts.size());
++        std::erase_if(
++            projection_parts,
++            [&](const auto & part)
++            {
++                size_t index = &part - projection_parts.data();
++                return global_ctx->future_part->parts[index]->isEmpty();
++            });
++
+         auto projection_future_part = std::make_shared<FutureMergedMutatedPart>();
+         projection_future_part->assign(std::move(projection_parts), /*patch_parts_=*/ {});
+         projection_future_part->name = projection->name;
+diff --git a/src/Storages/MergeTree/MergeTask.h b/src/Storages/MergeTree/MergeTask.h
+index 51a63ae42265..d280a13fc5f0 100644
+--- a/src/Storages/MergeTree/MergeTask.h
++++ b/src/Storages/MergeTree/MergeTask.h
+@@ -239,6 +239,9 @@ class MergeTask
+ 
+         UInt64 prev_elapsed_ms{0};
+ 
++        /// Current merge may or may not reduce number of rows. It's not known until the horizontal stage is finished.
++        bool merge_may_reduce_rows{false};
++
+         // will throw an exception if merge was cancelled in any way.
+         void checkOperationIsNotCanceled() const;
+         bool isCancelled() const;
+diff --git a/src/Storages/StorageMergeTreeIndex.cpp b/src/Storages/StorageMergeTreeIndex.cpp
+index 479825e954ff..0a9354c5b4f7 100644
+--- a/src/Storages/StorageMergeTreeIndex.cpp
++++ b/src/Storages/StorageMergeTreeIndex.cpp
+@@ -16,6 +16,7 @@
+ #include <Access/Common/AccessFlags.h>
+ #include <Common/HashTable/HashSet.h>
+ #include <Common/escapeForFileName.h>
++#include <Interpreters/ExpressionActions.h>
+ #include <Processors/QueryPlan/QueryPlan.h>
+ #include <Processors/QueryPlan/SourceStepWithFilter.h>
+ #include <Processors/ISource.h>
+@@ -28,6 +29,7 @@ namespace DB
+ namespace ErrorCodes
+ {
+     extern const int BAD_ARGUMENTS;
++    extern const int CORRUPTED_DATA;
+     extern const int NO_SUCH_COLUMN_IN_TABLE;
+     extern const int NOT_IMPLEMENTED;
+ }
+@@ -38,6 +40,7 @@ class MergeTreeIndexSource : public ISource, WithContext
+     MergeTreeIndexSource(
+         Block header_,
+         Block index_header_,
++        Block minmax_header_,
+         MergeTreeData::DataPartsVector data_parts_,
+         ContextPtr context_,
+         bool with_marks_)
+@@ -45,6 +48,7 @@ class MergeTreeIndexSource : public ISource, WithContext
+         , WithContext(context_)
+         , header(std::move(header_))
+         , index_header(std::move(index_header_))
++        , minmax_header(std::move(minmax_header_))
+         , data_parts(std::move(data_parts_))
+         , with_marks(with_marks_)
+     {
+@@ -104,6 +108,22 @@ class MergeTreeIndexSource : public ISource, WithContext
+                     result_columns[pos] = index_column->convertToFullColumnIfConst();
+                 }
+             }
++            else if (minmax_header.has(column_name))
++            {
++                size_t minmax_pos = minmax_header.getPositionByName(column_name);
++                if (minmax_pos >= part->minmax_idx->hyperrectangle.size())
++                    throw Exception(
++                        ErrorCodes::CORRUPTED_DATA,
++                        "Part {} has broken minmax_idx: size = {} but {} has pos = {}",
++                        part->name,
++                        part->minmax_idx->hyperrectangle.size(),
++                        column_name,
++                        minmax_pos);
++
++                auto column = column_type->createColumnConst(
++                    num_rows, Tuple{part->minmax_idx->hyperrectangle[minmax_pos].left, part->minmax_idx->hyperrectangle[minmax_pos].right});
++                result_columns[pos] = column->convertToFullColumnIfConst();
++            }
+             else if (column_name == part_name_column.name)
+             {
+                 auto column = column_type->createColumnConst(num_rows, part->name);
+@@ -236,6 +256,7 @@ class MergeTreeIndexSource : public ISource, WithContext
+ 
+     Block header;
+     Block index_header;
++    Block minmax_header;
+     MergeTreeData::DataPartsVector data_parts;
+     bool with_marks;
+ 
+@@ -251,18 +272,33 @@ StorageMergeTreeIndex::StorageMergeTreeIndex(
+     const StorageID & table_id_,
+     const StoragePtr & source_table_,
+     const ColumnsDescription & columns,
+-    bool with_marks_)
++    bool with_marks_,
++    bool with_minmax_)
+     : IStorage(table_id_)
+     , source_table(source_table_)
+     , with_marks(with_marks_)
++    , with_minmax(with_minmax_)
+ {
+     const auto * merge_tree = dynamic_cast<const MergeTreeData *>(source_table.get());
+     if (!merge_tree)
+         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage MergeTreeIndex expected MergeTree table, got: {}", source_table->getName());
+ 
+     data_parts = merge_tree->getDataPartsVectorForInternalUsage();
++    std::erase_if(data_parts, [](const MergeTreeData::DataPartPtr & part) { return part->isEmpty(); });
++
+     key_sample_block = merge_tree->getInMemoryMetadataPtr()->getPrimaryKey().sample_block;
+ 
++    if (with_minmax)
++    {
++        const auto & partition_key = merge_tree->getInMemoryMetadataPtr()->getPartitionKey();
++        if (!partition_key.column_names.empty() && partition_key.expression)
++        {
++            for (const auto & column : partition_key.expression->getRequiredColumnsWithTypes())
++                minmax_sample_block.insert(
++                    {nullptr, std::make_shared<DataTypeTuple>(DataTypes{column.type, column.type}), fmt::format("minmax_{}", column.name)});
++        }
++    }
++
+     StorageInMemoryMetadata storage_metadata;
+     storage_metadata.setColumns(columns);
+     setInMemoryMetadata(storage_metadata);
+@@ -368,12 +404,19 @@ void ReadFromMergeTreeIndex::initializePipeline(QueryPipelineBuilder & pipeline,
+ {
+     auto filtered_parts = storage->getFilteredDataParts(virtual_columns_filter);
+ 
+-    LOG_DEBUG(log, "Reading index{}from {} parts of table {}",
+-        storage->with_marks ? " with marks " : " ",
++    LOG_DEBUG(log, "Reading index{}{} from {} parts of table {}",
++        storage->with_marks ? " with marks" : "",
++        storage->with_minmax ? " with minmax_idx" : "",
+         filtered_parts.size(),
+         storage->source_table->getStorageID().getNameForLogs());
+ 
+-    pipeline.init(Pipe(std::make_shared<MergeTreeIndexSource>(getOutputHeader(), storage->key_sample_block, std::move(filtered_parts), context, storage->with_marks)));
++    pipeline.init(Pipe(std::make_shared<MergeTreeIndexSource>(
++        getOutputHeader(),
++        storage->key_sample_block,
++        storage->minmax_sample_block,
++        std::move(filtered_parts),
++        context,
++        storage->with_marks)));
+ }
+ 
+ MergeTreeData::DataPartsVector StorageMergeTreeIndex::getFilteredDataParts(const ExpressionActionsPtr & virtual_columns_filter) const
+diff --git a/src/Storages/StorageMergeTreeIndex.h b/src/Storages/StorageMergeTreeIndex.h
+index ed8274d7d92e..04deefabe5e2 100644
+--- a/src/Storages/StorageMergeTreeIndex.h
++++ b/src/Storages/StorageMergeTreeIndex.h
+@@ -19,7 +19,8 @@ class StorageMergeTreeIndex final : public IStorage
+         const StorageID & table_id_,
+         const StoragePtr & source_table_,
+         const ColumnsDescription & columns,
+-        bool with_marks_);
++        bool with_marks_,
++        bool with_minmax_);
+ 
+     void read(
+         QueryPlan & query_plan,
+@@ -40,9 +41,11 @@ class StorageMergeTreeIndex final : public IStorage
+ 
+     StoragePtr source_table;
+     bool with_marks;
++    bool with_minmax;
+ 
+     MergeTreeData::DataPartsVector data_parts;
+     Block key_sample_block;
++    Block minmax_sample_block;
+ };
+ 
+ }
+diff --git a/src/TableFunctions/TableFunctionMergeTreeIndex.cpp b/src/TableFunctions/TableFunctionMergeTreeIndex.cpp
+index b8ffcf86136b..863427af4790 100644
+--- a/src/TableFunctions/TableFunctionMergeTreeIndex.cpp
++++ b/src/TableFunctions/TableFunctionMergeTreeIndex.cpp
+@@ -1,6 +1,7 @@
+ #include <Storages/StorageMergeTreeIndex.h>
+ #include <TableFunctions/ITableFunction.h>
+ #include <Interpreters/DatabaseCatalog.h>
++#include <Interpreters/ExpressionActions.h>
+ #include <Interpreters/evaluateConstantExpression.h>
+ #include <Storages/checkAndGetLiteralArgument.h>
+ #include <TableFunctions/TableFunctionFactory.h>
+@@ -43,6 +44,7 @@ class TableFunctionMergeTreeIndex : public ITableFunction
+ 
+     StorageID source_table_id{StorageID::createEmpty()};
+     bool with_marks = false;
++    bool with_minmax = false;
+ };
+ 
+ void TableFunctionMergeTreeIndex::parseArguments(const ASTPtr & ast_function, ContextPtr context)
+@@ -66,20 +68,29 @@ void TableFunctionMergeTreeIndex::parseArguments(const ASTPtr & ast_function, Co
+     if (!rest_args.empty())
+     {
+         auto params = getParamsMapFromAST(rest_args, context);
+-        auto param = params.extract("with_marks");
+ 
+-        if (!param.empty())
++        auto extract_flag = [&](auto param, const String & param_name) -> UInt64
+         {
+-            auto & value = param.mapped();
+-            if (value.getType() != Field::Types::Bool && value.getType() != Field::Types::UInt64)
+-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+-                    "Table function '{}' expected bool flag for 'with_marks' argument", getName());
+-
+-            if (value.getType() == Field::Types::Bool)
+-                with_marks = value.safeGet<bool>();
++            if (!param.empty())
++            {
++                auto & value = param.mapped();
++                if (value.getType() != Field::Types::Bool && value.getType() != Field::Types::UInt64)
++                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                                    "Table function '{}' expected bool flag for '{}' argument", getName(), param_name);
++
++                if (value.getType() == Field::Types::Bool)
++                    return value.template safeGet<bool>();
++                else
++                    return value.template safeGet<UInt64>();
++            }
+             else
+-                with_marks = value.safeGet<UInt64>();
+-        }
++            {
++                return 0;
++            }
++        };
++
++        with_marks = extract_flag(params.extract("with_marks"), "with_marks");
++        with_minmax = extract_flag(params.extract("with_minmax"), "with_minmax");
+ 
+         if (!params.empty())
+         {
+@@ -99,7 +110,7 @@ static NameSet getAllPossibleStreamNames(
+     NameSet all_streams;
+ 
+     /// Add the stream with the name of column
+-    /// because it may be abcent in serialization streams (e.g. for Tuple type)
++    /// because it may be absent in serialization streams (e.g. for Tuple type)
+     /// but in compact parts we write only marks for whole columns, not subsubcolumns.
+     auto main_stream_name = escapeForFileName(column.name);
+     all_streams.insert(Nested::concatenateName(main_stream_name, "mark"));
+@@ -140,6 +151,16 @@ ColumnsDescription TableFunctionMergeTreeIndex::getActualTableStructure(ContextP
+     for (const auto & column : StorageMergeTreeIndex::virtuals_sample_block)
+         columns.add({column.name, column.type});
+ 
++    if (with_minmax)
++    {
++        const auto & partition_key = metadata_snapshot->getPartitionKey();
++        if (!partition_key.column_names.empty() && partition_key.expression)
++        {
++            for (const auto & column : partition_key.expression->getRequiredColumnsWithTypes())
++                columns.add({fmt::format("minmax_{}", column.name), std::make_shared<DataTypeTuple>(DataTypes{column.type, column.type})});
++        }
++    }
++
+     for (const auto & column : metadata_snapshot->getPrimaryKey().sample_block)
+         columns.add({column.name, column.type});
+ 
+@@ -183,7 +204,8 @@ StoragePtr TableFunctionMergeTreeIndex::executeImpl(
+     auto columns = getActualTableStructure(context, is_insert_query);
+ 
+     StorageID storage_id(getDatabaseName(), table_name);
+-    auto res = std::make_shared<StorageMergeTreeIndex>(std::move(storage_id), std::move(source_table), std::move(columns), with_marks);
++    auto res = std::make_shared<StorageMergeTreeIndex>(
++        std::move(storage_id), std::move(source_table), std::move(columns), with_marks, with_minmax);
+ 
+     res->startup();
+     return res;
+@@ -196,7 +218,7 @@ void registerTableFunctionMergeTreeIndex(TableFunctionFactory & factory)
+         .documentation =
+         {
+             .description = "Represents the contents of index and marks files of MergeTree tables. It can be used for introspection",
+-            .examples = {{"mergeTreeIndex", "SELECT * FROM mergeTreeIndex(currentDatabase(), mt_table, with_marks = true)", ""}},
++            .examples = {{"mergeTreeIndex", "SELECT * FROM mergeTreeIndex(currentDatabase(), mt_table, with_marks = true, with_minmax = true)", ""}},
+             .category = FunctionDocumentation::Category::TableFunction
+         },
+         .allow_readonly = true,

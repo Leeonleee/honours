@@ -1,0 +1,336 @@
+diff --git a/src/Core/Settings.cpp b/src/Core/Settings.cpp
+index e1bee79e5bd6..5f5a326ff94e 100644
+--- a/src/Core/Settings.cpp
++++ b/src/Core/Settings.cpp
+@@ -169,11 +169,14 @@ Squash blocks passed to the external table to a specified size in bytes, if bloc
+ )", 0) \
+     DECLARE(UInt64, max_joined_block_size_rows, DEFAULT_BLOCK_SIZE, R"(
+ Maximum block size for JOIN result (if join algorithm supports it). 0 means unlimited.
++)", 0) \
++    DECLARE(UInt64, max_joined_block_size_bytes, 4 * 1024 * 1024, R"(
++Maximum block size in bytes for JOIN result (if join algorithm supports it). 0 means unlimited.
+ )", 0) \
+     DECLARE(UInt64, min_joined_block_size_rows, DEFAULT_BLOCK_SIZE, R"(
+ Minimum block size in rows for JOIN input and output blocks (if join algorithm supports it). Small blocks will be squashed. 0 means unlimited.
+ )", 0) \
+-    DECLARE(UInt64, min_joined_block_size_bytes, 524288, R"(
++    DECLARE(UInt64, min_joined_block_size_bytes, 512 * 1024, R"(
+ Minimum block size in bytes for JOIN input and output blocks (if join algorithm supports it). Small blocks will be squashed. 0 means unlimited.
+ )", 0) \
+     DECLARE(UInt64, max_insert_threads, 0, R"(
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index c7c48f2506b4..a431c8087957 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -41,6 +41,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+         /// Note: please check if the key already exists to prevent duplicate entries.
+         addSettingsChanges(settings_changes_history, "25.8",
+         {
++            {"max_joined_block_size_bytes", 0, 4 * 1024 * 1024, "New setting"},
+             {"azure_max_single_part_upload_size", 100 * 1024 * 1024, 32 * 1024 * 1024, "Align with S3"},
+             {"azure_max_redirects", 10, 10, "New setting"},
+             {"azure_max_get_rps", 0, 0, "New setting"},
+diff --git a/src/Interpreters/ConcurrentHashJoin.cpp b/src/Interpreters/ConcurrentHashJoin.cpp
+index 9987f643e783..332e1aa4d23d 100644
+--- a/src/Interpreters/ConcurrentHashJoin.cpp
++++ b/src/Interpreters/ConcurrentHashJoin.cpp
+@@ -189,6 +189,7 @@ ConcurrentHashJoin::ConcurrentHashJoin(
+                         fmt::format("concurrent{}", i),
+                         /*use_two_level_maps*/ true);
+                     inner_hash_join->data->setMaxJoinedBlockRows(table_join->maxJoinedBlockRows());
++                    inner_hash_join->data->setMaxJoinedBlockBytes(table_join->maxJoinedBlockBytes());
+                     hash_joins[i] = std::move(inner_hash_join);
+                 });
+         }
+diff --git a/src/Interpreters/HashJoin/HashJoin.cpp b/src/Interpreters/HashJoin/HashJoin.cpp
+index 138b07fc7ad2..f444f92ea4d5 100644
+--- a/src/Interpreters/HashJoin/HashJoin.cpp
++++ b/src/Interpreters/HashJoin/HashJoin.cpp
+@@ -139,6 +139,7 @@ HashJoin::HashJoin(
+     , tmp_data(table_join_->getTempDataOnDisk())
+     , right_sample_block(*right_sample_block_)
+     , max_joined_block_rows(table_join->maxJoinedBlockRows())
++    , max_joined_block_bytes(table_join->maxJoinedBlockBytes())
+     , instance_log_id(!instance_id_.empty() ? "(" + instance_id_ + ") " : "")
+     , log(getLogger("HashJoin"))
+ {
+@@ -916,15 +917,29 @@ IJoinResult::JoinResultBlock CrossJoinResult::next()
+         for (const ColumnWithTypeAndName & right_column : join.sample_block_with_columns_to_add)
+             dst_columns.emplace_back(right_column.column->cloneEmpty());
+ 
++        size_t to_reserve = 0;
++        if (common::mulOverflow(block.rows(), join.data->rows_to_join, to_reserve))
++            to_reserve = join.max_joined_block_rows;
++
++        to_reserve = std::min(join.max_joined_block_rows, to_reserve);
++
+         for (auto & dst : dst_columns)
+-            dst->reserve(join.max_joined_block_rows);
++            dst->reserve(to_reserve);
+     }
+ 
+     size_t rows_total = block.rows();
+     size_t rows_added = 0;
++    size_t bytes_added = 0;
++
++    auto enough_data = [&]()
++    {
++        return (join.max_joined_block_rows && rows_added > join.max_joined_block_rows)
++            || (join.max_joined_block_bytes && bytes_added > join.max_joined_block_bytes);
++    };
++
+     for (; left_row < rows_total; ++left_row)
+     {
+-        if (rows_added >= join.max_joined_block_rows)
++        if (enough_data())
+             break;
+ 
+         auto process_right_block = [&](const Columns & columns)
+@@ -940,6 +955,14 @@ IJoinResult::JoinResultBlock CrossJoinResult::next()
+                 const IColumn & column_right = *columns[col_num];
+                 dst_columns[num_existing_columns + col_num]->insertRangeFrom(column_right, 0, rows_right);
+             }
++
++            if (join.max_joined_block_bytes)
++            {
++                bytes_added = 0;
++                /// Using byteSize here instead of allocatedBytes because memory was already reserved.
++                for (const auto & dst : dst_columns)
++                    bytes_added += dst->byteSize();
++            }
+         };
+ 
+         if (!right_block_it.has_value())
+@@ -947,7 +970,7 @@ IJoinResult::JoinResultBlock CrossJoinResult::next()
+ 
+         for (; *right_block_it != join.data->columns.end(); ++*right_block_it)
+         {
+-            if (rows_added >= join.max_joined_block_rows)
++            if (enough_data())
+                 break;
+ 
+             const auto & scattered_columns = **right_block_it;
+@@ -978,7 +1001,7 @@ IJoinResult::JoinResultBlock CrossJoinResult::next()
+ 
+             while (reader)
+             {
+-                if (rows_added >= join.max_joined_block_rows)
++                if (enough_data())
+                     break;
+ 
+                 auto block_right = reader.value()->read();
+diff --git a/src/Interpreters/HashJoin/HashJoin.h b/src/Interpreters/HashJoin/HashJoin.h
+index 0d13e60e43db..5752f83db229 100644
+--- a/src/Interpreters/HashJoin/HashJoin.h
++++ b/src/Interpreters/HashJoin/HashJoin.h
+@@ -438,6 +438,7 @@ class HashJoin : public IJoin
+     void shrinkStoredBlocksToFit(size_t & total_bytes_in_join, bool force_optimize = false);
+ 
+     void setMaxJoinedBlockRows(size_t value) { max_joined_block_rows = value; }
++    void setMaxJoinedBlockBytes(size_t value) { max_joined_block_bytes = value; }
+ 
+     void materializeColumnsFromLeftBlock(Block & block) const;
+     Block materializeColumnsFromRightBlock(Block block) const;
+@@ -506,6 +507,7 @@ class HashJoin : public IJoin
+ 
+     /// Maximum number of rows in result block. If it is 0, then no limits.
+     size_t max_joined_block_rows = 0;
++    size_t max_joined_block_bytes = 0;
+ 
+     /// When tracked memory consumption is more than a threshold, we will shrink to fit stored blocks.
+     bool shrink_blocks = false;
+diff --git a/src/Interpreters/HashJoin/HashJoinMethodsImpl.h b/src/Interpreters/HashJoin/HashJoinMethodsImpl.h
+index 41eda2847580..6eff70b7dc48 100644
+--- a/src/Interpreters/HashJoin/HashJoinMethodsImpl.h
++++ b/src/Interpreters/HashJoin/HashJoinMethodsImpl.h
+@@ -123,6 +123,8 @@ JoinResultPtr HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinBlockImpl(
+             join.required_right_keys,
+             join.required_right_keys_sources,
+             join.max_joined_block_rows,
++            join.max_joined_block_bytes,
++            join.data->allocated_size / std::max<size_t>(1, join.data->rows_to_join),
+             join_features.need_filter,
+             is_join_get
+         });
+diff --git a/src/Interpreters/HashJoin/HashJoinResult.cpp b/src/Interpreters/HashJoin/HashJoinResult.cpp
+index 62e853d22e0b..8528ba672100 100644
+--- a/src/Interpreters/HashJoin/HashJoinResult.cpp
++++ b/src/Interpreters/HashJoin/HashJoinResult.cpp
+@@ -188,18 +188,24 @@ static Block generateBlock(
+ static size_t numLeftRowsForNextBlock(
+     size_t next_row,
+     const IColumn::Offsets & offsets,
+-    size_t max_joined_block_rows)
++    size_t max_joined_block_rows,
++    size_t max_joined_block_bytes,
++    size_t avg_bytes_per_row)
+ {
+     /// If rows are not replicated, do not split block.
+-    if (offsets.empty() || max_joined_block_rows == 0)
++    if (offsets.empty() || (max_joined_block_rows == 0 && max_joined_block_bytes == 0))
+         return 0;
+ 
+     /// If offsets does not increase block size, do not split block.
+     if (offsets.back() <= offsets.size())
+         return 0;
+ 
++    size_t max_rows = max_joined_block_rows;
++    if (max_joined_block_bytes)
++        max_rows = std::min<size_t>(max_rows, max_joined_block_bytes / std::max<size_t>(avg_bytes_per_row, 1));
++
+     const size_t prev_offset = next_row ? offsets[next_row - 1] : 0;
+-    const size_t next_allowed_offset = prev_offset + max_joined_block_rows;
++    const size_t next_allowed_offset = prev_offset + max_rows;
+ 
+     if (offsets.back() <= next_allowed_offset)
+         return offsets.size() - next_row;
+@@ -234,12 +240,18 @@ HashJoinResult::HashJoinResult(
+ {
+ }
+ 
++static size_t getAvgBytesPerRow(const Block & block)
++{
++    return block.allocatedBytes() / std::max<size_t>(1, block.rows());
++}
++
+ IJoinResult::JoinResultBlock HashJoinResult::next()
+ {
+     if (!scattered_block)
+         return {};
+ 
+-    auto num_lhs_rows = numLeftRowsForNextBlock(next_row, offsets, properties.max_joined_block_rows);
++    size_t avg_bytes_per_row = properties.avg_joined_bytes_per_row + getAvgBytesPerRow(scattered_block->getSourceBlock());
++    auto num_lhs_rows = numLeftRowsForNextBlock(next_row, offsets, properties.max_joined_block_rows, properties.max_joined_block_bytes, avg_bytes_per_row);
+     if (num_lhs_rows == 0 || (next_row == 0 && num_lhs_rows >= scattered_block->rows()))
+     {
+         auto block = generateBlock(
+diff --git a/src/Interpreters/HashJoin/HashJoinResult.h b/src/Interpreters/HashJoin/HashJoinResult.h
+index 2ed6f4d8b59a..f4d0e169ae97 100644
+--- a/src/Interpreters/HashJoin/HashJoinResult.h
++++ b/src/Interpreters/HashJoin/HashJoinResult.h
+@@ -16,6 +16,9 @@ class HashJoinResult : public IJoinResult
+         const std::vector<String> & required_right_keys_sources;
+ 
+         size_t max_joined_block_rows;
++        size_t max_joined_block_bytes;
++
++        size_t avg_joined_bytes_per_row;
+ 
+         bool need_filter;
+         bool is_join_get;
+diff --git a/src/Interpreters/JoinInfo.cpp b/src/Interpreters/JoinInfo.cpp
+index 837e62c87107..72acca4b9520 100644
+--- a/src/Interpreters/JoinInfo.cpp
++++ b/src/Interpreters/JoinInfo.cpp
+@@ -43,6 +43,7 @@ namespace Setting
+     extern const SettingsUInt64 parallel_hash_join_threshold;
+ 
+     extern const SettingsUInt64 max_joined_block_size_rows;
++    extern const SettingsUInt64 max_joined_block_size_bytes;
+     extern const SettingsString temporary_files_codec;
+     extern const SettingsUInt64 join_output_by_rowlist_perkey_rows_threshold;
+     extern const SettingsUInt64 join_to_sort_minimum_perkey_rows;
+@@ -79,6 +80,7 @@ namespace QueryPlanSerializationSetting
+     extern const QueryPlanSerializationSettingsUInt64 parallel_hash_join_threshold;
+ 
+     extern const QueryPlanSerializationSettingsUInt64 max_joined_block_size_rows;
++    extern const QueryPlanSerializationSettingsUInt64 max_joined_block_size_bytes;
+     extern const QueryPlanSerializationSettingsString temporary_files_codec;
+     extern const QueryPlanSerializationSettingsUInt64 join_output_by_rowlist_perkey_rows_threshold;
+     extern const QueryPlanSerializationSettingsUInt64 join_to_sort_minimum_perkey_rows;
+@@ -101,6 +103,7 @@ JoinSettings::JoinSettings(const Settings & query_settings)
+     default_max_bytes_in_join = query_settings[Setting::default_max_bytes_in_join];
+ 
+     max_joined_block_size_rows = query_settings[Setting::max_joined_block_size_rows];
++    max_joined_block_size_bytes = query_settings[Setting::max_joined_block_size_bytes];
+     min_joined_block_size_rows = query_settings[Setting::min_joined_block_size_rows];
+     min_joined_block_size_bytes = query_settings[Setting::min_joined_block_size_bytes];
+ 
+@@ -158,6 +161,7 @@ JoinSettings::JoinSettings(const QueryPlanSerializationSettings & settings)
+     parallel_hash_join_threshold = settings[QueryPlanSerializationSetting::parallel_hash_join_threshold];
+ 
+     max_joined_block_size_rows = settings[QueryPlanSerializationSetting::max_joined_block_size_rows];
++    max_joined_block_size_bytes = settings[QueryPlanSerializationSetting::max_joined_block_size_bytes];
+     temporary_files_codec = settings[QueryPlanSerializationSetting::temporary_files_codec];
+     join_output_by_rowlist_perkey_rows_threshold = settings[QueryPlanSerializationSetting::join_output_by_rowlist_perkey_rows_threshold];
+     join_to_sort_minimum_perkey_rows = settings[QueryPlanSerializationSetting::join_to_sort_minimum_perkey_rows];
+@@ -197,6 +201,7 @@ void JoinSettings::updatePlanSettings(QueryPlanSerializationSettings & settings)
+     settings[QueryPlanSerializationSetting::parallel_hash_join_threshold] = parallel_hash_join_threshold;
+ 
+     settings[QueryPlanSerializationSetting::max_joined_block_size_rows] = max_joined_block_size_rows;
++    settings[QueryPlanSerializationSetting::max_joined_block_size_rows] = max_joined_block_size_bytes;
+     settings[QueryPlanSerializationSetting::temporary_files_codec] = temporary_files_codec;
+     settings[QueryPlanSerializationSetting::join_output_by_rowlist_perkey_rows_threshold] = join_output_by_rowlist_perkey_rows_threshold;
+     settings[QueryPlanSerializationSetting::join_to_sort_minimum_perkey_rows] = join_to_sort_minimum_perkey_rows;
+diff --git a/src/Interpreters/JoinInfo.h b/src/Interpreters/JoinInfo.h
+index 1bc0a7ffb72b..c3f9f5e26d9f 100644
+--- a/src/Interpreters/JoinInfo.h
++++ b/src/Interpreters/JoinInfo.h
+@@ -222,6 +222,7 @@ struct JoinSettings
+     UInt64 default_max_bytes_in_join;
+ 
+     UInt64 max_joined_block_size_rows;
++    UInt64 max_joined_block_size_bytes;
+     UInt64 min_joined_block_size_rows;
+     UInt64 min_joined_block_size_bytes;
+ 
+diff --git a/src/Interpreters/TableJoin.cpp b/src/Interpreters/TableJoin.cpp
+index 0844d10c9802..e6ec44ffe6f0 100644
+--- a/src/Interpreters/TableJoin.cpp
++++ b/src/Interpreters/TableJoin.cpp
+@@ -55,6 +55,7 @@ namespace Setting
+     extern const SettingsBool join_use_nulls;
+     extern const SettingsUInt64 max_bytes_in_join;
+     extern const SettingsUInt64 max_joined_block_size_rows;
++    extern const SettingsUInt64 max_joined_block_size_bytes;
+     extern const SettingsUInt64 max_memory_usage;
+     extern const SettingsUInt64 max_rows_in_join;
+     extern const SettingsUInt64 partial_merge_join_left_table_buffer_bytes;
+@@ -142,6 +143,7 @@ TableJoin::TableJoin(const Settings & settings, VolumePtr tmp_volume_, Temporary
+     , cross_join_min_rows_to_compress(settings[Setting::cross_join_min_rows_to_compress])
+     , cross_join_min_bytes_to_compress(settings[Setting::cross_join_min_bytes_to_compress])
+     , max_joined_block_rows(settings[Setting::max_joined_block_size_rows])
++    , max_joined_block_bytes(settings[Setting::max_joined_block_size_bytes])
+     , join_algorithms(settings[Setting::join_algorithm])
+     , partial_merge_join_rows_in_right_blocks(settings[Setting::partial_merge_join_rows_in_right_blocks])
+     , partial_merge_join_left_table_buffer_bytes(settings[Setting::partial_merge_join_left_table_buffer_bytes])
+@@ -165,6 +167,7 @@ TableJoin::TableJoin(const JoinSettings & settings, bool join_use_nulls_, Volume
+     , cross_join_min_rows_to_compress(settings.cross_join_min_rows_to_compress)
+     , cross_join_min_bytes_to_compress(settings.cross_join_min_bytes_to_compress)
+     , max_joined_block_rows(settings.max_joined_block_size_rows)
++    , max_joined_block_bytes(settings.max_joined_block_size_bytes)
+     , join_algorithms(settings.join_algorithms)
+     , partial_merge_join_rows_in_right_blocks(settings.partial_merge_join_rows_in_right_blocks)
+     , partial_merge_join_left_table_buffer_bytes(settings.partial_merge_join_left_table_buffer_bytes)
+diff --git a/src/Interpreters/TableJoin.h b/src/Interpreters/TableJoin.h
+index d06666d1d8b4..d69e01bccd46 100644
+--- a/src/Interpreters/TableJoin.h
++++ b/src/Interpreters/TableJoin.h
+@@ -151,6 +151,7 @@ class TableJoin
+     const UInt64 cross_join_min_rows_to_compress = 1000;
+     const UInt64 cross_join_min_bytes_to_compress = 10000;
+     const size_t max_joined_block_rows = 0;
++    const size_t max_joined_block_bytes = 0;
+     std::vector<JoinAlgorithm> join_algorithms;
+     const size_t partial_merge_join_rows_in_right_blocks = 0;
+     const size_t partial_merge_join_left_table_buffer_bytes = 0;
+@@ -309,6 +310,7 @@ class TableJoin
+     bool allowJoinSorting() const { return allow_join_sorting; }
+     size_t defaultMaxBytes() const { return default_max_bytes; }
+     size_t maxJoinedBlockRows() const { return max_joined_block_rows; }
++    size_t maxJoinedBlockBytes() const { return max_joined_block_bytes; }
+     size_t maxRowsInRightBlock() const { return partial_merge_join_rows_in_right_blocks; }
+     size_t maxBytesInLeftBuffer() const { return partial_merge_join_left_table_buffer_bytes; }
+     size_t maxFilesToMerge() const { return max_files_to_merge; }
+diff --git a/src/Processors/QueryPlan/QueryPlanSerializationSettings.cpp b/src/Processors/QueryPlan/QueryPlanSerializationSettings.cpp
+index b71355293d8e..6e9e7d0beb27 100644
+--- a/src/Processors/QueryPlan/QueryPlanSerializationSettings.cpp
++++ b/src/Processors/QueryPlan/QueryPlanSerializationSettings.cpp
+@@ -54,6 +54,7 @@ namespace DB
+     DECLARE(UInt64, max_bytes_in_join, 0, "Maximum size of the hash table for JOIN (in number of bytes in memory).", 0) \
+     DECLARE(UInt64, default_max_bytes_in_join, 1000000000, "Maximum size of right-side table if limit is required but max_bytes_in_join is not set.", 0) \
+     DECLARE(UInt64, max_joined_block_size_rows, DEFAULT_BLOCK_SIZE, "Maximum block size for JOIN result (if join algorithm supports it). 0 means unlimited.", 0) \
++    DECLARE(UInt64, max_joined_block_size_bytes, 4 * 1024 * 1024, "Maximum block size in bytes for JOIN result (if join algorithm supports it). 0 means unlimited.", 0) \
+     DECLARE(UInt64, min_joined_block_size_rows, DEFAULT_BLOCK_SIZE, "Minimum block size in rows for JOIN input and output blocks (if join algorithm supports it). Small blocks will be squashed. 0 means unlimited.", 0) \
+     DECLARE(UInt64, min_joined_block_size_bytes, 524288, "Minimum block size in bytes for JOIN input and output blocks (if join algorithm supports it). Small blocks will be squashed. 0 means unlimited.)", 0) \
+     \

@@ -1,0 +1,384 @@
+diff --git a/programs/local/LocalServer.cpp b/programs/local/LocalServer.cpp
+index 1ddd05809b2f..31687dbdf625 100644
+--- a/programs/local/LocalServer.cpp
++++ b/programs/local/LocalServer.cpp
+@@ -405,12 +405,19 @@ void LocalServer::cleanup()
+ }
+ 
+ 
+-std::string LocalServer::getInitialCreateTableQuery()
++std::pair<std::string, std::string> LocalServer::getInitialCreateTableQuery()
+ {
+-    if (!getClientConfiguration().has("table-structure") && !getClientConfiguration().has("table-file") && !getClientConfiguration().has("table-data-format") && (!isRegularFile(STDIN_FILENO) || queries.empty()))
++    /// The input data can be specified explicitly with any of the `file`, `structure`, `input-format` command line arguments,
++    /// or it can be implicitly specified in stdin - then the structure and format is autodetected.
++    /// But if queries were not specified in the command line, they might me in stdin, and this means that stdin is not input data.
++
++    if (!getClientConfiguration().has("table-structure")
++        && !getClientConfiguration().has("table-file")
++        && !getClientConfiguration().has("table-data-format")
++        && (queries.empty() || !isFileDescriptorSuitableForInput(stdin_fd))) /// In we know that there is data in stdin, we can auto-detect the format.
+         return {};
+ 
+-    auto table_name = backQuoteIfNeed(getClientConfiguration().getString("table-name", "table"));
++    auto table_name = getClientConfiguration().getString("table-name", "table");
+     auto table_structure = getClientConfiguration().getString("table-structure", "auto");
+ 
+     String table_file;
+@@ -429,15 +436,24 @@ std::string LocalServer::getInitialCreateTableQuery()
+         table_file = quoteString(file_name);
+     }
+ 
+-    String data_format = backQuoteIfNeed(default_input_format);
++    String data_format;
++
++    if (default_input_format == "auto" && getClientConfiguration().has("table-structure"))
++        data_format = "TabSeparated";   /// Compatibility with older versions when format inference was not available.
++    else
++        data_format = backQuoteIfNeed(default_input_format);
+ 
+     if (table_structure == "auto")
+         table_structure = "";
+     else
+         table_structure = "(" + table_structure + ")";
+ 
+-    return fmt::format("CREATE TEMPORARY TABLE {} {} ENGINE = File({}, {}, {});",
+-                       table_name, table_structure, data_format, table_file, compression);
++    return
++    {
++        table_name,
++        fmt::format("CREATE TEMPORARY TABLE {} {} ENGINE = File({}, {}, {});",
++            backQuote(table_name), table_structure, data_format, table_file, compression)
++    };
+ }
+ 
+ 
+@@ -613,10 +629,13 @@ try
+         std::cerr << std::endl;
+     }
+ 
++    auto [table_name, initial_query] = getInitialCreateTableQuery();
++    if (!table_name.empty())
++        client_context->setSetting("implicit_table_at_top_level", table_name);
++
+     connect();
+ 
+-    String initial_query = getInitialCreateTableQuery();
+-    if (!initial_query.empty())
++    if (!table_name.empty())
+         processQueryText(initial_query);
+ 
+ #if USE_FUZZING_MODE
+@@ -855,7 +874,7 @@ void LocalServer::processConfig()
+ #endif
+ 
+     /// NOTE: it is important to apply any overrides before
+-    /// setDefaultProfiles() calls since it will copy current context (i.e.
++    /// `setDefaultProfiles` calls since it will copy current context (i.e.
+     /// there is separate context for Buffer tables).
+     adjustSettings();
+     applySettingsOverridesForLocal(global_context);
+diff --git a/programs/local/LocalServer.h b/programs/local/LocalServer.h
+index 5c070c8d3ee0..747ece68d41b 100644
+--- a/programs/local/LocalServer.h
++++ b/programs/local/LocalServer.h
+@@ -53,9 +53,10 @@ class LocalServer : public ClientApplicationBase, public Loggers
+ private:
+     /** Composes CREATE subquery based on passed arguments (--structure --file --table and --input-format)
+       * This query will be executed first, before queries passed through --query argument
+-      * Returns empty string if it cannot compose that query.
++      * Returns a pair of the table name and the corresponding create table statement.
++      * Returns empty strings if it cannot compose that query.
+       */
+-    std::string getInitialCreateTableQuery();
++    std::pair<std::string, std::string> getInitialCreateTableQuery();
+ 
+     void tryInitPath();
+     void setupUsers();
+diff --git a/src/Analyzer/QueryTreeBuilder.cpp b/src/Analyzer/QueryTreeBuilder.cpp
+index c12c076c045f..679774de81c7 100644
+--- a/src/Analyzer/QueryTreeBuilder.cpp
++++ b/src/Analyzer/QueryTreeBuilder.cpp
+@@ -4,7 +4,6 @@
+ #include <Common/quoteString.h>
+ 
+ #include <DataTypes/FieldToDataType.h>
+-#include <Parsers/ParserSelectWithUnionQuery.h>
+ #include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Parsers/ASTSelectIntersectExceptQuery.h>
+ #include <Parsers/ASTExpressionList.h>
+@@ -47,12 +46,12 @@
+ 
+ #include <Databases/IDatabase.h>
+ 
+-#include <Interpreters/StorageID.h>
+ #include <Interpreters/Context.h>
+ 
+ 
+ namespace DB
+ {
++
+ namespace Setting
+ {
+     extern const SettingsBool allow_experimental_variant_type;
+@@ -62,6 +61,7 @@ namespace Setting
+     extern const SettingsUInt64 limit;
+     extern const SettingsUInt64 offset;
+     extern const SettingsBool use_variant_as_common_type;
++    extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+ 
+@@ -123,7 +123,7 @@ class QueryTreeBuilder
+ 
+     QueryTreeNodePtr buildWindow(const ASTPtr & window_definition, const ContextPtr & context) const;
+ 
+-    QueryTreeNodePtr buildJoinTree(const ASTSelectQuery & select_query, const ContextPtr & context) const;
++    QueryTreeNodePtr buildJoinTree(bool is_subquery, const ASTSelectQuery & select_query, const ContextPtr & context) const;
+ 
+     ColumnTransformersNodes buildColumnTransformers(const ASTPtr & matcher_expression, const ContextPtr & context) const;
+ 
+@@ -239,7 +239,8 @@ QueryTreeNodePtr QueryTreeBuilder::buildSelectIntersectExceptQuery(const ASTPtr
+     return union_node;
+ }
+ 
+-QueryTreeNodePtr QueryTreeBuilder::buildSelectExpression(const ASTPtr & select_query,
++QueryTreeNodePtr QueryTreeBuilder::buildSelectExpression(
++    const ASTPtr & select_query,
+     bool is_subquery,
+     const std::string & cte_name,
+     const ASTPtr & aliases,
+@@ -313,7 +314,7 @@ QueryTreeNodePtr QueryTreeBuilder::buildSelectExpression(const ASTPtr & select_q
+ 
+     auto current_context = current_query_tree->getContext();
+ 
+-    current_query_tree->getJoinTree() = buildJoinTree(select_query_typed, current_context);
++    current_query_tree->getJoinTree() = buildJoinTree(is_subquery, select_query_typed, current_context);
+ 
+     auto select_with_list = select_query_typed.with();
+     if (select_with_list)
+@@ -853,16 +854,23 @@ std::shared_ptr<TableFunctionNode> QueryTreeBuilder::buildTableFunction(const AS
+     return node;
+ }
+ 
+-QueryTreeNodePtr QueryTreeBuilder::buildJoinTree(const ASTSelectQuery & select_query, const ContextPtr & context) const
++QueryTreeNodePtr QueryTreeBuilder::buildJoinTree(bool is_subquery, const ASTSelectQuery & select_query, const ContextPtr & context) const
+ {
+     const auto & tables_in_select_query = select_query.tables();
+     if (!tables_in_select_query)
+     {
+-        /** If no table is specified in SELECT query we substitute system.one table.
+-          * SELECT * FROM system.one;
++        /** If no table is specified in SELECT query,
++          * if 'implicit_table_at_top_level' is set, we substitute it as a table,
++          * otherwise, we substitute the system.one table: SELECT * FROM system.one;
+           */
+-        Identifier storage_identifier("system.one");
+-        return std::make_shared<IdentifierNode>(storage_identifier);
++        if (!is_subquery)
++        {
++            String implicit_table = context->getSettingsRef()[Setting::implicit_table_at_top_level];
++            if (!implicit_table.empty())
++                return std::make_shared<IdentifierNode>(Identifier(implicit_table));
++        }
++
++        return std::make_shared<IdentifierNode>(Identifier("system.one"));
+     }
+ 
+     auto & tables = tables_in_select_query->as<ASTTablesInSelectQuery &>();
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.cpp b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+index 68d0acfacec9..2712129b1c92 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.cpp
++++ b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+@@ -113,6 +113,7 @@ namespace Setting
+     extern const SettingsBool allow_suspicious_types_in_order_by;
+     extern const SettingsBool allow_not_comparable_types_in_order_by;
+     extern const SettingsBool use_concurrency_control;
++    extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+ 
+@@ -581,6 +582,7 @@ void QueryAnalyzer::evaluateScalarSubqueryIfNeeded(QueryTreeNodePtr & node, Iden
+         Settings subquery_settings = context->getSettingsCopy();
+         subquery_settings[Setting::max_result_rows] = 1;
+         subquery_settings[Setting::extremes] = false;
++        subquery_settings[Setting::implicit_table_at_top_level] = "";
+         /// When execute `INSERT INTO t WITH ... SELECT ...`, it may lead to `Unknown columns`
+         /// exception with this settings enabled(https://github.com/ClickHouse/ClickHouse/issues/52494).
+         subquery_settings[Setting::use_structure_from_insertion_table_in_table_functions] = false;
+diff --git a/src/Client/ClientBase.cpp b/src/Client/ClientBase.cpp
+index e051910c6631..8e32adc9546f 100644
+--- a/src/Client/ClientBase.cpp
++++ b/src/Client/ClientBase.cpp
+@@ -877,10 +877,11 @@ void ClientBase::initClientContext()
+     client_context->setQueryParameters(query_parameters);
+ }
+ 
+-bool ClientBase::isRegularFile(int fd)
++bool ClientBase::isFileDescriptorSuitableForInput(int fd)
+ {
+     struct stat file_stat;
+-    return fstat(fd, &file_stat) == 0 && S_ISREG(file_stat.st_mode);
++    return fstat(fd, &file_stat) == 0
++        && (S_ISREG(file_stat.st_mode) || S_ISLNK(file_stat.st_mode));
+ }
+ 
+ void ClientBase::setDefaultFormatsAndCompressionFromConfiguration()
+@@ -900,7 +901,7 @@ void ClientBase::setDefaultFormatsAndCompressionFromConfiguration()
+         default_output_format = "Vertical";
+         is_default_format = false;
+     }
+-    else if (isRegularFile(stdout_fd))
++    else if (isFileDescriptorSuitableForInput(stdout_fd))
+     {
+         std::optional<String> format_from_file_name = FormatFactory::instance().tryGetFormatFromFileDescriptor(stdout_fd);
+         if (format_from_file_name)
+@@ -936,7 +937,7 @@ void ClientBase::setDefaultFormatsAndCompressionFromConfiguration()
+         if (format_from_file_name)
+             default_input_format = *format_from_file_name;
+         else
+-            default_input_format = "TSV";
++            default_input_format = "auto";
+     }
+     else
+     {
+@@ -944,7 +945,7 @@ void ClientBase::setDefaultFormatsAndCompressionFromConfiguration()
+         if (format_from_file_name)
+             default_input_format = *format_from_file_name;
+         else
+-            default_input_format = "TSV";
++            default_input_format = "auto";
+ 
+         std::optional<String> file_name = tryGetFileNameFromFileDescriptor(stdin_fd);
+         if (file_name)
+diff --git a/src/Client/ClientBase.h b/src/Client/ClientBase.h
+index 0144cbedc90e..473ad8add9dd 100644
+--- a/src/Client/ClientBase.h
++++ b/src/Client/ClientBase.h
+@@ -265,7 +265,7 @@ class ClientBase
+     static bool isSyncInsertWithData(const ASTInsertQuery & insert_query, const ContextPtr & context);
+     bool processMultiQueryFromFile(const String & file_name);
+ 
+-    static bool isRegularFile(int fd);
++    static bool isFileDescriptorSuitableForInput(int fd);
+ 
+     /// Adjust some settings after command line options and config had been processed.
+     void adjustSettings();
+diff --git a/src/Core/Settings.cpp b/src/Core/Settings.cpp
+index 60192a897d36..86e7289bdc14 100644
+--- a/src/Core/Settings.cpp
++++ b/src/Core/Settings.cpp
+@@ -6401,6 +6401,19 @@ Enable pushing user roles from originator to other nodes while performing a quer
+ )", 0) \
+     DECLARE(Bool, shared_merge_tree_sync_parts_on_partition_operations, true, R"(
+ Automatically synchronize set of data parts after MOVE|REPLACE|ATTACH partition operations in SMT tables. Cloud only
++)", 0) \
++    DECLARE(String, implicit_table_at_top_level, "", R"(
++If not empty, queries without FROM at the top level will read from this table instead of system.one.
++
++This is used in clickhouse-local for input data processing.
++The setting could be set explicitly by a user but is not intended for this type of usage.
++
++Subqueries are not affected by this setting (neither scalar, FROM, or IN subqueries).
++SELECTs at the top level of UNION, INTERSECT, EXCEPT chains are treated uniformly and affected by this setting, regardless of their grouping in parentheses.
++It is unspecified how this setting affects views and distributed queries.
++
++The setting accepts a table name (then the table is resolved from the current database) or a qualified name in the form of 'database.table'.
++Both database and table names have to be unquoted - only simple identifiers are allowed.
+ )", 0) \
+     \
+     DECLARE(Bool, allow_experimental_variant_type, true, R"(
+diff --git a/src/Core/SettingsChangesHistory.cpp b/src/Core/SettingsChangesHistory.cpp
+index 01b4bf59232a..8b145afc11f4 100644
+--- a/src/Core/SettingsChangesHistory.cpp
++++ b/src/Core/SettingsChangesHistory.cpp
+@@ -69,6 +69,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
+         addSettingsChanges(settings_changes_history, "25.5",
+         {
+             {"secondary_indices_enable_bulk_filtering", false, true, "A new algorithm for filtering by data skipping indices"},
++            {"implicit_table_at_top_level", "", "", "A new setting, used in clickhouse-local"},
+         });
+         addSettingsChanges(settings_changes_history, "25.4",
+         {
+diff --git a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+index 32d941c5f961..26261d9b290b 100644
+--- a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
++++ b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+@@ -5,14 +5,12 @@
+ #include <Core/Settings.h>
+ #include <DataTypes/DataTypeNullable.h>
+ #include <DataTypes/DataTypeTuple.h>
+-#include <IO/WriteBufferFromString.h>
+ #include <IO/WriteHelpers.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+ #include <Interpreters/ProcessorsProfileLog.h>
+ #include <Interpreters/addTypeConversionToAST.h>
+ #include <Interpreters/misc.h>
+-#include <Parsers/ASTExpressionList.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/ASTSelectQuery.h>
+@@ -38,6 +36,7 @@ namespace Setting
+     extern const SettingsBool extremes;
+     extern const SettingsUInt64 max_result_rows;
+     extern const SettingsBool use_concurrency_control;
++    extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+ namespace ErrorCodes
+@@ -96,6 +95,7 @@ static auto getQueryInterpreter(const ASTSubquery & subquery, ExecuteScalarSubqu
+     Settings subquery_settings = data.getContext()->getSettingsCopy();
+     subquery_settings[Setting::max_result_rows] = 1;
+     subquery_settings[Setting::extremes] = false;
++    subquery_settings[Setting::implicit_table_at_top_level] = "";
+     subquery_context->setSettings(subquery_settings);
+ 
+     if (subquery_context->hasQueryContext())
+diff --git a/src/Interpreters/InterpreterSelectQuery.cpp b/src/Interpreters/InterpreterSelectQuery.cpp
+index 12713604f8be..7f15995fa7ec 100644
+--- a/src/Interpreters/InterpreterSelectQuery.cpp
++++ b/src/Interpreters/InterpreterSelectQuery.cpp
+@@ -193,6 +193,7 @@ namespace Setting
+     extern const SettingsUInt64 max_bytes_to_transfer;
+     extern const SettingsUInt64 max_rows_to_transfer;
+     extern const SettingsOverflowMode transfer_overflow_mode;
++    extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+ namespace ServerSetting
+@@ -355,6 +356,7 @@ ContextPtr getSubqueryContext(const ContextPtr & context)
+     Settings subquery_settings = context->getSettingsCopy();
+     subquery_settings[Setting::max_result_rows] = 0;
+     subquery_settings[Setting::max_result_bytes] = 0;
++    subquery_settings[Setting::implicit_table_at_top_level] = "";
+     /// The calculation of extremes does not make sense and is not necessary (if you do it, then the extremes of the subquery can be taken for whole query).
+     subquery_settings[Setting::extremes] = false;
+     subquery_context->setSettings(subquery_settings);
+diff --git a/src/Interpreters/interpretSubquery.cpp b/src/Interpreters/interpretSubquery.cpp
+index a6c3c0902476..b8f3a9e0a0dd 100644
+--- a/src/Interpreters/interpretSubquery.cpp
++++ b/src/Interpreters/interpretSubquery.cpp
+@@ -1,6 +1,5 @@
+ #include <Common/typeid_cast.h>
+ #include <Core/Settings.h>
+-#include <IO/WriteHelpers.h>
+ 
+ #include <Storages/IStorage.h>
+ 
+@@ -23,6 +22,7 @@ namespace Setting
+     extern const SettingsBool extremes;
+     extern const SettingsUInt64 max_result_bytes;
+     extern const SettingsUInt64 max_result_rows;
++    extern const SettingsString implicit_table_at_top_level;
+ }
+ 
+ namespace ErrorCodes
+@@ -74,6 +74,7 @@ std::shared_ptr<InterpreterSelectWithUnionQuery> interpretSubquery(
+     subquery_settings[Setting::max_result_bytes] = 0;
+     /// The calculation of `extremes` does not make sense and is not necessary (if you do it, then the `extremes` of the subquery can be taken instead of the whole query).
+     subquery_settings[Setting::extremes] = false;
++    subquery_settings[Setting::implicit_table_at_top_level] = "";
+     subquery_context->setSettings(subquery_settings);
+ 
+     auto subquery_options = options.subquery();

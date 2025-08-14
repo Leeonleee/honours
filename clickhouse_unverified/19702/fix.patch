@@ -1,0 +1,318 @@
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp b/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
+index 22cb5ed6e9c2..b2a144ca7486 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
+@@ -74,20 +74,9 @@ size_t ReplicatedMergeTreePartCheckThread::size() const
+ }
+ 
+ 
+-void ReplicatedMergeTreePartCheckThread::searchForMissingPart(const String & part_name)
++ReplicatedMergeTreePartCheckThread::MissingPartSearchResult ReplicatedMergeTreePartCheckThread::searchForMissingPartOnOtherReplicas(const String & part_name)
+ {
+     auto zookeeper = storage.getZooKeeper();
+-    String part_path = storage.replica_path + "/parts/" + part_name;
+-
+-    /// If the part is in ZooKeeper, remove it from there and add the task to download it to the queue.
+-    if (zookeeper->exists(part_path))
+-    {
+-        LOG_WARNING(log, "Part {} exists in ZooKeeper but not locally. Removing from ZooKeeper and queueing a fetch.", part_name);
+-        ProfileEvents::increment(ProfileEvents::ReplicatedPartChecksFailed);
+-
+-        storage.removePartAndEnqueueFetch(part_name);
+-        return;
+-    }
+ 
+     /// If the part is not in ZooKeeper, we'll check if it's at least somewhere.
+     auto part_info = MergeTreePartInfo::fromPartName(part_name, storage.format_version);
+@@ -115,7 +104,7 @@ void ReplicatedMergeTreePartCheckThread::searchForMissingPart(const String & par
+         *   and don't delete the queue entry when in doubt.
+         */
+ 
+-    LOG_WARNING(log, "Checking if anyone has a part covering {}.", part_name);
++    LOG_WARNING(log, "Checking if anyone has a part {} or covering part.", part_name);
+ 
+     bool found_part_with_the_same_min_block = false;
+     bool found_part_with_the_same_max_block = false;
+@@ -123,15 +112,27 @@ void ReplicatedMergeTreePartCheckThread::searchForMissingPart(const String & par
+     Strings replicas = zookeeper->getChildren(storage.zookeeper_path + "/replicas");
+     for (const String & replica : replicas)
+     {
+-        Strings parts = zookeeper->getChildren(storage.zookeeper_path + "/replicas/" + replica + "/parts");
++        String replica_path = storage.zookeeper_path + "/replicas/" + replica;
++
++        Strings parts = zookeeper->getChildren(replica_path + "/parts");
+         for (const String & part_on_replica : parts)
+         {
+             auto part_on_replica_info = MergeTreePartInfo::fromPartName(part_on_replica, storage.format_version);
+ 
++            if (part_info == part_on_replica_info)
++            {
++                /// Found missing part at ourself. If we are here then something wrong with this part, so skipping.
++                if (replica_path == storage.replica_path)
++                    continue;
++
++                LOG_WARNING(log, "Found the missing part {} at {} on {}", part_name, part_on_replica, replica);
++                return MissingPartSearchResult::FoundAndNeedFetch;
++            }
++
+             if (part_on_replica_info.contains(part_info))
+             {
+                 LOG_WARNING(log, "Found part {} on {} that covers the missing part {}", part_on_replica, replica, part_name);
+-                return;
++                return MissingPartSearchResult::FoundAndDontNeedFetch;
+             }
+ 
+             if (part_info.contains(part_on_replica_info))
+@@ -144,7 +145,7 @@ void ReplicatedMergeTreePartCheckThread::searchForMissingPart(const String & par
+                 if (found_part_with_the_same_min_block && found_part_with_the_same_max_block)
+                 {
+                     LOG_WARNING(log, "Found parts with the same min block and with the same max block as the missing part {}. Hoping that it will eventually appear as a result of a merge.", part_name);
+-                    return;
++                    return MissingPartSearchResult::FoundAndDontNeedFetch;
+                 }
+             }
+         }
+@@ -160,28 +161,61 @@ void ReplicatedMergeTreePartCheckThread::searchForMissingPart(const String & par
+         not_found_msg = "smaller parts with either the same min block or the same max block.";
+     LOG_ERROR(log, "No replica has part covering {} and a merge is impossible: we didn't find {}", part_name, not_found_msg);
+ 
+-    ProfileEvents::increment(ProfileEvents::ReplicatedPartChecksFailed);
++    return MissingPartSearchResult::LostForever;
++}
++
++void ReplicatedMergeTreePartCheckThread::searchForMissingPartAndFetchIfPossible(const String & part_name, bool exists_in_zookeeper)
++{
++    auto zookeeper = storage.getZooKeeper();
++    auto missing_part_search_result = searchForMissingPartOnOtherReplicas(part_name);
+ 
+-    /// Is it in the replication queue? If there is - delete, because the task can not be processed.
+-    if (!storage.queue.remove(zookeeper, part_name))
++    /// If the part is in ZooKeeper, remove it from there and add the task to download it to the queue.
++    if (exists_in_zookeeper)
+     {
+-        /// The part was not in our queue. Why did it happen?
+-        LOG_ERROR(log, "Missing part {} is not in our queue.", part_name);
+-        return;
++        /// If part found on some other replica
++        if (missing_part_search_result == MissingPartSearchResult::FoundAndNeedFetch)
++        {
++            LOG_WARNING(log, "Part {} exists in ZooKeeper but not locally and found on other replica. Removing from ZooKeeper and queueing a fetch.", part_name);
++            storage.removePartAndEnqueueFetch(part_name);
++        }
++        else /// If we have covering part on other replica or part is lost forever we don't need to fetch anything
++        {
++            LOG_WARNING(log, "Part {} exists in ZooKeeper but not locally and not found on other replica. Removing it from ZooKeeper.", part_name);
++            storage.removePartFromZooKeeper(part_name);
++        }
+     }
+ 
+-    /** This situation is possible if on all the replicas where the part was, it deteriorated.
+-        * For example, a replica that has just written it has power turned off and the data has not been written from cache to disk.
+-        */
+-    LOG_ERROR(log, "Part {} is lost forever.", part_name);
+-    ProfileEvents::increment(ProfileEvents::ReplicatedDataLoss);
+-}
++    ProfileEvents::increment(ProfileEvents::ReplicatedPartChecksFailed);
+ 
++    if (missing_part_search_result == MissingPartSearchResult::LostForever)
++    {
++        /// Is it in the replication queue? If there is - delete, because the task can not be processed.
++        if (!storage.queue.remove(zookeeper, part_name))
++        {
++            /// The part was not in our queue.
++            LOG_WARNING(log, "Missing part {} is not in our queue, this can happen rarely.", part_name);
++        }
+ 
+-CheckResult ReplicatedMergeTreePartCheckThread::checkPart(const String & part_name)
++        /** This situation is possible if on all the replicas where the part was, it deteriorated.
++            * For example, a replica that has just written it has power turned off and the data has not been written from cache to disk.
++            */
++        LOG_ERROR(log, "Part {} is lost forever.", part_name);
++        ProfileEvents::increment(ProfileEvents::ReplicatedDataLoss);
++    }
++}
++
++std::pair<bool, MergeTreeDataPartPtr> ReplicatedMergeTreePartCheckThread::findLocalPart(const String & part_name)
+ {
+-    LOG_WARNING(log, "Checking part {}", part_name);
+-    ProfileEvents::increment(ProfileEvents::ReplicatedPartChecks);
++    auto zookeeper = storage.getZooKeeper();
++    String part_path = storage.replica_path + "/parts/" + part_name;
++
++    /// It's important to check zookeeper first and after that check local storage,
++    /// because our checks of local storage and zookeeper are not consistent.
++    /// If part exists in zookeeper and doesn't exists in local storage definitely require
++    /// to fetch this part. But if we check local storage first and than check zookeeper
++    /// some background process can successfully commit part between this checks (both to the local stoarge and zookeeper),
++    /// but checker thread will remove part from zookeeper and queue fetch.
++    bool exists_in_zookeeper = zookeeper->exists(part_path);
+ 
+     /// If the part is still in the PreCommitted -> Committed transition, it is not lost
+     /// and there is no need to go searching for it on other replicas. To definitely find the needed part
+@@ -190,17 +224,27 @@ CheckResult ReplicatedMergeTreePartCheckThread::checkPart(const String & part_na
+     if (!part)
+         part = storage.getActiveContainingPart(part_name);
+ 
++    return std::make_pair(exists_in_zookeeper, part);
++}
++
++CheckResult ReplicatedMergeTreePartCheckThread::checkPart(const String & part_name)
++{
++    LOG_WARNING(log, "Checking part {}", part_name);
++    ProfileEvents::increment(ProfileEvents::ReplicatedPartChecks);
++
++    auto [exists_in_zookeeper, part] = findLocalPart(part_name);
++
+     /// We do not have this or a covering part.
+     if (!part)
+     {
+-        searchForMissingPart(part_name);
++        searchForMissingPartAndFetchIfPossible(part_name, exists_in_zookeeper);
+         return {part_name, false, "Part is missing, will search for it"};
+     }
++
+     /// We have this part, and it's active. We will check whether we need this part and whether it has the right data.
+-    else if (part->name == part_name)
++    if (part->name == part_name)
+     {
+         auto zookeeper = storage.getZooKeeper();
+-
+         auto table_lock = storage.lockForShare(RWLockImpl::NO_QUERY, storage.getSettings()->lock_acquire_timeout_for_background_operations);
+ 
+         auto local_part_header = ReplicatedMergeTreePartHeader::fromColumnsAndChecksums(
+@@ -254,11 +298,11 @@ CheckResult ReplicatedMergeTreePartCheckThread::checkPart(const String & part_na
+ 
+                 tryLogCurrentException(log, __PRETTY_FUNCTION__);
+ 
+-                String message = "Part " + part_name + " looks broken. Removing it and queueing a fetch.";
++                String message = "Part " + part_name + " looks broken. Removing it and will try to fetch.";
+                 LOG_ERROR(log, message);
+-                ProfileEvents::increment(ProfileEvents::ReplicatedPartChecksFailed);
+ 
+-                storage.removePartAndEnqueueFetch(part_name);
++                /// Part is broken, let's try to find it and fetch.
++                searchForMissingPartAndFetchIfPossible(part_name, exists_in_zookeeper);
+ 
+                 /// Delete part locally.
+                 storage.forgetPartAndMoveToDetached(part, "broken");
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.h b/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.h
+index 4239d7a8051e..8257898fe3f1 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.h
++++ b/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.h
+@@ -12,6 +12,7 @@
+ #include <common/logger_useful.h>
+ #include <Core/BackgroundSchedulePool.h>
+ #include <Storages/CheckResults.h>
++#include <Storages/MergeTree/IMergeTreeDataPart.h>
+ 
+ namespace DB
+ {
+@@ -73,7 +74,26 @@ class ReplicatedMergeTreePartCheckThread
+ private:
+     void run();
+ 
+-    void searchForMissingPart(const String & part_name);
++    /// Search for missing part and queue fetch if possible. Otherwise
++    /// remove part from zookeeper and queue.
++    void searchForMissingPartAndFetchIfPossible(const String & part_name, bool exists_in_zookeeper);
++
++    std::pair<bool, MergeTreeDataPartPtr> findLocalPart(const String & part_name);
++
++    enum MissingPartSearchResult
++    {
++        /// We found this part on other replica, let's fetch it.
++        FoundAndNeedFetch,
++        /// We found covering part or source part with same min and max block number
++        /// don't need to fetch because we should do it during normal queue processing.
++        FoundAndDontNeedFetch,
++        /// Covering part not found anywhere and exact part_name doesn't found on other
++        /// replicas.
++        LostForever,
++    };
++
++    /// Search for missing part on other replicas or covering part on all replicas (including our replica).
++    MissingPartSearchResult searchForMissingPartOnOtherReplicas(const String & part_name);
+ 
+     StorageReplicatedMergeTree & storage;
+     String log_name;
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index ab1254acc5f7..26a916d2356d 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -420,13 +420,26 @@ bool ReplicatedMergeTreeQueue::remove(zkutil::ZooKeeperPtr zookeeper, const Stri
+     {
+         std::unique_lock lock(state_mutex);
+ 
+-        virtual_parts.remove(part_name);
++        bool removed = virtual_parts.remove(part_name);
+ 
+         for (Queue::iterator it = queue.begin(); it != queue.end();)
+         {
+             if ((*it)->new_part_name == part_name)
+             {
+                 found = *it;
++                if (removed)
++                {
++                    /// Preserve invariant `virtual_parts` = `current_parts` + `queue`.
++                    /// We remove new_part from virtual parts and add all source parts
++                    /// which present in current_parts.
++                    for (const auto & source_part : found->source_parts)
++                    {
++                        auto part_in_current_parts = current_parts.getContainingPart(source_part);
++                        if (part_in_current_parts == source_part)
++                            virtual_parts.add(source_part);
++                    }
++                }
++
+                 updateStateOnQueueEntryRemoval(
+                     found, /* is_successful = */ false,
+                     min_unprocessed_insert_time_changed, max_processed_insert_time_changed, lock);
+@@ -1010,7 +1023,7 @@ bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const String & log_
+     /// NOTE The above is redundant, but left for a more convenient message in the log.
+     auto result_part = MergeTreePartInfo::fromPartName(new_part_name, format_version);
+ 
+-    /// It can slow down when the size of `future_parts` is large. But it can not be large, since `BackgroundProcessingPool` is limited.
++    /// It can slow down when the size of `future_parts` is large. But it can not be large, since background pool is limited.
+     for (const auto & future_part_elem : future_parts)
+     {
+         auto future_part = MergeTreePartInfo::fromPartName(future_part_elem.first, format_version);
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 4eb7d7ebccde..a6fd50c4c8e2 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -3013,6 +3013,21 @@ void StorageReplicatedMergeTree::removePartFromZooKeeper(const String & part_nam
+     ops.emplace_back(zkutil::makeRemoveRequest(part_path, -1));
+ }
+ 
++void StorageReplicatedMergeTree::removePartFromZooKeeper(const String & part_name)
++{
++    auto zookeeper = getZooKeeper();
++    String part_path = replica_path + "/parts/" + part_name;
++    Coordination::Stat stat;
++
++    /// Part doesn't exist, nothing to remove
++    if (!zookeeper->exists(part_path, &stat))
++        return;
++
++    Coordination::Requests ops;
++
++    removePartFromZooKeeper(part_name, ops, stat.numChildren > 0);
++    zookeeper->multi(ops);
++}
+ 
+ void StorageReplicatedMergeTree::removePartAndEnqueueFetch(const String & part_name)
+ {
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index cf36cf82fc98..6db05294b635 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -381,6 +381,9 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+     /// Set has_children to true for "old-style" parts (those with /columns and /checksums child znodes).
+     void removePartFromZooKeeper(const String & part_name, Coordination::Requests & ops, bool has_children);
+ 
++    /// Just removes part from ZooKeeper using previous method
++    void removePartFromZooKeeper(const String & part_name);
++
+     /// Quickly removes big set of parts from ZooKeeper (using async multi queries)
+     void removePartsFromZooKeeper(zkutil::ZooKeeperPtr & zookeeper, const Strings & part_names,
+                                   NameSet * parts_should_be_retried = nullptr);

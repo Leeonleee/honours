@@ -1,0 +1,232 @@
+diff --git a/dbms/programs/server/HTTPHandler.cpp b/dbms/programs/server/HTTPHandler.cpp
+index a645019875a3..261504926f5b 100644
+--- a/dbms/programs/server/HTTPHandler.cpp
++++ b/dbms/programs/server/HTTPHandler.cpp
+@@ -4,6 +4,7 @@
+ #include <Poco/File.h>
+ #include <Poco/Net/HTTPBasicCredentials.h>
+ #include <Poco/Net/HTTPServerRequest.h>
++#include <Poco/Net/HTTPServerRequestImpl.h>
+ #include <Poco/Net/HTTPServerResponse.h>
+ #include <Poco/Net/NetException.h>
+ 
+@@ -558,9 +559,47 @@ void HTTPHandler::processQuery(
+     client_info.http_method = http_method;
+     client_info.http_user_agent = request.get("User-Agent", "");
+ 
++    auto appendCallback = [&context] (ProgressCallback callback)
++    {
++        auto prev = context.getProgressCallback();
++
++        context.setProgressCallback([prev, callback] (const Progress & progress)
++        {
++            if (prev)
++                prev(progress);
++
++            callback(progress);
++        });
++    };
++
+     /// While still no data has been sent, we will report about query execution progress by sending HTTP headers.
+     if (settings.send_progress_in_http_headers)
+-        context.setProgressCallback([&used_output] (const Progress & progress) { used_output.out->onProgress(progress); });
++        appendCallback([&used_output] (const Progress & progress) { used_output.out->onProgress(progress); });
++
++    if (settings.readonly > 0 && settings.cancel_http_readonly_queries_on_client_close)
++    {
++        Poco::Net::StreamSocket & socket = dynamic_cast<Poco::Net::HTTPServerRequestImpl &>(request).socket();
++
++        appendCallback([&context, &socket](const Progress &)
++        {
++            /// Assume that at the point this method is called no one is reading data from the socket any more.
++            /// True for read-only queries.
++            try
++            {
++                char b;
++                int status = socket.receiveBytes(&b, 1, MSG_DONTWAIT | MSG_PEEK);
++                if (status == 0)
++                    context.killCurrentQuery();
++            }
++            catch (Poco::TimeoutException &)
++            {
++            }
++            catch (...)
++            {
++                context.killCurrentQuery();
++            }
++        });
++    }
+ 
+     executeQuery(*in, *used_output.out_maybe_delayed_and_compressed, /* allow_into_outfile = */ false, context,
+         [&response] (const String & content_type) { response.setContentType(content_type); });
+diff --git a/dbms/src/Interpreters/Context.cpp b/dbms/src/Interpreters/Context.cpp
+index f5c99c140bcb..d9453f58e6a2 100644
+--- a/dbms/src/Interpreters/Context.cpp
++++ b/dbms/src/Interpreters/Context.cpp
+@@ -1077,6 +1077,13 @@ void Context::setCurrentQueryId(const String & query_id)
+     client_info.current_query_id = query_id_to_set;
+ }
+ 
++void Context::killCurrentQuery()
++{
++    if (process_list_elem)
++    {
++        process_list_elem->cancelQuery(true);
++    }
++};
+ 
+ String Context::getDefaultFormat() const
+ {
+diff --git a/dbms/src/Interpreters/Context.h b/dbms/src/Interpreters/Context.h
+index a0c6d59cd6de..93ff7a8484e4 100644
+--- a/dbms/src/Interpreters/Context.h
++++ b/dbms/src/Interpreters/Context.h
+@@ -236,6 +236,8 @@ class Context
+     void setCurrentDatabase(const String & name);
+     void setCurrentQueryId(const String & query_id);
+ 
++    void killCurrentQuery();
++
+     void setInsertionTable(std::pair<String, String> && db_and_table) { insertion_table = db_and_table; }
+     const std::pair<String, String> & getInsertionTable() const { return insertion_table; }
+ 
+diff --git a/dbms/src/Interpreters/InterpreterKillQueryQuery.cpp b/dbms/src/Interpreters/InterpreterKillQueryQuery.cpp
+index 43f4e55297f8..0360fed05dee 100644
+--- a/dbms/src/Interpreters/InterpreterKillQueryQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterKillQueryQuery.cpp
+@@ -26,9 +26,6 @@ namespace ErrorCodes
+     extern const int CANNOT_KILL;
+ }
+ 
+-
+-using CancellationCode = ProcessList::CancellationCode;
+-
+ static const char * cancellationCodeToStatus(CancellationCode code)
+ {
+     switch (code)
+diff --git a/dbms/src/Interpreters/ProcessList.cpp b/dbms/src/Interpreters/ProcessList.cpp
+index 0ba14316a3ec..12d77c5fa354 100644
+--- a/dbms/src/Interpreters/ProcessList.cpp
++++ b/dbms/src/Interpreters/ProcessList.cpp
+@@ -325,6 +325,29 @@ bool QueryStatus::tryGetQueryStreams(BlockInputStreamPtr & in, BlockOutputStream
+     return true;
+ }
+ 
++CancellationCode QueryStatus::cancelQuery(bool kill)
++{
++    /// Streams are destroyed, and ProcessListElement will be deleted from ProcessList soon. We need wait a little bit
++    if (streamsAreReleased())
++        return CancellationCode::CancelSent;
++
++    BlockInputStreamPtr input_stream;
++    BlockOutputStreamPtr output_stream;
++
++    if (tryGetQueryStreams(input_stream, output_stream))
++    {
++        if (input_stream)
++        {
++            input_stream->cancel(kill);
++            return CancellationCode::CancelSent;
++        }
++        return CancellationCode::CancelCannotBeSent;
++    }
++    /// Query is not even started
++    is_killed.store(true);
++    return CancellationCode::CancelSent;
++}
++
+ 
+ void QueryStatus::setUserProcessList(ProcessListForUser * user_process_list_)
+ {
+@@ -356,7 +379,7 @@ QueryStatus * ProcessList::tryGetProcessListElement(const String & current_query
+ }
+ 
+ 
+-ProcessList::CancellationCode ProcessList::sendCancelToQuery(const String & current_query_id, const String & current_user, bool kill)
++CancellationCode ProcessList::sendCancelToQuery(const String & current_query_id, const String & current_user, bool kill)
+ {
+     std::lock_guard lock(mutex);
+ 
+@@ -365,25 +388,7 @@ ProcessList::CancellationCode ProcessList::sendCancelToQuery(const String & curr
+     if (!elem)
+         return CancellationCode::NotFound;
+ 
+-    /// Streams are destroyed, and ProcessListElement will be deleted from ProcessList soon. We need wait a little bit
+-    if (elem->streamsAreReleased())
+-        return CancellationCode::CancelSent;
+-
+-    BlockInputStreamPtr input_stream;
+-    BlockOutputStreamPtr output_stream;
+-
+-    if (elem->tryGetQueryStreams(input_stream, output_stream))
+-    {
+-        if (input_stream)
+-        {
+-            input_stream->cancel(kill);
+-            return CancellationCode::CancelSent;
+-        }
+-        return CancellationCode::CancelCannotBeSent;
+-    }
+-    /// Query is not even started
+-    elem->is_killed.store(true);
+-    return CancellationCode::CancelSent;
++    return elem->cancelQuery(kill);
+ }
+ 
+ 
+diff --git a/dbms/src/Interpreters/ProcessList.h b/dbms/src/Interpreters/ProcessList.h
+index 5d2b6db95d07..c9eff51bf7bb 100644
+--- a/dbms/src/Interpreters/ProcessList.h
++++ b/dbms/src/Interpreters/ProcessList.h
+@@ -70,6 +70,14 @@ struct QueryStatusInfo
+     std::shared_ptr<Settings> query_settings;
+ };
+ 
++enum class CancellationCode
++{
++    NotFound = 0,                     /// already cancelled
++    QueryIsNotInitializedYet = 1,
++    CancelCannotBeSent = 2,
++    CancelSent = 3,
++    Unknown
++};
+ 
+ /// Query and information about its execution.
+ class QueryStatus
+@@ -192,6 +200,8 @@ class QueryStatus
+     /// Get query in/out pointers from BlockIO
+     bool tryGetQueryStreams(BlockInputStreamPtr & in, BlockOutputStreamPtr & out) const;
+ 
++    CancellationCode cancelQuery(bool kill);
++
+     bool isKilled() const { return is_killed; }
+ };
+ 
+@@ -312,15 +322,6 @@ class ProcessList
+         max_size = max_size_;
+     }
+ 
+-    enum class CancellationCode
+-    {
+-        NotFound = 0,                     /// already cancelled
+-        QueryIsNotInitializedYet = 1,
+-        CancelCannotBeSent = 2,
+-        CancelSent = 3,
+-        Unknown
+-    };
+-
+     /// Try call cancel() for input and output streams of query with specified id and user
+     CancellationCode sendCancelToQuery(const String & current_query_id, const String & current_user, bool kill = false);
+ };
+diff --git a/dbms/src/Interpreters/Settings.h b/dbms/src/Interpreters/Settings.h
+index 156b220a35a3..fdeba24b92eb 100644
+--- a/dbms/src/Interpreters/Settings.h
++++ b/dbms/src/Interpreters/Settings.h
+@@ -299,6 +299,7 @@ struct Settings
+     M(SettingBool, low_cardinality_allow_in_native_format, true, "Use LowCardinality type in Native format. Otherwise, convert LowCardinality columns to ordinary for select query, and convert ordinary columns to required LowCardinality for insert query.") \
+     M(SettingBool, allow_experimental_multiple_joins_emulation, false, "Emulate multiple joins using subselects") \
+     M(SettingBool, allow_experimental_cross_to_join_conversion, false, "Convert CROSS JOIN to INNER JOIN if possible") \
++    M(SettingBool, cancel_http_readonly_queries_on_client_close, false, "Cancel HTTP readonly queries when a client closes the connection without waiting for response.") \
+ 
+ #define DECLARE(TYPE, NAME, DEFAULT, DESCRIPTION) \
+     TYPE NAME {DEFAULT};

@@ -1,0 +1,421 @@
+diff --git a/src/Interpreters/InterpreterAlterQuery.cpp b/src/Interpreters/InterpreterAlterQuery.cpp
+index 61277b8160ce..cd35e619d373 100644
+--- a/src/Interpreters/InterpreterAlterQuery.cpp
++++ b/src/Interpreters/InterpreterAlterQuery.cpp
+@@ -23,7 +23,6 @@ namespace DB
+ namespace ErrorCodes
+ {
+     extern const int LOGICAL_ERROR;
+-    extern const int SUPPORT_IS_DISABLED;
+     extern const int INCORRECT_QUERY;
+ }
+ 
+@@ -62,10 +61,6 @@ BlockIO InterpreterAlterQuery::execute()
+             alter_commands.emplace_back(std::move(*alter_command));
+         else if (auto partition_command = PartitionCommand::parse(command_ast))
+         {
+-            if (partition_command->type == PartitionCommand::DROP_DETACHED_PARTITION
+-                && !context.getSettingsRef().allow_drop_detached)
+-                throw DB::Exception("Cannot execute query: DROP DETACHED PART is disabled "
+-                                    "(see allow_drop_detached setting)", ErrorCodes::SUPPORT_IS_DISABLED);
+             partition_commands.emplace_back(std::move(*partition_command));
+         }
+         else if (auto mut_command = MutationCommand::parse(command_ast))
+@@ -90,6 +85,7 @@ BlockIO InterpreterAlterQuery::execute()
+ 
+     if (!partition_commands.empty())
+     {
++        table->checkAlterPartitionIsPossible(partition_commands, metadata_snapshot, context.getSettingsRef());
+         table->alterPartition(query_ptr, metadata_snapshot, partition_commands, context);
+     }
+ 
+diff --git a/src/Storages/AlterCommands.cpp b/src/Storages/AlterCommands.cpp
+index ea78d4122751..ca2a0aed108f 100644
+--- a/src/Storages/AlterCommands.cpp
++++ b/src/Storages/AlterCommands.cpp
+@@ -1003,6 +1003,9 @@ void AlterCommands::validate(const StorageInMemoryMetadata & metadata, const Con
+         }
+     }
+ 
++    if (all_columns.empty())
++        throw Exception{"Cannot DROP or CLEAR all columns", ErrorCodes::BAD_ARGUMENTS};
++
+     validateColumnsDefaultsAndGetSampleBlock(default_expr_list, all_columns.getAll(), context);
+ }
+ 
+diff --git a/src/Storages/ColumnsDescription.h b/src/Storages/ColumnsDescription.h
+index 1d6d04f303fb..a95705d79f4b 100644
+--- a/src/Storages/ColumnsDescription.h
++++ b/src/Storages/ColumnsDescription.h
+@@ -121,6 +121,11 @@ class ColumnsDescription
+         return columns.size();
+     }
+ 
++    bool empty() const
++    {
++        return columns.empty();
++    }
++
+     /// Keep the sequence of columns and allow to lookup by name.
+     using Container = boost::multi_index_container<
+         ColumnDescription,
+diff --git a/src/Storages/IStorage.cpp b/src/Storages/IStorage.cpp
+index 919464a6a5de..4513394cada7 100644
+--- a/src/Storages/IStorage.cpp
++++ b/src/Storages/IStorage.cpp
+@@ -102,6 +102,10 @@ void IStorage::checkAlterIsPossible(const AlterCommands & commands, const Settin
+     }
+ }
+ 
++void IStorage::checkAlterPartitionIsPossible(const PartitionCommands & /*commands*/, const StorageMetadataPtr & /*metadata_snapshot*/, const Settings & /*settings*/) const
++{
++    throw Exception("Table engine " + getName() + " doesn't support partitioning", ErrorCodes::NOT_IMPLEMENTED);
++}
+ 
+ StorageID IStorage::getStorageID() const
+ {
+diff --git a/src/Storages/IStorage.h b/src/Storages/IStorage.h
+index 3022a234625d..e6a1a8e12989 100644
+--- a/src/Storages/IStorage.h
++++ b/src/Storages/IStorage.h
+@@ -360,6 +360,9 @@ class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromo
+         throw Exception("Partition operations are not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
++    /// Checks that partition commands can be applied to storage.
++    virtual void checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const;
++
+     /** Perform any background work. For example, combining parts in a MergeTree type table.
+       * Returns whether any work has been done.
+       */
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 89e7cf95d508..8c7b5321c820 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -110,6 +110,7 @@ namespace ErrorCodes
+     extern const int UNKNOWN_DISK;
+     extern const int NOT_ENOUGH_SPACE;
+     extern const int ALTER_OF_COLUMN_IS_FORBIDDEN;
++    extern const int SUPPORT_IS_DISABLED;
+ }
+ 
+ 
+@@ -1421,12 +1422,20 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const S
+     columns_in_keys.insert(columns_alter_type_metadata_only.begin(), columns_alter_type_metadata_only.end());
+     columns_in_keys.insert(columns_alter_type_check_safe_for_partition.begin(), columns_alter_type_check_safe_for_partition.end());
+ 
++    NameSet dropped_columns;
++
+     std::map<String, const IDataType *> old_types;
+     for (const auto & column : old_metadata.getColumns().getAllPhysical())
+         old_types.emplace(column.name, column.type.get());
+ 
+     for (const AlterCommand & command : commands)
+     {
++        /// Just validate partition expression
++        if (command.partition)
++        {
++            getPartitionIDFromQuery(command.partition, global_context);
++        }
++
+         if (command.type == AlterCommand::MODIFY_ORDER_BY && !is_custom_partitioned)
+         {
+             throw Exception(
+@@ -1456,6 +1465,7 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const S
+                     "Trying to ALTER DROP key " + backQuoteIfNeed(command.column_name) + " column which is a part of key expression",
+                     ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN);
+             }
++            dropped_columns.emplace(command.column_name);
+         }
+         else if (command.isModifyingData(getInMemoryMetadata()))
+         {
+@@ -1530,6 +1540,27 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, const S
+                 checkStoragePolicy(global_context.getStoragePolicy(changed_setting.value.safeGet<String>()));
+         }
+     }
++
++    for (const auto & part : getDataPartsVector())
++    {
++        bool at_least_one_column_rest = false;
++        for (const auto & column : part->getColumns())
++        {
++            if (!dropped_columns.count(column.name))
++            {
++                at_least_one_column_rest = true;
++                break;
++            }
++        }
++        if (!at_least_one_column_rest)
++        {
++            std::string postfix;
++            if (dropped_columns.size() > 1)
++                postfix = "s";
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                "Cannot drop or clear column{} '{}', because all columns in part '{}' will be removed from disk. Empty parts are not allowed", postfix, boost::algorithm::join(dropped_columns, ", "), part->name);
++        }
++    }
+ }
+ 
+ MergeTreeDataPartType MergeTreeData::choosePartType(size_t bytes_uncompressed, size_t rows_count) const
+@@ -2525,6 +2556,45 @@ void MergeTreeData::freezePartition(const ASTPtr & partition_ast, const StorageM
+         context);
+ }
+ 
++void MergeTreeData::checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & /*metadata_snapshot*/, const Settings & settings) const
++{
++    for (const auto & command : commands)
++    {
++        if (command.type == PartitionCommand::DROP_DETACHED_PARTITION
++            && !settings.allow_drop_detached)
++            throw DB::Exception("Cannot execute query: DROP DETACHED PART is disabled "
++                                "(see allow_drop_detached setting)", ErrorCodes::SUPPORT_IS_DISABLED);
++
++        if (command.partition && command.type != PartitionCommand::DROP_DETACHED_PARTITION)
++        {
++            if (command.part)
++            {
++                auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
++                /// We able to parse it
++                MergeTreePartInfo::fromPartName(part_name, format_version);
++            }
++            else
++            {
++                /// We able to parse it
++                getPartitionIDFromQuery(command.partition, global_context);
++            }
++        }
++    }
++}
++
++void MergeTreeData::checkPartitionCanBeDropped(const ASTPtr & partition)
++{
++    const String partition_id = getPartitionIDFromQuery(partition, global_context);
++    auto parts_to_remove = getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
++
++    UInt64 partition_size = 0;
++
++    for (const auto & part : parts_to_remove)
++        partition_size += part->getBytesOnDisk();
++
++    auto table_id = getStorageID();
++    global_context.checkPartitionCanBeDropped(table_id.database_name, table_id.table_name, partition_size);
++}
+ 
+ void MergeTreeData::movePartitionToDisk(const ASTPtr & partition, const String & name, bool moving_part, const Context & context)
+ {
+@@ -2626,7 +2696,7 @@ void MergeTreeData::movePartitionToVolume(const ASTPtr & partition, const String
+ }
+ 
+ 
+-String MergeTreeData::getPartitionIDFromQuery(const ASTPtr & ast, const Context & context)
++String MergeTreeData::getPartitionIDFromQuery(const ASTPtr & ast, const Context & context) const
+ {
+     const auto & partition_ast = ast->as<ASTPartition &>();
+ 
+@@ -3045,7 +3115,7 @@ MergeTreeData::DataPartsVector MergeTreeData::getDataPartsVector() const
+ }
+ 
+ MergeTreeData::DataPartPtr MergeTreeData::getAnyPartInPartition(
+-    const String & partition_id, DataPartsLock & /*data_parts_lock*/)
++    const String & partition_id, DataPartsLock & /*data_parts_lock*/) const
+ {
+     auto it = data_parts_by_state_and_info.lower_bound(DataPartStateAndPartitionID{DataPartState::Committed, partition_id});
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeData.h b/src/Storages/MergeTree/MergeTreeData.h
+index af511b481396..2c53b3287cd1 100644
+--- a/src/Storages/MergeTree/MergeTreeData.h
++++ b/src/Storages/MergeTree/MergeTreeData.h
+@@ -24,6 +24,7 @@
+ #include <Disks/StoragePolicy.h>
+ #include <Interpreters/Aggregator.h>
+ #include <Storages/extractKeyExpressionList.h>
++#include <Storages/PartitionCommands.h>
+ 
+ #include <boost/multi_index_container.hpp>
+ #include <boost/multi_index/ordered_index.hpp>
+@@ -505,6 +506,9 @@ class MergeTreeData : public IStorage
+     /// If something is wrong, throws an exception.
+     void checkAlterIsPossible(const AlterCommands & commands, const Settings & settings) const override;
+ 
++    /// Checks that partition name in all commands is valid
++    void checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const override;
++
+     /// Change MergeTreeSettings
+     void changeSettings(
+         const ASTPtr & new_settings,
+@@ -547,6 +551,8 @@ class MergeTreeData : public IStorage
+     /// Moves partition to specified Volume
+     void movePartitionToVolume(const ASTPtr & partition, const String & name, bool moving_part, const Context & context);
+ 
++    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
++
+     size_t getColumnCompressedSize(const std::string & name) const
+     {
+         auto lock = lockParts();
+@@ -561,7 +567,7 @@ class MergeTreeData : public IStorage
+     }
+ 
+     /// For ATTACH/DETACH/DROP PARTITION.
+-    String getPartitionIDFromQuery(const ASTPtr & ast, const Context & context);
++    String getPartitionIDFromQuery(const ASTPtr & ast, const Context & context) const;
+ 
+     /// Extracts MergeTreeData of other *MergeTree* storage
+     ///  and checks that their structure suitable for ALTER TABLE ATTACH PARTITION FROM
+@@ -815,7 +821,7 @@ class MergeTreeData : public IStorage
+     void removePartContributionToColumnSizes(const DataPartPtr & part);
+ 
+     /// If there is no part in the partition with ID `partition_id`, returns empty ptr. Should be called under the lock.
+-    DataPartPtr getAnyPartInPartition(const String & partition_id, DataPartsLock & data_parts_lock);
++    DataPartPtr getAnyPartInPartition(const String & partition_id, DataPartsLock & data_parts_lock) const;
+ 
+     /// Return parts in the Committed set that are covered by the new_part_info or the part that covers it.
+     /// Will check that the new part doesn't already exist and that it doesn't intersect existing part.
+diff --git a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 63d4bdf1aa5c..3deb61bf8db9 100644
+--- a/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -1068,20 +1068,6 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
+         }
+     }
+ 
+-    /// TODO: it makes sense to check DROP_RANGE also
+-    if (entry.type == LogEntry::CLEAR_COLUMN || entry.type == LogEntry::REPLACE_RANGE)
+-    {
+-        String conflicts_description;
+-        String range_name = (entry.type == LogEntry::REPLACE_RANGE) ? entry.replace_range_entry->drop_range_part_name : entry.new_part_name;
+-        auto range = MergeTreePartInfo::fromPartName(range_name, format_version);
+-
+-        if (0 != getConflictsCountForRange(range, entry, &conflicts_description, state_lock))
+-        {
+-            LOG_DEBUG(log, conflicts_description);
+-            return false;
+-        }
+-    }
+-
+     /// Alters must be executed one by one. First metadata change, and after that data alter (MUTATE_PART entries with).
+     /// corresponding alter_version.
+     if (entry.type == LogEntry::ALTER_METADATA)
+diff --git a/src/Storages/StorageMaterializedView.cpp b/src/Storages/StorageMaterializedView.cpp
+index 9e6245c3ced1..9cbe06a37015 100644
+--- a/src/Storages/StorageMaterializedView.cpp
++++ b/src/Storages/StorageMaterializedView.cpp
+@@ -257,6 +257,13 @@ void StorageMaterializedView::alterPartition(
+     getTargetTable()->alterPartition(query, metadata_snapshot, commands, context);
+ }
+ 
++void StorageMaterializedView::checkAlterPartitionIsPossible(
++    const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const
++{
++    checkStatementCanBeForwarded();
++    getTargetTable()->checkAlterPartitionIsPossible(commands, metadata_snapshot, settings);
++}
++
+ void StorageMaterializedView::mutate(const MutationCommands & commands, const Context & context)
+ {
+     checkStatementCanBeForwarded();
+diff --git a/src/Storages/StorageMaterializedView.h b/src/Storages/StorageMaterializedView.h
+index f45d9203badf..2692880eb2c2 100644
+--- a/src/Storages/StorageMaterializedView.h
++++ b/src/Storages/StorageMaterializedView.h
+@@ -53,6 +53,8 @@ class StorageMaterializedView final : public ext::shared_ptr_helper<StorageMater
+ 
+     void alterPartition(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, const PartitionCommands & commands, const Context & context) override;
+ 
++    void checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const override;
++
+     void mutate(const MutationCommands & commands, const Context & context) override;
+ 
+     void renameInMemory(const StorageID & new_table_id) override;
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 13db64f7758d..eecde28b7bbe 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -209,22 +209,6 @@ void StorageMergeTree::checkTableCanBeDropped() const
+     global_context.checkTableCanBeDropped(table_id.database_name, table_id.table_name, getTotalActiveSizeInBytes());
+ }
+ 
+-void StorageMergeTree::checkPartitionCanBeDropped(const ASTPtr & partition)
+-{
+-    auto table_id = getStorageID();
+-
+-    const String partition_id = getPartitionIDFromQuery(partition, global_context);
+-    auto parts_to_remove = getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
+-
+-    UInt64 partition_size = 0;
+-
+-    for (const auto & part : parts_to_remove)
+-    {
+-        partition_size += part->getBytesOnDisk();
+-    }
+-    global_context.checkPartitionCanBeDropped(table_id.database_name, table_id.table_name, partition_size);
+-}
+-
+ void StorageMergeTree::drop()
+ {
+     shutdown();
+diff --git a/src/Storages/StorageMergeTree.h b/src/Storages/StorageMergeTree.h
+index 9418f1a073c5..c80c9f443778 100644
+--- a/src/Storages/StorageMergeTree.h
++++ b/src/Storages/StorageMergeTree.h
+@@ -81,8 +81,6 @@ class StorageMergeTree final : public ext::shared_ptr_helper<StorageMergeTree>,
+ 
+     void checkTableCanBeDropped() const override;
+ 
+-    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+-
+     ActionLock getActionLock(StorageActionBlockType action_type) override;
+ 
+     CheckResults checkData(const ASTPtr & query, const Context & context) override;
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 5fa8bb82ea1c..cd7a8f3d39dc 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -4054,22 +4054,6 @@ void StorageReplicatedMergeTree::checkTableCanBeDropped() const
+     global_context.checkTableCanBeDropped(table_id.database_name, table_id.table_name, getTotalActiveSizeInBytes());
+ }
+ 
+-
+-void StorageReplicatedMergeTree::checkPartitionCanBeDropped(const ASTPtr & partition)
+-{
+-    const String partition_id = getPartitionIDFromQuery(partition, global_context);
+-    auto parts_to_remove = getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
+-
+-    UInt64 partition_size = 0;
+-
+-    for (const auto & part : parts_to_remove)
+-        partition_size += part->getBytesOnDisk();
+-
+-    auto table_id = getStorageID();
+-    global_context.checkPartitionCanBeDropped(table_id.database_name, table_id.table_name, partition_size);
+-}
+-
+-
+ void StorageReplicatedMergeTree::rename(const String & new_path_to_table_data, const StorageID & new_table_id)
+ {
+     MergeTreeData::rename(new_path_to_table_data, new_table_id);
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index 5d8b0883f70e..f6690051ad6e 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -134,8 +134,6 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+ 
+     void checkTableCanBeDropped() const override;
+ 
+-    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+-
+     ActionLock getActionLock(StorageActionBlockType action_type) override;
+ 
+     /// Wait when replication queue size becomes less or equal than queue_size
+diff --git a/src/Storages/getStructureOfRemoteTable.cpp b/src/Storages/getStructureOfRemoteTable.cpp
+index aca5456d85ec..7dfee90588ab 100644
+--- a/src/Storages/getStructureOfRemoteTable.cpp
++++ b/src/Storages/getStructureOfRemoteTable.cpp
+@@ -43,7 +43,7 @@ ColumnsDescription getStructureOfRemoteTable(
+ 
+             /// Expect at least some columns.
+             /// This is a hack to handle the empty block case returned by Connection when skip_unavailable_shards is set.
+-            if (res.size() == 0)
++            if (res.empty())
+                 continue;
+ 
+             return res;

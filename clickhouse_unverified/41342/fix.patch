@@ -1,0 +1,1070 @@
+diff --git a/programs/keeper/CMakeLists.txt b/programs/keeper/CMakeLists.txt
+index ce176ccade50..9266a4ca4197 100644
+--- a/programs/keeper/CMakeLists.txt
++++ b/programs/keeper/CMakeLists.txt
+@@ -45,6 +45,7 @@ if (BUILD_STANDALONE_KEEPER)
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperLogStore.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperServer.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperSnapshotManager.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperSnapshotManagerS3.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperStateMachine.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperStateManager.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Coordination/KeeperStorage.cpp
+diff --git a/src/Coordination/KeeperDispatcher.cpp b/src/Coordination/KeeperDispatcher.cpp
+index d725ecb5cfea..6e9116d4b757 100644
+--- a/src/Coordination/KeeperDispatcher.cpp
++++ b/src/Coordination/KeeperDispatcher.cpp
+@@ -1,13 +1,20 @@
+ #include <Coordination/KeeperDispatcher.h>
++
++#include <Poco/Path.h>
++#include <Poco/Util/AbstractConfiguration.h>
++
++#include <Common/hex.h>
+ #include <Common/setThreadName.h>
+ #include <Common/ZooKeeper/KeeperException.h>
++#include <Common/checkStackSize.h>
++#include <Common/CurrentMetrics.h>
++
++
+ #include <future>
+ #include <chrono>
+-#include <Poco/Path.h>
+-#include <Common/hex.h>
+ #include <filesystem>
+-#include <Common/checkStackSize.h>
+-#include <Common/CurrentMetrics.h>
++#include <iterator>
++#include <limits>
+ 
+ namespace CurrentMetrics
+ {
+@@ -32,9 +39,7 @@ KeeperDispatcher::KeeperDispatcher()
+     : responses_queue(std::numeric_limits<size_t>::max())
+     , configuration_and_settings(std::make_shared<KeeperConfigurationAndSettings>())
+     , log(&Poco::Logger::get("KeeperDispatcher"))
+-{
+-}
+-
++{}
+ 
+ void KeeperDispatcher::requestThread()
+ {
+@@ -191,7 +196,13 @@ void KeeperDispatcher::snapshotThread()
+ 
+         try
+         {
+-            task.create_snapshot(std::move(task.snapshot));
++            auto snapshot_path = task.create_snapshot(std::move(task.snapshot));
++
++            if (snapshot_path.empty())
++                continue;
++
++            if (isLeader())
++                snapshot_s3.uploadSnapshot(snapshot_path);
+         }
+         catch (...)
+         {
+@@ -285,7 +296,9 @@ void KeeperDispatcher::initialize(const Poco::Util::AbstractConfiguration & conf
+     responses_thread = ThreadFromGlobalPool([this] { responseThread(); });
+     snapshot_thread = ThreadFromGlobalPool([this] { snapshotThread(); });
+ 
+-    server = std::make_unique<KeeperServer>(configuration_and_settings, config, responses_queue, snapshots_queue);
++    snapshot_s3.startup(config);
++
++    server = std::make_unique<KeeperServer>(configuration_and_settings, config, responses_queue, snapshots_queue, snapshot_s3);
+ 
+     try
+     {
+@@ -312,7 +325,6 @@ void KeeperDispatcher::initialize(const Poco::Util::AbstractConfiguration & conf
+     /// Start it after keeper server start
+     session_cleaner_thread = ThreadFromGlobalPool([this] { sessionCleanerTask(); });
+     update_configuration_thread = ThreadFromGlobalPool([this] { updateConfigurationThread(); });
+-    updateConfiguration(config);
+ 
+     LOG_DEBUG(log, "Dispatcher initialized");
+ }
+@@ -415,6 +427,8 @@ void KeeperDispatcher::shutdown()
+         if (server)
+             server->shutdown();
+ 
++        snapshot_s3.shutdown();
++
+         CurrentMetrics::set(CurrentMetrics::KeeperAliveConnections, 0);
+ 
+     }
+@@ -678,6 +692,8 @@ void KeeperDispatcher::updateConfiguration(const Poco::Util::AbstractConfigurati
+         if (!push_result)
+             throw Exception(ErrorCodes::SYSTEM_ERROR, "Cannot push configuration update to queue");
+     }
++
++    snapshot_s3.updateS3Configuration(config);
+ }
+ 
+ void KeeperDispatcher::updateKeeperStatLatency(uint64_t process_time_ms)
+diff --git a/src/Coordination/KeeperDispatcher.h b/src/Coordination/KeeperDispatcher.h
+index 3b524b24ed7a..0003867adbef 100644
+--- a/src/Coordination/KeeperDispatcher.h
++++ b/src/Coordination/KeeperDispatcher.h
+@@ -14,6 +14,7 @@
+ #include <Coordination/CoordinationSettings.h>
+ #include <Coordination/Keeper4LWInfo.h>
+ #include <Coordination/KeeperConnectionStats.h>
++#include <Coordination/KeeperSnapshotManagerS3.h>
+ 
+ namespace DB
+ {
+@@ -76,6 +77,8 @@ class KeeperDispatcher
+     /// Counter for new session_id requests.
+     std::atomic<int64_t> internal_session_id_counter{0};
+ 
++    KeeperSnapshotManagerS3 snapshot_s3;
++
+     /// Thread put requests to raft
+     void requestThread();
+     /// Thread put responses for subscribed sessions
+diff --git a/src/Coordination/KeeperServer.cpp b/src/Coordination/KeeperServer.cpp
+index 7a0cee746c6c..1c8959379dac 100644
+--- a/src/Coordination/KeeperServer.cpp
++++ b/src/Coordination/KeeperServer.cpp
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <Coordination/KeeperStateMachine.h>
+ #include <Coordination/KeeperStateManager.h>
++#include <Coordination/KeeperSnapshotManagerS3.h>
+ #include <Coordination/LoggerWrapper.h>
+ #include <Coordination/ReadBufferFromNuraftBuffer.h>
+ #include <Coordination/WriteBufferFromNuraftBuffer.h>
+@@ -105,7 +106,8 @@ KeeperServer::KeeperServer(
+     const KeeperConfigurationAndSettingsPtr & configuration_and_settings_,
+     const Poco::Util::AbstractConfiguration & config,
+     ResponsesQueue & responses_queue_,
+-    SnapshotsQueue & snapshots_queue_)
++    SnapshotsQueue & snapshots_queue_,
++    KeeperSnapshotManagerS3 & snapshot_manager_s3)
+     : server_id(configuration_and_settings_->server_id)
+     , coordination_settings(configuration_and_settings_->coordination_settings)
+     , log(&Poco::Logger::get("KeeperServer"))
+@@ -125,6 +127,7 @@ KeeperServer::KeeperServer(
+         configuration_and_settings_->snapshot_storage_path,
+         coordination_settings,
+         keeper_context,
++        config.getBool("keeper_server.upload_snapshot_on_exit", true) ? &snapshot_manager_s3 : nullptr,
+         checkAndGetSuperdigest(configuration_and_settings_->super_digest));
+ 
+     state_manager = nuraft::cs_new<KeeperStateManager>(
+diff --git a/src/Coordination/KeeperServer.h b/src/Coordination/KeeperServer.h
+index 6873ef2a01e0..a33e29b45405 100644
+--- a/src/Coordination/KeeperServer.h
++++ b/src/Coordination/KeeperServer.h
+@@ -71,7 +71,8 @@ class KeeperServer
+         const KeeperConfigurationAndSettingsPtr & settings_,
+         const Poco::Util::AbstractConfiguration & config_,
+         ResponsesQueue & responses_queue_,
+-        SnapshotsQueue & snapshots_queue_);
++        SnapshotsQueue & snapshots_queue_,
++        KeeperSnapshotManagerS3 & snapshot_manager_s3);
+ 
+     /// Load state machine from the latest snapshot and load log storage. Start NuRaft with required settings.
+     void startup(const Poco::Util::AbstractConfiguration & config, bool enable_ipv6 = true);
+diff --git a/src/Coordination/KeeperSnapshotManager.h b/src/Coordination/KeeperSnapshotManager.h
+index c00ce9421e74..526477120832 100644
+--- a/src/Coordination/KeeperSnapshotManager.h
++++ b/src/Coordination/KeeperSnapshotManager.h
+@@ -87,7 +87,7 @@ struct KeeperStorageSnapshot
+ };
+ 
+ using KeeperStorageSnapshotPtr = std::shared_ptr<KeeperStorageSnapshot>;
+-using CreateSnapshotCallback = std::function<void(KeeperStorageSnapshotPtr &&)>;
++using CreateSnapshotCallback = std::function<std::string(KeeperStorageSnapshotPtr &&)>;
+ 
+ 
+ using SnapshotMetaAndStorage = std::pair<SnapshotMetadataPtr, KeeperStoragePtr>;
+diff --git a/src/Coordination/KeeperSnapshotManagerS3.cpp b/src/Coordination/KeeperSnapshotManagerS3.cpp
+new file mode 100644
+index 000000000000..2e19d496407f
+--- /dev/null
++++ b/src/Coordination/KeeperSnapshotManagerS3.cpp
+@@ -0,0 +1,311 @@
++#include <Coordination/KeeperSnapshotManagerS3.h>
++
++#if USE_AWS_S3
++#include <Core/UUID.h>
++
++#include <Common/Exception.h>
++#include <Common/setThreadName.h>
++
++#include <IO/S3Common.h>
++#include <IO/WriteBufferFromS3.h>
++#include <IO/ReadBufferFromS3.h>
++#include <IO/ReadBufferFromFile.h>
++#include <IO/ReadHelpers.h>
++#include <IO/S3/PocoHTTPClient.h>
++#include <IO/WriteHelpers.h>
++#include <IO/copyData.h>
++
++#include <aws/core/auth/AWSCredentials.h>
++#include <aws/s3/S3Client.h>
++#include <aws/s3/S3Errors.h>
++#include <aws/s3/model/HeadObjectRequest.h>
++#include <aws/s3/model/DeleteObjectRequest.h>
++
++#include <filesystem>
++
++namespace fs = std::filesystem;
++
++namespace DB
++{
++
++struct KeeperSnapshotManagerS3::S3Configuration
++{
++    S3Configuration(S3::URI uri_, S3::AuthSettings auth_settings_, std::shared_ptr<const Aws::S3::S3Client> client_)
++        : uri(std::move(uri_))
++        , auth_settings(std::move(auth_settings_))
++        , client(std::move(client_))
++    {}
++
++    S3::URI uri;
++    S3::AuthSettings auth_settings;
++    std::shared_ptr<const Aws::S3::S3Client> client;
++};
++
++KeeperSnapshotManagerS3::KeeperSnapshotManagerS3()
++    : snapshots_s3_queue(std::numeric_limits<size_t>::max())
++    , log(&Poco::Logger::get("KeeperSnapshotManagerS3"))
++    , uuid(UUIDHelpers::generateV4())
++{}
++
++void KeeperSnapshotManagerS3::updateS3Configuration(const Poco::Util::AbstractConfiguration & config)
++{
++    try
++    {
++        const std::string config_prefix = "keeper_server.s3_snapshot";
++
++        if (!config.has(config_prefix))
++        {
++            std::lock_guard client_lock{snapshot_s3_client_mutex};
++            if (snapshot_s3_client)
++                LOG_INFO(log, "S3 configuration was removed");
++            snapshot_s3_client = nullptr;
++            return;
++        }
++
++        auto auth_settings = S3::AuthSettings::loadFromConfig(config_prefix, config);
++
++        auto endpoint = config.getString(config_prefix + ".endpoint");
++        auto new_uri = S3::URI{Poco::URI(endpoint)};
++
++        {
++            std::lock_guard client_lock{snapshot_s3_client_mutex};
++            // if client is not changed (same auth settings, same endpoint) we don't need to update
++            if (snapshot_s3_client && snapshot_s3_client->client && auth_settings == snapshot_s3_client->auth_settings
++                && snapshot_s3_client->uri.uri == new_uri.uri)
++                return;
++        }
++
++        LOG_INFO(log, "S3 configuration was updated");
++
++        auto credentials = Aws::Auth::AWSCredentials(auth_settings.access_key_id, auth_settings.secret_access_key);
++        HeaderCollection headers = auth_settings.headers;
++
++        static constexpr size_t s3_max_redirects = 10;
++        static constexpr bool enable_s3_requests_logging = false;
++
++        if (!new_uri.key.empty())
++        {
++            LOG_ERROR(log, "Invalid endpoint defined for S3, it shouldn't contain key, endpoint: {}", endpoint);
++            return;
++        }
++
++        S3::PocoHTTPClientConfiguration client_configuration = S3::ClientFactory::instance().createClientConfiguration(
++            auth_settings.region,
++            RemoteHostFilter(), s3_max_redirects,
++            enable_s3_requests_logging,
++            /* for_disk_s3 = */ false);
++
++        client_configuration.endpointOverride = new_uri.endpoint;
++
++        auto client = S3::ClientFactory::instance().create(
++            client_configuration,
++            new_uri.is_virtual_hosted_style,
++            credentials.GetAWSAccessKeyId(),
++            credentials.GetAWSSecretKey(),
++            auth_settings.server_side_encryption_customer_key_base64,
++            std::move(headers),
++            auth_settings.use_environment_credentials.value_or(false),
++            auth_settings.use_insecure_imds_request.value_or(false));
++
++        auto new_client = std::make_shared<KeeperSnapshotManagerS3::S3Configuration>(std::move(new_uri), std::move(auth_settings), std::move(client));
++
++        {
++            std::lock_guard client_lock{snapshot_s3_client_mutex};
++            snapshot_s3_client = std::move(new_client);
++        }
++        LOG_INFO(log, "S3 client was updated");
++    }
++    catch (...)
++    {
++        LOG_ERROR(log, "Failed to create an S3 client for snapshots");
++        tryLogCurrentException(__PRETTY_FUNCTION__);
++    }
++}
++std::shared_ptr<KeeperSnapshotManagerS3::S3Configuration> KeeperSnapshotManagerS3::getSnapshotS3Client() const
++{
++    std::lock_guard lock{snapshot_s3_client_mutex};
++    return snapshot_s3_client;
++}
++
++void KeeperSnapshotManagerS3::uploadSnapshotImpl(const std::string & snapshot_path)
++{
++    try
++    {
++        auto s3_client = getSnapshotS3Client();
++        if (s3_client == nullptr)
++            return;
++
++        S3Settings::ReadWriteSettings read_write_settings;
++        read_write_settings.upload_part_size_multiply_parts_count_threshold = 10000;
++
++        const auto create_writer = [&](const auto & key)
++        {
++            return WriteBufferFromS3
++            {
++                s3_client->client,
++                s3_client->uri.bucket,
++                key,
++                read_write_settings
++            };
++        };
++
++        const auto file_exists = [&](const auto & key)
++        {
++            Aws::S3::Model::HeadObjectRequest request;
++            request.SetBucket(s3_client->uri.bucket);
++            request.SetKey(key);
++            auto outcome = s3_client->client->HeadObject(request);
++
++            if (outcome.IsSuccess())
++                return true;
++
++            const auto & error = outcome.GetError();
++            if (error.GetErrorType() != Aws::S3::S3Errors::NO_SUCH_KEY && error.GetErrorType() != Aws::S3::S3Errors::RESOURCE_NOT_FOUND)
++                throw S3Exception(error.GetErrorType(), "Failed to verify existence of lock file: {}", error.GetMessage());
++
++            return false;
++        };
++
++
++        LOG_INFO(log, "Will try to upload snapshot on {} to S3", snapshot_path);
++        ReadBufferFromFile snapshot_file(snapshot_path);
++
++        auto snapshot_name = fs::path(snapshot_path).filename().string();
++        auto lock_file = fmt::format(".{}_LOCK", snapshot_name);
++
++        if (file_exists(snapshot_name))
++        {
++            LOG_ERROR(log, "Snapshot {} already exists", snapshot_name);
++            return;
++        }
++
++        // First we need to verify that there isn't already a lock file for the snapshot we want to upload
++        // Only leader uploads a snapshot, but there can be a rare case where we have 2 leaders in NuRaft
++        if (file_exists(lock_file))
++        {
++            LOG_ERROR(log, "Lock file for {} already, exists. Probably a different node is already uploading the snapshot", snapshot_name);
++            return;
++        }
++
++        // We write our UUID to lock file
++        LOG_DEBUG(log, "Trying to create a lock file");
++        WriteBufferFromS3 lock_writer = create_writer(lock_file);
++        writeUUIDText(uuid, lock_writer);
++        lock_writer.finalize();
++
++        // We read back the written UUID, if it's the same we can upload the file
++        ReadBufferFromS3 lock_reader
++        {
++            s3_client->client,
++            s3_client->uri.bucket,
++            lock_file,
++            "",
++            1,
++            {}
++        };
++
++        std::string read_uuid;
++        readStringUntilEOF(read_uuid, lock_reader);
++
++        if (read_uuid != toString(uuid))
++        {
++            LOG_ERROR(log, "Failed to create a lock file");
++            return;
++        }
++
++        SCOPE_EXIT(
++        {
++            LOG_INFO(log, "Removing lock file");
++            try
++            {
++                Aws::S3::Model::DeleteObjectRequest delete_request;
++                delete_request.SetBucket(s3_client->uri.bucket);
++                delete_request.SetKey(lock_file);
++                auto delete_outcome = s3_client->client->DeleteObject(delete_request);
++                if (!delete_outcome.IsSuccess())
++                    throw S3Exception(delete_outcome.GetError().GetMessage(), delete_outcome.GetError().GetErrorType());
++            }
++            catch (...)
++            {
++                LOG_INFO(log, "Failed to delete lock file for {} from S3", snapshot_path);
++                tryLogCurrentException(__PRETTY_FUNCTION__);
++            }
++        });
++
++        WriteBufferFromS3 snapshot_writer = create_writer(snapshot_name);
++        copyData(snapshot_file, snapshot_writer);
++        snapshot_writer.finalize();
++
++        LOG_INFO(log, "Successfully uploaded {} to S3", snapshot_path);
++    }
++    catch (...)
++    {
++        LOG_INFO(log, "Failure during upload of {} to S3", snapshot_path);
++        tryLogCurrentException(__PRETTY_FUNCTION__);
++    }
++}
++
++void KeeperSnapshotManagerS3::snapshotS3Thread()
++{
++    setThreadName("KeeperS3SnpT");
++
++    while (!shutdown_called)
++    {
++        std::string snapshot_path;
++        if (!snapshots_s3_queue.pop(snapshot_path))
++            break;
++
++        if (shutdown_called)
++            break;
++
++        uploadSnapshotImpl(snapshot_path);
++    }
++}
++
++void KeeperSnapshotManagerS3::uploadSnapshot(const std::string & path, bool async_upload)
++{
++    if (getSnapshotS3Client() == nullptr)
++        return;
++
++    if (async_upload)
++    {
++        if (!snapshots_s3_queue.push(path))
++            LOG_WARNING(log, "Failed to add snapshot {} to S3 queue", path);
++
++        return;
++    }
++
++    uploadSnapshotImpl(path);
++}
++
++void KeeperSnapshotManagerS3::startup(const Poco::Util::AbstractConfiguration & config)
++{
++    updateS3Configuration(config);
++    snapshot_s3_thread = ThreadFromGlobalPool([this] { snapshotS3Thread(); });
++}
++
++void KeeperSnapshotManagerS3::shutdown()
++{
++    if (shutdown_called)
++        return;
++
++    LOG_DEBUG(log, "Shutting down KeeperSnapshotManagerS3");
++    shutdown_called = true;
++
++    try
++    {
++        snapshots_s3_queue.finish();
++        if (snapshot_s3_thread.joinable())
++            snapshot_s3_thread.join();
++    }
++    catch (...)
++    {
++        tryLogCurrentException(__PRETTY_FUNCTION__);
++    }
++
++    LOG_INFO(log, "KeeperSnapshotManagerS3 shut down");
++}
++
++}
++
++#endif
+diff --git a/src/Coordination/KeeperSnapshotManagerS3.h b/src/Coordination/KeeperSnapshotManagerS3.h
+new file mode 100644
+index 000000000000..5b62d114aae6
+--- /dev/null
++++ b/src/Coordination/KeeperSnapshotManagerS3.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include "config.h"
++
++#include <Poco/Util/AbstractConfiguration.h>
++
++#if USE_AWS_S3
++#include <Common/ConcurrentBoundedQueue.h>
++#include <Common/ThreadPool.h>
++#include <Common/logger_useful.h>
++
++#include <string>
++#endif
++
++namespace DB
++{
++
++#if USE_AWS_S3
++class KeeperSnapshotManagerS3
++{
++public:
++    KeeperSnapshotManagerS3();
++
++    void updateS3Configuration(const Poco::Util::AbstractConfiguration & config);
++    void uploadSnapshot(const std::string & path, bool async_upload = true);
++
++    void startup(const Poco::Util::AbstractConfiguration & config);
++    void shutdown();
++private:
++    using SnapshotS3Queue = ConcurrentBoundedQueue<std::string>;
++    SnapshotS3Queue snapshots_s3_queue;
++
++    /// Upload new snapshots to S3
++    ThreadFromGlobalPool snapshot_s3_thread;
++
++    struct S3Configuration;
++    mutable std::mutex snapshot_s3_client_mutex;
++    std::shared_ptr<S3Configuration> snapshot_s3_client;
++
++    std::atomic<bool> shutdown_called{false};
++
++    Poco::Logger * log;
++
++    UUID uuid;
++
++    std::shared_ptr<S3Configuration> getSnapshotS3Client() const;
++
++    void uploadSnapshotImpl(const std::string & snapshot_path);
++
++    /// Thread upload snapshots to S3 in the background
++    void snapshotS3Thread();
++};
++#else
++class KeeperSnapshotManagerS3
++{
++public:
++    KeeperSnapshotManagerS3() = default;
++
++    void updateS3Configuration(const Poco::Util::AbstractConfiguration &) {}
++    void uploadSnapshot(const std::string &, [[maybe_unused]] bool async_upload = true) {}
++
++    void startup(const Poco::Util::AbstractConfiguration &) {}
++
++    void shutdown() {}
++};
++#endif
++
++}
+diff --git a/src/Coordination/KeeperStateMachine.cpp b/src/Coordination/KeeperStateMachine.cpp
+index c5a66ce29cab..ee5bfa48357e 100644
+--- a/src/Coordination/KeeperStateMachine.cpp
++++ b/src/Coordination/KeeperStateMachine.cpp
+@@ -44,6 +44,7 @@ KeeperStateMachine::KeeperStateMachine(
+     const std::string & snapshots_path_,
+     const CoordinationSettingsPtr & coordination_settings_,
+     const KeeperContextPtr & keeper_context_,
++    KeeperSnapshotManagerS3 * snapshot_manager_s3_,
+     const std::string & superdigest_)
+     : coordination_settings(coordination_settings_)
+     , snapshot_manager(
+@@ -59,6 +60,7 @@ KeeperStateMachine::KeeperStateMachine(
+     , log(&Poco::Logger::get("KeeperStateMachine"))
+     , superdigest(superdigest_)
+     , keeper_context(keeper_context_)
++    , snapshot_manager_s3(snapshot_manager_s3_)
+ {
+ }
+ 
+@@ -400,13 +402,22 @@ void KeeperStateMachine::create_snapshot(nuraft::snapshot & s, nuraft::async_res
+         }
+ 
+         when_done(ret, exception);
++
++        return ret ? latest_snapshot_path : "";
+     };
+ 
+ 
+     if (keeper_context->server_state == KeeperContext::Phase::SHUTDOWN)
+     {
+         LOG_INFO(log, "Creating a snapshot during shutdown because 'create_snapshot_on_exit' is enabled.");
+-        snapshot_task.create_snapshot(std::move(snapshot_task.snapshot));
++        auto snapshot_path = snapshot_task.create_snapshot(std::move(snapshot_task.snapshot));
++
++        if (!snapshot_path.empty() && snapshot_manager_s3)
++        {
++            LOG_INFO(log, "Uploading snapshot {} during shutdown because 'upload_snapshot_on_exit' is enabled.", snapshot_path);
++            snapshot_manager_s3->uploadSnapshot(snapshot_path, /* asnyc_upload */ false);
++        }
++
+         return;
+     }
+ 
+diff --git a/src/Coordination/KeeperStateMachine.h b/src/Coordination/KeeperStateMachine.h
+index fbd4fdc5ac2b..ffc7fce1cfea 100644
+--- a/src/Coordination/KeeperStateMachine.h
++++ b/src/Coordination/KeeperStateMachine.h
+@@ -2,11 +2,13 @@
+ 
+ #include <Coordination/CoordinationSettings.h>
+ #include <Coordination/KeeperSnapshotManager.h>
++#include <Coordination/KeeperSnapshotManagerS3.h>
++#include <Coordination/KeeperContext.h>
+ #include <Coordination/KeeperStorage.h>
++
+ #include <libnuraft/nuraft.hxx>
+ #include <Common/ConcurrentBoundedQueue.h>
+ #include <Common/logger_useful.h>
+-#include <Coordination/KeeperContext.h>
+ 
+ 
+ namespace DB
+@@ -26,6 +28,7 @@ class KeeperStateMachine : public nuraft::state_machine
+         const std::string & snapshots_path_,
+         const CoordinationSettingsPtr & coordination_settings_,
+         const KeeperContextPtr & keeper_context_,
++        KeeperSnapshotManagerS3 * snapshot_manager_s3_,
+         const std::string & superdigest_ = "");
+ 
+     /// Read state from the latest snapshot
+@@ -146,6 +149,8 @@ class KeeperStateMachine : public nuraft::state_machine
+     const std::string superdigest;
+ 
+     KeeperContextPtr keeper_context;
++
++    KeeperSnapshotManagerS3 * snapshot_manager_s3;
+ };
+ 
+ }
+diff --git a/src/IO/S3/PocoHTTPClient.h b/src/IO/S3/PocoHTTPClient.h
+index 57e4369e565b..5649638285db 100644
+--- a/src/IO/S3/PocoHTTPClient.h
++++ b/src/IO/S3/PocoHTTPClient.h
+@@ -2,20 +2,22 @@
+ 
+ #include "config.h"
+ 
++#include <string>
++#include <vector>
++
+ #if USE_AWS_S3
+ 
+ #include <Common/RemoteHostFilter.h>
+ #include <IO/ConnectionTimeouts.h>
+ #include <IO/HTTPCommon.h>
+ #include <IO/S3/SessionAwareIOStream.h>
+-#include <Storages/StorageS3Settings.h>
++#include <Storages/HeaderCollection.h>
+ 
+ #include <aws/core/client/ClientConfiguration.h>
+ #include <aws/core/http/HttpClient.h>
+ #include <aws/core/http/HttpRequest.h>
+ #include <aws/core/http/standard/StandardHttpResponse.h>
+ 
+-
+ namespace Aws::Http::Standard
+ {
+ class StandardHttpResponse;
+@@ -23,6 +25,7 @@ class StandardHttpResponse;
+ 
+ namespace DB
+ {
++
+ class Context;
+ }
+ 
+diff --git a/src/IO/S3Common.cpp b/src/IO/S3Common.cpp
+index df19748b4930..859f5ce796be 100644
+--- a/src/IO/S3Common.cpp
++++ b/src/IO/S3Common.cpp
+@@ -1,9 +1,11 @@
++#include <IO/S3Common.h>
++
++#include <Common/Exception.h>
++#include <Poco/Util/AbstractConfiguration.h>
+ #include "config.h"
+ 
+ #if USE_AWS_S3
+ 
+-#    include <IO/S3Common.h>
+-
+ #    include <Common/quoteString.h>
+ 
+ #    include <IO/WriteBufferFromString.h>
+@@ -780,25 +782,16 @@ namespace S3
+ 
+             boost::to_upper(name);
+             if (name != S3 && name != COS && name != OBS && name != OSS)
+-            {
+                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Object storage system name is unrecognized in virtual hosted style S3 URI: {}", quoteString(name));
+-            }
++
+             if (name == S3)
+-            {
+                 storage_name = name;
+-            }
+             else if (name == OBS)
+-            {
+                 storage_name = OBS;
+-            }
+             else if (name == OSS)
+-            {
+                 storage_name = OSS;
+-            }
+             else
+-            {
+                 storage_name = COSN;
+-            }
+         }
+         else if (re2::RE2::PartialMatch(uri.getPath(), path_style_pattern, &bucket, &key))
+         {
+@@ -851,8 +844,82 @@ namespace S3
+     {
+         return getObjectInfo(client_ptr, bucket, key, version_id, throw_on_error, for_disk_s3).size;
+     }
++
+ }
+ 
+ }
+ 
+ #endif
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int INVALID_CONFIG_PARAMETER;
++}
++
++namespace S3
++{
++
++AuthSettings AuthSettings::loadFromConfig(const std::string & config_elem, const Poco::Util::AbstractConfiguration & config)
++{
++    auto access_key_id = config.getString(config_elem + ".access_key_id", "");
++    auto secret_access_key = config.getString(config_elem + ".secret_access_key", "");
++    auto region = config.getString(config_elem + ".region", "");
++    auto server_side_encryption_customer_key_base64 = config.getString(config_elem + ".server_side_encryption_customer_key_base64", "");
++
++    std::optional<bool> use_environment_credentials;
++    if (config.has(config_elem + ".use_environment_credentials"))
++        use_environment_credentials = config.getBool(config_elem + ".use_environment_credentials");
++
++    std::optional<bool> use_insecure_imds_request;
++    if (config.has(config_elem + ".use_insecure_imds_request"))
++        use_insecure_imds_request = config.getBool(config_elem + ".use_insecure_imds_request");
++
++    HeaderCollection headers;
++    Poco::Util::AbstractConfiguration::Keys subconfig_keys;
++    config.keys(config_elem, subconfig_keys);
++    for (const std::string & subkey : subconfig_keys)
++    {
++        if (subkey.starts_with("header"))
++        {
++            auto header_str = config.getString(config_elem + "." + subkey);
++            auto delimiter = header_str.find(':');
++            if (delimiter == std::string::npos)
++                throw Exception("Malformed s3 header value", ErrorCodes::INVALID_CONFIG_PARAMETER);
++            headers.emplace_back(HttpHeader{header_str.substr(0, delimiter), header_str.substr(delimiter + 1, String::npos)});
++        }
++    }
++
++    return AuthSettings
++    {
++        std::move(access_key_id), std::move(secret_access_key),
++        std::move(region),
++        std::move(server_side_encryption_customer_key_base64),
++        std::move(headers),
++        use_environment_credentials,
++        use_insecure_imds_request
++    };
++}
++
++
++void AuthSettings::updateFrom(const AuthSettings & from)
++{
++    /// Update with check for emptyness only parameters which
++    /// can be passed not only from config, but via ast.
++
++    if (!from.access_key_id.empty())
++        access_key_id = from.access_key_id;
++    if (!from.secret_access_key.empty())
++        secret_access_key = from.secret_access_key;
++
++    headers = from.headers;
++    region = from.region;
++    server_side_encryption_customer_key_base64 = from.server_side_encryption_customer_key_base64;
++    use_environment_credentials = from.use_environment_credentials;
++    use_insecure_imds_request = from.use_insecure_imds_request;
++}
++
++}
++}
+diff --git a/src/IO/S3Common.h b/src/IO/S3Common.h
+index 5c27b32985ff..93e5eb78c7ff 100644
+--- a/src/IO/S3Common.h
++++ b/src/IO/S3Common.h
+@@ -1,5 +1,11 @@
+ #pragma once
+ 
++#include <Storages/HeaderCollection.h>
++#include <IO/S3/PocoHTTPClient.h>
++
++#include <string>
++#include <optional>
++
+ #include "config.h"
+ 
+ #if USE_AWS_S3
+@@ -8,7 +14,6 @@
+ #include <aws/core/Aws.h>
+ #include <aws/core/client/ClientConfiguration.h>
+ #include <aws/s3/S3Errors.h>
+-#include <IO/S3/PocoHTTPClient.h>
+ #include <Poco/URI.h>
+ 
+ #include <Common/Exception.h>
+@@ -27,8 +32,6 @@ namespace ErrorCodes
+ }
+ 
+ class RemoteHostFilter;
+-struct HttpHeader;
+-using HeaderCollection = std::vector<HttpHeader>;
+ 
+ class S3Exception : public Exception
+ {
+@@ -130,5 +133,33 @@ S3::ObjectInfo getObjectInfo(std::shared_ptr<const Aws::S3::S3Client> client_ptr
+ size_t getObjectSize(std::shared_ptr<const Aws::S3::S3Client> client_ptr, const String & bucket, const String & key, const String & version_id, bool throw_on_error, bool for_disk_s3);
+ 
+ }
+-
+ #endif
++
++namespace Poco::Util
++{
++class AbstractConfiguration;
++};
++
++namespace DB::S3
++{
++
++struct AuthSettings
++{
++    static AuthSettings loadFromConfig(const std::string & config_elem, const Poco::Util::AbstractConfiguration & config);
++
++    std::string access_key_id;
++    std::string secret_access_key;
++    std::string region;
++    std::string server_side_encryption_customer_key_base64;
++
++    HeaderCollection headers;
++
++    std::optional<bool> use_environment_credentials;
++    std::optional<bool> use_insecure_imds_request;
++
++    bool operator==(const AuthSettings & other) const = default;
++
++    void updateFrom(const AuthSettings & from);
++};
++
++}
+diff --git a/src/Storages/ExternalDataSourceConfiguration.h b/src/Storages/ExternalDataSourceConfiguration.h
+index 0890247eb45d..5736336983a9 100644
+--- a/src/Storages/ExternalDataSourceConfiguration.h
++++ b/src/Storages/ExternalDataSourceConfiguration.h
+@@ -117,7 +117,7 @@ struct URLBasedDataSourceConfiguration
+ 
+ struct StorageS3Configuration : URLBasedDataSourceConfiguration
+ {
+-    S3Settings::AuthSettings auth_settings;
++    S3::AuthSettings auth_settings;
+     S3Settings::ReadWriteSettings rw_settings;
+ };
+ 
+diff --git a/src/Storages/StorageS3.h b/src/Storages/StorageS3.h
+index a983a59d98ce..c74a85019643 100644
+--- a/src/Storages/StorageS3.h
++++ b/src/Storages/StorageS3.h
+@@ -197,7 +197,7 @@ class StorageS3 : public IStorage, WithContext
+         const S3::URI uri;
+         std::shared_ptr<const Aws::S3::S3Client> client;
+ 
+-        S3Settings::AuthSettings auth_settings;
++        S3::AuthSettings auth_settings;
+         S3Settings::ReadWriteSettings rw_settings;
+ 
+         /// If s3 configuration was passed from ast, then it is static.
+@@ -209,7 +209,7 @@ class StorageS3 : public IStorage, WithContext
+ 
+         S3Configuration(
+             const String & url_,
+-            const S3Settings::AuthSettings & auth_settings_,
++            const S3::AuthSettings & auth_settings_,
+             const S3Settings::ReadWriteSettings & rw_settings_,
+             const HeaderCollection & headers_from_ast_)
+             : uri(S3::URI(url_))
+diff --git a/src/Storages/StorageS3Settings.cpp b/src/Storages/StorageS3Settings.cpp
+index 4ab3375e1886..65e9bb1ab8c4 100644
+--- a/src/Storages/StorageS3Settings.cpp
++++ b/src/Storages/StorageS3Settings.cpp
+@@ -1,5 +1,7 @@
+ #include <Storages/StorageS3Settings.h>
+ 
++#include <IO/S3Common.h>
++
+ #include <Poco/Util/AbstractConfiguration.h>
+ #include <Common/Exception.h>
+ #include <Interpreters/Context.h>
+@@ -9,10 +11,6 @@
+ 
+ namespace DB
+ {
+-namespace ErrorCodes
+-{
+-    extern const int INVALID_CONFIG_PARAMETER;
+-}
+ 
+ void StorageS3Settings::loadFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config, const Settings & settings)
+ {
+@@ -46,41 +44,8 @@ void StorageS3Settings::loadFromConfig(const String & config_elem, const Poco::U
+         if (config.has(config_elem + "." + key + ".endpoint"))
+         {
+             auto endpoint = get_string_for_key(key, "endpoint", false);
+-            auto access_key_id = get_string_for_key(key, "access_key_id");
+-            auto secret_access_key = get_string_for_key(key, "secret_access_key");
+-            auto region = get_string_for_key(key, "region");
+-            auto server_side_encryption_customer_key_base64 = get_string_for_key(key, "server_side_encryption_customer_key_base64");
+-
+-            std::optional<bool> use_environment_credentials;
+-            if (config.has(config_elem + "." + key + ".use_environment_credentials"))
+-                use_environment_credentials = config.getBool(config_elem + "." + key + ".use_environment_credentials");
+-
+-            std::optional<bool> use_insecure_imds_request;
+-            if (config.has(config_elem + "." + key + ".use_insecure_imds_request"))
+-                use_insecure_imds_request = config.getBool(config_elem + "." + key + ".use_insecure_imds_request");
+-
+-            HeaderCollection headers;
+-            Poco::Util::AbstractConfiguration::Keys subconfig_keys;
+-            config.keys(config_elem + "." + key, subconfig_keys);
+-            for (const String & subkey : subconfig_keys)
+-            {
+-                if (subkey.starts_with("header"))
+-                {
+-                    auto header_str = config.getString(config_elem + "." + key + "." + subkey);
+-                    auto delimiter = header_str.find(':');
+-                    if (delimiter == String::npos)
+-                        throw Exception("Malformed s3 header value", ErrorCodes::INVALID_CONFIG_PARAMETER);
+-                    headers.emplace_back(HttpHeader{header_str.substr(0, delimiter), header_str.substr(delimiter + 1, String::npos)});
+-                }
+-            }
+-
+-            S3Settings::AuthSettings auth_settings{
+-                    std::move(access_key_id), std::move(secret_access_key),
+-                    std::move(region),
+-                    std::move(server_side_encryption_customer_key_base64),
+-                    std::move(headers),
+-                    use_environment_credentials,
+-                    use_insecure_imds_request};
++
++            auto auth_settings = S3::AuthSettings::loadFromConfig(config_elem + "." + key, config);
+ 
+             S3Settings::ReadWriteSettings rw_settings;
+             rw_settings.max_single_read_retries = get_uint_for_key(key, "max_single_read_retries", true, settings.s3_max_single_read_retries);
+diff --git a/src/Storages/StorageS3Settings.h b/src/Storages/StorageS3Settings.h
+index 80ef4f52debd..2da4a1d75904 100644
+--- a/src/Storages/StorageS3Settings.h
++++ b/src/Storages/StorageS3Settings.h
+@@ -9,6 +9,8 @@
+ #include <Interpreters/Context_fwd.h>
+ #include <Storages/HeaderCollection.h>
+ 
++#include <IO/S3Common.h>
++
+ namespace Poco::Util
+ {
+ class AbstractConfiguration;
+@@ -21,46 +23,6 @@ struct Settings;
+ 
+ struct S3Settings
+ {
+-    struct AuthSettings
+-    {
+-        String access_key_id;
+-        String secret_access_key;
+-        String region;
+-        String server_side_encryption_customer_key_base64;
+-
+-        HeaderCollection headers;
+-
+-        std::optional<bool> use_environment_credentials;
+-        std::optional<bool> use_insecure_imds_request;
+-
+-        inline bool operator==(const AuthSettings & other) const
+-        {
+-            return access_key_id == other.access_key_id && secret_access_key == other.secret_access_key
+-                && region == other.region
+-                && server_side_encryption_customer_key_base64 == other.server_side_encryption_customer_key_base64
+-                && headers == other.headers
+-                && use_environment_credentials == other.use_environment_credentials
+-                && use_insecure_imds_request == other.use_insecure_imds_request;
+-        }
+-
+-        void updateFrom(const AuthSettings & from)
+-        {
+-            /// Update with check for emptyness only parameters which
+-            /// can be passed not only from config, but via ast.
+-
+-            if (!from.access_key_id.empty())
+-                access_key_id = from.access_key_id;
+-            if (!from.secret_access_key.empty())
+-                secret_access_key = from.secret_access_key;
+-
+-            headers = from.headers;
+-            region = from.region;
+-            server_side_encryption_customer_key_base64 = from.server_side_encryption_customer_key_base64;
+-            use_environment_credentials = from.use_environment_credentials;
+-            use_insecure_imds_request = from.use_insecure_imds_request;
+-        }
+-    };
+-
+     struct ReadWriteSettings
+     {
+         size_t max_single_read_retries = 0;
+@@ -90,7 +52,7 @@ struct S3Settings
+         void updateFromSettingsIfEmpty(const Settings & settings);
+     };
+ 
+-    AuthSettings auth_settings;
++    S3::AuthSettings auth_settings;
+     ReadWriteSettings rw_settings;
+ 
+     inline bool operator==(const S3Settings & other) const
+diff --git a/utils/keeper-data-dumper/main.cpp b/utils/keeper-data-dumper/main.cpp
+index 0762c740ac17..dd3c3a4e2ada 100644
+--- a/utils/keeper-data-dumper/main.cpp
++++ b/utils/keeper-data-dumper/main.cpp
+@@ -63,7 +63,7 @@ int main(int argc, char *argv[])
+     SnapshotsQueue snapshots_queue{1};
+     CoordinationSettingsPtr settings = std::make_shared<CoordinationSettings>();
+     KeeperContextPtr keeper_context = std::make_shared<DB::KeeperContext>();
+-    auto state_machine = std::make_shared<KeeperStateMachine>(queue, snapshots_queue, argv[1], settings, keeper_context);
++    auto state_machine = std::make_shared<KeeperStateMachine>(queue, snapshots_queue, argv[1], settings, keeper_context, nullptr);
+     state_machine->init();
+     size_t last_commited_index = state_machine->last_commit_index();
+ 

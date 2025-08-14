@@ -1,0 +1,252 @@
+diff --git a/dbms/src/DataStreams/ParallelParsingBlockInputStream.cpp b/dbms/src/DataStreams/ParallelParsingBlockInputStream.cpp
+index 3f6ddbd7a15f..3669e77080b2 100644
+--- a/dbms/src/DataStreams/ParallelParsingBlockInputStream.cpp
++++ b/dbms/src/DataStreams/ParallelParsingBlockInputStream.cpp
+@@ -34,7 +34,7 @@ void ParallelParsingBlockInputStream::segmentatorThreadFunction()
+ 
+             unit.is_last = !have_more_data;
+             unit.status = READY_TO_PARSE;
+-            scheduleParserThreadForUnitWithNumber(current_unit_number);
++            scheduleParserThreadForUnitWithNumber(segmentator_ticket_number);
+             ++segmentator_ticket_number;
+ 
+             if (!have_more_data)
+@@ -49,12 +49,13 @@ void ParallelParsingBlockInputStream::segmentatorThreadFunction()
+     }
+ }
+ 
+-void ParallelParsingBlockInputStream::parserThreadFunction(size_t current_unit_number)
++void ParallelParsingBlockInputStream::parserThreadFunction(size_t current_ticket_number)
+ {
+     try
+     {
+         setThreadName("ChunkParser");
+ 
++        const auto current_unit_number = current_ticket_number % processing_units.size();
+         auto & unit = processing_units[current_unit_number];
+ 
+         /*
+@@ -64,9 +65,9 @@ void ParallelParsingBlockInputStream::parserThreadFunction(size_t current_unit_n
+          * can use it from multiple threads simultaneously.
+          */
+         ReadBuffer read_buffer(unit.segment.data(), unit.segment.size(), 0);
+-        auto parser = std::make_unique<InputStreamFromInputFormat>(
+-                input_processor_creator(read_buffer, header,
+-                row_input_format_params, format_settings));
++        auto format = input_processor_creator(read_buffer, header, row_input_format_params, format_settings);
++        format->setCurrentUnitNumber(current_ticket_number);
++        auto parser = std::make_unique<InputStreamFromInputFormat>(std::move(format));
+ 
+         unit.block_ext.block.clear();
+         unit.block_ext.block_missing_values.clear();
+diff --git a/dbms/src/DataStreams/ParallelParsingBlockInputStream.h b/dbms/src/DataStreams/ParallelParsingBlockInputStream.h
+index 89a9d7c8926b..1b2bfbd52e2c 100644
+--- a/dbms/src/DataStreams/ParallelParsingBlockInputStream.h
++++ b/dbms/src/DataStreams/ParallelParsingBlockInputStream.h
+@@ -213,9 +213,9 @@ class ParallelParsingBlockInputStream : public IBlockInputStream
+     std::deque<ProcessingUnit> processing_units;
+ 
+ 
+-    void scheduleParserThreadForUnitWithNumber(size_t unit_number)
++    void scheduleParserThreadForUnitWithNumber(size_t ticket_number)
+     {
+-        pool.scheduleOrThrowOnError(std::bind(&ParallelParsingBlockInputStream::parserThreadFunction, this, unit_number));
++        pool.scheduleOrThrowOnError(std::bind(&ParallelParsingBlockInputStream::parserThreadFunction, this, ticket_number));
+     }
+ 
+     void finishAndWait()
+diff --git a/dbms/src/Formats/FormatFactory.cpp b/dbms/src/Formats/FormatFactory.cpp
+index b67c659ee898..e6c01d81b816 100644
+--- a/dbms/src/Formats/FormatFactory.cpp
++++ b/dbms/src/Formats/FormatFactory.cpp
+@@ -144,9 +144,19 @@ BlockInputStreamPtr FormatFactory::getInput(
+ 
+     // Doesn't make sense to use parallel parsing with less than four threads
+     // (segmentator + two parsers + reader).
+-    if (settings.input_format_parallel_parsing
+-        && file_segmentation_engine
+-        && settings.max_threads >= 4)
++    bool parallel_parsing = settings.input_format_parallel_parsing && file_segmentation_engine && settings.max_threads >= 4;
++
++    if (parallel_parsing && name == "JSONEachRow")
++    {
++        /// FIXME ParallelParsingBlockInputStream doesn't support formats with non-trivial readPrefix() and readSuffix()
++
++        /// For JSONEachRow we can safely skip whitespace characters
++        skipWhitespaceIfAny(buf);
++        if (buf.eof() || *buf.position() == '[')
++            parallel_parsing = false; /// Disable it for JSONEachRow if data is in square brackets (see JSONEachRowRowInputFormat)
++    }
++
++    if (parallel_parsing)
+     {
+         const auto & input_getter = getCreators(name).input_processor_creator;
+         if (!input_getter)
+diff --git a/dbms/src/Processors/Formats/IInputFormat.h b/dbms/src/Processors/Formats/IInputFormat.h
+index 00cb38405cf7..e1537aff6c56 100644
+--- a/dbms/src/Processors/Formats/IInputFormat.h
++++ b/dbms/src/Processors/Formats/IInputFormat.h
+@@ -38,6 +38,13 @@ class IInputFormat : public ISource
+         static const BlockMissingValues none;
+         return none;
+     }
++
++    size_t getCurrentUnitNumber() const { return current_unit_number; }
++    void setCurrentUnitNumber(size_t current_unit_number_) { current_unit_number = current_unit_number_; }
++
++private:
++    /// Number of currently parsed chunk (if parallel parsing is enabled)
++    size_t current_unit_number = 0;
+ };
+ 
+ }
+diff --git a/dbms/src/Processors/Formats/IRowInputFormat.h b/dbms/src/Processors/Formats/IRowInputFormat.h
+index 436b358cb053..1931fba2a0dc 100644
+--- a/dbms/src/Processors/Formats/IRowInputFormat.h
++++ b/dbms/src/Processors/Formats/IRowInputFormat.h
+@@ -77,6 +77,8 @@ class IRowInputFormat : public IInputFormat
+ 
+     const BlockMissingValues & getMissingValues() const override { return block_missing_values; }
+ 
++    size_t getTotalRows() const { return total_rows; }
++
+ private:
+     Params params;
+ 
+diff --git a/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp b/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
+index e4eea18f25c8..d9cd8a21769e 100644
+--- a/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
++++ b/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.cpp
+@@ -216,46 +216,37 @@ void JSONEachRowRowInputFormat::readNestedData(const String & name, MutableColum
+ 
+ bool JSONEachRowRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & ext)
+ {
+-    /// Set flag data_in_square_brackets if data starts with '['.
+-    if (!in.eof() && parsing_stage == ParsingStage::START)
+-    {
+-        parsing_stage = ParsingStage::PROCESS;
+-        skipWhitespaceIfAny(in);
+-        if (*in.position() == '[')
+-        {
+-            data_in_square_brackets = true;
+-            ++in.position();
+-        }
+-    }
+-
++    if (!allow_new_rows)
++        return false;
+     skipWhitespaceIfAny(in);
+ 
+-    /// We consume ;, or 
+ before scanning a new row, instead scanning to next row at the end.
++    /// We consume , or 
+ before scanning a new row, instead scanning to next row at the end.
+     /// The reason is that if we want an exact number of rows read with LIMIT x
+     /// from a streaming table engine with text data format, like File or Kafka
+     /// then seeking to next ;, or 
+ would trigger reading of an extra row at the end.
+ 
+     /// Semicolon is added for convenience as it could be used at end of INSERT query.
+-    if (!in.eof() && (*in.position() == ',' || *in.position() == ';'))
+-        ++in.position();
+-
+-    /// Finish reading rows if data is in square brackets and ']' received.
+-    skipWhitespaceIfAny(in);
+-    if (!in.eof() && *in.position() == ']' && data_in_square_brackets)
++    bool is_first_row = getCurrentUnitNumber() == 0 && getTotalRows() == 1;
++    if (!in.eof())
+     {
+-        data_in_square_brackets = false;
+-        parsing_stage = ParsingStage::FINISH;
+-        ++in.position();
+-        return false;
++        /// There may be optional ',' (but not before the first row)
++        if (!is_first_row && *in.position() == ',')
++            ++in.position();
++        else if (!data_in_square_brackets && *in.position() == ';')
++        {
++            /// ';' means the end of query (but it cannot be before ']')
++            return allow_new_rows = false;
++        }
++        else if (data_in_square_brackets && *in.position() == ']')
++        {
++            /// ']' means the end of query
++            return allow_new_rows = false;
++        }
+     }
+ 
+     skipWhitespaceIfAny(in);
+-    if (in.eof() || parsing_stage == ParsingStage::FINISH)
+-    {
+-        if (data_in_square_brackets)
+-            throw Exception("Unexpected end of data: received end of stream instead of ']'.", ErrorCodes::INCORRECT_DATA);
++    if (in.eof())
+         return false;
+-    }
+ 
+     size_t num_columns = columns.size();
+ 
+@@ -291,6 +282,32 @@ void JSONEachRowRowInputFormat::resetParser()
+     prev_positions.clear();
+ }
+ 
++void JSONEachRowRowInputFormat::readPrefix()
++{
++    skipWhitespaceIfAny(in);
++    if (!in.eof() && *in.position() == '[')
++    {
++        ++in.position();
++        data_in_square_brackets = true;
++    }
++}
++
++void JSONEachRowRowInputFormat::readSuffix()
++{
++    skipWhitespaceIfAny(in);
++    if (data_in_square_brackets)
++    {
++        assertChar(']', in);
++        skipWhitespaceIfAny(in);
++    }
++    if (!in.eof() && *in.position() == ';')
++    {
++        ++in.position();
++        skipWhitespaceIfAny(in);
++    }
++    assertEOF(in);
++}
++
+ 
+ void registerInputFormatProcessorJSONEachRow(FormatFactory & factory)
+ {
+diff --git a/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.h b/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.h
+index 10e15e62b694..a0a4b735a3e5 100644
+--- a/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.h
++++ b/dbms/src/Processors/Formats/Impl/JSONEachRowRowInputFormat.h
+@@ -24,6 +24,9 @@ class JSONEachRowRowInputFormat : public IRowInputFormat
+ 
+     String getName() const override { return "JSONEachRowRowInputFormat"; }
+ 
++    void readPrefix() override;
++    void readSuffix() override;
++
+     bool readRow(MutableColumns & columns, RowReadExtension & ext) override;
+     bool allowSyncAfterError() const override { return true; }
+     void syncAfterError() override;
+@@ -71,15 +74,7 @@ class JSONEachRowRowInputFormat : public IRowInputFormat
+     /// This flag is needed to know if data is in square brackets.
+     bool data_in_square_brackets = false;
+ 
+-    /// This is needed to know the stage of parsing.
+-    enum class ParsingStage
+-    {
+-        START,
+-        PROCESS,
+-        FINISH
+-    };
+-
+-    ParsingStage parsing_stage = ParsingStage::START;
++    bool allow_new_rows = true;
+ };
+ 
+ }

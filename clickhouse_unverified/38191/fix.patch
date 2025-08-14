@@ -1,0 +1,2226 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index 4702985c0ae6..053bfc6bb4e4 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -212,6 +212,7 @@ try
+ 
+     /// Clearing old temporary files.
+     fs::directory_iterator dir_end;
++    size_t unknown_files = 0;
+     for (fs::directory_iterator it(path); it != dir_end; ++it)
+     {
+         if (it->is_regular_file() && startsWith(it->path().filename(), "tmp"))
+@@ -220,8 +221,17 @@ try
+             fs::remove(it->path());
+         }
+         else
+-            LOG_DEBUG(log, "Found unknown file in temporary path {}", it->path().string());
++        {
++            unknown_files++;
++            if (unknown_files < 100)
++                LOG_DEBUG(log, "Found unknown {} {} in temporary path",
++                    it->is_regular_file() ? "file" : (it->is_directory() ? "directory" : "element"),
++                    it->path().string());
++        }
+     }
++
++    if (unknown_files)
++        LOG_DEBUG(log, "Found {} unknown files in temporary path", unknown_files);
+ }
+ catch (...)
+ {
+diff --git a/src/Common/BitHelpers.h b/src/Common/BitHelpers.h
+index 6a3efb58c42d..6356d5b81d5b 100644
+--- a/src/Common/BitHelpers.h
++++ b/src/Common/BitHelpers.h
+@@ -1,8 +1,9 @@
+ #pragma once
+ 
++#include <cassert>
++#include <concepts>
+ #include <cstddef>
+ #include <cstdint>
+-#include <cassert>
+ #include <type_traits>
+ #include <base/defines.h>
+ 
+@@ -117,3 +118,9 @@ inline T maskLowBits(unsigned char bits)
+ 
+     return result;
+ }
++
++template <std::integral T>
++constexpr bool isPowerOf2(T number)
++{
++    return number > 0 && (number & (number - 1)) == 0;
++}
+diff --git a/src/Common/HashTable/Hash.h b/src/Common/HashTable/Hash.h
+index 189db68f59af..550eea66a0f3 100644
+--- a/src/Common/HashTable/Hash.h
++++ b/src/Common/HashTable/Hash.h
+@@ -76,7 +76,7 @@ inline DB::UInt64 intHashCRC32(DB::UInt64 x, DB::UInt64 updated_value)
+ }
+ 
+ template <typename T>
+-requires (sizeof(T) > sizeof(DB::UInt64))
++requires std::has_unique_object_representations_v<T> && (sizeof(T) % sizeof(DB::UInt64) == 0)
+ inline DB::UInt64 intHashCRC32(const T & x, DB::UInt64 updated_value)
+ {
+     const auto * begin = reinterpret_cast<const char *>(&x);
+@@ -89,6 +89,25 @@ inline DB::UInt64 intHashCRC32(const T & x, DB::UInt64 updated_value)
+     return updated_value;
+ }
+ 
++template <std::floating_point T>
++requires(sizeof(T) <= sizeof(UInt64))
++inline DB::UInt64 intHashCRC32(T x, DB::UInt64 updated_value)
++{
++    static_assert(std::numeric_limits<T>::is_iec559);
++
++    // In IEEE 754, the only two floating point numbers that compare equal are 0.0 and -0.0.
++    // See std::hash<float>.
++    if (x == static_cast<T>(0.0))
++        return intHashCRC32(0, updated_value);
++
++    UInt64 repr;
++    if constexpr (sizeof(T) == sizeof(UInt32))
++        repr = std::bit_cast<UInt32>(x);
++    else
++        repr = std::bit_cast<UInt64>(x);
++
++    return intHashCRC32(repr, updated_value);
++}
+ 
+ inline UInt32 updateWeakHash32(const DB::UInt8 * pos, size_t size, DB::UInt32 updated_value)
+ {
+diff --git a/src/Common/WeakHash.h b/src/Common/WeakHash.h
+index bfea75eddf18..b59624e64f24 100644
+--- a/src/Common/WeakHash.h
++++ b/src/Common/WeakHash.h
+@@ -11,13 +11,16 @@ namespace DB
+ /// The main purpose why this class needed is to support data initialization. Initially, every bit is 1.
+ class WeakHash32
+ {
++    static constexpr UInt32 kDefaultInitialValue = ~UInt32(0);
++
+ public:
++
+     using Container = PaddedPODArray<UInt32>;
+ 
+-    explicit WeakHash32(size_t size) : data(size, ~UInt32(0)) {}
++    explicit WeakHash32(size_t size, UInt32 initial_value = kDefaultInitialValue) : data(size, initial_value) {}
+     WeakHash32(const WeakHash32 & other) { data.assign(other.data); }
+ 
+-    void reset(size_t size) { data.assign(size, ~UInt32(0)); }
++    void reset(size_t size, UInt32 initial_value = kDefaultInitialValue) { data.assign(size, initial_value); }
+ 
+     const Container & getData() const { return data; }
+     Container & getData() { return data; }
+diff --git a/src/Core/Joins.cpp b/src/Core/Joins.cpp
+index 1cd7215335f2..9c8ece822248 100644
+--- a/src/Core/Joins.cpp
++++ b/src/Core/Joins.cpp
+@@ -64,6 +64,7 @@ const char * toString(JoinAlgorithm join_algorithm)
+         case JoinAlgorithm::PARALLEL_HASH: return "PARALLEL_HASH";
+         case JoinAlgorithm::DIRECT: return "DIRECT";
+         case JoinAlgorithm::FULL_SORTING_MERGE: return "FULL_SORTING_MERGE";
++        case JoinAlgorithm::GRACE_HASH: return "GRACE_HASH";
+     }
+ }
+ 
+diff --git a/src/Core/Joins.h b/src/Core/Joins.h
+index 7c91c5a5c162..6884e8dfd9a7 100644
+--- a/src/Core/Joins.h
++++ b/src/Core/Joins.h
+@@ -102,6 +102,7 @@ enum class JoinAlgorithm
+     PARTIAL_MERGE,
+     PREFER_PARTIAL_MERGE,
+     PARALLEL_HASH,
++    GRACE_HASH,
+     DIRECT,
+     FULL_SORTING_MERGE,
+ };
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index cfc7df6c8539..2830160aa64b 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -661,6 +661,8 @@ static constexpr UInt64 operator""_GiB(unsigned long long value)
+     M(Bool, throw_if_no_data_to_insert, true, "Enables or disables empty INSERTs, enabled by default", 0) \
+     M(Bool, compatibility_ignore_auto_increment_in_create_table, false, "Ignore AUTO_INCREMENT keyword in column declaration if true, otherwise return error. It simplifies migration from MySQL", 0) \
+     M(Bool, multiple_joins_try_to_keep_original_names, false, "Do not add aliases to top level expression list on multiple joins rewrite", 0) \
++    M(UInt64, grace_hash_join_initial_buckets, 1, "Initial number of grace hash join buckets", 0) \
++    M(UInt64, grace_hash_join_max_buckets, 1024, "Limit on the number of grace hash join buckets", 0) \
+     M(Bool, optimize_distinct_in_order, true, "Enable DISTINCT optimization if some columns in DISTINCT form a prefix of sorting. For example, prefix of sorting key in merge tree or ORDER BY statement", 0) \
+     M(Bool, optimize_sorting_by_input_stream_properties, true, "Optimize sorting by sorting properties of input stream", 0) \
+     M(UInt64, insert_keeper_max_retries, 0, "Max retries for keeper operations during insert", 0) \
+diff --git a/src/Core/SettingsEnums.cpp b/src/Core/SettingsEnums.cpp
+index 2a564ebe6d3c..632587106a1a 100644
+--- a/src/Core/SettingsEnums.cpp
++++ b/src/Core/SettingsEnums.cpp
+@@ -38,7 +38,8 @@ IMPLEMENT_SETTING_MULTI_ENUM(JoinAlgorithm, ErrorCodes::UNKNOWN_JOIN,
+      {"prefer_partial_merge", JoinAlgorithm::PREFER_PARTIAL_MERGE},
+      {"parallel_hash",        JoinAlgorithm::PARALLEL_HASH},
+      {"direct",               JoinAlgorithm::DIRECT},
+-     {"full_sorting_merge",   JoinAlgorithm::FULL_SORTING_MERGE}})
++     {"full_sorting_merge",   JoinAlgorithm::FULL_SORTING_MERGE},
++     {"grace_hash",           JoinAlgorithm::GRACE_HASH}})
+ 
+ 
+ IMPLEMENT_SETTING_ENUM(TotalsMode, ErrorCodes::UNKNOWN_TOTALS_MODE,
+diff --git a/src/Interpreters/ConcurrentHashJoin.cpp b/src/Interpreters/ConcurrentHashJoin.cpp
+index cc79a71245b7..6c77539532fc 100644
+--- a/src/Interpreters/ConcurrentHashJoin.cpp
++++ b/src/Interpreters/ConcurrentHashJoin.cpp
+@@ -161,15 +161,12 @@ bool ConcurrentHashJoin::alwaysReturnsEmptySet() const
+     return true;
+ }
+ 
+-std::shared_ptr<NotJoinedBlocks> ConcurrentHashJoin::getNonJoinedBlocks(
++IBlocksStreamPtr ConcurrentHashJoin::getNonJoinedBlocks(
+         const Block & /*left_sample_block*/, const Block & /*result_sample_block*/, UInt64 /*max_block_size*/) const
+ {
+-    if (table_join->strictness() == JoinStrictness::Asof ||
+-        table_join->strictness() == JoinStrictness::Semi ||
+-        !isRightOrFull(table_join->kind()))
+-    {
++    if (!JoinCommon::hasNonJoinedBlocks(*table_join))
+         return {};
+-    }
++
+     throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid join type. join kind: {}, strictness: {}", table_join->kind(), table_join->strictness());
+ }
+ 
+@@ -204,6 +201,7 @@ IColumn::Selector ConcurrentHashJoin::selectDispatchBlock(const Strings & key_co
+ 
+ Blocks ConcurrentHashJoin::dispatchBlock(const Strings & key_columns_names, const Block & from_block)
+ {
++    /// TODO: use JoinCommon::scatterBlockByHash
+     size_t num_shards = hash_joins.size();
+     size_t num_cols = from_block.columns();
+ 
+diff --git a/src/Interpreters/ConcurrentHashJoin.h b/src/Interpreters/ConcurrentHashJoin.h
+index 705e6ba81b73..a00c3ed13265 100644
+--- a/src/Interpreters/ConcurrentHashJoin.h
++++ b/src/Interpreters/ConcurrentHashJoin.h
+@@ -47,7 +47,7 @@ class ConcurrentHashJoin : public IJoin
+     size_t getTotalByteCount() const override;
+     bool alwaysReturnsEmptySet() const override;
+     bool supportParallelJoin() const override { return true; }
+-    std::shared_ptr<NotJoinedBlocks>
++    IBlocksStreamPtr
+     getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override;
+ 
+ private:
+diff --git a/src/Interpreters/DirectJoin.h b/src/Interpreters/DirectJoin.h
+index 6a6f45054740..bdbd155dc366 100644
+--- a/src/Interpreters/DirectJoin.h
++++ b/src/Interpreters/DirectJoin.h
+@@ -48,7 +48,7 @@ class DirectKeyValueJoin : public IJoin
+ 
+     virtual bool isFilled() const override { return true; }
+ 
+-    virtual std::shared_ptr<NotJoinedBlocks>
++    virtual IBlocksStreamPtr
+     getNonJoinedBlocks(const Block &, const Block &, UInt64) const override
+     {
+         return nullptr;
+diff --git a/src/Interpreters/ExpressionAnalyzer.cpp b/src/Interpreters/ExpressionAnalyzer.cpp
+index b34dbf3128cc..17788fce53f0 100644
+--- a/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -22,6 +22,7 @@
+ #include <Interpreters/ExpressionActions.h>
+ #include <Interpreters/ExpressionAnalyzer.h>
+ #include <Interpreters/ExternalDictionariesLoader.h>
++#include <Interpreters/GraceHashJoin.h>
+ #include <Interpreters/HashJoin.h>
+ #include <Interpreters/JoinSwitcher.h>
+ #include <Interpreters/MergeJoin.h>
+@@ -1009,12 +1010,26 @@ static ActionsDAGPtr createJoinedBlockActions(ContextPtr context, const TableJoi
+ 
+ std::shared_ptr<DirectKeyValueJoin> tryKeyValueJoin(std::shared_ptr<TableJoin> analyzed_join, const Block & right_sample_block);
+ 
+-static std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> analyzed_join, std::unique_ptr<QueryPlan> & joined_plan, ContextPtr context)
++
++static std::shared_ptr<IJoin> chooseJoinAlgorithm(
++    std::shared_ptr<TableJoin> analyzed_join, const ColumnsWithTypeAndName & left_sample_columns, std::unique_ptr<QueryPlan> & joined_plan, ContextPtr context)
+ {
++    const auto & settings = context->getSettings();
++
++    Block left_sample_block(left_sample_columns);
++    for (auto & column : left_sample_block)
++    {
++        if (!column.column)
++            column.column = column.type->createColumn();
++    }
++
+     Block right_sample_block = joined_plan->getCurrentDataStream().header;
+ 
++    std::vector<String> tried_algorithms;
++
+     if (analyzed_join->isEnabledAlgorithm(JoinAlgorithm::DIRECT))
+     {
++        tried_algorithms.push_back(toString(JoinAlgorithm::DIRECT));
+         JoinPtr direct_join = tryKeyValueJoin(analyzed_join, right_sample_block);
+         if (direct_join)
+         {
+@@ -1027,6 +1042,7 @@ static std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> ana
+     if (analyzed_join->isEnabledAlgorithm(JoinAlgorithm::PARTIAL_MERGE) ||
+         analyzed_join->isEnabledAlgorithm(JoinAlgorithm::PREFER_PARTIAL_MERGE))
+     {
++        tried_algorithms.push_back(toString(JoinAlgorithm::PARTIAL_MERGE));
+         if (MergeJoin::isSupported(analyzed_join))
+             return std::make_shared<MergeJoin>(analyzed_join, right_sample_block);
+     }
+@@ -1036,22 +1052,37 @@ static std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> ana
+         analyzed_join->isEnabledAlgorithm(JoinAlgorithm::PREFER_PARTIAL_MERGE) ||
+         analyzed_join->isEnabledAlgorithm(JoinAlgorithm::PARALLEL_HASH))
+     {
++        tried_algorithms.push_back(toString(JoinAlgorithm::HASH));
+         if (analyzed_join->allowParallelHashJoin())
+-            return std::make_shared<ConcurrentHashJoin>(context, analyzed_join, context->getSettings().max_threads, right_sample_block);
++            return std::make_shared<ConcurrentHashJoin>(context, analyzed_join, settings.max_threads, right_sample_block);
+         return std::make_shared<HashJoin>(analyzed_join, right_sample_block);
+     }
+ 
+     if (analyzed_join->isEnabledAlgorithm(JoinAlgorithm::FULL_SORTING_MERGE))
+     {
++        tried_algorithms.push_back(toString(JoinAlgorithm::FULL_SORTING_MERGE));
+         if (FullSortingMergeJoin::isSupported(analyzed_join))
+             return std::make_shared<FullSortingMergeJoin>(analyzed_join, right_sample_block);
+     }
+ 
++    if (analyzed_join->isEnabledAlgorithm(JoinAlgorithm::GRACE_HASH))
++    {
++        tried_algorithms.push_back(toString(JoinAlgorithm::GRACE_HASH));
++        if (GraceHashJoin::isSupported(analyzed_join))
++            return std::make_shared<GraceHashJoin>(context, analyzed_join, left_sample_block, right_sample_block, context->getTempDataOnDisk());
++    }
++
+     if (analyzed_join->isEnabledAlgorithm(JoinAlgorithm::AUTO))
+-        return std::make_shared<JoinSwitcher>(analyzed_join, right_sample_block);
++    {
++        tried_algorithms.push_back(toString(JoinAlgorithm::AUTO));
++
++        if (MergeJoin::isSupported(analyzed_join))
++            return std::make_shared<JoinSwitcher>(analyzed_join, right_sample_block);
++    }
+ 
+-    throw Exception("Can't execute any of specified algorithms for specified strictness/kind and right storage type",
+-                     ErrorCodes::NOT_IMPLEMENTED);
++    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++        "Can't execute {} join algorithm for this strictness/kind and right storage type",
++        fmt::join(tried_algorithms, " or "));
+ }
+ 
+ static std::unique_ptr<QueryPlan> buildJoinedPlan(
+@@ -1186,7 +1217,7 @@ JoinPtr SelectQueryExpressionAnalyzer::makeJoin(
+         joined_plan->addStep(std::move(converting_step));
+     }
+ 
+-    JoinPtr join = chooseJoinAlgorithm(analyzed_join, joined_plan, getContext());
++    JoinPtr join = chooseJoinAlgorithm(analyzed_join, left_columns, joined_plan, getContext());
+     return join;
+ }
+ 
+diff --git a/src/Interpreters/FullSortingMergeJoin.h b/src/Interpreters/FullSortingMergeJoin.h
+index 14c812591591..fa7d0478535e 100644
+--- a/src/Interpreters/FullSortingMergeJoin.h
++++ b/src/Interpreters/FullSortingMergeJoin.h
+@@ -100,7 +100,7 @@ class FullSortingMergeJoin : public IJoin
+ 
+     bool alwaysReturnsEmptySet() const override { return false; }
+ 
+-    std::shared_ptr<NotJoinedBlocks>
++    IBlocksStreamPtr
+     getNonJoinedBlocks(const Block & /* left_sample_block */, const Block & /* result_sample_block */, UInt64 /* max_block_size */) const override
+     {
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "FullSortingMergeJoin::getNonJoinedBlocks should not be called");
+diff --git a/src/Interpreters/GraceHashJoin.cpp b/src/Interpreters/GraceHashJoin.cpp
+new file mode 100644
+index 000000000000..5ef276135917
+--- /dev/null
++++ b/src/Interpreters/GraceHashJoin.cpp
+@@ -0,0 +1,628 @@
++#include <Interpreters/GraceHashJoin.h>
++#include <Interpreters/HashJoin.h>
++#include <Interpreters/TableJoin.h>
++#include <Interpreters/Context.h>
++
++#include <Formats/NativeWriter.h>
++#include <Interpreters/TemporaryDataOnDisk.h>
++
++#include <Compression/CompressedWriteBuffer.h>
++#include <Core/ProtocolDefines.h>
++#include <Disks/IVolume.h>
++#include <Disks/TemporaryFileOnDisk.h>
++#include <IO/WriteBufferFromTemporaryFile.h>
++#include <Common/logger_useful.h>
++#include <Common/thread_local_rng.h>
++
++#include <base/FnTraits.h>
++#include <fmt/format.h>
++
++#include <Formats/formatBlock.h>
++
++namespace CurrentMetrics
++{
++    extern const Metric TemporaryFilesForJoin;
++}
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LIMIT_EXCEEDED;
++    extern const int LOGICAL_ERROR;
++    extern const int NOT_IMPLEMENTED;
++}
++
++namespace
++{
++    class AccumulatedBlockReader
++    {
++    public:
++        AccumulatedBlockReader(TemporaryFileStream & reader_,
++                               std::mutex & mutex_,
++                               size_t result_block_size_ = DEFAULT_BLOCK_SIZE * 8)
++            : reader(reader_)
++            , mutex(mutex_)
++            , result_block_size(result_block_size_)
++        {
++            if (!reader.isWriteFinished())
++                throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading not finished file");
++        }
++
++        Block read()
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++
++            if (eof)
++                return {};
++
++            Blocks blocks;
++            size_t rows_read = 0;
++            while (rows_read < result_block_size)
++            {
++                Block block = reader.read();
++                rows_read += block.rows();
++                if (!block)
++                {
++                    eof = true;
++                    return concatenateBlocks(blocks);
++                }
++                blocks.push_back(std::move(block));
++            }
++
++            return concatenateBlocks(blocks);
++        }
++
++    private:
++        TemporaryFileStream & reader;
++        std::mutex & mutex;
++
++        const size_t result_block_size;
++        bool eof = false;
++    };
++
++    std::deque<size_t> generateRandomPermutation(size_t from, size_t to)
++    {
++        size_t size = to - from;
++        std::deque<size_t> indices(size);
++        std::iota(indices.begin(), indices.end(), from);
++        std::shuffle(indices.begin(), indices.end(), thread_local_rng);
++        return indices;
++    }
++
++    // Try to apply @callback in the order specified in @indices
++    // Until it returns true for each index in the @indices.
++    void retryForEach(std::deque<size_t> indices, Fn<bool(size_t)> auto callback)
++    {
++        while (!indices.empty())
++        {
++            size_t bucket_index = indices.front();
++            indices.pop_front();
++
++            if (!callback(bucket_index))
++                indices.push_back(bucket_index);
++        }
++    }
++}
++
++class GraceHashJoin::FileBucket : boost::noncopyable
++{
++    enum class State : int
++    {
++        WRITING_BLOCKS,
++        JOINING_BLOCKS,
++        FINISHED,
++    };
++
++public:
++    using BucketLock = std::unique_lock<std::mutex>;
++
++    struct Stats
++    {
++        TemporaryFileStream::Stat left;
++        TemporaryFileStream::Stat right;
++    };
++
++    explicit FileBucket(size_t bucket_index_,
++                        TemporaryFileStream & left_file_,
++                        TemporaryFileStream & right_file_,
++                        Poco::Logger * log_)
++        : idx{bucket_index_}
++        , left_file{left_file_}
++        , right_file{right_file_}
++        , state{State::WRITING_BLOCKS}
++        , log(log_)
++    {
++    }
++
++    void addLeftBlock(const Block & block)
++    {
++        std::unique_lock<std::mutex> lock(left_file_mutex);
++        addBlockImpl(block, left_file, lock);
++    }
++
++    void addRightBlock(const Block & block)
++    {
++        std::unique_lock<std::mutex> lock(right_file_mutex);
++        addBlockImpl(block, right_file, lock);
++    }
++
++    bool tryAddLeftBlock(const Block & block)
++    {
++        std::unique_lock<std::mutex> lock(left_file_mutex, std::try_to_lock);
++        return addBlockImpl(block, left_file, lock);
++    }
++
++    bool tryAddRightBlock(const Block & block)
++    {
++        std::unique_lock<std::mutex> lock(right_file_mutex, std::try_to_lock);
++        return addBlockImpl(block, right_file, lock);
++    }
++
++    bool finished() const
++    {
++        std::unique_lock<std::mutex> left_lock(left_file_mutex);
++        return left_file.isEof();
++    }
++
++    bool empty() const { return is_empty.load(); }
++
++    Stats getStat() const { return stats; }
++
++    AccumulatedBlockReader startJoining()
++    {
++        LOG_TRACE(log, "Joining file bucket {}", idx);
++
++        {
++            std::unique_lock<std::mutex> left_lock(left_file_mutex);
++            std::unique_lock<std::mutex> right_lock(right_file_mutex);
++
++            stats.left = left_file.finishWriting();
++            stats.right = right_file.finishWriting();
++            state = State::JOINING_BLOCKS;
++        }
++
++        return AccumulatedBlockReader(right_file, right_file_mutex);
++    }
++
++    AccumulatedBlockReader getLeftTableReader()
++    {
++        ensureState(State::JOINING_BLOCKS);
++        return AccumulatedBlockReader(left_file, left_file_mutex);
++    }
++
++    const size_t idx;
++
++private:
++    bool addBlockImpl(const Block & block, TemporaryFileStream & writer, std::unique_lock<std::mutex> & lock)
++    {
++        ensureState(State::WRITING_BLOCKS);
++
++        if (!lock.owns_lock())
++            return false;
++
++        if (block.rows())
++            is_empty = false;
++
++        writer.write(block);
++        return true;
++    }
++
++    void transition(State expected, State desired)
++    {
++        State prev = state.exchange(desired);
++        if (prev != expected)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid state transition from {} (got {}) to {}", expected, prev, desired);
++    }
++
++    void ensureState(State expected) const
++    {
++        State cur_state = state.load();
++        if (cur_state != expected)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid state transition, expected {}, got {}", expected, state.load());
++    }
++
++    TemporaryFileStream & left_file;
++    TemporaryFileStream & right_file;
++    mutable std::mutex left_file_mutex;
++    mutable std::mutex right_file_mutex;
++
++    std::atomic_bool is_empty = true;
++
++    std::atomic<State> state;
++    Stats stats;
++
++    Poco::Logger * log;
++};
++
++
++static void flushBlocksToBuckets(Blocks & blocks, const GraceHashJoin::Buckets & buckets_snapshot)
++{
++    assert(blocks.size() == buckets_snapshot.size());
++    retryForEach(
++        generateRandomPermutation(1, buckets_snapshot.size()),
++        [&](size_t i)
++        {
++            if (!blocks[i].rows())
++                return true;
++            bool flushed = buckets_snapshot[i]->tryAddRightBlock(blocks[i]);
++            if (flushed)
++                blocks[i].clear();
++            return flushed;
++        });
++}
++
++GraceHashJoin::GraceHashJoin(
++    ContextPtr context_, std::shared_ptr<TableJoin> table_join_,
++    const Block & left_sample_block_,
++    const Block & right_sample_block_,
++    TemporaryDataOnDiskScopePtr tmp_data_,
++    bool any_take_last_row_)
++    : log{&Poco::Logger::get("GraceHashJoin")}
++    , context{context_}
++    , table_join{std::move(table_join_)}
++    , left_sample_block{left_sample_block_}
++    , right_sample_block{right_sample_block_}
++    , any_take_last_row{any_take_last_row_}
++    , max_num_buckets{context->getSettingsRef().grace_hash_join_max_buckets}
++    , max_block_size{context->getSettingsRef().max_block_size}
++    , left_key_names(table_join->getOnlyClause().key_names_left)
++    , right_key_names(table_join->getOnlyClause().key_names_right)
++    , tmp_data(std::make_unique<TemporaryDataOnDisk>(tmp_data_, CurrentMetrics::TemporaryFilesForJoin))
++    , hash_join(makeInMemoryJoin())
++{
++    if (!GraceHashJoin::isSupported(table_join))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "GraceHashJoin is not supported for this join type");
++
++}
++
++void GraceHashJoin::initBuckets()
++{
++    const auto & settings = context->getSettingsRef();
++
++    size_t initial_num_buckets = roundUpToPowerOfTwoOrZero(std::clamp<size_t>(settings.grace_hash_join_initial_buckets, 1, settings.grace_hash_join_max_buckets));
++
++    for (size_t i = 0; i < initial_num_buckets; ++i)
++    {
++        addBucket(buckets);
++    }
++
++    if (buckets.empty())
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "No buckets created");
++
++    LOG_TRACE(log, "Initialize {} buckets", buckets.size());
++
++    current_bucket = buckets.front().get();
++    current_bucket->startJoining();
++}
++
++bool GraceHashJoin::isSupported(const std::shared_ptr<TableJoin> & table_join)
++{
++    bool is_asof = (table_join->strictness() == JoinStrictness::Asof);
++    return !is_asof && isInnerOrLeft(table_join->kind()) && table_join->oneDisjunct();
++}
++
++GraceHashJoin::~GraceHashJoin() = default;
++
++bool GraceHashJoin::addJoinedBlock(const Block & block, bool /*check_limits*/)
++{
++    if (current_bucket == nullptr)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "GraceHashJoin is not initialized");
++
++    Block materialized = materializeBlock(block);
++    addJoinedBlockImpl(materialized);
++    return true;
++}
++
++bool GraceHashJoin::fitsInMemory() const
++{
++    /// One row can't be split, avoid loop
++    if (hash_join->getTotalRowCount() < 2)
++        return true;
++
++    return table_join->sizeLimits().softCheck(hash_join->getTotalRowCount(), hash_join->getTotalByteCount());
++}
++
++GraceHashJoin::Buckets GraceHashJoin::rehashBuckets(size_t to_size)
++{
++    std::unique_lock lock(rehash_mutex);
++    size_t current_size = buckets.size();
++
++    if (to_size <= current_size)
++        return buckets;
++
++    assert(isPowerOf2(to_size));
++
++    if (to_size > max_num_buckets)
++    {
++        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
++            "Too many grace hash join buckets ({} > {}), consider increasing grace_hash_join_max_buckets or max_rows_in_join/max_bytes_in_join",
++            to_size, max_num_buckets);
++    }
++
++    LOG_TRACE(log, "Rehashing from {} to {}", current_size, to_size);
++
++    buckets.reserve(to_size);
++    for (size_t i = current_size; i < to_size; ++i)
++        addBucket(buckets);
++
++    return buckets;
++}
++
++void GraceHashJoin::addBucket(Buckets & destination)
++{
++    BucketPtr new_bucket = std::make_shared<FileBucket>(
++        destination.size(), tmp_data->createStream(left_sample_block), tmp_data->createStream(right_sample_block), log);
++    destination.emplace_back(std::move(new_bucket));
++}
++
++void GraceHashJoin::checkTypesOfKeys(const Block & block) const
++{
++    assert(hash_join);
++    return hash_join->checkTypesOfKeys(block);
++}
++
++void GraceHashJoin::initialize(const Block & sample_block)
++{
++    left_sample_block = sample_block.cloneEmpty();
++    output_sample_block = left_sample_block.cloneEmpty();
++    ExtraBlockPtr not_processed;
++    hash_join->joinBlock(output_sample_block, not_processed);
++    initBuckets();
++}
++
++void GraceHashJoin::joinBlock(Block & block, std::shared_ptr<ExtraBlock> & not_processed)
++{
++    if (block.rows() == 0)
++    {
++        hash_join->joinBlock(block, not_processed);
++        return;
++    }
++
++    materializeBlockInplace(block);
++
++    Buckets buckets_snapshot = getCurrentBuckets();
++    size_t num_buckets = buckets_snapshot.size();
++    Blocks blocks = JoinCommon::scatterBlockByHash(left_key_names, block, num_buckets);
++
++    block = std::move(blocks[current_bucket->idx]);
++
++    hash_join->joinBlock(block, not_processed);
++    if (not_processed)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unhandled not processed block in GraceHashJoin");
++
++    // We need to skip the first bucket that is already joined in memory, so we start with 1.
++    retryForEach(
++        generateRandomPermutation(1, num_buckets),
++        [&blocks, &buckets_snapshot](size_t idx)
++        {
++            if (blocks[idx].rows() == 0)
++                return true;
++            return buckets_snapshot[idx]->tryAddLeftBlock(blocks[idx]);
++        });
++}
++
++void GraceHashJoin::setTotals(const Block & block)
++{
++    if (block.rows() > 0)
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Totals are not supported for GraceHashJoin, got '{}'", block.dumpStructure());
++}
++
++size_t GraceHashJoin::getTotalRowCount() const
++{
++    std::lock_guard lock(hash_join_mutex);
++    assert(hash_join);
++    return hash_join->getTotalRowCount();
++}
++
++size_t GraceHashJoin::getTotalByteCount() const
++{
++    std::lock_guard lock(hash_join_mutex);
++    assert(hash_join);
++    return hash_join->getTotalByteCount();
++}
++
++bool GraceHashJoin::alwaysReturnsEmptySet() const
++{
++    if (!isInnerOrRight(table_join->kind()))
++        return false;
++
++    std::shared_lock lock(rehash_mutex);
++
++    bool file_buckets_are_empty = std::all_of(buckets.begin(), buckets.end(), [](const auto & bucket) { return bucket->empty(); });
++    bool hash_join_is_empty = hash_join && hash_join->alwaysReturnsEmptySet();
++
++    return hash_join_is_empty && file_buckets_are_empty;
++}
++
++IBlocksStreamPtr GraceHashJoin::getNonJoinedBlocks(const Block &, const Block &, UInt64) const
++{
++    /// We do no support returning non joined blocks here.
++    /// TODO: They _should_ be reported by getDelayedBlocks instead
++    return nullptr;
++}
++
++class GraceHashJoin::DelayedBlocks : public IBlocksStream
++{
++public:
++    explicit DelayedBlocks(size_t current_bucket_, Buckets buckets_, InMemoryJoinPtr hash_join_, const Names & left_key_names_, const Names & right_key_names_)
++        : current_bucket(current_bucket_)
++        , buckets(std::move(buckets_))
++        , hash_join(std::move(hash_join_))
++        , left_reader(buckets[current_bucket]->getLeftTableReader())
++        , left_key_names(left_key_names_)
++        , right_key_names(right_key_names_)
++    {
++    }
++
++    Block nextImpl() override
++    {
++        Block block;
++        size_t num_buckets = buckets.size();
++        size_t current_idx = buckets[current_bucket]->idx;
++
++        do
++        {
++            block = left_reader.read();
++            if (!block)
++            {
++                return {};
++            }
++
++            Blocks blocks = JoinCommon::scatterBlockByHash(left_key_names, block, num_buckets);
++            block = std::move(blocks[current_idx]);
++
++            /*
++             * We need to filter out blocks that were written to the current bucket `B_{n}`
++             * but then virtually moved to another bucket `B_{n+i}` on rehash.
++             * Bucket `B_{n+i}` is waiting for the buckets with smaller index to be processed,
++             * and rows can be moved only forward (because we increase hash modulo twice on each rehash),
++             * so it is safe to add blocks.
++             */
++            for (size_t bucket_idx = 0; bucket_idx < num_buckets; ++bucket_idx)
++            {
++                if (blocks[bucket_idx].rows() == 0)
++                    continue;
++
++                if (bucket_idx == current_idx) // Rows that are still in our bucket
++                    continue;
++
++                buckets[bucket_idx]->addLeftBlock(blocks[bucket_idx]);
++            }
++        } while (block.rows() == 0);
++
++        ExtraBlockPtr not_processed;
++        hash_join->joinBlock(block, not_processed);
++
++        if (not_processed)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsupported hash join type");
++
++        return block;
++    }
++
++    size_t current_bucket;
++    Buckets buckets;
++    InMemoryJoinPtr hash_join;
++
++    AccumulatedBlockReader left_reader;
++
++    Names left_key_names;
++    Names right_key_names;
++};
++
++IBlocksStreamPtr GraceHashJoin::getDelayedBlocks()
++{
++    std::lock_guard current_bucket_lock(current_bucket_mutex);
++
++    if (current_bucket == nullptr)
++        return nullptr;
++
++    size_t bucket_idx = current_bucket->idx;
++
++    if (hash_join)
++    {
++        auto right_blocks = hash_join->releaseJoinedBlocks();
++        Blocks blocks = JoinCommon::scatterBlockByHash(right_key_names, right_blocks, buckets.size());
++
++        for (size_t i = 0; i < blocks.size(); ++i)
++        {
++            if (blocks[i].rows() == 0 || i == bucket_idx)
++                continue;
++
++            if (i < bucket_idx)
++                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected bucket index {} when current bucket is {}", i, bucket_idx);
++            buckets[i]->addRightBlock(blocks[i]);
++        }
++    }
++
++    hash_join = makeInMemoryJoin();
++
++    for (bucket_idx = bucket_idx + 1; bucket_idx < buckets.size(); ++bucket_idx)
++    {
++        current_bucket = buckets[bucket_idx].get();
++        if (current_bucket->finished() || current_bucket->empty())
++        {
++            LOG_TRACE(log, "Skipping {} {} bucket {}",
++                current_bucket->finished() ? "finished" : "",
++                current_bucket->empty() ? "empty" : "",
++                bucket_idx);
++            continue;
++        }
++
++        auto right_reader = current_bucket->startJoining();
++        size_t num_rows = 0; /// count rows that were written and rehashed
++        while (Block block = right_reader.read())
++        {
++            num_rows += block.rows();
++            addJoinedBlockImpl(std::move(block));
++        }
++
++        LOG_TRACE(log, "Loaded bucket {} with {}(/{}) rows",
++            bucket_idx, hash_join->getTotalRowCount(), num_rows);
++
++        return std::make_unique<DelayedBlocks>(current_bucket->idx, buckets, hash_join, left_key_names, right_key_names);
++    }
++
++    LOG_TRACE(log, "Finished loading all buckets");
++
++    current_bucket = nullptr;
++    return nullptr;
++}
++
++GraceHashJoin::InMemoryJoinPtr GraceHashJoin::makeInMemoryJoin()
++{
++    return std::make_unique<InMemoryJoin>(table_join, right_sample_block, any_take_last_row);
++}
++
++void GraceHashJoin::addJoinedBlockImpl(Block block)
++{
++    Buckets buckets_snapshot = getCurrentBuckets();
++    Blocks blocks = JoinCommon::scatterBlockByHash(right_key_names, block, buckets_snapshot.size());
++    size_t bucket_index = current_bucket->idx;
++
++    // Add block to the in-memory join
++    if (blocks[bucket_index].rows() > 0)
++    {
++        std::lock_guard lock(hash_join_mutex);
++
++        hash_join->addJoinedBlock(blocks[bucket_index], /* check_limits = */ false);
++        bool overflow = !fitsInMemory();
++
++        if (overflow)
++        {
++            auto right_blocks = hash_join->releaseJoinedBlocks();
++            right_blocks.pop_back();
++
++            for (const auto & right_block : right_blocks)
++                blocks.push_back(right_block);
++        }
++
++        while (overflow)
++        {
++            buckets_snapshot = rehashBuckets(buckets_snapshot.size() * 2);
++
++            blocks = JoinCommon::scatterBlockByHash(right_key_names, blocks, buckets_snapshot.size());
++            hash_join = makeInMemoryJoin();
++            hash_join->addJoinedBlock(blocks[bucket_index], /* check_limits = */ false);
++            overflow = !fitsInMemory();
++        }
++        blocks[bucket_index].clear();
++    }
++
++    flushBlocksToBuckets(blocks, buckets_snapshot);
++}
++
++size_t GraceHashJoin::getNumBuckets() const
++{
++    std::shared_lock lock(rehash_mutex);
++    return buckets.size();
++}
++
++GraceHashJoin::Buckets GraceHashJoin::getCurrentBuckets() const
++{
++    std::shared_lock lock(rehash_mutex);
++    return buckets;
++}
++
++}
+diff --git a/src/Interpreters/GraceHashJoin.h b/src/Interpreters/GraceHashJoin.h
+new file mode 100644
+index 000000000000..f4e75f142f3f
+--- /dev/null
++++ b/src/Interpreters/GraceHashJoin.h
+@@ -0,0 +1,142 @@
++#pragma once
++
++#include <Interpreters/Context_fwd.h>
++#include <Interpreters/IJoin.h>
++#include <Interpreters/TemporaryDataOnDisk.h>
++
++#include <Core/Block.h>
++
++#include <Common/MultiVersion.h>
++
++#include <mutex>
++
++namespace DB
++{
++
++class TableJoin;
++class HashJoin;
++
++/**
++ * Efficient and highly parallel implementation of external memory JOIN based on HashJoin.
++ * Supports most of the JOIN modes, except CROSS and ASOF.
++ *
++ * The joining algorithm consists of three stages:
++ *
++ * 1) During the first stage we accumulate blocks of the right table via @addJoinedBlock.
++ * Each input block is split into multiple buckets based on the hash of the row join keys.
++ * The first bucket is added to the in-memory HashJoin, and the remaining buckets are written to disk for further processing.
++ * When the size of HashJoin exceeds the limits, we double the number of buckets.
++ * There can be multiple threads calling addJoinedBlock, just like @ConcurrentHashJoin.
++ *
++ * 2) At the second stage we process left table blocks via @joinBlock.
++ * Again, each input block is split into multiple buckets by hash.
++ * The first bucket is joined in-memory via HashJoin::joinBlock, and the remaining buckets are written to the disk.
++ *
++ * 3) When the last thread reading left table block finishes, the last stage begins.
++ * Each @DelayedJoinedBlocksTransform calls repeatedly @getDelayedBlocks until there are no more unfinished buckets left.
++ * Inside @getDelayedBlocks we select the next unprocessed bucket, load right table blocks from disk into in-memory HashJoin,
++ * And then join them with left table blocks.
++ *
++ * After joining the left table blocks, we can load non-joined rows from the right table for RIGHT/FULL JOINs.
++ * Note that non-joined rows are processed in multiple threads, unlike HashJoin/ConcurrentHashJoin/MergeJoin.
++ */
++class GraceHashJoin final : public IJoin
++{
++    class FileBucket;
++    class DelayedBlocks;
++    using InMemoryJoin = HashJoin;
++
++    using InMemoryJoinPtr = std::shared_ptr<InMemoryJoin>;
++
++public:
++    using BucketPtr = std::shared_ptr<FileBucket>;
++    using Buckets = std::vector<BucketPtr>;
++
++    GraceHashJoin(
++        ContextPtr context_, std::shared_ptr<TableJoin> table_join_,
++        const Block & left_sample_block_, const Block & right_sample_block_,
++        TemporaryDataOnDiskScopePtr tmp_data_,
++        bool any_take_last_row_ = false);
++
++    ~GraceHashJoin() override;
++
++    const TableJoin & getTableJoin() const override { return *table_join; }
++
++    void initialize(const Block & sample_block) override;
++
++    bool addJoinedBlock(const Block & block, bool check_limits) override;
++    void checkTypesOfKeys(const Block & block) const override;
++    void joinBlock(Block & block, std::shared_ptr<ExtraBlock> & not_processed) override;
++
++    void setTotals(const Block & block) override;
++
++    size_t getTotalRowCount() const override;
++    size_t getTotalByteCount() const override;
++    bool alwaysReturnsEmptySet() const override;
++
++    bool supportParallelJoin() const override { return true; }
++    bool supportTotals() const override { return false; }
++
++    IBlocksStreamPtr
++    getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override;
++
++    /// Open iterator over joined blocks.
++    /// Must be called after all @joinBlock calls.
++    IBlocksStreamPtr getDelayedBlocks() override;
++    bool hasDelayedBlocks() const override { return true; }
++
++    static bool isSupported(const std::shared_ptr<TableJoin> & table_join);
++
++private:
++    void initBuckets();
++    /// Create empty join for in-memory processing.
++    InMemoryJoinPtr makeInMemoryJoin();
++
++    /// Add right table block to the @join. Calls @rehash on overflow.
++    void addJoinedBlockImpl(Block block);
++
++    /// Check that @join satisifes limits on rows/bytes in @table_join.
++    bool fitsInMemory() const;
++
++    /// Create new bucket at the end of @destination.
++    void addBucket(Buckets & destination);
++
++    /// Increase number of buckets to match desired_size.
++    /// Called when HashJoin in-memory table for one bucket exceeds the limits.
++    ///
++    /// NB: after @rehashBuckets there may be rows that are written to the buckets that they do not belong to.
++    /// It is fine; these rows will be written to the corresponding buckets during the third stage.
++    Buckets rehashBuckets(size_t to_size);
++
++    /// Perform some bookkeeping after all calls to @joinBlock.
++    void startReadingDelayedBlocks();
++
++    size_t getNumBuckets() const;
++    Buckets getCurrentBuckets() const;
++
++    Poco::Logger * log;
++    ContextPtr context;
++    std::shared_ptr<TableJoin> table_join;
++    Block left_sample_block;
++    Block right_sample_block;
++    Block output_sample_block;
++    bool any_take_last_row;
++    const size_t max_num_buckets;
++    size_t max_block_size;
++
++    Names left_key_names;
++    Names right_key_names;
++
++    TemporaryDataOnDiskPtr tmp_data;
++
++    Buckets buckets;
++    mutable std::shared_mutex rehash_mutex;
++
++    FileBucket * current_bucket = nullptr;
++    mutable std::mutex current_bucket_mutex;
++
++    InMemoryJoinPtr hash_join;
++    mutable std::mutex hash_join_mutex;
++};
++
++}
+diff --git a/src/Interpreters/HashJoin.cpp b/src/Interpreters/HashJoin.cpp
+index 41c7c28a6fa5..6f1634b4e39d 100644
+--- a/src/Interpreters/HashJoin.cpp
++++ b/src/Interpreters/HashJoin.cpp
+@@ -3,6 +3,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include <Common/StackTrace.h>
+ #include <Common/logger_useful.h>
+ 
+ #include <Columns/ColumnConst.h>
+@@ -225,7 +226,6 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
+     , log(&Poco::Logger::get("HashJoin"))
+ {
+     LOG_DEBUG(log, "HashJoin. Datatype: {}, kind: {}, strictness: {}", data->type, kind, strictness);
+-    LOG_DEBUG(log, "Right sample block: {}", right_sample_block.dumpStructure());
+ 
+     if (isCrossOrComma(kind))
+     {
+@@ -249,15 +249,6 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
+         sample_block_with_columns_to_add = right_table_keys = materializeBlock(right_sample_block);
+     }
+ 
+-    LOG_TRACE(log, "Columns to add: [{}], required right [{}]",
+-              sample_block_with_columns_to_add.dumpStructure(), fmt::join(required_right_keys.getNames(), ", "));
+-    {
+-        std::vector<String> log_text;
+-        for (const auto & clause : table_join->getClauses())
+-            log_text.push_back(clause.formatDebug());
+-        LOG_TRACE(log, "Joining on: {}", fmt::join(log_text, " | "));
+-    }
+-
+     JoinCommon::convertToFullColumnsInplace(right_table_keys);
+     initRightBlockStructure(data->sample_block);
+ 
+@@ -644,7 +635,10 @@ void HashJoin::initRightBlockStructure(Block & saved_block_sample)
+ 
+     bool multiple_disjuncts = !table_join->oneDisjunct();
+     /// We could remove key columns for LEFT | INNER HashJoin but we should keep them for JoinSwitcher (if any).
+-    bool save_key_columns = table_join->isEnabledAlgorithm(JoinAlgorithm::AUTO) || isRightOrFull(kind) || multiple_disjuncts;
++    bool save_key_columns = table_join->isEnabledAlgorithm(JoinAlgorithm::AUTO) ||
++                            table_join->isEnabledAlgorithm(JoinAlgorithm::GRACE_HASH) ||
++                            isRightOrFull(kind) ||
++                            multiple_disjuncts;
+     if (save_key_columns)
+     {
+         saved_block_sample = right_table_keys.cloneEmpty();
+@@ -887,7 +881,8 @@ class AddedColumns
+     static void assertBlockEqualsStructureUpToLowCard(const Block & lhs_block, const Block & rhs_block)
+     {
+         if (lhs_block.columns() != rhs_block.columns())
+-            throw Exception("Different number of columns in blocks", ErrorCodes::LOGICAL_ERROR);
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "Different number of columns in blocks [{}] and [{}]",
++                lhs_block.dumpStructure(), rhs_block.dumpStructure());
+ 
+         for (size_t i = 0; i < lhs_block.columns(); ++i)
+         {
+@@ -1684,6 +1679,9 @@ void HashJoin::checkTypesOfKeys(const Block & block) const
+ 
+ void HashJoin::joinBlock(Block & block, ExtraBlockPtr & not_processed)
+ {
++    if (data->released)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot join after data has been released");
++
+     for (const auto & onexpr : table_join->getClauses())
+     {
+         auto cond_column_name = onexpr.condColumnNames();
+@@ -1951,16 +1949,13 @@ class NotJoinedHash final : public NotJoinedBlocks::RightColumnsFiller
+     }
+ };
+ 
+-std::shared_ptr<NotJoinedBlocks> HashJoin::getNonJoinedBlocks(const Block & left_sample_block,
++IBlocksStreamPtr HashJoin::getNonJoinedBlocks(const Block & left_sample_block,
+                                                               const Block & result_sample_block,
+                                                               UInt64 max_block_size) const
+ {
+-    if (table_join->strictness() == JoinStrictness::Asof ||
+-        table_join->strictness() == JoinStrictness::Semi ||
+-        !isRightOrFull(table_join->kind()))
+-    {
++    if (!JoinCommon::hasNonJoinedBlocks(*table_join))
+         return {};
+-    }
++
+     bool multiple_disjuncts = !table_join->oneDisjunct();
+ 
+     if (multiple_disjuncts)
+@@ -1968,7 +1963,7 @@ std::shared_ptr<NotJoinedBlocks> HashJoin::getNonJoinedBlocks(const Block & left
+         /// ... calculate `left_columns_count` ...
+         size_t left_columns_count = left_sample_block.columns();
+         auto non_joined = std::make_unique<NotJoinedHash<true>>(*this, max_block_size);
+-        return std::make_shared<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
++        return std::make_unique<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
+ 
+     }
+     else
+@@ -1976,7 +1971,7 @@ std::shared_ptr<NotJoinedBlocks> HashJoin::getNonJoinedBlocks(const Block & left
+         size_t left_columns_count = left_sample_block.columns();
+         assert(left_columns_count == result_sample_block.columns() - required_right_keys.columns() - sample_block_with_columns_to_add.columns());
+         auto non_joined = std::make_unique<NotJoinedHash<false>>(*this, max_block_size);
+-        return std::make_shared<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
++        return std::make_unique<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
+     }
+ }
+ 
+@@ -1998,6 +1993,41 @@ void HashJoin::reuseJoinedData(const HashJoin & join)
+     }
+ }
+ 
++BlocksList HashJoin::releaseJoinedBlocks()
++{
++    BlocksList right_blocks = std::move(data->blocks);
++    data->released = true;
++    BlocksList restored_blocks;
++
++    /// names to positions optimization
++    std::vector<size_t> positions;
++    std::vector<bool> is_nullable;
++    if (!right_blocks.empty())
++    {
++        positions.reserve(right_sample_block.columns());
++        const Block & tmp_block = *right_blocks.begin();
++        for (const auto & sample_column : right_sample_block)
++        {
++            positions.emplace_back(tmp_block.getPositionByName(sample_column.name));
++            is_nullable.emplace_back(JoinCommon::isNullable(sample_column.type));
++        }
++    }
++
++    for (Block & saved_block : right_blocks)
++    {
++        Block restored_block;
++        for (size_t i = 0; i < positions.size(); ++i)
++        {
++            auto & column = saved_block.getByPosition(positions[i]);
++            restored_block.insert(correctNullability(std::move(column), is_nullable[i]));
++        }
++        restored_blocks.emplace_back(std::move(restored_block));
++    }
++
++    return restored_blocks;
++}
++
++
+ const ColumnWithTypeAndName & HashJoin::rightAsofKeyColumn() const
+ {
+     /// It should be nullable when right side is nullable
+diff --git a/src/Interpreters/HashJoin.h b/src/Interpreters/HashJoin.h
+index 587fed9b4a61..5ea47823b69e 100644
+--- a/src/Interpreters/HashJoin.h
++++ b/src/Interpreters/HashJoin.h
+@@ -2,7 +2,6 @@
+ 
+ #include <variant>
+ #include <optional>
+-#include <shared_mutex>
+ #include <deque>
+ #include <vector>
+ 
+@@ -187,7 +186,7 @@ class HashJoin : public IJoin
+       * Use only after all calls to joinBlock was done.
+       * left_sample_block is passed without account of 'use_nulls' setting (columns will be converted to Nullable inside).
+       */
+-    std::shared_ptr<NotJoinedBlocks> getNonJoinedBlocks(
++    IBlocksStreamPtr getNonJoinedBlocks(
+         const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override;
+ 
+     /// Number of keys in all built JOIN maps.
+@@ -336,6 +335,8 @@ class HashJoin : public IJoin
+ 
+         /// Additional data - strings for string keys and continuation elements of single-linked lists of references to rows.
+         Arena pool;
++
++        bool released = false;
+     };
+ 
+     using RightTableDataPtr = std::shared_ptr<RightTableData>;
+@@ -350,10 +351,13 @@ class HashJoin : public IJoin
+     void reuseJoinedData(const HashJoin & join);
+ 
+     RightTableDataPtr getJoinedData() const { return data; }
++    BlocksList releaseJoinedBlocks();
+ 
+     bool isUsed(size_t off) const { return used_flags.getUsedSafe(off); }
+     bool isUsed(const Block * block_ptr, size_t row_idx) const { return used_flags.getUsedSafe(block_ptr, row_idx); }
+ 
++    void debugKeys() const;
++
+ private:
+     template<bool> friend class NotJoinedHash;
+ 
+diff --git a/src/Interpreters/IJoin.h b/src/Interpreters/IJoin.h
+index b699988e926c..69d69ce30a68 100644
+--- a/src/Interpreters/IJoin.h
++++ b/src/Interpreters/IJoin.h
+@@ -7,17 +7,21 @@
+ #include <Core/Block.h>
+ #include <Columns/IColumn.h>
+ #include <Common/Exception.h>
++#include <Common/logger_useful.h>
+ 
+ namespace DB
+ {
+ 
+-class Block;
+-
+ struct ExtraBlock;
+ using ExtraBlockPtr = std::shared_ptr<ExtraBlock>;
+ 
+ class TableJoin;
+ class NotJoinedBlocks;
++class IBlocksStream;
++using IBlocksStreamPtr = std::shared_ptr<IBlocksStream>;
++
++class IJoin;
++using JoinPtr = std::shared_ptr<IJoin>;
+ 
+ enum class JoinPipelineType
+ {
+@@ -51,6 +55,12 @@ class IJoin
+     /// @returns false, if some limit was exceeded and you should not insert more data.
+     virtual bool addJoinedBlock(const Block & block, bool check_limits = true) = 0; /// NOLINT
+ 
++    /* Some initialization may be required before joinBlock() call.
++     * It's better to done in in constructor, but left block exact structure is not known at that moment.
++     * TODO: pass correct left block sample to the constructor.
++     */
++    virtual void initialize(const Block & /* left_sample_block */) {}
++
+     virtual void checkTypesOfKeys(const Block & block) const = 0;
+ 
+     /// Join the block with data from left hand of JOIN to the right hand data (that was previously built by calls to addJoinedBlock).
+@@ -77,15 +87,44 @@ class IJoin
+ 
+     // That can run FillingRightJoinSideTransform parallelly
+     virtual bool supportParallelJoin() const { return false; }
++    virtual bool supportTotals() const { return true; }
++
++    /// Peek next stream of delayed joined blocks.
++    virtual IBlocksStreamPtr getDelayedBlocks() { return nullptr; }
++    virtual bool hasDelayedBlocks() const { return false; }
+ 
+-    virtual std::shared_ptr<NotJoinedBlocks>
+-    getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const = 0;
++    virtual IBlocksStreamPtr
++        getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const = 0;
+ 
+ private:
+     Block totals;
+ };
+ 
++class IBlocksStream
++{
++public:
++    /// Returns empty block on EOF
++    Block next()
++    {
++        if (finished)
++            return {};
++
++        if (Block res = nextImpl())
++            return res;
+ 
+-using JoinPtr = std::shared_ptr<IJoin>;
++        finished = true;
++        return {};
++    }
++
++    virtual ~IBlocksStream() = default;
++
++    bool isFinished() const { return finished; }
++
++protected:
++    virtual Block nextImpl() = 0;
++
++    std::atomic_bool finished{false};
++
++};
+ 
+ }
+diff --git a/src/Interpreters/JoinSwitcher.cpp b/src/Interpreters/JoinSwitcher.cpp
+index 5d5a9b278254..996fd1e4ac77 100644
+--- a/src/Interpreters/JoinSwitcher.cpp
++++ b/src/Interpreters/JoinSwitcher.cpp
+@@ -7,16 +7,6 @@
+ namespace DB
+ {
+ 
+-static ColumnWithTypeAndName correctNullability(ColumnWithTypeAndName && column, bool nullable)
+-{
+-    if (nullable)
+-        JoinCommon::convertColumnToNullable(column);
+-    else
+-        JoinCommon::removeColumnNullability(column);
+-
+-    return std::move(column);
+-}
+-
+ JoinSwitcher::JoinSwitcher(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block_)
+     : limits(table_join_->sizeLimits())
+     , switched(false)
+@@ -43,45 +33,25 @@ bool JoinSwitcher::addJoinedBlock(const Block & block, bool)
+     size_t bytes = join->getTotalByteCount();
+ 
+     if (!limits.softCheck(rows, bytes))
+-        switchJoin();
++        return switchJoin();
+ 
+     return true;
+ }
+ 
+-void JoinSwitcher::switchJoin()
++bool JoinSwitcher::switchJoin()
+ {
+-    std::shared_ptr<HashJoin::RightTableData> joined_data = static_cast<const HashJoin &>(*join).getJoinedData();
+-    BlocksList right_blocks = std::move(joined_data->blocks);
++    HashJoin * hash_join = assert_cast<HashJoin *>(join.get());
++    BlocksList right_blocks = hash_join->releaseJoinedBlocks();
+ 
+-    /// Destroy old join & create new one. Early destroy for memory saving.
++    /// Destroy old join & create new one.
+     join = std::make_shared<MergeJoin>(table_join, right_sample_block);
+ 
+-    /// names to positions optimization
+-    std::vector<size_t> positions;
+-    std::vector<bool> is_nullable;
+-    if (!right_blocks.empty())
+-    {
+-        positions.reserve(right_sample_block.columns());
+-        const Block & tmp_block = *right_blocks.begin();
+-        for (const auto & sample_column : right_sample_block)
+-        {
+-            positions.emplace_back(tmp_block.getPositionByName(sample_column.name));
+-            is_nullable.emplace_back(JoinCommon::isNullable(sample_column.type));
+-        }
+-    }
+-
+-    for (Block & saved_block : right_blocks)
+-    {
+-        Block restored_block;
+-        for (size_t i = 0; i < positions.size(); ++i)
+-        {
+-            auto & column = saved_block.getByPosition(positions[i]);
+-            restored_block.insert(correctNullability(std::move(column), is_nullable[i]));
+-        }
+-        join->addJoinedBlock(restored_block);
+-    }
++    bool success = true;
++    for (const Block & saved_block : right_blocks)
++        success = success && join->addJoinedBlock(saved_block);
+ 
+     switched = true;
++    return success;
+ }
+ 
+ }
+diff --git a/src/Interpreters/JoinSwitcher.h b/src/Interpreters/JoinSwitcher.h
+index 30115710e225..eec4787037d9 100644
+--- a/src/Interpreters/JoinSwitcher.h
++++ b/src/Interpreters/JoinSwitcher.h
+@@ -60,12 +60,22 @@ class JoinSwitcher : public IJoin
+         return join->alwaysReturnsEmptySet();
+     }
+ 
+-    std::shared_ptr<NotJoinedBlocks>
++    IBlocksStreamPtr
+     getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override
+     {
+         return join->getNonJoinedBlocks(left_sample_block, result_sample_block, max_block_size);
+     }
+ 
++    IBlocksStreamPtr getDelayedBlocks() override
++    {
++        return join->getDelayedBlocks();
++    }
++
++    bool hasDelayedBlocks() const override
++    {
++        return join->hasDelayedBlocks();
++    }
++
+ private:
+     JoinPtr join;
+     SizeLimits limits;
+@@ -76,7 +86,7 @@ class JoinSwitcher : public IJoin
+ 
+     /// Change join-in-memory to join-on-disk moving right hand JOIN data from one to another.
+     /// Throws an error if join-on-disk do not support JOIN kind or strictness.
+-    void switchJoin();
++    bool switchJoin();
+ };
+ 
+ }
+diff --git a/src/Interpreters/JoinUtils.cpp b/src/Interpreters/JoinUtils.cpp
+index 59e2475a9b2a..d17d3c0d44eb 100644
+--- a/src/Interpreters/JoinUtils.cpp
++++ b/src/Interpreters/JoinUtils.cpp
+@@ -14,6 +14,11 @@
+ 
+ #include <IO/WriteHelpers.h>
+ 
++#include <Common/HashTable/Hash.h>
++#include <Common/WeakHash.h>
++
++#include <base/FnTraits.h>
++
+ namespace DB
+ {
+ 
+@@ -573,6 +578,111 @@ void splitAdditionalColumns(const Names & key_names, const Block & sample_block,
+     }
+ }
+ 
++template <Fn<size_t(size_t)> Sharder>
++static IColumn::Selector hashToSelector(const WeakHash32 & hash, Sharder sharder)
++{
++    const auto & hashes = hash.getData();
++    size_t num_rows = hashes.size();
++
++    IColumn::Selector selector(num_rows);
++    for (size_t i = 0; i < num_rows; ++i)
++        selector[i] = sharder(intHashCRC32(hashes[i]));
++    return selector;
++}
++
++template <Fn<size_t(size_t)> Sharder>
++static Blocks scatterBlockByHashImpl(const Strings & key_columns_names, const Block & block, size_t num_shards, Sharder sharder)
++{
++    size_t num_rows = block.rows();
++    size_t num_cols = block.columns();
++
++    /// Use non-standard initial value so as not to degrade hash map performance inside shard that uses the same CRC32 algorithm.
++    WeakHash32 hash(num_rows);
++    for (const auto & key_name : key_columns_names)
++    {
++        ColumnPtr key_col = materializeColumn(block, key_name);
++        key_col->updateWeakHash32(hash);
++    }
++    auto selector = hashToSelector(hash, sharder);
++
++    Blocks result;
++    result.reserve(num_shards);
++    for (size_t i = 0; i < num_shards; ++i)
++    {
++        result.emplace_back(block.cloneEmpty());
++    }
++
++    for (size_t i = 0; i < num_cols; ++i)
++    {
++        auto dispatched_columns = block.getByPosition(i).column->scatter(num_shards, selector);
++        assert(result.size() == dispatched_columns.size());
++        for (size_t block_index = 0; block_index < num_shards; ++block_index)
++        {
++            result[block_index].getByPosition(i).column = std::move(dispatched_columns[block_index]);
++        }
++    }
++    return result;
++}
++
++static Blocks scatterBlockByHashPow2(const Strings & key_columns_names, const Block & block, size_t num_shards)
++{
++    size_t mask = num_shards - 1;
++    return scatterBlockByHashImpl(key_columns_names, block, num_shards, [mask](size_t hash) { return hash & mask; });
++}
++
++static Blocks scatterBlockByHashGeneric(const Strings & key_columns_names, const Block & block, size_t num_shards)
++{
++    return scatterBlockByHashImpl(key_columns_names, block, num_shards, [num_shards](size_t hash) { return hash % num_shards; });
++}
++
++Blocks scatterBlockByHash(const Strings & key_columns_names, const Block & block, size_t num_shards)
++{
++    if (num_shards == 0)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Number of shards must be positive");
++    UNUSED(scatterBlockByHashPow2);
++    // if (likely(isPowerOf2(num_shards)))
++    //     return scatterBlockByHashPow2(key_columns_names, block, num_shards);
++    return scatterBlockByHashGeneric(key_columns_names, block, num_shards);
++}
++
++template<typename T>
++static Blocks scatterBlockByHashForList(const Strings & key_columns_names, const T & blocks, size_t num_shards)
++{
++    std::vector<Blocks> scattered_blocks(num_shards);
++    for (const auto & block : blocks)
++    {
++        if (block.rows() == 0)
++            continue;
++        auto scattered = scatterBlockByHash(key_columns_names, block, num_shards);
++        for (size_t i = 0; i < num_shards; ++i)
++            scattered_blocks[i].emplace_back(std::move(scattered[i]));
++    }
++
++    Blocks result;
++    result.reserve(num_shards);
++    for (size_t i = 0; i < num_shards; ++i)
++    {
++        result.emplace_back(concatenateBlocks(scattered_blocks[i]));
++    }
++    return result;
++}
++
++Blocks scatterBlockByHash(const Strings & key_columns_names, const Blocks & blocks, size_t num_shards)
++{
++    return scatterBlockByHashForList(key_columns_names, blocks, num_shards);
++}
++
++Blocks scatterBlockByHash(const Strings & key_columns_names, const BlocksList & blocks, size_t num_shards)
++{
++    return scatterBlockByHashForList(key_columns_names, blocks, num_shards);
++}
++
++bool hasNonJoinedBlocks(const TableJoin & table_join)
++{
++    return table_join.strictness() != JoinStrictness::Asof && table_join.strictness() != JoinStrictness::Semi
++        && isRightOrFull(table_join.kind());
++}
++
+ ColumnPtr filterWithBlanks(ColumnPtr src_column, const IColumn::Filter & filter, bool inverse_filter)
+ {
+     ColumnPtr column = src_column->convertToFullColumnIfConst();
+@@ -735,7 +845,7 @@ void NotJoinedBlocks::copySameKeys(Block & block) const
+     }
+ }
+ 
+-Block NotJoinedBlocks::read()
++Block NotJoinedBlocks::nextImpl()
+ {
+     Block result_block = result_sample_block.cloneEmpty();
+     {
+diff --git a/src/Interpreters/JoinUtils.h b/src/Interpreters/JoinUtils.h
+index 2e26ab782a10..bcff6e60a9ad 100644
+--- a/src/Interpreters/JoinUtils.h
++++ b/src/Interpreters/JoinUtils.h
+@@ -106,13 +106,19 @@ void splitAdditionalColumns(const Names & key_names, const Block & sample_block,
+ 
+ void changeLowCardinalityInplace(ColumnWithTypeAndName & column);
+ 
++Blocks scatterBlockByHash(const Strings & key_columns_names, const Block & block, size_t num_shards);
++Blocks scatterBlockByHash(const Strings & key_columns_names, const Blocks & blocks, size_t num_shards);
++Blocks scatterBlockByHash(const Strings & key_columns_names, const BlocksList & blocks, size_t num_shards);
++
++bool hasNonJoinedBlocks(const TableJoin & table_join);
++
+ /// Insert default values for rows marked in filter
+ ColumnPtr filterWithBlanks(ColumnPtr src_column, const IColumn::Filter & filter, bool inverse_filter = false);
+ 
+ }
+ 
+ /// Creates result from right table data in RIGHT and FULL JOIN when keys are not present in left table.
+-class NotJoinedBlocks final
++class NotJoinedBlocks final : public IBlocksStream
+ {
+ public:
+     using LeftToRightKeyRemap = std::unordered_map<String, String>;
+@@ -134,7 +140,7 @@ class NotJoinedBlocks final
+               size_t left_columns_count,
+               const LeftToRightKeyRemap & left_to_right_key_remap);
+ 
+-    Block read();
++    Block nextImpl() override;
+ 
+ private:
+     void extractColumnChanges(size_t right_pos, size_t result_pos);
+diff --git a/src/Interpreters/MergeJoin.cpp b/src/Interpreters/MergeJoin.cpp
+index bb9c7bf3f906..191372cd5454 100644
+--- a/src/Interpreters/MergeJoin.cpp
++++ b/src/Interpreters/MergeJoin.cpp
+@@ -1114,7 +1114,7 @@ class NotJoinedMerge final : public NotJoinedBlocks::RightColumnsFiller
+ };
+ 
+ 
+-std::shared_ptr<NotJoinedBlocks> MergeJoin::getNonJoinedBlocks(
++IBlocksStreamPtr MergeJoin::getNonJoinedBlocks(
+     const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const
+ {
+     if (table_join->strictness() == JoinStrictness::All && (is_right || is_full))
+@@ -1122,7 +1122,7 @@ std::shared_ptr<NotJoinedBlocks> MergeJoin::getNonJoinedBlocks(
+         size_t left_columns_count = left_sample_block.columns();
+         assert(left_columns_count == result_sample_block.columns() - right_columns_to_add.columns());
+         auto non_joined = std::make_unique<NotJoinedMerge>(*this, max_block_size);
+-        return std::make_shared<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
++        return std::make_unique<NotJoinedBlocks>(std::move(non_joined), result_sample_block, left_columns_count, table_join->leftToRightKeyRemap());
+     }
+     return nullptr;
+ }
+diff --git a/src/Interpreters/MergeJoin.h b/src/Interpreters/MergeJoin.h
+index 3ea15d142406..770ca0409bf2 100644
+--- a/src/Interpreters/MergeJoin.h
++++ b/src/Interpreters/MergeJoin.h
+@@ -35,7 +35,7 @@ class MergeJoin : public IJoin
+     /// Has to be called only after setTotals()/mergeRightBlocks()
+     bool alwaysReturnsEmptySet() const override { return (is_right || is_inner) && min_max_right_blocks.empty(); }
+ 
+-    std::shared_ptr<NotJoinedBlocks> getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override;
++    IBlocksStreamPtr getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override;
+ 
+     static bool isSupported(const std::shared_ptr<TableJoin> & table_join);
+ 
+diff --git a/src/Planner/PlannerJoinTree.cpp b/src/Planner/PlannerJoinTree.cpp
+index 0566b579be12..2fd469986ecf 100644
+--- a/src/Planner/PlannerJoinTree.cpp
++++ b/src/Planner/PlannerJoinTree.cpp
+@@ -494,7 +494,8 @@ QueryPlan buildQueryPlanForJoinNode(QueryTreeNodePtr join_tree_node,
+         }
+     }
+ 
+-    auto left_table_names = left_plan.getCurrentDataStream().header.getNames();
++    const Block & left_header = left_plan.getCurrentDataStream().header;
++    auto left_table_names = left_header.getNames();
+     NameSet left_table_names_set(left_table_names.begin(), left_table_names.end());
+ 
+     auto columns_from_joined_table = right_plan.getCurrentDataStream().header.getNamesAndTypesList();
+@@ -506,7 +507,8 @@ QueryPlan buildQueryPlanForJoinNode(QueryTreeNodePtr join_tree_node,
+             table_join->addJoinedColumn(column_from_joined_table);
+     }
+ 
+-    auto join_algorithm = chooseJoinAlgorithm(table_join, join_node.getRightTableExpression(), right_plan.getCurrentDataStream().header, planner_context);
++    const Block & right_header = right_plan.getCurrentDataStream().header;
++    auto join_algorithm = chooseJoinAlgorithm(table_join, join_node.getRightTableExpression(), left_header, right_header, planner_context);
+ 
+     auto result_plan = QueryPlan();
+ 
+diff --git a/src/Planner/PlannerJoins.cpp b/src/Planner/PlannerJoins.cpp
+index b59dccc92c21..0a10a20b5eb9 100644
+--- a/src/Planner/PlannerJoins.cpp
++++ b/src/Planner/PlannerJoins.cpp
+@@ -34,6 +34,7 @@
+ #include <Interpreters/DirectJoin.h>
+ #include <Interpreters/JoinSwitcher.h>
+ #include <Interpreters/ArrayJoinAction.h>
++#include <Interpreters/GraceHashJoin.h>
+ 
+ #include <Planner/PlannerActionsVisitor.h>
+ #include <Planner/PlannerContext.h>
+@@ -662,6 +663,7 @@ std::shared_ptr<DirectKeyValueJoin> tryDirectJoin(const std::shared_ptr<TableJoi
+ 
+ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_join,
+     const QueryTreeNodePtr & right_table_expression,
++    const Block & left_table_expression_header,
+     const Block & right_table_expression_header,
+     const PlannerContextPtr & planner_context)
+ {
+@@ -720,6 +722,20 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_jo
+             return std::make_shared<FullSortingMergeJoin>(table_join, right_table_expression_header);
+     }
+ 
++    if (table_join->isEnabledAlgorithm(JoinAlgorithm::GRACE_HASH))
++    {
++        if (GraceHashJoin::isSupported(table_join))
++        {
++            auto query_context = planner_context->getQueryContext();
++            return std::make_shared<GraceHashJoin>(
++                query_context,
++                table_join,
++                left_table_expression_header,
++                right_table_expression_header,
++                query_context->getTempDataOnDisk());
++        }
++    }
++
+     if (table_join->isEnabledAlgorithm(JoinAlgorithm::AUTO))
+         return std::make_shared<JoinSwitcher>(table_join, right_table_expression_header);
+ 
+diff --git a/src/Planner/PlannerJoins.h b/src/Planner/PlannerJoins.h
+index d305249e789b..c61bce932e0f 100644
+--- a/src/Planner/PlannerJoins.h
++++ b/src/Planner/PlannerJoins.h
+@@ -190,6 +190,7 @@ std::optional<bool> tryExtractConstantFromJoinNode(const QueryTreeNodePtr & join
+   */
+ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_join,
+     const QueryTreeNodePtr & right_table_expression,
++    const Block & left_table_expression_header,
+     const Block & right_table_expression_header,
+     const PlannerContextPtr & planner_context);
+ 
+diff --git a/src/Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h b/src/Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h
+index 8c2eef00af0f..b363991c2f60 100644
+--- a/src/Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h
++++ b/src/Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h
+@@ -1,7 +1,6 @@
+ #pragma once
+ #include <Processors/QueryPlan/ITransformingStep.h>
+ #include <Processors/Transforms/CreateSetAndFilterOnTheFlyTransform.h>
+-#include <Processors/DelayedPortsProcessor.h>
+ 
+ 
+ namespace DB
+diff --git a/src/Processors/Transforms/JoiningTransform.cpp b/src/Processors/Transforms/JoiningTransform.cpp
+index fed28a11ad54..c28a84e9d5d3 100644
+--- a/src/Processors/Transforms/JoiningTransform.cpp
++++ b/src/Processors/Transforms/JoiningTransform.cpp
+@@ -16,6 +16,7 @@ Block JoiningTransform::transformHeader(Block header, const JoinPtr & join)
+ {
+     LOG_DEBUG(&Poco::Logger::get("JoiningTransform"), "Before join block: '{}'", header.dumpStructure());
+     join->checkTypesOfKeys(header);
++    join->initialize(header);
+     ExtraBlockPtr tmp;
+     join->joinBlock(header, tmp);
+     LOG_DEBUG(&Poco::Logger::get("JoiningTransform"), "After join block: '{}'", header.dumpStructure());
+@@ -38,17 +39,27 @@ JoiningTransform::JoiningTransform(
+     , max_block_size(max_block_size_)
+ {
+     if (!join->isFilled())
+-        inputs.emplace_back(Block(), this);
++        inputs.emplace_back(Block(), this); // Wait for FillingRightJoinSideTransform
++}
++
++JoiningTransform::~JoiningTransform() = default;
++
++OutputPort & JoiningTransform::getFinishedSignal()
++{
++    assert(outputs.size() == 2);
++    return outputs.back();
+ }
+ 
+ IProcessor::Status JoiningTransform::prepare()
+ {
+     auto & output = outputs.front();
++    auto & on_finish_output = outputs.back();
+ 
+     /// Check can output.
+     if (output.isFinished() || stop_reading)
+     {
+         output.finish();
++        on_finish_output.finish();
+         for (auto & input : inputs)
+             input.close();
+         return Status::Finished;
+@@ -93,6 +104,7 @@ IProcessor::Status JoiningTransform::prepare()
+             return Status::Ready;
+ 
+         output.finish();
++        on_finish_output.finish();
+         return Status::Finished;
+     }
+ 
+@@ -134,7 +146,7 @@ void JoiningTransform::work()
+             }
+         }
+ 
+-        Block block = non_joined_blocks->read();
++        Block block = non_joined_blocks->next();
+         if (!block)
+         {
+             process_non_joined = false;
+@@ -298,4 +310,132 @@ void FillingRightJoinSideTransform::work()
+     set_totals = for_totals;
+ }
+ 
++
++DelayedJoinedBlocksWorkerTransform::DelayedJoinedBlocksWorkerTransform(Block output_header)
++    : IProcessor(InputPorts{Block()}, OutputPorts{output_header})
++{
++}
++
++IProcessor::Status DelayedJoinedBlocksWorkerTransform::prepare()
++{
++    if (inputs.size() != 1 && outputs.size() != 1)
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "DelayedJoinedBlocksWorkerTransform must have exactly one input port");
++
++    auto & output = outputs.front();
++
++    auto & input = inputs.front();
++
++    if (output_chunk)
++    {
++        input.setNotNeeded();
++
++        if (!output.canPush())
++            return Status::PortFull;
++
++        output.push(std::move(output_chunk));
++        output_chunk.clear();
++        return Status::PortFull;
++    }
++
++    if (!task)
++    {
++        if (!input.hasData())
++        {
++            input.setNeeded();
++            return Status::NeedData;
++        }
++
++        auto data = input.pullData(true);
++        if (data.exception)
++        {
++            output.pushException(data.exception);
++            return Status::Finished;
++        }
++
++        if (!data.chunk.hasChunkInfo())
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "DelayedJoinedBlocksWorkerTransform must have chunk info");
++        task = std::dynamic_pointer_cast<const DelayedBlocksTask>(data.chunk.getChunkInfo());
++    }
++    else
++    {
++        input.setNotNeeded();
++    }
++
++    if (task->finished)
++    {
++        input.close();
++        output.finish();
++        return Status::Finished;
++    }
++
++    return Status::Ready;
++}
++
++void DelayedJoinedBlocksWorkerTransform::work()
++{
++    if (!task)
++        return;
++
++    Block block = task->delayed_blocks->next();
++
++    if (!block)
++    {
++        task.reset();
++        return;
++    }
++
++    // Add block to the output
++    auto rows = block.rows();
++    output_chunk.setColumns(block.getColumns(), rows);
++}
++
++DelayedJoinedBlocksTransform::DelayedJoinedBlocksTransform(size_t num_streams, JoinPtr join_)
++    : IProcessor(InputPorts{}, OutputPorts(num_streams, Block()))
++    , join(std::move(join_))
++{
++}
++
++void DelayedJoinedBlocksTransform::work()
++{
++    delayed_blocks = join->getDelayedBlocks();
++    finished = finished || delayed_blocks == nullptr;
++}
++
++
++IProcessor::Status DelayedJoinedBlocksTransform::prepare()
++{
++    for (auto & output : outputs)
++    {
++        if (!output.canPush())
++            return Status::PortFull;
++    }
++
++    if (finished)
++    {
++        for (auto & output : outputs)
++        {
++            Chunk chunk;
++            chunk.setChunkInfo(std::make_shared<DelayedBlocksTask>());
++            output.push(std::move(chunk));
++            output.finish();
++        }
++
++        return Status::Finished;
++    }
++
++    if (delayed_blocks)
++    {
++        for (auto & output : outputs)
++        {
++            Chunk chunk;
++            chunk.setChunkInfo(std::make_shared<DelayedBlocksTask>(delayed_blocks));
++            output.push(std::move(chunk));
++        }
++        delayed_blocks = nullptr;
++        return Status::PortFull;
++    }
++
++    return Status::Ready;
++}
++
+ }
+diff --git a/src/Processors/Transforms/JoiningTransform.h b/src/Processors/Transforms/JoiningTransform.h
+index 0595d0356575..e7edff40c565 100644
+--- a/src/Processors/Transforms/JoiningTransform.h
++++ b/src/Processors/Transforms/JoiningTransform.h
+@@ -9,6 +9,8 @@ class IJoin;
+ using JoinPtr = std::shared_ptr<IJoin>;
+ 
+ class NotJoinedBlocks;
++class IBlocksStream;
++using IBlocksStreamPtr = std::shared_ptr<IBlocksStream>;
+ 
+ /// Join rows to chunk form left table.
+ /// This transform usually has two input ports and one output.
+@@ -47,10 +49,14 @@ class JoiningTransform : public IProcessor
+         bool default_totals_ = false,
+         FinishCounterPtr finish_counter_ = nullptr);
+ 
++    ~JoiningTransform() override;
++
+     String getName() const override { return "JoiningTransform"; }
+ 
+     static Block transformHeader(Block header, const JoinPtr & join);
+ 
++    OutputPort & getFinishedSignal();
++
+     Status prepare() override;
+     void work() override;
+ 
+@@ -76,7 +82,7 @@ class JoiningTransform : public IProcessor
+     ExtraBlockPtr not_processed;
+ 
+     FinishCounterPtr finish_counter;
+-    std::shared_ptr<NotJoinedBlocks> non_joined_blocks;
++    IBlocksStreamPtr non_joined_blocks;
+     size_t max_block_size;
+ 
+     Block readExecute(Chunk & chunk);
+@@ -104,4 +110,55 @@ class FillingRightJoinSideTransform : public IProcessor
+     bool set_totals = false;
+ };
+ 
++
++class DelayedBlocksTask : public ChunkInfo
++{
++public:
++
++    explicit DelayedBlocksTask() : finished(true) {}
++    explicit DelayedBlocksTask(IBlocksStreamPtr delayed_blocks_) : delayed_blocks(std::move(delayed_blocks_)) {}
++
++    IBlocksStreamPtr delayed_blocks = nullptr;
++
++    bool finished = false;
++};
++
++using DelayedBlocksTaskPtr = std::shared_ptr<const DelayedBlocksTask>;
++
++
++/// Reads delayed joined blocks from Join
++class DelayedJoinedBlocksTransform : public IProcessor
++{
++public:
++    explicit DelayedJoinedBlocksTransform(size_t num_streams, JoinPtr join_);
++
++    String getName() const override { return "DelayedJoinedBlocksTransform"; }
++
++    Status prepare() override;
++    void work() override;
++
++private:
++    JoinPtr join;
++
++    IBlocksStreamPtr delayed_blocks = nullptr;
++    bool finished = false;
++};
++
++class DelayedJoinedBlocksWorkerTransform : public IProcessor
++{
++public:
++    explicit DelayedJoinedBlocksWorkerTransform(Block output_header);
++
++    String getName() const override { return "DelayedJoinedBlocksWorkerTransform"; }
++
++    Status prepare() override;
++    void work() override;
++
++private:
++    DelayedBlocksTaskPtr task;
++    Chunk output_chunk;
++
++    bool finished = false;
++};
++
+ }
+diff --git a/src/QueryPipeline/QueryPipelineBuilder.cpp b/src/QueryPipeline/QueryPipelineBuilder.cpp
+index 812bd155b423..626296834a24 100644
+--- a/src/QueryPipeline/QueryPipelineBuilder.cpp
++++ b/src/QueryPipeline/QueryPipelineBuilder.cpp
+@@ -22,7 +22,8 @@
+ #include <Interpreters/TableJoin.h>
+ #include <Common/typeid_cast.h>
+ #include <Common/CurrentThread.h>
+-#include "Core/SortDescription.h"
++#include <Processors/ConcatProcessor.h>
++#include <Core/SortDescription.h>
+ #include <QueryPipeline/narrowPipe.h>
+ #include <Processors/DelayedPortsProcessor.h>
+ #include <Processors/RowsBeforeLimitCounter.h>
+@@ -383,7 +384,7 @@ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesRightLe
+     /// Collect the NEW processors for the right pipeline.
+     QueryPipelineProcessorsCollector collector(*right);
+     /// Remember the last step of the right pipeline.
+-    ExpressionStep* step = typeid_cast<ExpressionStep*>(right->pipe.processors->back()->getQueryPlanStep());
++    ExpressionStep * step = typeid_cast<ExpressionStep *>(right->pipe.processors->back()->getQueryPlanStep());
+     if (!step)
+     {
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "The top step of the right pipeline should be ExpressionStep");
+@@ -391,6 +392,10 @@ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesRightLe
+ 
+     /// In case joined subquery has totals, and we don't, add default chunk to totals.
+     bool default_totals = false;
++
++    if (!join->supportTotals() && (left->hasTotals() || right->hasTotals()))
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Current join algorithm is supported only for pipelines without totals");
++
+     if (!left->hasTotals() && right->hasTotals())
+     {
+         left->addDefaultTotals();
+@@ -453,26 +458,94 @@ std::unique_ptr<QueryPipelineBuilder> QueryPipelineBuilder::joinPipelinesRightLe
+     auto lit = left->pipe.output_ports.begin();
+     auto rit = right->pipe.output_ports.begin();
+ 
++
++    std::vector<OutputPort *> joined_output_ports;
++    std::vector<OutputPort *> delayed_root_output_ports;
++
++    std::shared_ptr<DelayedJoinedBlocksTransform> delayed_root = nullptr;
++    if (join->hasDelayedBlocks())
++    {
++        delayed_root = std::make_shared<DelayedJoinedBlocksTransform>(num_streams, join);
++        if (!delayed_root->getInputs().empty() || delayed_root->getOutputs().size() != num_streams)
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "DelayedJoinedBlocksTransform should have no inputs and {} outputs, but has {} inputs and {} outputs",
++                            num_streams, delayed_root->getInputs().size(), delayed_root->getOutputs().size());
++
++        if (collected_processors)
++            collected_processors->emplace_back(delayed_root);
++        left->pipe.processors->emplace_back(delayed_root);
++
++        for (auto & outport : delayed_root->getOutputs())
++            delayed_root_output_ports.emplace_back(&outport);
++    }
++
++
++    Block left_header = left->getHeader();
++    Block joined_header = JoiningTransform::transformHeader(left_header, join);
++
+     for (size_t i = 0; i < num_streams; ++i)
+     {
+         auto joining = std::make_shared<JoiningTransform>(
+-            left->getHeader(), output_header, join, max_block_size, false, default_totals, finish_counter);
++            left_header, output_header, join, max_block_size, false, default_totals, finish_counter);
++
+         connect(**lit, joining->getInputs().front());
+         connect(**rit, joining->getInputs().back());
+-        *lit = &joining->getOutputs().front();
++        if (delayed_root)
++        {
++            // Process delayed joined blocks when all JoiningTransform are finished.
++            auto delayed = std::make_shared<DelayedJoinedBlocksWorkerTransform>(joined_header);
++            if (delayed->getInputs().size() != 1 || delayed->getOutputs().size() != 1)
++                throw Exception("DelayedJoinedBlocksWorkerTransform should have one input and one output", ErrorCodes::LOGICAL_ERROR);
++
++            connect(*delayed_root_output_ports[i], delayed->getInputs().front());
++
++            joined_output_ports.push_back(&joining->getOutputs().front());
++            joined_output_ports.push_back(&delayed->getOutputs().front());
++
++            if (collected_processors)
++                collected_processors->emplace_back(delayed);
++            left->pipe.processors->emplace_back(std::move(delayed));
++        }
++        else
++        {
++            *lit = &joining->getOutputs().front();
++        }
++
+ 
+         ++lit;
+         ++rit;
+-
+         if (collected_processors)
+             collected_processors->emplace_back(joining);
+ 
+         left->pipe.processors->emplace_back(std::move(joining));
+     }
+ 
++    if (delayed_root)
++    {
++        // Process DelayedJoinedBlocksTransform after all JoiningTransforms.
++        DelayedPortsProcessor::PortNumbers delayed_ports_numbers;
++        delayed_ports_numbers.reserve(joined_output_ports.size() / 2);
++        for (size_t i = 1; i < joined_output_ports.size(); i += 2)
++            delayed_ports_numbers.push_back(i);
++
++        auto delayed_processor = std::make_shared<DelayedPortsProcessor>(joined_header, 2 * num_streams, delayed_ports_numbers);
++        if (collected_processors)
++            collected_processors->emplace_back(delayed_processor);
++        left->pipe.processors->emplace_back(delayed_processor);
++
++        // Connect @delayed_processor ports with inputs (JoiningTransforms & DelayedJoinedBlocksTransforms) / pipe outputs
++        auto next_delayed_input = delayed_processor->getInputs().begin();
++        for (OutputPort * port : joined_output_ports)
++            connect(*port, *next_delayed_input++);
++        left->pipe.output_ports.clear();
++        for (OutputPort & port : delayed_processor->getOutputs())
++            left->pipe.output_ports.push_back(&port);
++        left->pipe.header = joined_header;
++        left->resize(num_streams);
++    }
++
+     if (left->hasTotals())
+     {
+-        auto joining = std::make_shared<JoiningTransform>(left->getHeader(), output_header, join, max_block_size, true, default_totals);
++        auto joining = std::make_shared<JoiningTransform>(left_header, output_header, join, max_block_size, true, default_totals);
+         connect(*left->pipe.totals_port, joining->getInputs().front());
+         connect(**rit, joining->getInputs().back());
+         left->pipe.totals_port = &joining->getOutputs().front();

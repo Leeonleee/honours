@@ -1,0 +1,823 @@
+diff --git a/dbms/CMakeLists.txt b/dbms/CMakeLists.txt
+index e7cc084237fc..63a454d0ea64 100644
+--- a/dbms/CMakeLists.txt
++++ b/dbms/CMakeLists.txt
+@@ -410,6 +410,6 @@ if (ENABLE_TESTS AND USE_GTEST)
+     # gtest framework has substandard code
+     target_compile_options(unit_tests_dbms PRIVATE -Wno-zero-as-null-pointer-constant -Wno-undef -Wno-sign-compare -Wno-used-but-marked-unused -Wno-missing-noreturn)
+ 
+-    target_link_libraries(unit_tests_dbms PRIVATE ${GTEST_BOTH_LIBRARIES} clickhouse_functions clickhouse_parsers dbms clickhouse_common_zookeeper)
++    target_link_libraries(unit_tests_dbms PRIVATE ${GTEST_BOTH_LIBRARIES} clickhouse_functions clickhouse_parsers dbms clickhouse_common_zookeeper string_utils)
+     add_check(unit_tests_dbms)
+ endif ()
+diff --git a/dbms/programs/client/Client.cpp b/dbms/programs/client/Client.cpp
+index 8874eeac6c70..df5e8568d21c 100644
+--- a/dbms/programs/client/Client.cpp
++++ b/dbms/programs/client/Client.cpp
+@@ -608,6 +608,7 @@ class Client : public Poco::Util::Application
+ 
+             if (!ends_with_backslash && (ends_with_semicolon || has_vertical_output_suffix || (!config().has("multiline") && !hasDataInSTDIN())))
+             {
++                // TODO: should we do sensitive data masking on client too? History file can be source of secret leaks.
+                 if (input != prev_input)
+                 {
+                     /// Replace line breaks with spaces to prevent the following problem.
+diff --git a/dbms/programs/local/LocalServer.cpp b/dbms/programs/local/LocalServer.cpp
+index 1844c0377845..f4eac1baec2c 100644
+--- a/dbms/programs/local/LocalServer.cpp
++++ b/dbms/programs/local/LocalServer.cpp
+@@ -74,6 +74,7 @@ void LocalServer::initialize(Poco::Util::Application & self)
+ 
+     if (config().has("logger") || config().has("logger.level") || config().has("logger.log"))
+     {
++        // sensitive data rules are not used here
+         buildLoggers(config(), logger());
+     }
+     else
+diff --git a/dbms/programs/odbc-bridge/ODBCBridge.cpp b/dbms/programs/odbc-bridge/ODBCBridge.cpp
+index cf265eb6abb0..214d9f75328f 100644
+--- a/dbms/programs/odbc-bridge/ODBCBridge.cpp
++++ b/dbms/programs/odbc-bridge/ODBCBridge.cpp
+@@ -124,6 +124,7 @@ void ODBCBridge::initialize(Application & self)
+     config().setString("logger", "ODBCBridge");
+ 
+     buildLoggers(config(), logger());
++
+     log = &logger();
+     hostname = config().getString("listen-host", "localhost");
+     port = config().getUInt("http-port");
+@@ -162,6 +163,12 @@ int ODBCBridge::main(const std::vector<std::string> & /*args*/)
+     context = std::make_shared<Context>(Context::createGlobal());
+     context->makeGlobalContext();
+ 
++    if (config().has("query_masking_rules"))
++    {
++        context->setSensitiveDataMasker(std::make_unique<SensitiveDataMasker>(config(), "query_masking_rules"));
++        setLoggerSensitiveDataMasker(logger(), context->getSensitiveDataMasker());
++    }
++
+     auto server = Poco::Net::HTTPServer(
+         new HandlerFactory("ODBCRequestHandlerFactory-factory", keep_alive_timeout, context), server_pool, socket, http_params);
+     server.start();
+diff --git a/dbms/programs/server/Server.cpp b/dbms/programs/server/Server.cpp
+index f10dc07ab56a..82f50f265692 100644
+--- a/dbms/programs/server/Server.cpp
++++ b/dbms/programs/server/Server.cpp
+@@ -278,7 +278,11 @@ int Server::main(const std::vector<std::string> & /*args*/)
+           *  table engines could use Context on destroy.
+           */
+         LOG_INFO(log, "Shutting down storages.");
++
++        // global_context is the owner of sensitive_data_masker, which will be destoyed after global_context->shutdown() call
++        setLoggerSensitiveDataMasker(logger(), nullptr);
+         global_context->shutdown();
++
+         LOG_DEBUG(log, "Shutted down storages.");
+ 
+         /** Explicitly destroy Context. It is more convenient than in destructor of Server, because logger is still available.
+@@ -407,6 +411,12 @@ int Server::main(const std::vector<std::string> & /*args*/)
+ 
+     /// Initialize main config reloader.
+     std::string include_from_path = config().getString("include_from", "/etc/metrika.xml");
++
++    if (config().has("query_masking_rules"))
++    {
++        global_context->setSensitiveDataMasker(std::make_unique<SensitiveDataMasker>(config(), "query_masking_rules"));
++    }
++
+     auto main_config_reloader = std::make_unique<ConfigReloader>(config_path,
+         include_from_path,
+         config().getString("path", ""),
+@@ -416,6 +426,10 @@ int Server::main(const std::vector<std::string> & /*args*/)
+         {
+             setTextLog(global_context->getTextLog());
+             buildLoggers(*config, logger());
++            if (auto masker = global_context->getSensitiveDataMasker())
++            {
++                setLoggerSensitiveDataMasker(logger(), masker);
++            }
+             global_context->setClustersConfig(config);
+             global_context->setMacros(std::make_unique<Macros>(*config, "macros"));
+         },
+diff --git a/dbms/programs/server/config.xml b/dbms/programs/server/config.xml
+index 814b7dded3c3..d8fcd9b0c9ee 100644
+--- a/dbms/programs/server/config.xml
++++ b/dbms/programs/server/config.xml
+@@ -439,6 +439,20 @@
+       -->
+     <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+ 
++
++    <!-- Uncomment to use query masking rules.
++        name - name for the rule (optional)
++        regexp - RE2 compatible regular expression (mandatory)
++        replace - substitution string for sensitive data (optional, by default - six asterisks)
++    <query_masking_rules>
++        <rule>
++            <name>hide SSN</name>
++            <regexp>(^|\D)\d{3}-\d{2}-\d{4}($|\D)</regexp>
++            <replace>000-00-0000</replace>
++        </rule>
++    </query_masking_rules>
++    -->
++
+     <!-- Uncomment to disable ClickHouse internal DNS caching. -->
+     <!-- <disable_internal_dns_cache>1</disable_internal_dns_cache> -->
+ </yandex>
+diff --git a/dbms/src/Common/ProfileEvents.cpp b/dbms/src/Common/ProfileEvents.cpp
+index 67303b085f44..947e3890078a 100644
+--- a/dbms/src/Common/ProfileEvents.cpp
++++ b/dbms/src/Common/ProfileEvents.cpp
+@@ -46,6 +46,8 @@
+     M(NetworkSendElapsedMicroseconds, "") \
+     M(ThrottlerSleepMicroseconds, "Total time a query was sleeping to conform the 'max_network_bandwidth' setting.") \
+     \
++    M(QueryMaskingRulesMatch, "Number of times query masking rules was successfully matched.") \
++    \
+     M(ReplicatedPartFetches, "Number of times a data part was downloaded from replica of a ReplicatedMergeTree table.") \
+     M(ReplicatedPartFailedFetches, "") \
+     M(ObsoleteReplicatedParts, "") \
+diff --git a/dbms/src/Common/SensitiveDataMasker.cpp b/dbms/src/Common/SensitiveDataMasker.cpp
+new file mode 100644
+index 000000000000..488c0be42459
+--- /dev/null
++++ b/dbms/src/Common/SensitiveDataMasker.cpp
+@@ -0,0 +1,166 @@
++#include "SensitiveDataMasker.h"
++
++#include <set>
++#include <string>
++#include <atomic>
++
++#include <re2/re2.h>
++#include <re2/stringpiece.h>
++
++#include <Poco/Util/AbstractConfiguration.h>
++
++#include <common/logger_useful.h>
++
++#include <Common/Exception.h>
++#include <Common/StringUtils/StringUtils.h>
++
++#ifndef NDEBUG
++#    include <iostream>
++#endif
++
++namespace DB
++{
++namespace ErrorCodes
++{
++    extern const int CANNOT_COMPILE_REGEXP;
++    extern const int NO_ELEMENTS_IN_CONFIG;
++    extern const int INVALID_CONFIG_PARAMETER;
++}
++
++class SensitiveDataMasker::MaskingRule
++{
++private:
++    const std::string name;
++    const std::string replacement_string;
++    const std::string regexp_string;
++
++    const RE2 regexp;
++    const re2::StringPiece replacement;
++
++    mutable std::atomic<std::uint64_t> matches_count = 0;
++
++public:
++    //* TODO: option with hyperscan? https://software.intel.com/en-us/articles/why-and-how-to-replace-pcre-with-hyperscan
++    // re2::set should also work quite fast, but it doesn't return the match position, only which regexp was matched
++
++    MaskingRule(const std::string & name, const std::string & _regexp_string, const std::string & _replacement_string)
++        : name(name)
++        , replacement_string(_replacement_string)
++        , regexp_string(_regexp_string)
++        , regexp(regexp_string, RE2::Quiet)
++        , replacement(replacement_string)
++    {
++        if (!regexp.ok())
++            throw DB::Exception(
++                "SensitiveDataMasker: cannot compile re2: " + _regexp_string + ", error: " + regexp.error()
++                    + ". Look at https://github.com/google/re2/wiki/Syntax for reference.",
++                DB::ErrorCodes::CANNOT_COMPILE_REGEXP);
++    }
++    int apply(std::string & data) const
++    {
++        auto m = RE2::GlobalReplace(&data, regexp, replacement);
++        matches_count += m;
++        return m;
++    }
++
++    const std::string & getName() const { return name; }
++    const std::string & getReplacementString() const { return replacement_string; }
++    uint64_t getMatchesCount() const { return matches_count; }
++};
++
++SensitiveDataMasker::SensitiveDataMasker(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
++{
++    Poco::Util::AbstractConfiguration::Keys keys;
++    config.keys(config_prefix, keys);
++    Logger * logger = &Logger::get("SensitiveDataMaskerConfigRead");
++
++    std::set<std::string> used_names;
++
++    for (const auto & rule : keys)
++    {
++        if (startsWith(rule, "rule"))
++        {
++            auto rule_config_prefix = config_prefix + "." + rule;
++
++            auto rule_name = config.getString(rule_config_prefix + ".name", rule_config_prefix);
++
++            if (used_names.count(rule_name) == 0)
++            {
++                used_names.insert(rule_name);
++            }
++            else
++            {
++                throw Exception(
++                    "query_masking_rules configuration contains more than one rule named '" + rule_name + "'.",
++                    ErrorCodes::INVALID_CONFIG_PARAMETER);
++            }
++
++            auto regexp = config.getString(rule_config_prefix + ".regexp", "");
++
++            if (regexp == "")
++            {
++                throw Exception(
++                    "query_masking_rules configuration, rule '" + rule_name + "' has no <regexp> node or <regexp> is empty.",
++                    ErrorCodes::NO_ELEMENTS_IN_CONFIG);
++            }
++
++            auto replace = config.getString(rule_config_prefix + ".replace", "******");
++
++            try
++            {
++                addMaskingRule(rule_name, regexp, replace);
++            }
++            catch (DB::Exception & e)
++            {
++                e.addMessage("while adding query masking rule '" + rule_name + "'.");
++                throw;
++            }
++        }
++        else
++        {
++            LOG_WARNING(logger, "Unused param " << config_prefix << '.' << rule);
++        }
++    }
++    auto rules_count = this->rulesCount();
++    if (rules_count > 0)
++    {
++        LOG_INFO(logger, rules_count << " query masking rules loaded.");
++    }
++}
++
++SensitiveDataMasker::~SensitiveDataMasker() {}
++
++void SensitiveDataMasker::addMaskingRule(
++    const std::string & name, const std::string & regexp_string, const std::string & replacement_string)
++{
++    all_masking_rules.push_back(std::make_unique<MaskingRule>(name, regexp_string, replacement_string));
++}
++
++
++int SensitiveDataMasker::wipeSensitiveData(std::string & data) const
++{
++    int matches = 0;
++    for (auto & rule : all_masking_rules)
++    {
++        matches += rule->apply(data);
++    }
++    return matches;
++}
++
++#ifndef NDEBUG
++void SensitiveDataMasker::printStats()
++{
++    for (auto & rule : all_masking_rules)
++    {
++        std::cout << rule->getName() << " (replacement to " << rule->getReplacementString() << ") matched " << rule->getMatchesCount()
++                  << " times" << std::endl;
++    }
++}
++#endif
++
++unsigned long SensitiveDataMasker::rulesCount() const
++{
++    return all_masking_rules.size();
++}
++
++}
+diff --git a/dbms/src/Common/SensitiveDataMasker.h b/dbms/src/Common/SensitiveDataMasker.h
+new file mode 100644
+index 000000000000..02e86976d028
+--- /dev/null
++++ b/dbms/src/Common/SensitiveDataMasker.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <memory>
++#include <vector>
++
++namespace Poco
++{
++namespace Util
++{
++    class AbstractConfiguration;
++}
++}
++
++namespace DB
++{
++class SensitiveDataMasker
++{
++private:
++    class MaskingRule;
++    std::vector<std::unique_ptr<MaskingRule>> all_masking_rules;
++
++public:
++    SensitiveDataMasker(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
++    ~SensitiveDataMasker();
++    void addMaskingRule(const std::string & name, const std::string & regexp_string, const std::string & replacement_string);
++    int wipeSensitiveData(std::string & data) const;
++
++#ifndef NDEBUG
++    void printStats();
++#endif
++
++    unsigned long rulesCount() const;
++};
++
++};
+diff --git a/dbms/src/Interpreters/Context.cpp b/dbms/src/Interpreters/Context.cpp
+index fb8487154523..cb05b0e4fc87 100644
+--- a/dbms/src/Interpreters/Context.cpp
++++ b/dbms/src/Interpreters/Context.cpp
+@@ -86,6 +86,7 @@ namespace ErrorCodes
+     extern const int SESSION_NOT_FOUND;
+     extern const int SESSION_IS_LOCKED;
+     extern const int CANNOT_GET_CREATE_TABLE_QUERY;
++    extern const int LOGICAL_ERROR;
+ }
+ 
+ 
+@@ -142,6 +143,8 @@ struct ContextShared
+     std::unique_ptr<DDLWorker> ddl_worker;                  /// Process ddl commands from zk.
+     /// Rules for selecting the compression settings, depending on the size of the part.
+     mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector;
++    /// Allows to remove sensitive data from queries using set of regexp-based rules
++    std::unique_ptr<SensitiveDataMasker> sensitive_data_masker;
+     std::optional<MergeTreeSettings> merge_tree_settings; /// Settings of MergeTree* engines.
+     size_t max_table_size_to_drop = 50000000000lu;          /// Protects MergeTree tables from accidental DROP (50GB by default)
+     size_t max_partition_size_to_drop = 50000000000lu;      /// Protects MergeTree partitions from accidental DROP (50GB by default)
+@@ -284,6 +287,8 @@ struct ContextShared
+ 
+         /// Stop trace collector if any
+         trace_collector.reset();
++
++        sensitive_data_masker.reset();
+     }
+ 
+     bool hasTraceCollector()
+@@ -533,6 +538,23 @@ String Context::getUserFilesPath() const
+     return shared->user_files_path;
+ }
+ 
++void Context::setSensitiveDataMasker(std::unique_ptr<SensitiveDataMasker> sensitive_data_masker)
++{
++    if (!sensitive_data_masker)
++        throw Exception("Logical error: the 'sensitive_data_masker' is not set", ErrorCodes::LOGICAL_ERROR);
++    
++    if (sensitive_data_masker->rulesCount() > 0)
++    {
++        auto lock = getLock();
++        shared->sensitive_data_masker = std::move(sensitive_data_masker);
++    }
++}
++
++SensitiveDataMasker * Context::getSensitiveDataMasker() const
++{
++    return shared->sensitive_data_masker.get();
++}
++
+ void Context::setPath(const String & path)
+ {
+     auto lock = getLock();
+diff --git a/dbms/src/Interpreters/Context.h b/dbms/src/Interpreters/Context.h
+index f7ba0a7dbaa4..d8e4748ddad6 100644
+--- a/dbms/src/Interpreters/Context.h
++++ b/dbms/src/Interpreters/Context.h
+@@ -12,6 +12,7 @@
+ #include <Common/MultiVersion.h>
+ #include <Common/ThreadPool.h>
+ #include "config_core.h"
++#include <Common/SensitiveDataMasker.h>
+ #include <Storages/IStorage_fwd.h>
+ #include <atomic>
+ #include <chrono>
+@@ -177,6 +178,9 @@ class Context
+     String getFlagsPath() const;
+     String getUserFilesPath() const;
+ 
++    void setSensitiveDataMasker(std::unique_ptr<SensitiveDataMasker> sensitive_data_masker);
++    SensitiveDataMasker * getSensitiveDataMasker() const;
++
+     void setPath(const String & path);
+     void setTemporaryPath(const String & path);
+     void setFlagsPath(const String & path);
+diff --git a/dbms/src/Interpreters/executeQuery.cpp b/dbms/src/Interpreters/executeQuery.cpp
+index 07445aac646e..3793f2f79c9b 100644
+--- a/dbms/src/Interpreters/executeQuery.cpp
++++ b/dbms/src/Interpreters/executeQuery.cpp
+@@ -28,12 +28,19 @@
+ #include <Interpreters/InterpreterSetQuery.h>
+ #include <Interpreters/ReplaceQueryParameterVisitor.h>
+ #include <Interpreters/executeQuery.h>
++#include <Common/ProfileEvents.h>
++
+ #include <Interpreters/DNSCacheUpdater.h>
+ 
+ #include <Processors/Transforms/LimitsCheckingTransform.h>
+ #include <Processors/Transforms/MaterializingTransform.h>
+ #include <Processors/Formats/IOutputFormat.h>
+ 
++namespace ProfileEvents
++{
++    extern const Event QueryMaskingRulesMatch;
++}
++
+ namespace DB
+ {
+ 
+@@ -54,7 +61,6 @@ static void checkASTSizeLimits(const IAST & ast, const Settings & settings)
+         ast.checkSize(settings.max_ast_elements);
+ }
+ 
+-
+ /// NOTE This is wrong in case of single-line comments and in case of multiline string literals.
+ static String joinLines(const String & query)
+ {
+@@ -64,6 +70,27 @@ static String joinLines(const String & query)
+ }
+ 
+ 
++static String prepareQueryForLogging(const String & query, Context & context)
++{
++    String res = query;
++
++    // wiping sensitive data before cropping query by log_queries_cut_to_length,
++    // otherwise something like credit card without last digit can go to log
++    if (auto masker = context.getSensitiveDataMasker())
++    {
++        auto matches = masker->wipeSensitiveData(res);
++        if (matches > 0)
++        {
++            ProfileEvents::increment(ProfileEvents::QueryMaskingRulesMatch, matches);
++        }
++    }
++
++    res = res.substr(0, context.getSettingsRef().log_queries_cut_to_length);
++
++    return res;
++}
++
++
+ /// Log query into text log (not into system table).
+ static void logQuery(const String & query, const Context & context, bool internal)
+ {
+@@ -111,7 +138,7 @@ static void logException(Context & context, QueryLogElement & elem)
+ }
+ 
+ 
+-static void onExceptionBeforeStart(const String & query, Context & context, time_t current_time)
++static void onExceptionBeforeStart(const String & query_for_logging, Context & context, time_t current_time)
+ {
+     /// Exception before the query execution.
+     context.getQuota().addError();
+@@ -126,7 +153,7 @@ static void onExceptionBeforeStart(const String & query, Context & context, time
+     elem.event_time = current_time;
+     elem.query_start_time = current_time;
+ 
+-    elem.query = query.substr(0, settings.log_queries_cut_to_length);
++    elem.query = query_for_logging;
+     elem.exception = getCurrentExceptionMessage(false);
+ 
+     elem.client_info = context.getClientInfo();
+@@ -192,10 +219,12 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+     {
+         /// Anyway log the query.
+         String query = String(begin, begin + std::min(end - begin, static_cast<ptrdiff_t>(max_query_size)));
+-        logQuery(query.substr(0, settings.log_queries_cut_to_length), context, internal);
++
++        auto query_for_logging = prepareQueryForLogging(query, context);
++        logQuery(query_for_logging, context, internal);
+ 
+         if (!internal)
+-            onExceptionBeforeStart(query, context, current_time);
++            onExceptionBeforeStart(query_for_logging, context, current_time);
+ 
+         throw;
+     }
+@@ -205,6 +234,8 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+     BlockIO res;
+     QueryPipeline & pipeline = res.pipeline;
+ 
++    String query_for_logging = "";
++
+     try
+     {
+         /// Replace ASTQueryParameter with ASTLiteral for prepared statements.
+@@ -217,7 +248,9 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+             query = serializeAST(*ast);
+         }
+ 
+-        logQuery(query.substr(0, settings.log_queries_cut_to_length), context, internal);
++        query_for_logging = prepareQueryForLogging(query, context);
++
++        logQuery(query_for_logging, context, internal);
+ 
+         /// Check the limits.
+         checkASTSizeLimits(*ast, settings);
+@@ -231,7 +264,8 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+         ProcessList::EntryPtr process_list_entry;
+         if (!internal && !ast->as<ASTShowProcesslistQuery>())
+         {
+-            process_list_entry = context.getProcessList().insert(query, ast.get(), context);
++            /// processlist also has query masked now, to avoid secrets leaks though SHOW PROCESSLIST by other users.
++            process_list_entry = context.getProcessList().insert(query_for_logging, ast.get(), context);
+             context.setProcessListElement(&process_list_entry->get());
+         }
+ 
+@@ -323,7 +357,7 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+             elem.event_time = current_time;
+             elem.query_start_time = current_time;
+ 
+-            elem.query = query.substr(0, settings.log_queries_cut_to_length);
++            elem.query = query_for_logging;
+ 
+             elem.client_info = context.getClientInfo();
+ 
+@@ -469,7 +503,12 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
+     catch (...)
+     {
+         if (!internal)
+-            onExceptionBeforeStart(query, context, current_time);
++        {
++            if (query_for_logging.empty())
++                query_for_logging = prepareQueryForLogging(query, context);
++
++            onExceptionBeforeStart(query_for_logging, context, current_time);
++        }
+ 
+         throw;
+     }
+diff --git a/docs/en/operations/server_settings/settings.md b/docs/en/operations/server_settings/settings.md
+index 2be36a6e0c64..3da0dd7d8d2c 100644
+--- a/docs/en/operations/server_settings/settings.md
++++ b/docs/en/operations/server_settings/settings.md
+@@ -554,6 +554,36 @@ If the table doesn't exist, ClickHouse will create it. If the structure of the q
+ </query_log>
+ ```
+ 
++## query_masking_rules
++
++Regexp-based rules, which will be applied to queries as well as all log messages before storing them in server logs,
++`system.query_log`, `system.text_log`, `system.processes` table, and in logs sent to client. That allows preventing
++sensitive data leakage from SQL queries (like names / emails / personal
++identifiers / credit card numbers etc) to logs.
++
++**Example**
++
++```xml
++<query_masking_rules>
++    <rule>
++        <name>hide SSN</name>
++        <regexp>(^|\D)\d{3}-\d{2}-\d{4}($|\D)</regexp>
++        <replace>000-00-0000</replace>
++    </rule>
++</query_masking_rules>
++```
++
++Config fields:
++- `name` - name for the rule (optional)
++- `regexp` - RE2 compatible regular expression (mandatory)
++- `replace` - substitution string for sensitive data (optional, by default - six asterisks)
++
++The masking rules are applied on whole query (to prevent leaks of sensitive data from malformed / non parsable queries).
++
++`system.events` table have counter `QueryMaskingRulesMatch` which have overall number of query masking rules matches.
++
++For distributed queries each server have to be configured separately, otherwise subquries passed to other
++nodes will be stored without masking.
+ 
+ ## remote_servers {#server_settings_remote_servers}
+ 
+diff --git a/libs/libdaemon/src/BaseDaemon.cpp b/libs/libdaemon/src/BaseDaemon.cpp
+index 807506775aee..931d91bd8b52 100644
+--- a/libs/libdaemon/src/BaseDaemon.cpp
++++ b/libs/libdaemon/src/BaseDaemon.cpp
+@@ -648,6 +648,7 @@ void BaseDaemon::initialize(Application & self)
+             throw Poco::Exception("Cannot change directory to /tmp");
+     }
+ 
++    // sensitive data masking rules are not used here
+     buildLoggers(config(), logger());
+ 
+     if (is_daemon)
+diff --git a/libs/libloggers/loggers/Loggers.cpp b/libs/libloggers/loggers/Loggers.cpp
+index ebdc3e375713..eab541dd2ee2 100644
+--- a/libs/libloggers/loggers/Loggers.cpp
++++ b/libs/libloggers/loggers/Loggers.cpp
+@@ -11,6 +11,11 @@
+ #include <Poco/Net/RemoteSyslogChannel.h>
+ #include <Poco/Path.h>
+ 
++namespace DB
++{
++    class SensitiveDataMasker;
++}
++
+ 
+ // TODO: move to libcommon
+ static std::string createDirectory(const std::string & file)
+@@ -162,12 +167,21 @@ void Loggers::buildLoggers(Poco::Util::AbstractConfiguration & config, Poco::Log
+             logger.root().get(level).setLevel(config.getString("logger.levels." + level, "trace"));
+ }
+ 
++void Loggers::setLoggerSensitiveDataMasker(Poco::Logger & logger, DB::SensitiveDataMasker * sensitive_data_masker)
++{
++    if (auto split = dynamic_cast<DB::OwnSplitChannel *>(logger.getChannel()))
++    {
++        split->setMasker(sensitive_data_masker);
++    }
++}
++
+ void Loggers::closeLogs(Poco::Logger & logger)
+ {
+     if (log_file)
+         log_file->close();
+     if (error_log_file)
+         error_log_file->close();
++    // Shouldn't syslog_channel be closed here too?
+ 
+     if (!log_file)
+         logger.warning("Logging to console but received signal to close log file (ignoring).");
+diff --git a/libs/libloggers/loggers/Loggers.h b/libs/libloggers/loggers/Loggers.h
+index 4cc3df3757a0..49135afadc61 100644
+--- a/libs/libloggers/loggers/Loggers.h
++++ b/libs/libloggers/loggers/Loggers.h
+@@ -8,7 +8,12 @@
+ 
+ namespace Poco::Util
+ {
+-class AbstractConfiguration;
++    class AbstractConfiguration;
++}
++
++namespace DB
++{
++    class SensitiveDataMasker;
+ }
+ 
+ 
+@@ -16,6 +21,8 @@ class Loggers
+ {
+ public:
+     void buildLoggers(Poco::Util::AbstractConfiguration & config, Poco::Logger & logger, const std::string & cmd_name = "");
++    void setLoggerSensitiveDataMasker(Poco::Logger & logger, DB::SensitiveDataMasker * sensitive_data_masker);
++
+ 
+     /// Close log files. On next log write files will be reopened.
+     void closeLogs(Poco::Logger & logger);
+@@ -31,10 +38,10 @@ class Loggers
+     std::optional<size_t> layer;
+ 
+ private:
+-    /// Файлы с логами.
+     Poco::AutoPtr<Poco::FileChannel> log_file;
+     Poco::AutoPtr<Poco::FileChannel> error_log_file;
+     Poco::AutoPtr<Poco::Channel> syslog_channel;
++
+     /// Previous value of logger element in config. It is used to reinitialize loggers whenever the value changed.
+     std::string config_logger;
+ 
+diff --git a/libs/libloggers/loggers/OwnPatternFormatter.h b/libs/libloggers/loggers/OwnPatternFormatter.h
+index 0e100aa6f33b..dc1254cba294 100644
+--- a/libs/libloggers/loggers/OwnPatternFormatter.h
++++ b/libs/libloggers/loggers/OwnPatternFormatter.h
+@@ -5,18 +5,18 @@
+ #include "ExtendedLogChannel.h"
+ 
+ 
+-/** Форматирует по своему.
+-  * Некоторые детали невозможно получить, используя только Poco::PatternFormatter.
++/** Format log messages own way.
++  * We can't obtain some details using Poco::PatternFormatter.
+   *
+-  * Во-первых, используется номер потока не среди потоков Poco::Thread,
+-  *  а среди всех потоков, для которых был получен номер (см. ThreadNumber.h)
++  * Firstly, the thread number here is peaked not from Poco::Thread
++  * threads only, but from all threads with number assigned (see ThreadNumber.h)
+   *
+-  * Во-вторых, корректно выводится локальная дата и время.
+-  * Poco::PatternFormatter плохо работает с локальным временем,
+-  *  в ситуациях, когда в ближайшем будущем намечается отмена или введение daylight saving time.
+-  *  - см. исходники Poco и http://thread.gmane.org/gmane.comp.time.tz/8883
++  * Secondly, the local date and time are correctly displayed.
++  * Poco::PatternFormatter does not work well with local time,
++  * when timestamps are close to DST timeshift moments.
++  * - see Poco sources and http://thread.gmane.org/gmane.comp.time.tz/8883
+   *
+-  * Также сделан чуть более эффективным (что имеет мало значения).
++  * Also it's made a bit more efficient (unimportant).
+   */
+ 
+ class Loggers;
+diff --git a/libs/libloggers/loggers/OwnSplitChannel.cpp b/libs/libloggers/loggers/OwnSplitChannel.cpp
+index e4f0c7e473a1..69e540e1d210 100644
+--- a/libs/libloggers/loggers/OwnSplitChannel.cpp
++++ b/libs/libloggers/loggers/OwnSplitChannel.cpp
+@@ -20,6 +20,23 @@ void OwnSplitChannel::log(const Poco::Message & msg)
+     if (channels.empty() && (logs_queue == nullptr || msg.getPriority() > logs_queue->max_priority))
+         return;
+ 
++    if (auto masker = sensitive_data_masker.load())
++    {
++        auto message_text = msg.getText();
++        auto matches = masker->wipeSensitiveData(message_text);
++        if (matches > 0)
++        {
++            logSplit({msg, message_text}); // we will continue with the copy of original message with text modified
++            return;
++        }
++
++    }
++    logSplit(msg);
++}
++
++
++void OwnSplitChannel::logSplit(const Poco::Message & msg)
++{
+     ExtendedLogMessage msg_ext = ExtendedLogMessage::getFrom(msg);
+ 
+     /// Log data to child channels
+@@ -31,6 +48,8 @@ void OwnSplitChannel::log(const Poco::Message & msg)
+             channel.first->log(msg); // ordinary child
+     }
+ 
++    auto logs_queue = CurrentThread::getInternalTextLogsQueue();
++
+     /// Log to "TCP queue" if message is not too noisy
+     if (logs_queue && msg.getPriority() <= logs_queue->max_priority)
+     {
+@@ -80,6 +99,12 @@ void OwnSplitChannel::log(const Poco::Message & msg)
+         log->add(elem);
+ }
+ 
++
++void OwnSplitChannel::setMasker(DB::SensitiveDataMasker * _sensitive_data_masker)
++{
++    sensitive_data_masker.store(_sensitive_data_masker);
++}
++
+ void OwnSplitChannel::addChannel(Poco::AutoPtr<Poco::Channel> channel)
+ {
+     channels.emplace_back(std::move(channel), dynamic_cast<ExtendedLogChannel *>(channel.get()));
+diff --git a/libs/libloggers/loggers/OwnSplitChannel.h b/libs/libloggers/loggers/OwnSplitChannel.h
+index ee190124c664..4b4da639b979 100644
+--- a/libs/libloggers/loggers/OwnSplitChannel.h
++++ b/libs/libloggers/loggers/OwnSplitChannel.h
+@@ -1,8 +1,10 @@
+ #pragma once
++#include <atomic>
+ #include <vector>
+ #include <Poco/AutoPtr.h>
+ #include <Poco/Channel.h>
+ #include "ExtendedLogChannel.h"
++#include <Common/SensitiveDataMasker.h>
+ #include <Interpreters/TextLog.h>
+ 
+ 
+@@ -17,16 +19,21 @@ class OwnSplitChannel : public Poco::Channel
+     /// Makes an extended message from msg and passes it to the client logs queue and child (if possible)
+     void log(const Poco::Message & msg) override;
+ 
++    void setMasker(DB::SensitiveDataMasker * _sensitive_data_masker);
++
+     /// Adds a child channel
+     void addChannel(Poco::AutoPtr<Poco::Channel> channel);
+ 
+     void addTextLog(std::shared_ptr<DB::TextLog> log);
+ 
+ private:
++    void logSplit(const Poco::Message & msg);
++
+     using ChannelPtr = Poco::AutoPtr<Poco::Channel>;
+     /// Handler and its pointer casted to extended interface
+     using ExtendedChannelPtrPair = std::pair<ChannelPtr, ExtendedLogChannel *>;
+     std::vector<ExtendedChannelPtrPair> channels;
++    std::atomic<DB::SensitiveDataMasker *> sensitive_data_masker = nullptr; // global context owns that object, pointer should be reset before context destroying.
+ 
+     std::mutex text_log_mutex;
+     std::weak_ptr<DB::TextLog> text_log;

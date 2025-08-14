@@ -1,0 +1,874 @@
+diff --git a/programs/client/Suggest.cpp b/programs/client/Suggest.cpp
+index 029388a0bdad..d4db49a15988 100644
+--- a/programs/client/Suggest.cpp
++++ b/programs/client/Suggest.cpp
+@@ -6,6 +6,7 @@
+ #include <IO/WriteBufferFromString.h>
+ #include <IO/Operators.h>
+ 
++
+ namespace DB
+ {
+ namespace ErrorCodes
+diff --git a/src/Common/Throttler.cpp b/src/Common/Throttler.cpp
+new file mode 100644
+index 000000000000..3462abfeb54d
+--- /dev/null
++++ b/src/Common/Throttler.cpp
+@@ -0,0 +1,108 @@
++#include <Common/Throttler.h>
++#include <Common/ProfileEvents.h>
++#include <Common/Exception.h>
++#include <Common/Stopwatch.h>
++#include <IO/WriteHelpers.h>
++#include <cmath>
++
++namespace ProfileEvents
++{
++    extern const Event ThrottlerSleepMicroseconds;
++}
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int LIMIT_EXCEEDED;
++}
++
++/// Just 10^9.
++static constexpr auto NS = 1000000000UL;
++
++/// Tracking window. Actually the size is not really important. We just want to avoid
++/// throttles when there are no actions for a long period time.
++static const double window_ns = 7UL * NS;
++
++void Throttler::add(size_t amount)
++{
++    size_t new_count;
++    /// This outer variable is always equal to smoothed_speed.
++    /// We use to avoid race condition.
++    double current_speed = 0;
++
++    {
++        std::lock_guard lock(mutex);
++
++        auto now = clock_gettime_ns();
++        /// If prev_ns is equal to zero (first `add` call) we known nothing about speed
++        /// and don't track anything.
++        if (max_speed && prev_ns != 0)
++        {
++            /// Time spent to process the amount of bytes
++            double time_spent = now - prev_ns;
++
++            /// The speed in bytes per second is equal to amount / time_spent in seconds
++            auto new_speed = amount / (time_spent / NS);
++
++            /// We want to make old values of speed less important for our smoothed value
++            /// so we decay it's value with coef.
++            auto decay_coeff = std::pow(0.5, time_spent / window_ns);
++
++            /// Weighted average between previous and new speed
++            smoothed_speed = smoothed_speed * decay_coeff + (1 - decay_coeff) * new_speed;
++            current_speed = smoothed_speed;
++        }
++
++        count += amount;
++        new_count = count;
++        prev_ns = now;
++    }
++
++    if (limit && new_count > limit)
++        throw Exception(limit_exceeded_exception_message + std::string(" Maximum: ") + toString(limit), ErrorCodes::LIMIT_EXCEEDED);
++
++    if (max_speed && current_speed > max_speed)
++    {
++        /// If we was too fast then we have to sleep until our smoothed speed became <= max_speed
++        int64_t sleep_time = -window_ns * std::log2(max_speed / current_speed);
++
++        if (sleep_time > 0)
++        {
++            accumulated_sleep += sleep_time;
++
++            sleepForNanoseconds(sleep_time);
++
++            accumulated_sleep -= sleep_time;
++
++            ProfileEvents::increment(ProfileEvents::ThrottlerSleepMicroseconds, sleep_time / 1000UL);
++        }
++    }
++
++    if (parent)
++        parent->add(amount);
++}
++
++void Throttler::reset()
++{
++    std::lock_guard lock(mutex);
++
++    count = 0;
++    accumulated_sleep = 0;
++    smoothed_speed = 0;
++    prev_ns = 0;
++}
++
++bool Throttler::isThrottling() const
++{
++    if (accumulated_sleep != 0)
++        return true;
++
++    if (parent)
++        return parent->isThrottling();
++
++    return false;
++}
++
++}
+diff --git a/src/Common/Throttler.h b/src/Common/Throttler.h
+index 172cce783d84..a30df74d510a 100644
+--- a/src/Common/Throttler.h
++++ b/src/Common/Throttler.h
+@@ -2,32 +2,16 @@
+ 
+ #include <mutex>
+ #include <memory>
+-#include <Common/Stopwatch.h>
+-#include <Common/Exception.h>
+-#include <Common/ProfileEvents.h>
+ #include <common/sleep.h>
+-#include <IO/WriteHelpers.h>
+-
+-
+-namespace ProfileEvents
+-{
+-    extern const Event ThrottlerSleepMicroseconds;
+-}
+-
++#include <atomic>
+ 
+ namespace DB
+ {
+ 
+-namespace ErrorCodes
+-{
+-    extern const int LIMIT_EXCEEDED;
+-}
+-
+-
+ /** Allows you to limit the speed of something (in entities per second) using sleep.
+   * Specifics of work:
+-  * - only the average speed is considered, from the moment of the first call of `add` function;
+-  *   if there were periods with low speed, then during some time after them, the speed will be higher;
++  *  Tracks exponentially (pow of 1/2) smoothed speed with hardcoded window.
++  *  See more comments in .cpp file.
+   *
+   * Also allows you to set a limit on the maximum number of entities. If exceeded, an exception will be thrown.
+   */
+@@ -41,49 +25,9 @@ class Throttler
+               const std::shared_ptr<Throttler> & parent_ = nullptr)
+         : max_speed(max_speed_), limit(limit_), limit_exceeded_exception_message(limit_exceeded_exception_message_), parent(parent_) {}
+ 
+-    void add(const size_t amount)
+-    {
+-        size_t new_count;
+-        UInt64 elapsed_ns = 0;
+-
+-        {
+-            std::lock_guard lock(mutex);
+-
+-            if (max_speed)
+-            {
+-                if (0 == count)
+-                {
+-                    watch.start();
+-                    elapsed_ns = 0;
+-                }
+-                else
+-                    elapsed_ns = watch.elapsed();
+-            }
+-
+-            count += amount;
+-            new_count = count;
+-        }
+-
+-        if (limit && new_count > limit)
+-            throw Exception(limit_exceeded_exception_message + std::string(" Maximum: ") + toString(limit), ErrorCodes::LIMIT_EXCEEDED);
+-
+-        if (max_speed)
+-        {
+-            /// How much time to wait for the average speed to become `max_speed`.
+-            UInt64 desired_ns = new_count * 1000000000 / max_speed;
+-
+-            if (desired_ns > elapsed_ns)
+-            {
+-                UInt64 sleep_ns = desired_ns - elapsed_ns;
+-                sleepForNanoseconds(sleep_ns);
+-
+-                ProfileEvents::increment(ProfileEvents::ThrottlerSleepMicroseconds, sleep_ns / 1000UL);
+-            }
+-        }
+-
+-        if (parent)
+-            parent->add(amount);
+-    }
++    /// Calculates the smoothed speed, sleeps if required and throws exception on
++    /// limit overflow.
++    void add(size_t amount);
+ 
+     /// Not thread safe
+     void setParent(const std::shared_ptr<Throttler> & parent_)
+@@ -91,21 +35,23 @@ class Throttler
+         parent = parent_;
+     }
+ 
+-    void reset()
+-    {
+-        std::lock_guard lock(mutex);
++    /// Reset all throttlers internal stats
++    void reset();
+ 
+-        count = 0;
+-        watch.reset();
+-    }
++    /// Is throttler already accumulated some sleep time and throttling.
++    bool isThrottling() const;
+ 
+ private:
+-    size_t count = 0;
+-    const size_t max_speed = 0;
+-    const UInt64 limit = 0;        /// 0 - not limited.
++    size_t count{0};
++    const size_t max_speed{0};
++    const uint64_t limit{0};        /// 0 - not limited.
+     const char * limit_exceeded_exception_message = nullptr;
+-    Stopwatch watch {CLOCK_MONOTONIC_COARSE};
+     std::mutex mutex;
++    std::atomic<uint64_t> accumulated_sleep{0};
++    /// Smoothed value of current speed. Updated in `add` method.
++    double smoothed_speed{0};
++    /// previous `add` call time (in nanoseconds)
++    uint64_t prev_ns{0};
+ 
+     /// Used to implement a hierarchy of throttlers
+     std::shared_ptr<Throttler> parent;
+diff --git a/src/Common/ya.make b/src/Common/ya.make
+index 57b60e9cce50..2da45e02b41d 100644
+--- a/src/Common/ya.make
++++ b/src/Common/ya.make
+@@ -80,6 +80,7 @@ SRCS(
+     ThreadPool.cpp
+     ThreadProfileEvents.cpp
+     ThreadStatus.cpp
++    Throttler.cpp
+     TimerDescriptor.cpp
+     TraceCollector.cpp
+     UTF8Helpers.cpp
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index bc308b56599e..dfcb7d11acee 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -83,6 +83,8 @@ class IColumn;
+     M(UInt64, background_schedule_pool_size, 16, "Number of threads performing background tasks for replicated tables, dns cache updates. Only has meaning at server startup.", 0) \
+     M(UInt64, background_message_broker_schedule_pool_size, 16, "Number of threads performing background tasks for message streaming. Only has meaning at server startup.", 0) \
+     M(UInt64, background_distributed_schedule_pool_size, 16, "Number of threads performing background tasks for distributed sends. Only has meaning at server startup.", 0) \
++    M(UInt64, max_replicated_fetches_network_bandwidth_for_server, 0, "The maximum speed of data exchange over the network in bytes per second for replicated fetches. Zero means unlimited. Only has meaning at server startup.", 0) \
++    M(UInt64, max_replicated_sends_network_bandwidth_for_server, 0, "The maximum speed of data exchange over the network in bytes per second for replicated sends. Zero means unlimited. Only has meaning at server startup.", 0) \
+     \
+     M(Milliseconds, distributed_directory_monitor_sleep_time_ms, 100, "Sleep time for StorageDistributed DirectoryMonitors, in case of any errors delay grows exponentially.", 0) \
+     M(Milliseconds, distributed_directory_monitor_max_sleep_time_ms, 30000, "Maximum sleep time for StorageDistributed DirectoryMonitors, it limits exponential growth too.", 0) \
+diff --git a/src/IO/copyData.cpp b/src/IO/copyData.cpp
+index c653af761d4d..8a044b50de94 100644
+--- a/src/IO/copyData.cpp
++++ b/src/IO/copyData.cpp
+@@ -1,4 +1,5 @@
+ #include <Common/Exception.h>
++#include <Common/Throttler.h>
+ #include <IO/ReadBuffer.h>
+ #include <IO/WriteBuffer.h>
+ #include <IO/copyData.h>
+@@ -14,7 +15,7 @@ namespace ErrorCodes
+ namespace
+ {
+ 
+-void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t bytes, const std::atomic<int> * is_cancelled)
++void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t bytes, const std::atomic<int> * is_cancelled, ThrottlerPtr throttler)
+ {
+     /// If read to the end of the buffer, eof() either fills the buffer with new data and moves the cursor to the beginning, or returns false.
+     while (bytes > 0 && !from.eof())
+@@ -27,13 +28,16 @@ void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t
+         to.write(from.position(), count);
+         from.position() += count;
+         bytes -= count;
++
++        if (throttler)
++            throttler->add(count);
+     }
+ 
+     if (check_bytes && bytes > 0)
+         throw Exception("Attempt to read after EOF.", ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF);
+ }
+ 
+-void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t bytes, std::function<void()> cancellation_hook)
++void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t bytes, std::function<void()> cancellation_hook, ThrottlerPtr throttler)
+ {
+     /// If read to the end of the buffer, eof() either fills the buffer with new data and moves the cursor to the beginning, or returns false.
+     while (bytes > 0 && !from.eof())
+@@ -46,6 +50,9 @@ void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t
+         to.write(from.position(), count);
+         from.position() += count;
+         bytes -= count;
++
++        if (throttler)
++            throttler->add(count);
+     }
+ 
+     if (check_bytes && bytes > 0)
+@@ -56,32 +63,42 @@ void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to)
+ {
+-    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), nullptr);
++    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), nullptr, nullptr);
+ }
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, const std::atomic<int> & is_cancelled)
+ {
+-    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), &is_cancelled);
++    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), &is_cancelled, nullptr);
+ }
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, std::function<void()> cancellation_hook)
+ {
+-    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), cancellation_hook);
++    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), cancellation_hook, nullptr);
+ }
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes)
+ {
+-    copyDataImpl(from, to, true, bytes, nullptr);
++    copyDataImpl(from, to, true, bytes, nullptr, nullptr);
+ }
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes, const std::atomic<int> & is_cancelled)
+ {
+-    copyDataImpl(from, to, true, bytes, &is_cancelled);
++    copyDataImpl(from, to, true, bytes, &is_cancelled, nullptr);
+ }
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes, std::function<void()> cancellation_hook)
+ {
+-    copyDataImpl(from, to, true, bytes, cancellation_hook);
++    copyDataImpl(from, to, true, bytes, cancellation_hook, nullptr);
++}
++
++void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler)
++{
++    copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), &is_cancelled, throttler);
++}
++
++void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, size_t bytes, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler)
++{
++    copyDataImpl(from, to, true, bytes, &is_cancelled, throttler);
+ }
+ 
+ }
+diff --git a/src/IO/copyData.h b/src/IO/copyData.h
+index f888a039e9e4..2202f36f79e5 100644
+--- a/src/IO/copyData.h
++++ b/src/IO/copyData.h
+@@ -9,22 +9,26 @@ namespace DB
+ 
+ class ReadBuffer;
+ class WriteBuffer;
++class Throttler;
+ 
++using ThrottlerPtr = std::shared_ptr<Throttler>;
+ 
+-/** Copies data from ReadBuffer to WriteBuffer, all that is.
+-  */
++
++/// Copies data from ReadBuffer to WriteBuffer, all that is.
+ void copyData(ReadBuffer & from, WriteBuffer & to);
+ 
+-/** Copies `bytes` bytes from ReadBuffer to WriteBuffer. If there are no `bytes` bytes, then throws an exception.
+-  */
++/// Copies `bytes` bytes from ReadBuffer to WriteBuffer. If there are no `bytes` bytes, then throws an exception.
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes);
+ 
+-/** The same, with the condition to cancel.
+-  */
++/// The same, with the condition to cancel.
+ void copyData(ReadBuffer & from, WriteBuffer & to, const std::atomic<int> & is_cancelled);
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes, const std::atomic<int> & is_cancelled);
+ 
+ void copyData(ReadBuffer & from, WriteBuffer & to, std::function<void()> cancellation_hook);
+ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes, std::function<void()> cancellation_hook);
+ 
++/// Same as above but also use throttler to limit maximum speed
++void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler);
++void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, size_t bytes, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler);
++
+ }
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index a920a26e4c40..0c9b6ae473c8 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -11,6 +11,7 @@
+ #include <Common/setThreadName.h>
+ #include <Common/Stopwatch.h>
+ #include <Common/formatReadable.h>
++#include <Common/Throttler.h>
+ #include <Common/thread_local_rng.h>
+ #include <Coordination/KeeperStorageDispatcher.h>
+ #include <Compression/ICompressionCodec.h>
+@@ -363,6 +364,10 @@ struct ContextSharedPart
+     mutable std::optional<BackgroundSchedulePool> schedule_pool;    /// A thread pool that can run different jobs in background (used in replicated tables)
+     mutable std::optional<BackgroundSchedulePool> distributed_schedule_pool; /// A thread pool that can run different jobs in background (used for distributed sends)
+     mutable std::optional<BackgroundSchedulePool> message_broker_schedule_pool; /// A thread pool that can run different jobs in background (used for message brokers, like RabbitMQ and Kafka)
++
++    mutable ThrottlerPtr replicated_fetches_throttler; /// A server-wide throttler for replicated fetches
++    mutable ThrottlerPtr replicated_sends_throttler; /// A server-wide throttler for replicated sends
++
+     MultiVersion<Macros> macros;                            /// Substitutions extracted from config.
+     std::unique_ptr<DDLWorker> ddl_worker;                  /// Process ddl commands from zk.
+     /// Rules for selecting the compression settings, depending on the size of the part.
+@@ -1628,6 +1633,26 @@ BackgroundSchedulePool & Context::getMessageBrokerSchedulePool() const
+     return *shared->message_broker_schedule_pool;
+ }
+ 
++ThrottlerPtr Context::getReplicatedFetchesThrottler() const
++{
++    auto lock = getLock();
++    if (!shared->replicated_fetches_throttler)
++        shared->replicated_fetches_throttler = std::make_shared<Throttler>(
++            settings.max_replicated_fetches_network_bandwidth_for_server);
++
++    return shared->replicated_fetches_throttler;
++}
++
++ThrottlerPtr Context::getReplicatedSendsThrottler() const
++{
++    auto lock = getLock();
++    if (!shared->replicated_sends_throttler)
++        shared->replicated_sends_throttler = std::make_shared<Throttler>(
++            settings.max_replicated_sends_network_bandwidth_for_server);
++
++    return shared->replicated_sends_throttler;
++}
++
+ bool Context::hasDistributedDDL() const
+ {
+     return getConfigRef().has("distributed_ddl");
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index 97cb1b980f1f..2be34bb3cb12 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -113,6 +113,9 @@ using VolumePtr = std::shared_ptr<IVolume>;
+ struct NamedSession;
+ struct BackgroundTaskSchedulingSettings;
+ 
++class Throttler;
++using ThrottlerPtr = std::shared_ptr<Throttler>;
++
+ class ZooKeeperMetadataTransaction;
+ using ZooKeeperMetadataTransactionPtr = std::shared_ptr<ZooKeeperMetadataTransaction>;
+ 
+@@ -657,6 +660,9 @@ class Context: public std::enable_shared_from_this<Context>
+     BackgroundSchedulePool & getMessageBrokerSchedulePool() const;
+     BackgroundSchedulePool & getDistributedSchedulePool() const;
+ 
++    ThrottlerPtr getReplicatedFetchesThrottler() const;
++    ThrottlerPtr getReplicatedSendsThrottler() const;
++
+     /// Has distributed_ddl configuration or not.
+     bool hasDistributedDDL() const;
+     void setDDLWorker(std::unique_ptr<DDLWorker> ddl_worker);
+diff --git a/src/Storages/MergeTree/DataPartsExchange.cpp b/src/Storages/MergeTree/DataPartsExchange.cpp
+index 529fc9f54b8f..47f446a0b8b6 100644
+--- a/src/Storages/MergeTree/DataPartsExchange.cpp
++++ b/src/Storages/MergeTree/DataPartsExchange.cpp
+@@ -9,6 +9,7 @@
+ #include <Storages/MergeTree/MergeTreeDataPartInMemory.h>
+ #include <Storages/MergeTree/MergedBlockOutputStream.h>
+ #include <Storages/MergeTree/ReplicatedFetchList.h>
++#include <Storages/StorageReplicatedMergeTree.h>
+ #include <Common/CurrentMetrics.h>
+ #include <Common/NetException.h>
+ #include <IO/createReadBufferFromFileBase.h>
+@@ -86,6 +87,10 @@ struct ReplicatedFetchReadCallback
+ 
+ }
+ 
++
++Service::Service(StorageReplicatedMergeTree & data_) :
++    data(data_), log(&Poco::Logger::get(data.getLogName() + " (Replicated PartsService)")) {}
++
+ std::string Service::getId(const std::string & node_id) const
+ {
+     return getEndpointId(node_id);
+@@ -243,6 +248,8 @@ void Service::sendPartFromMemory(
+     NativeBlockOutputStream block_out(out, 0, metadata_snapshot->getSampleBlock());
+     part->checksums.write(out);
+     block_out.write(part_in_memory->block);
++
++    data.getSendsThrottler()->add(part_in_memory->block.bytes());
+ }
+ 
+ MergeTreeData::DataPart::Checksums Service::sendPartFromDisk(
+@@ -298,7 +305,7 @@ MergeTreeData::DataPart::Checksums Service::sendPartFromDisk(
+ 
+         auto file_in = disk->readFile(path);
+         HashingWriteBuffer hashing_out(out);
+-        copyData(*file_in, hashing_out, blocker.getCounter());
++        copyDataWithThrottler(*file_in, hashing_out, blocker.getCounter(), data.getSendsThrottler());
+ 
+         if (blocker.isCancelled())
+             throw Exception("Transferring part to replica was cancelled", ErrorCodes::ABORTED);
+@@ -354,7 +361,7 @@ void Service::sendPartS3Metadata(const MergeTreeData::DataPartPtr & part, WriteB
+ 
+         auto file_in = createReadBufferFromFileBase(metadata_file, 0, 0, 0, nullptr, DBMS_DEFAULT_BUFFER_SIZE);
+         HashingWriteBuffer hashing_out(out);
+-        copyData(*file_in, hashing_out, blocker.getCounter());
++        copyDataWithThrottler(*file_in, hashing_out, blocker.getCounter(), data.getSendsThrottler());
+         if (blocker.isCancelled())
+             throw Exception("Transferring part to replica was cancelled", ErrorCodes::ABORTED);
+ 
+@@ -388,6 +395,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::fetchPart(
+     const String & user,
+     const String & password,
+     const String & interserver_scheme,
++    ThrottlerPtr throttler,
+     bool to_detached,
+     const String & tmp_prefix_,
+     std::optional<CurrentlySubmergingEmergingTagger> * tagger_ptr,
+@@ -514,7 +522,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::fetchPart(
+ 
+         try
+         {
+-            return downloadPartToS3(part_name, replica_path, to_detached, tmp_prefix_, std::move(disks_s3), in);
++            return downloadPartToS3(part_name, replica_path, to_detached, tmp_prefix_, std::move(disks_s3), in, throttler);
+         }
+         catch (const Exception & e)
+         {
+@@ -522,7 +530,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::fetchPart(
+                 throw;
+             /// Try again but without S3 copy
+             return fetchPart(metadata_snapshot, context, part_name, replica_path, host, port, timeouts,
+-                user, password, interserver_scheme, to_detached, tmp_prefix_, nullptr, false);
++                user, password, interserver_scheme, throttler, to_detached, tmp_prefix_, nullptr, false);
+         }
+     }
+ 
+@@ -585,8 +593,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::fetchPart(
+ 
+     MergeTreeData::DataPart::Checksums checksums;
+     return part_type == "InMemory"
+-        ? downloadPartToMemory(part_name, part_uuid, metadata_snapshot, context, std::move(reservation), in, projections)
+-        : downloadPartToDisk(part_name, replica_path, to_detached, tmp_prefix_, sync, reservation->getDisk(), in, projections, checksums);
++        ? downloadPartToMemory(part_name, part_uuid, metadata_snapshot, context, std::move(reservation), in, projections, throttler)
++        : downloadPartToDisk(part_name, replica_path, to_detached, tmp_prefix_, sync, reservation->getDisk(), in, projections, checksums, throttler);
+ }
+ 
+ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToMemory(
+@@ -596,7 +604,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToMemory(
+     ContextPtr context,
+     ReservationPtr reservation,
+     PooledReadWriteBufferFromHTTP & in,
+-    size_t projections)
++    size_t projections,
++    ThrottlerPtr throttler)
+ {
+     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, reservation->getDisk(), 0);
+     MergeTreeData::MutableDataPartPtr new_data_part =
+@@ -612,6 +621,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToMemory(
+ 
+         NativeBlockInputStream block_in(in, 0);
+         auto block = block_in.read();
++        throttler->add(block.bytes());
+ 
+         MergeTreePartInfo new_part_info("all", 0, 0, 0);
+         MergeTreeData::MutableDataPartPtr new_projection_part =
+@@ -643,6 +653,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToMemory(
+ 
+     NativeBlockInputStream block_in(in, 0);
+     auto block = block_in.read();
++    throttler->add(block.bytes());
+ 
+     new_data_part->uuid = part_uuid;
+     new_data_part->is_temp = true;
+@@ -666,7 +677,8 @@ void Fetcher::downloadBaseOrProjectionPartToDisk(
+     bool sync,
+     DiskPtr disk,
+     PooledReadWriteBufferFromHTTP & in,
+-    MergeTreeData::DataPart::Checksums & checksums) const
++    MergeTreeData::DataPart::Checksums & checksums,
++    ThrottlerPtr throttler) const
+ {
+     size_t files;
+     readBinary(files, in);
+@@ -689,7 +701,7 @@ void Fetcher::downloadBaseOrProjectionPartToDisk(
+ 
+         auto file_out = disk->writeFile(fs::path(part_download_path) / file_name);
+         HashingWriteBuffer hashing_out(*file_out);
+-        copyData(in, hashing_out, file_size, blocker.getCounter());
++        copyDataWithThrottler(in, hashing_out, file_size, blocker.getCounter(), throttler);
+ 
+         if (blocker.isCancelled())
+         {
+@@ -726,7 +738,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
+     DiskPtr disk,
+     PooledReadWriteBufferFromHTTP & in,
+     size_t projections,
+-    MergeTreeData::DataPart::Checksums & checksums)
++    MergeTreeData::DataPart::Checksums & checksums,
++    ThrottlerPtr throttler)
+ {
+     static const String TMP_PREFIX = "tmp_fetch_";
+     String tmp_prefix = tmp_prefix_.empty() ? TMP_PREFIX : tmp_prefix_;
+@@ -763,13 +776,13 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
+         MergeTreeData::DataPart::Checksums projection_checksum;
+         disk->createDirectories(part_download_path + projection_name + ".proj/");
+         downloadBaseOrProjectionPartToDisk(
+-            replica_path, part_download_path + projection_name + ".proj/", sync, disk, in, projection_checksum);
++            replica_path, part_download_path + projection_name + ".proj/", sync, disk, in, projection_checksum, throttler);
+         checksums.addFile(
+             projection_name + ".proj", projection_checksum.getTotalSizeOnDisk(), projection_checksum.getTotalChecksumUInt128());
+     }
+ 
+     // Download the base part
+-    downloadBaseOrProjectionPartToDisk(replica_path, part_download_path, sync, disk, in, checksums);
++    downloadBaseOrProjectionPartToDisk(replica_path, part_download_path, sync, disk, in, checksums, throttler);
+ 
+     assertEOF(in);
+     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk, 0);
+@@ -787,8 +800,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToS3(
+     bool to_detached,
+     const String & tmp_prefix_,
+     const Disks & disks_s3,
+-    PooledReadWriteBufferFromHTTP & in
+-    )
++    PooledReadWriteBufferFromHTTP & in,
++    ThrottlerPtr throttler)
+ {
+     if (disks_s3.empty())
+         throw Exception("No S3 disks anymore", ErrorCodes::LOGICAL_ERROR);
+@@ -841,7 +854,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToS3(
+ 
+             HashingWriteBuffer hashing_out(*file_out);
+ 
+-            copyData(in, hashing_out, file_size, blocker.getCounter());
++            copyDataWithThrottler(in, hashing_out, file_size, blocker.getCounter(), throttler);
+ 
+             if (blocker.isCancelled())
+             {
+diff --git a/src/Storages/MergeTree/DataPartsExchange.h b/src/Storages/MergeTree/DataPartsExchange.h
+index f59942ef7f46..eb776c33f0fb 100644
+--- a/src/Storages/MergeTree/DataPartsExchange.h
++++ b/src/Storages/MergeTree/DataPartsExchange.h
+@@ -7,6 +7,7 @@
+ #include <IO/copyData.h>
+ #include <IO/ConnectionTimeouts.h>
+ #include <IO/ReadWriteBufferFromHTTP.h>
++#include <Common/Throttler.h>
+ 
+ 
+ namespace zkutil
+@@ -18,15 +19,17 @@ namespace zkutil
+ namespace DB
+ {
+ 
++class StorageReplicatedMergeTree;
++
+ namespace DataPartsExchange
+ {
+ 
+-/** Service for sending parts from the table *MergeTree.
++/** Service for sending parts from the table *ReplicatedMergeTree.
+   */
+ class Service final : public InterserverIOEndpoint
+ {
+ public:
+-    explicit Service(MergeTreeData & data_) : data(data_), log(&Poco::Logger::get(data.getLogName() + " (Replicated PartsService)")) {}
++    explicit Service(StorageReplicatedMergeTree & data_);
+ 
+     Service(const Service &) = delete;
+     Service & operator=(const Service &) = delete;
+@@ -51,7 +54,7 @@ class Service final : public InterserverIOEndpoint
+ 
+     /// StorageReplicatedMergeTree::shutdown() waits for all parts exchange handlers to finish,
+     /// so Service will never access dangling reference to storage
+-    MergeTreeData & data;
++    StorageReplicatedMergeTree & data;
+     Poco::Logger * log;
+ };
+ 
+@@ -74,6 +77,7 @@ class Fetcher final : private boost::noncopyable
+         const String & user,
+         const String & password,
+         const String & interserver_scheme,
++        ThrottlerPtr throttler,
+         bool to_detached = false,
+         const String & tmp_prefix_ = "",
+         std::optional<CurrentlySubmergingEmergingTagger> * tagger_ptr = nullptr,
+@@ -90,7 +94,9 @@ class Fetcher final : private boost::noncopyable
+             bool sync,
+             DiskPtr disk,
+             PooledReadWriteBufferFromHTTP & in,
+-            MergeTreeData::DataPart::Checksums & checksums) const;
++            MergeTreeData::DataPart::Checksums & checksums,
++            ThrottlerPtr throttler) const;
++
+ 
+     MergeTreeData::MutableDataPartPtr downloadPartToDisk(
+             const String & part_name,
+@@ -101,7 +107,8 @@ class Fetcher final : private boost::noncopyable
+             DiskPtr disk,
+             PooledReadWriteBufferFromHTTP & in,
+             size_t projections,
+-            MergeTreeData::DataPart::Checksums & checksums);
++            MergeTreeData::DataPart::Checksums & checksums,
++            ThrottlerPtr throttler);
+ 
+     MergeTreeData::MutableDataPartPtr downloadPartToMemory(
+             const String & part_name,
+@@ -110,7 +117,8 @@ class Fetcher final : private boost::noncopyable
+             ContextPtr context,
+             ReservationPtr reservation,
+             PooledReadWriteBufferFromHTTP & in,
+-            size_t projections);
++            size_t projections,
++            ThrottlerPtr throttler);
+ 
+     MergeTreeData::MutableDataPartPtr downloadPartToS3(
+             const String & part_name,
+@@ -118,7 +126,8 @@ class Fetcher final : private boost::noncopyable
+             bool to_detached,
+             const String & tmp_prefix_,
+             const Disks & disks_s3,
+-            PooledReadWriteBufferFromHTTP & in);
++            PooledReadWriteBufferFromHTTP & in,
++            ThrottlerPtr throttler);
+ 
+     MergeTreeData & data;
+     Poco::Logger * log;
+diff --git a/src/Storages/MergeTree/MergeTreeSettings.h b/src/Storages/MergeTree/MergeTreeSettings.h
+index 673105b3ed46..888ca80e0153 100644
+--- a/src/Storages/MergeTree/MergeTreeSettings.h
++++ b/src/Storages/MergeTree/MergeTreeSettings.h
+@@ -92,6 +92,8 @@ struct Settings;
+     M(Bool, replicated_can_become_leader, true, "If true, Replicated tables replicas on this node will try to acquire leadership.", 0) \
+     M(Seconds, zookeeper_session_expiration_check_period, 60, "ZooKeeper session expiration check period, in seconds.", 0) \
+     M(Bool, detach_old_local_parts_when_cloning_replica, 1, "Do not remove old local parts when repairing lost replica.", 0) \
++    M(UInt64, max_replicated_fetches_network_bandwidth, 0, "The maximum speed of data exchange over the network in bytes per second for replicated fetches. Zero means unlimited.", 0) \
++    M(UInt64, max_replicated_sends_network_bandwidth, 0, "The maximum speed of data exchange over the network in bytes per second for replicated sends. Zero means unlimited.", 0) \
+     \
+     /** Check delay of replicas settings. */ \
+     M(UInt64, min_relative_delay_to_measure, 120, "Calculate relative replica delay only if absolute delay is not less that this value.", 0) \
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index cb48d08b64ec..305d48e28e94 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -290,6 +290,8 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
+     , part_moves_between_shards_orchestrator(*this)
+     , allow_renaming(allow_renaming_)
+     , replicated_fetches_pool_size(getContext()->getSettingsRef().background_fetches_pool_size)
++    , replicated_fetches_throttler(std::make_shared<Throttler>(getSettings()->max_replicated_fetches_network_bandwidth, getContext()->getReplicatedFetchesThrottler()))
++    , replicated_sends_throttler(std::make_shared<Throttler>(getSettings()->max_replicated_sends_network_bandwidth, getContext()->getReplicatedSendsThrottler()))
+ {
+     queue_updating_task = getContext()->getSchedulePool().createTask(
+         getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::queueUpdatingTask)", [this]{ queueUpdatingTask(); });
+@@ -2507,7 +2509,8 @@ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
+ 
+             part_desc->res_part = fetcher.fetchPart(
+                 metadata_snapshot, getContext(), part_desc->found_new_part_name, source_replica_path,
+-                address.host, address.replication_port, timeouts, credentials->getUser(), credentials->getPassword(), interserver_scheme, false, TMP_PREFIX + "fetch_");
++                address.host, address.replication_port, timeouts, credentials->getUser(), credentials->getPassword(),
++                interserver_scheme, replicated_fetches_throttler, false, TMP_PREFIX + "fetch_");
+ 
+             /// TODO: check columns_version of fetched part
+ 
+@@ -2624,7 +2627,8 @@ void StorageReplicatedMergeTree::executeClonePartFromShard(const LogEntry & entr
+             return fetcher.fetchPart(
+                 metadata_snapshot, getContext(), entry.new_part_name, source_replica_path,
+                 address.host, address.replication_port,
+-                timeouts, credentials->getUser(), credentials->getPassword(), interserver_scheme, true);
++                timeouts, credentials->getUser(), credentials->getPassword(), interserver_scheme,
++                replicated_fetches_throttler, true);
+         };
+ 
+         part = get_part();
+@@ -3163,6 +3167,13 @@ bool StorageReplicatedMergeTree::canExecuteFetch(const ReplicatedMergeTreeLogEnt
+         return false;
+     }
+ 
++    if (replicated_fetches_throttler->isThrottling())
++    {
++        disable_reason = fmt::format("Not executing fetch of part {} because fetches have already throttled by network settings "
++                                     "<max_replicated_fetches_network_bandwidth> or <max_replicated_fetches_network_bandwidth_for_server>.", entry.new_part_name);
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -4031,6 +4042,7 @@ bool StorageReplicatedMergeTree::fetchPart(const String & part_name, const Stora
+                 credentials->getUser(),
+                 credentials->getPassword(),
+                 interserver_scheme,
++                replicated_fetches_throttler,
+                 to_detached,
+                 "",
+                 &tagger_ptr,
+@@ -4180,7 +4192,8 @@ bool StorageReplicatedMergeTree::fetchExistsPart(const String & part_name, const
+         return fetcher.fetchPart(
+             metadata_snapshot, getContext(), part_name, source_replica_path,
+             address.host, address.replication_port,
+-            timeouts, credentials->getUser(), credentials->getPassword(), interserver_scheme, false, "", nullptr, true,
++            timeouts, credentials->getUser(), credentials->getPassword(),
++            interserver_scheme, replicated_fetches_throttler, false, "", nullptr, true,
+             replaced_disk);
+     };
+ 
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index ec542acc2755..8ffb4974cb3d 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -26,6 +26,7 @@
+ #include <Interpreters/PartLog.h>
+ #include <Common/randomSeed.h>
+ #include <Common/ZooKeeper/ZooKeeper.h>
++#include <Common/Throttler.h>
+ #include <Core/BackgroundSchedulePool.h>
+ #include <Processors/Pipe.h>
+ #include <Storages/MergeTree/BackgroundJobsExecutor.h>
+@@ -239,6 +240,18 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+     /// Get best replica having this partition on S3
+     String getSharedDataReplica(const IMergeTreeDataPart & part) const;
+ 
++    /// Get throttler for replicated fetches
++    ThrottlerPtr getFetchesThrottler() const
++    {
++        return replicated_fetches_throttler;
++    }
++
++    /// Get throttler for replicated sends
++    ThrottlerPtr getSendsThrottler() const
++    {
++        return replicated_sends_throttler;
++    }
++
+ private:
+     /// Get a sequential consistent view of current parts.
+     ReplicatedMergeTreeQuorumAddedParts::PartitionIdToMaxBlock getMaxAddedBlocks() const;
+@@ -363,6 +376,11 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+ 
+     const size_t replicated_fetches_pool_size;
+ 
++    /// Throttlers used in DataPartsExchange to lower maximum fetch/sends
++    /// speed.
++    ThrottlerPtr replicated_fetches_throttler;
++    ThrottlerPtr replicated_sends_throttler;
++
+     template <class Func>
+     void foreachCommittedParts(Func && func, bool select_sequential_consistency) const;
+ 

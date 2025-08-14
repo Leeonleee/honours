@@ -1,0 +1,540 @@
+diff --git a/docs/en/engines/table-engines/mergetree-family/mergetree.md b/docs/en/engines/table-engines/mergetree-family/mergetree.md
+index 7ffbd9a5baef..183b94f46418 100644
+--- a/docs/en/engines/table-engines/mergetree-family/mergetree.md
++++ b/docs/en/engines/table-engines/mergetree-family/mergetree.md
+@@ -1005,7 +1005,7 @@ They can be used for prewhere optimization only if we enable `set allow_statisti
+ 
+ ## Column-level Settings {#column-level-settings}
+ 
+-Certain MergeTree settings can be override at column level:
++Certain MergeTree settings can be overridden at column level:
+ 
+ - `max_compress_block_size` — Maximum size of blocks of uncompressed data before compressing for writing to a table.
+ - `min_compress_block_size` — Minimum size of blocks of uncompressed data required for compression when writing the next mark.
+diff --git a/src/Storages/Statistics/ConditionSelectivityEstimator.cpp b/src/Storages/Statistics/ConditionSelectivityEstimator.cpp
+index 57dff958b9a9..432659f51f8d 100644
+--- a/src/Storages/Statistics/ConditionSelectivityEstimator.cpp
++++ b/src/Storages/Statistics/ConditionSelectivityEstimator.cpp
+@@ -19,7 +19,7 @@ void ConditionSelectivityEstimator::ColumnSelectivityEstimator::merge(String par
+ Float64 ConditionSelectivityEstimator::ColumnSelectivityEstimator::estimateLess(const Field & val, Float64 rows) const
+ {
+     if (part_statistics.empty())
+-        return default_normal_cond_factor * rows;
++        return default_cond_range_factor * rows;
+     Float64 result = 0;
+     Float64 part_rows = 0;
+     for (const auto & [key, estimator] : part_statistics)
+@@ -39,13 +39,7 @@ Float64 ConditionSelectivityEstimator::ColumnSelectivityEstimator::estimateEqual
+ {
+     if (part_statistics.empty())
+     {
+-        auto float_val = StatisticsUtils::tryConvertToFloat64(val);
+-        if (!float_val)
+-            return default_unknown_cond_factor * rows;
+-        else if (float_val.value() < - threshold || float_val.value() > threshold)
+-            return default_normal_cond_factor * rows;
+-        else
+-            return default_good_cond_factor * rows;
++        return default_cond_equal_factor * rows;
+     }
+     Float64 result = 0;
+     Float64 partial_cnt = 0;
+@@ -149,30 +143,22 @@ Float64 ConditionSelectivityEstimator::estimateRowCount(const RPNBuilderTreeNode
+ 
+     auto [op, val] = extractBinaryOp(node, col);
+ 
+-    if (op == "equals")
++    if (dummy)
+     {
+-        if (dummy)
+-        {
+-            auto float_val = StatisticsUtils::tryConvertToFloat64(val);
+-            if (!float_val || (float_val < - threshold || float_val > threshold))
+-                return default_normal_cond_factor * total_rows;
+-            else
+-                return default_good_cond_factor * total_rows;
+-        }
+-        return estimator.estimateEqual(val, total_rows);
++        if (op == "equals")
++            return default_cond_equal_factor * total_rows;
++        else if (op == "less" || op == "lessOrEquals" || op == "greater" || op == "greaterOrEquals")
++            return default_cond_range_factor * total_rows;
++        else
++            return default_unknown_cond_factor * total_rows;
+     }
++
++    if (op == "equals")
++        return estimator.estimateEqual(val, total_rows);
+     else if (op == "less" || op == "lessOrEquals")
+-    {
+-        if (dummy)
+-            return default_normal_cond_factor * total_rows;
+         return estimator.estimateLess(val, total_rows);
+-    }
+     else if (op == "greater" || op == "greaterOrEquals")
+-    {
+-        if (dummy)
+-            return default_normal_cond_factor * total_rows;
+         return estimator.estimateGreater(val, total_rows);
+-    }
+     else
+         return default_unknown_cond_factor * total_rows;
+ }
+diff --git a/src/Storages/Statistics/ConditionSelectivityEstimator.h b/src/Storages/Statistics/ConditionSelectivityEstimator.h
+index ce7fdd12e925..269ee9ac6cb7 100644
+--- a/src/Storages/Statistics/ConditionSelectivityEstimator.h
++++ b/src/Storages/Statistics/ConditionSelectivityEstimator.h
+@@ -38,12 +38,10 @@ class ConditionSelectivityEstimator
+ 
+     std::pair<String, Field> extractBinaryOp(const RPNBuilderTreeNode & node, const String & column_name) const;
+ 
+-    static constexpr auto default_good_cond_factor = 0.1;
+-    static constexpr auto default_normal_cond_factor = 0.5;
+-    static constexpr auto default_unknown_cond_factor = 1.0;
+-    /// Conditions like "x = N" are considered good if abs(N) > threshold.
+-    /// This is used to assume that condition is likely to have good selectivity.
+-    static constexpr auto threshold = 2;
++    /// Used to estimate the selectivity of a condition when there is no statistics.
++    static constexpr auto default_cond_range_factor = 0.5;
++    static constexpr auto default_cond_equal_factor = 0.01;
++    static constexpr auto default_unknown_cond_factor = 1;
+ 
+     UInt64 total_rows = 0;
+     std::map<String, ColumnSelectivityEstimator> column_estimators;
+diff --git a/src/Storages/Statistics/Statistics.cpp b/src/Storages/Statistics/Statistics.cpp
+index ade3326288a5..fd686c5f0aae 100644
+--- a/src/Storages/Statistics/Statistics.cpp
++++ b/src/Storages/Statistics/Statistics.cpp
+@@ -1,14 +1,17 @@
+ #include <Storages/Statistics/Statistics.h>
++#include <Common/Exception.h>
++#include <Common/FieldVisitorConvertToNumber.h>
++#include <Common/logger_useful.h>
++#include <DataTypes/DataTypeFactory.h>
+ #include <IO/ReadHelpers.h>
+ #include <IO/WriteHelpers.h>
++#include <Interpreters/convertFieldToType.h>
+ #include <Storages/ColumnsDescription.h>
+ #include <Storages/Statistics/ConditionSelectivityEstimator.h>
+ #include <Storages/Statistics/StatisticsCountMinSketch.h>
+ #include <Storages/Statistics/StatisticsTDigest.h>
+ #include <Storages/Statistics/StatisticsUniq.h>
+ #include <Storages/StatisticsDescription.h>
+-#include <Common/Exception.h>
+-#include <Common/logger_useful.h>
+ 
+ 
+ #include "config.h" /// USE_DATASKETCHES
+@@ -27,33 +30,26 @@ enum StatisticsFileVersion : UInt16
+     V0 = 0,
+ };
+ 
+-std::optional<Float64> StatisticsUtils::tryConvertToFloat64(const Field & field)
++std::optional<Float64> StatisticsUtils::tryConvertToFloat64(const Field & value, const DataTypePtr & data_type)
+ {
+-    switch (field.getType())
++    if (data_type->isValueRepresentedByNumber())
+     {
+-        case Field::Types::Int64:
+-            return field.get<Int64>();
+-        case Field::Types::UInt64:
+-            return field.get<UInt64>();
+-        case Field::Types::Float64:
+-            return field.get<Float64>();
+-        case Field::Types::Int128:
+-            return field.get<Int128>();
+-        case Field::Types::UInt128:
+-            return field.get<UInt128>();
+-        case Field::Types::Int256:
+-            return field.get<Int256>();
+-        case Field::Types::UInt256:
+-            return field.get<UInt256>();
+-        default:
++        Field value_converted;
++
++        if (isInteger(data_type) && (value.getType() == Field::Types::Float64 || value.getType() == Field::Types::String))
++            /// For case val_int32 < 10.5 or val_int32 < '10.5' we should convert 10.5 to Float64.
++            value_converted = convertFieldToType(value, *DataTypeFactory::instance().get("Float64"));
++        else
++            /// We should convert value to the real column data type and then translate it to Float64.
++            /// For example for expression col_date > '2024-08-07', if we directly convert '2024-08-07' to Float64, we will get null.
++            value_converted = convertFieldToType(value, *data_type);
++
++        if (value_converted.isNull())
+             return {};
+-    }
+-}
+ 
+-std::optional<String> StatisticsUtils::tryConvertToString(const DB::Field & field)
+-{
+-    if (field.getType() == Field::Types::String)
+-        return field.get<String>();
++        Float64 value_as_float = applyVisitor(FieldVisitorConvertToNumber<Float64>(), value_converted);
++        return value_as_float;
++    }
+     return {};
+ }
+ 
+@@ -89,21 +85,23 @@ Float64 IStatistics::estimateLess(const Field & /*val*/) const
+     throw Exception(ErrorCodes::LOGICAL_ERROR, "Less-than estimation is not implemented for this type of statistics");
+ }
+ 
+-/// -------------------------------------
+-/// Implementation of the estimation:
+-/// Note: Each statistics object supports certain types predicates natively, e.g.
+-/// - TDigest: '< X' (less-than predicates)
+-/// - Count-min sketches: '= X' (equal predicates)
+-/// - Uniq (HyperLogLog): 'count distinct(*)' (column cardinality)
+-/// If multiple statistics objects are available per column, it is sometimes also possible to combine them in a clever way.
+-/// For that reason, all estimation are performed in a central place (here), and we don't simply pass the predicate to the first statistics
+-/// object that supports it natively.
++/// Notes:
++/// - Statistics object usually only support estimation for certain types of predicates, e.g.
++///    - TDigest: '< X' (less-than predicates)
++///    - Count-min sketches: '= X' (equal predicates)
++///    - Uniq (HyperLogLog): 'count distinct(*)' (column cardinality)
++///
++/// If multiple statistics objects in a column support estimating a predicate, we want to try statistics in order of descending accuracy
++/// (e.g. MinMax statistics are simpler than TDigest statistics and thus worse for estimating 'less' predicates).
++///
++/// Sometimes, it is possible to combine multiple statistics in a clever way. For that reason, all estimation are performed in a central
++/// place (here), and we don't simply pass the predicate to the first statistics object that supports it natively.
+ 
+ Float64 ColumnStatistics::estimateLess(const Field & val) const
+ {
+     if (stats.contains(StatisticsType::TDigest))
+         return stats.at(StatisticsType::TDigest)->estimateLess(val);
+-    return rows * ConditionSelectivityEstimator::default_normal_cond_factor;
++    return rows * ConditionSelectivityEstimator::default_cond_range_factor;
+ }
+ 
+ Float64 ColumnStatistics::estimateGreater(const Field & val) const
+@@ -113,8 +111,7 @@ Float64 ColumnStatistics::estimateGreater(const Field & val) const
+ 
+ Float64 ColumnStatistics::estimateEqual(const Field & val) const
+ {
+-    auto float_val = StatisticsUtils::tryConvertToFloat64(val);
+-    if (float_val.has_value() && stats.contains(StatisticsType::Uniq) && stats.contains(StatisticsType::TDigest))
++    if (stats_desc.data_type->isValueRepresentedByNumber() && stats.contains(StatisticsType::Uniq) && stats.contains(StatisticsType::TDigest))
+     {
+         /// 2048 is the default number of buckets in TDigest. In this case, TDigest stores exactly one value (with many rows) for every bucket.
+         if (stats.at(StatisticsType::Uniq)->estimateCardinality() < 2048)
+@@ -124,10 +121,7 @@ Float64 ColumnStatistics::estimateEqual(const Field & val) const
+     if (stats.contains(StatisticsType::CountMinSketch))
+         return stats.at(StatisticsType::CountMinSketch)->estimateEqual(val);
+ #endif
+-    if (!float_val.has_value() && (float_val < - ConditionSelectivityEstimator::threshold || float_val > ConditionSelectivityEstimator::threshold))
+-        return rows * ConditionSelectivityEstimator::default_normal_cond_factor;
+-    else
+-        return rows * ConditionSelectivityEstimator::default_good_cond_factor;
++    return rows * ConditionSelectivityEstimator::default_cond_equal_factor;
+ }
+ 
+ /// -------------------------------------
+@@ -204,15 +198,15 @@ void MergeTreeStatisticsFactory::registerValidator(StatisticsType stats_type, Va
+ 
+ MergeTreeStatisticsFactory::MergeTreeStatisticsFactory()
+ {
+-    registerValidator(StatisticsType::TDigest, tdigestValidator);
+-    registerCreator(StatisticsType::TDigest, tdigestCreator);
++    registerValidator(StatisticsType::TDigest, tdigestStatisticsValidator);
++    registerCreator(StatisticsType::TDigest, tdigestStatisticsCreator);
+ 
+-    registerValidator(StatisticsType::Uniq, uniqValidator);
+-    registerCreator(StatisticsType::Uniq, uniqCreator);
++    registerValidator(StatisticsType::Uniq, uniqStatisticsValidator);
++    registerCreator(StatisticsType::Uniq, uniqStatisticsCreator);
+ 
+ #if USE_DATASKETCHES
+-    registerValidator(StatisticsType::CountMinSketch, countMinSketchValidator);
+-    registerCreator(StatisticsType::CountMinSketch, countMinSketchCreator);
++    registerValidator(StatisticsType::CountMinSketch, countMinSketchStatisticsValidator);
++    registerCreator(StatisticsType::CountMinSketch, countMinSketchStatisticsCreator);
+ #endif
+ }
+ 
+@@ -222,7 +216,7 @@ MergeTreeStatisticsFactory & MergeTreeStatisticsFactory::instance()
+     return instance;
+ }
+ 
+-void MergeTreeStatisticsFactory::validate(const ColumnStatisticsDescription & stats, DataTypePtr data_type) const
++void MergeTreeStatisticsFactory::validate(const ColumnStatisticsDescription & stats, const DataTypePtr & data_type) const
+ {
+     for (const auto & [type, desc] : stats.types_to_desc)
+     {
+diff --git a/src/Storages/Statistics/Statistics.h b/src/Storages/Statistics/Statistics.h
+index 16f0c67eabd8..2a30c0de315d 100644
+--- a/src/Storages/Statistics/Statistics.h
++++ b/src/Storages/Statistics/Statistics.h
+@@ -14,12 +14,11 @@ namespace DB
+ constexpr auto STATS_FILE_PREFIX = "statistics_";
+ constexpr auto STATS_FILE_SUFFIX = ".stats";
+ 
+-
+ struct StatisticsUtils
+ {
+     /// Returns std::nullopt if input Field cannot be converted to a concrete value
+-    static std::optional<Float64> tryConvertToFloat64(const Field & field);
+-    static std::optional<String> tryConvertToString(const Field & field);
++    /// - `data_type` is the type of the column on which the statistics object was build on
++    static std::optional<Float64> tryConvertToFloat64(const Field & value, const DataTypePtr & data_type);
+ };
+ 
+ /// Statistics describe properties of the values in the column,
+@@ -87,10 +86,10 @@ class MergeTreeStatisticsFactory : private boost::noncopyable
+ public:
+     static MergeTreeStatisticsFactory & instance();
+ 
+-    void validate(const ColumnStatisticsDescription & stats, DataTypePtr data_type) const;
++    void validate(const ColumnStatisticsDescription & stats, const DataTypePtr & data_type) const;
+ 
+-    using Validator = std::function<void(const SingleStatisticsDescription & stats, DataTypePtr data_type)>;
+-    using Creator = std::function<StatisticsPtr(const SingleStatisticsDescription & stats, DataTypePtr data_type)>;
++    using Validator = std::function<void(const SingleStatisticsDescription & stats, const DataTypePtr & data_type)>;
++    using Creator = std::function<StatisticsPtr(const SingleStatisticsDescription & stats, const DataTypePtr & data_type)>;
+ 
+     ColumnStatisticsPtr get(const ColumnStatisticsDescription & stats) const;
+     ColumnsStatistics getMany(const ColumnsDescription & columns) const;
+diff --git a/src/Storages/Statistics/StatisticsCountMinSketch.cpp b/src/Storages/Statistics/StatisticsCountMinSketch.cpp
+index e69bbc1515be..0dc01f5fcf0e 100644
+--- a/src/Storages/Statistics/StatisticsCountMinSketch.cpp
++++ b/src/Storages/Statistics/StatisticsCountMinSketch.cpp
+@@ -25,8 +25,8 @@ extern const int ILLEGAL_STATISTICS;
+ static constexpr auto num_hashes = 7uz;
+ static constexpr auto num_buckets = 2718uz;
+ 
+-StatisticsCountMinSketch::StatisticsCountMinSketch(const SingleStatisticsDescription & stat_, DataTypePtr data_type_)
+-    : IStatistics(stat_)
++StatisticsCountMinSketch::StatisticsCountMinSketch(const SingleStatisticsDescription & description, const DataTypePtr & data_type_)
++    : IStatistics(description)
+     , sketch(num_hashes, num_buckets)
+     , data_type(data_type_)
+ {
+@@ -84,17 +84,17 @@ void StatisticsCountMinSketch::deserialize(ReadBuffer & buf)
+ }
+ 
+ 
+-void countMinSketchValidator(const SingleStatisticsDescription &, DataTypePtr data_type)
++void countMinSketchStatisticsValidator(const SingleStatisticsDescription & /*description*/, const DataTypePtr & data_type)
+ {
+-    data_type = removeNullable(data_type);
+-    data_type = removeLowCardinalityAndNullable(data_type);
+-    if (!data_type->isValueRepresentedByNumber() && !isStringOrFixedString(data_type))
++    DataTypePtr inner_data_type = removeNullable(data_type);
++    inner_data_type = removeLowCardinalityAndNullable(inner_data_type);
++    if (!inner_data_type->isValueRepresentedByNumber() && !isStringOrFixedString(inner_data_type))
+         throw Exception(ErrorCodes::ILLEGAL_STATISTICS, "Statistics of type 'count_min' does not support type {}", data_type->getName());
+ }
+ 
+-StatisticsPtr countMinSketchCreator(const SingleStatisticsDescription & stat, DataTypePtr data_type)
++StatisticsPtr countMinSketchStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type)
+ {
+-    return std::make_shared<StatisticsCountMinSketch>(stat, data_type);
++    return std::make_shared<StatisticsCountMinSketch>(description, data_type);
+ }
+ 
+ }
+diff --git a/src/Storages/Statistics/StatisticsCountMinSketch.h b/src/Storages/Statistics/StatisticsCountMinSketch.h
+index 6c8b74f8c359..d1de1a3aea5c 100644
+--- a/src/Storages/Statistics/StatisticsCountMinSketch.h
++++ b/src/Storages/Statistics/StatisticsCountMinSketch.h
+@@ -14,7 +14,7 @@ namespace DB
+ class StatisticsCountMinSketch : public IStatistics
+ {
+ public:
+-    StatisticsCountMinSketch(const SingleStatisticsDescription & stat_, DataTypePtr data_type_);
++    StatisticsCountMinSketch(const SingleStatisticsDescription & description, const DataTypePtr & data_type_);
+ 
+     Float64 estimateEqual(const Field & val) const override;
+ 
+@@ -31,8 +31,8 @@ class StatisticsCountMinSketch : public IStatistics
+ };
+ 
+ 
+-void countMinSketchValidator(const SingleStatisticsDescription &, DataTypePtr data_type);
+-StatisticsPtr countMinSketchCreator(const SingleStatisticsDescription & stat, DataTypePtr);
++void countMinSketchStatisticsValidator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
++StatisticsPtr countMinSketchStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
+ 
+ }
+ 
+diff --git a/src/Storages/Statistics/StatisticsTDigest.cpp b/src/Storages/Statistics/StatisticsTDigest.cpp
+index 66150e00fdb2..285b779036f3 100644
+--- a/src/Storages/Statistics/StatisticsTDigest.cpp
++++ b/src/Storages/Statistics/StatisticsTDigest.cpp
+@@ -1,33 +1,29 @@
+ #include <Storages/Statistics/StatisticsTDigest.h>
+-#include <DataTypes/DataTypeNullable.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
++#include <DataTypes/DataTypeNullable.h>
+ 
+ namespace DB
+ {
+ namespace ErrorCodes
+ {
+ extern const int ILLEGAL_STATISTICS;
+-extern const int LOGICAL_ERROR;
+ }
+ 
+-StatisticsTDigest::StatisticsTDigest(const SingleStatisticsDescription & stat_)
+-    : IStatistics(stat_)
++StatisticsTDigest::StatisticsTDigest(const SingleStatisticsDescription & description, const DataTypePtr & data_type_)
++    : IStatistics(description)
++    , data_type(data_type_)
+ {
+ }
+ 
+ void StatisticsTDigest::update(const ColumnPtr & column)
+ {
+-    size_t rows = column->size();
+-    for (size_t row = 0; row < rows; ++row)
++    for (size_t row = 0; row < column->size(); ++row)
+     {
+-        Field field;
+-        column->get(row, field);
+-
+-        if (field.isNull())
++        if (column->isNullAt(row))
+             continue;
+ 
+-        if (auto field_as_float = StatisticsUtils::tryConvertToFloat64(field))
+-            t_digest.add(*field_as_float, 1);
++        auto data = column->getFloat64(row);
++        t_digest.add(data, 1);
+     }
+ }
+ 
+@@ -43,31 +39,31 @@ void StatisticsTDigest::deserialize(ReadBuffer & buf)
+ 
+ Float64 StatisticsTDigest::estimateLess(const Field & val) const
+ {
+-    auto val_as_float = StatisticsUtils::tryConvertToFloat64(val);
+-    if (val_as_float)
+-        return t_digest.getCountLessThan(*val_as_float);
+-    throw Exception(ErrorCodes::LOGICAL_ERROR, "Statistics 'tdigest' does not support estimating value of type {}", val.getTypeName());
++    auto val_as_float = StatisticsUtils::tryConvertToFloat64(val, data_type);
++    if (!val_as_float.has_value())
++        return 0;
++    return t_digest.getCountLessThan(*val_as_float);
+ }
+ 
+ Float64 StatisticsTDigest::estimateEqual(const Field & val) const
+ {
+-    auto val_as_float = StatisticsUtils::tryConvertToFloat64(val);
+-    if (val_as_float)
+-        return t_digest.getCountEqual(*val_as_float);
+-    throw Exception(ErrorCodes::LOGICAL_ERROR, "Statistics 'tdigest' does not support estimating value of type {}", val.getTypeName());
++    auto val_as_float = StatisticsUtils::tryConvertToFloat64(val, data_type);
++    if (!val_as_float.has_value())
++        return 0;
++    return t_digest.getCountEqual(*val_as_float);
+ }
+ 
+-void tdigestValidator(const SingleStatisticsDescription &, DataTypePtr data_type)
++void tdigestStatisticsValidator(const SingleStatisticsDescription & /*description*/, const DataTypePtr & data_type)
+ {
+-    data_type = removeNullable(data_type);
+-    data_type = removeLowCardinalityAndNullable(data_type);
+-    if (!data_type->isValueRepresentedByNumber())
++    DataTypePtr inner_data_type = removeNullable(data_type);
++    inner_data_type = removeLowCardinalityAndNullable(inner_data_type);
++    if (!inner_data_type->isValueRepresentedByNumber())
+         throw Exception(ErrorCodes::ILLEGAL_STATISTICS, "Statistics of type 'tdigest' do not support type {}", data_type->getName());
+ }
+ 
+-StatisticsPtr tdigestCreator(const SingleStatisticsDescription & stat, DataTypePtr)
++StatisticsPtr tdigestStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type)
+ {
+-    return std::make_shared<StatisticsTDigest>(stat);
++    return std::make_shared<StatisticsTDigest>(description, data_type);
+ }
+ 
+ }
+diff --git a/src/Storages/Statistics/StatisticsTDigest.h b/src/Storages/Statistics/StatisticsTDigest.h
+index 614973e5d8b6..5e744fee2ce2 100644
+--- a/src/Storages/Statistics/StatisticsTDigest.h
++++ b/src/Storages/Statistics/StatisticsTDigest.h
+@@ -9,7 +9,7 @@ namespace DB
+ class StatisticsTDigest : public IStatistics
+ {
+ public:
+-    explicit StatisticsTDigest(const SingleStatisticsDescription & stat_);
++    explicit StatisticsTDigest(const SingleStatisticsDescription & description, const DataTypePtr & data_type_);
+ 
+     void update(const ColumnPtr & column) override;
+ 
+@@ -21,9 +21,10 @@ class StatisticsTDigest : public IStatistics
+ 
+ private:
+     QuantileTDigest<Float64> t_digest;
++    DataTypePtr data_type;
+ };
+ 
+-void tdigestValidator(const SingleStatisticsDescription &, DataTypePtr data_type);
+-StatisticsPtr tdigestCreator(const SingleStatisticsDescription & stat, DataTypePtr);
++void tdigestStatisticsValidator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
++StatisticsPtr tdigestStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
+ 
+ }
+diff --git a/src/Storages/Statistics/StatisticsUniq.cpp b/src/Storages/Statistics/StatisticsUniq.cpp
+index 8f60ffcf0b59..07311b5b86d0 100644
+--- a/src/Storages/Statistics/StatisticsUniq.cpp
++++ b/src/Storages/Statistics/StatisticsUniq.cpp
+@@ -11,8 +11,8 @@ namespace ErrorCodes
+     extern const int ILLEGAL_STATISTICS;
+ }
+ 
+-StatisticsUniq::StatisticsUniq(const SingleStatisticsDescription & stat_, const DataTypePtr & data_type)
+-    : IStatistics(stat_)
++StatisticsUniq::StatisticsUniq(const SingleStatisticsDescription & description, const DataTypePtr & data_type)
++    : IStatistics(description)
+ {
+     arena = std::make_unique<Arena>();
+     AggregateFunctionProperties properties;
+@@ -52,17 +52,17 @@ UInt64 StatisticsUniq::estimateCardinality() const
+     return column->getUInt(0);
+ }
+ 
+-void uniqValidator(const SingleStatisticsDescription &, DataTypePtr data_type)
++void uniqStatisticsValidator(const SingleStatisticsDescription & /*description*/, const DataTypePtr & data_type)
+ {
+-    data_type = removeNullable(data_type);
+-    data_type = removeLowCardinalityAndNullable(data_type);
+-    if (!data_type->isValueRepresentedByNumber())
++    DataTypePtr inner_data_type = removeNullable(data_type);
++    inner_data_type = removeLowCardinalityAndNullable(inner_data_type);
++    if (!inner_data_type->isValueRepresentedByNumber())
+         throw Exception(ErrorCodes::ILLEGAL_STATISTICS, "Statistics of type 'uniq' do not support type {}", data_type->getName());
+ }
+ 
+-StatisticsPtr uniqCreator(const SingleStatisticsDescription & stat, DataTypePtr data_type)
++StatisticsPtr uniqStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type)
+ {
+-    return std::make_shared<StatisticsUniq>(stat, data_type);
++    return std::make_shared<StatisticsUniq>(description, data_type);
+ }
+ 
+ }
+diff --git a/src/Storages/Statistics/StatisticsUniq.h b/src/Storages/Statistics/StatisticsUniq.h
+index faabde8d47c4..1fdcab8bd891 100644
+--- a/src/Storages/Statistics/StatisticsUniq.h
++++ b/src/Storages/Statistics/StatisticsUniq.h
+@@ -10,7 +10,7 @@ namespace DB
+ class StatisticsUniq : public IStatistics
+ {
+ public:
+-    StatisticsUniq(const SingleStatisticsDescription & stat_, const DataTypePtr & data_type);
++    StatisticsUniq(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
+     ~StatisticsUniq() override;
+ 
+     void update(const ColumnPtr & column) override;
+@@ -27,7 +27,7 @@ class StatisticsUniq : public IStatistics
+ 
+ };
+ 
+-void uniqValidator(const SingleStatisticsDescription &, DataTypePtr data_type);
+-StatisticsPtr uniqCreator(const SingleStatisticsDescription & stat, DataTypePtr data_type);
++void uniqStatisticsValidator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
++StatisticsPtr uniqStatisticsCreator(const SingleStatisticsDescription & description, const DataTypePtr & data_type);
+ 
+ }

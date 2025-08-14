@@ -1,0 +1,576 @@
+diff --git a/docs/en/sql-reference/statements/system.md b/docs/en/sql-reference/statements/system.md
+index 0987c15bcddd..4235af1c255f 100644
+--- a/docs/en/sql-reference/statements/system.md
++++ b/docs/en/sql-reference/statements/system.md
+@@ -12,6 +12,7 @@ toc_title: SYSTEM
+ -   [DROP MARK CACHE](#query_language-system-drop-mark-cache)
+ -   [DROP UNCOMPRESSED CACHE](#query_language-system-drop-uncompressed-cache)
+ -   [DROP COMPILED EXPRESSION CACHE](#query_language-system-drop-compiled-expression-cache)
++-   [DROP REPLICA](#query_language-system-drop-replica)
+ -   [FLUSH LOGS](#query_language-system-flush_logs)
+ -   [RELOAD CONFIG](#query_language-system-reload-config)
+ -   [SHUTDOWN](#query_language-system-shutdown)
+@@ -67,6 +68,26 @@ For more convenient (automatic) cache management, see disable\_internal\_dns\_ca
+ 
+ Resets the mark cache. Used in development of ClickHouse and performance tests.
+ 
++## DROP REPLICA {#query_language-system-drop-replica}
++
++Replicas can be dropped using following syntax:
++
++```sql
++SYSTEM DROP REPLICA 'replica_name';
++SYSTEM DROP REPLICA 'replica_name' FROM DATABASE database;
++SYSTEM DROP REPLICA 'replica_name' FROM TABLE database.table;
++```
++
++Queries will remove the replica path in zookeeper, it's useful when you want to decrease your replica factor. It will only drop the inactive/stale replica, and it can't drop local replica, please use `SYSTEM DROP REPLICA` for that.
++
++If you want to drop a inactive/stale replicate table that does not have a local replica, you can following syntax:
++
++```sql
++SYSTEM DROP REPLICA 'replica_name' FROM ZKPATH '/path/to/table/in/zk';
++```
++
++It's useful to remove metadata of dead replica from ZooKeeper. The right way to decrease replication factor is `DROP TABLE`.
++
+ ## DROP UNCOMPRESSED CACHE {#query_language-system-drop-uncompressed-cache}
+ 
+ Reset the uncompressed data cache. Used in development of ClickHouse and performance tests.
+diff --git a/src/Access/AccessType.h b/src/Access/AccessType.h
+index c4fdbc46b71f..93f5fda9dbb0 100644
+--- a/src/Access/AccessType.h
++++ b/src/Access/AccessType.h
+@@ -133,6 +133,7 @@ enum class AccessType
+     M(SYSTEM_REPLICATED_SENDS, "SYSTEM STOP REPLICATED SENDS, SYSTEM START REPLICATED SENDS, STOP_REPLICATED_SENDS, START REPLICATED SENDS", TABLE, SYSTEM_SENDS) \
+     M(SYSTEM_SENDS, "SYSTEM STOP SENDS, SYSTEM START SENDS, STOP SENDS, START SENDS", GROUP, SYSTEM) \
+     M(SYSTEM_REPLICATION_QUEUES, "SYSTEM STOP REPLICATION QUEUES, SYSTEM START REPLICATION QUEUES, STOP_REPLICATION_QUEUES, START REPLICATION QUEUES", TABLE, SYSTEM) \
++    M(SYSTEM_DROP_REPLICA, "DROP REPLICA", TABLE, SYSTEM) \
+     M(SYSTEM_SYNC_REPLICA, "SYNC REPLICA", TABLE, SYSTEM) \
+     M(SYSTEM_RESTART_REPLICA, "RESTART REPLICA", TABLE, SYSTEM) \
+     M(SYSTEM_FLUSH_DISTRIBUTED, "FLUSH DISTRIBUTED", TABLE, SYSTEM_FLUSH) \
+diff --git a/src/Interpreters/InterpreterSystemQuery.cpp b/src/Interpreters/InterpreterSystemQuery.cpp
+index a11e0b8feb2a..d4bddd026574 100644
+--- a/src/Interpreters/InterpreterSystemQuery.cpp
++++ b/src/Interpreters/InterpreterSystemQuery.cpp
+@@ -185,7 +185,7 @@ BlockIO InterpreterSystemQuery::execute()
+ 
+     /// Make canonical query for simpler processing
+     if (!query.table.empty())
+-         table_id = context.resolveStorageID(StorageID(query.database, query.table), Context::ResolveOrdinary);
++        table_id = context.resolveStorageID(StorageID(query.database, query.table), Context::ResolveOrdinary);
+ 
+     if (!query.target_dictionary.empty() && !query.database.empty())
+         query.target_dictionary = query.database + "." + query.target_dictionary;
+@@ -285,6 +285,9 @@ BlockIO InterpreterSystemQuery::execute()
+         case Type::START_DISTRIBUTED_SENDS:
+             startStopAction(ActionLocks::DistributedSend, true);
+             break;
++        case Type::DROP_REPLICA:
++            dropReplica(query);
++            break;
+         case Type::SYNC_REPLICA:
+             syncReplica(query);
+             break;
+@@ -400,6 +403,117 @@ void InterpreterSystemQuery::restartReplicas(Context & system_context)
+     pool.wait();
+ }
+ 
++void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
++{
++    StorageReplicatedMergeTree::Status status;
++    auto zookeeper = context.getZooKeeper();
++
++    if (!table_id.empty())
++    {
++        context.checkAccess(AccessType::SYSTEM_DROP_REPLICA, table_id);
++        StoragePtr table = DatabaseCatalog::instance().getTable(table_id, context);
++
++        if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(table.get()))
++        {
++            storage_replicated->getStatus(status);
++            if (query.replica == status.replica_name)
++                throw Exception("We can't drop local replica, please use `DROP TABLE` if you want to clean the data and drop this replica", ErrorCodes::LOGICAL_ERROR);
++            if (zookeeper->exists(status.zookeeper_path + "/replicas/" + query.replica + "/is_active"))
++                throw Exception("Can't drop replica: " + query.replica + ", because it's active",
++                    ErrorCodes::LOGICAL_ERROR);
++            storage_replicated->dropReplica(zookeeper, status.zookeeper_path, query.replica, status.is_readonly);
++            LOG_TRACE(log, "DROP REPLICA " + table_id.getNameForLogs() +  " [" + query.replica + "]: OK");
++        }
++        else
++            throw Exception("Table " + table_id.getNameForLogs() + " is not replicated", ErrorCodes::BAD_ARGUMENTS);
++    }
++    else if (!query.database.empty())
++    {
++        DatabasePtr database = DatabaseCatalog::instance().tryGetDatabase(query.database);
++        if (database.get() != NULL)
++        {
++            for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
++            {
++                if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(iterator->table().get()))
++                {
++                    context.checkAccess(AccessType::SYSTEM_DROP_REPLICA, iterator->table()->getStorageID());
++                    storage_replicated->getStatus(status);
++                    if (query.replica == status.replica_name)
++                        throw Exception("We can't drop local replica, please use `DROP TABLE` if you want to clean the data and drop this replica", ErrorCodes::LOGICAL_ERROR);
++                    if (zookeeper->exists(status.zookeeper_path + "/replicas/" + query.replica + "/is_active"))
++                        throw Exception("Can't drop replica: " + query.replica + ", because it's active",
++                            ErrorCodes::LOGICAL_ERROR);
++                    storage_replicated->dropReplica(zookeeper, status.zookeeper_path, query.replica, status.is_readonly);
++                }
++            }
++            LOG_TRACE(log, "DROP REPLICA " + query.replica + " DATABSE " +  database->getDatabaseName() + ": OK");
++        }
++        else
++            throw Exception("DATABSE " + query.database + " doesn't exist", ErrorCodes::BAD_ARGUMENTS);
++    }
++    else if (!query.replica_zk_path.empty())
++    {
++        auto remote_replica_path = query.replica_zk_path  + "/replicas/" + query.replica;
++        auto & catalog = DatabaseCatalog::instance();
++
++        for (auto & elem : catalog.getDatabases())
++        {
++            DatabasePtr & database = elem.second;
++            for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
++            {
++                if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(iterator->table().get()))
++                {
++                    storage_replicated->getStatus(status);
++                    if (status.replica_path.compare(remote_replica_path) == 0)
++                        throw Exception("We can't drop local replica, please use `DROP TABLE` if you want to clean the data and drop this replica",
++                            ErrorCodes::LOGICAL_ERROR);
++                    if (status.replica_path.compare(query.replica_zk_path + "/replicas/" + status.replica_name) == 0)
++                    {
++                        if (zookeeper->exists(query.replica_zk_path + "/replicas/" + query.replica + "/is_active"))
++                            throw Exception("Can't drop replica: " + query.replica + ", because it's active",
++                                ErrorCodes::LOGICAL_ERROR);
++                        storage_replicated->dropReplica(zookeeper, query.replica_zk_path, query.replica, status.is_readonly);
++                        return;
++                    }
++                }
++            }
++        }
++
++        /// It may left some garbage if replica_path subtree are concurently modified
++        /// check if is active replica if we drop other replicas
++        if (zookeeper->exists(remote_replica_path + "/is_active"))
++            throw Exception("Can't remove replica: " + query.replica + ", because it's active",
++                ErrorCodes::LOGICAL_ERROR);
++
++        zookeeper->tryRemoveRecursive(remote_replica_path);
++        LOG_INFO(log, "Removing replica {}", query.replica_zk_path  + "/replicas/" + query.replica);
++    }
++    else if (query.is_drop_whole_replica)
++    {
++        auto databases = DatabaseCatalog::instance().getDatabases();
++
++        for (auto & elem : databases)
++        {
++            DatabasePtr & database = elem.second;
++            for (auto iterator = database->getTablesIterator(context); iterator->isValid(); iterator->next())
++            {
++                if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(iterator->table().get()))
++                {
++                    context.checkAccess(AccessType::SYSTEM_DROP_REPLICA, iterator->table()->getStorageID());
++                    storage_replicated->getStatus(status);
++                    if (query.replica == status.replica_name)
++                        throw Exception("We can't drop local replica, please use `DROP TABLE` if you want to clean the data and drop this replica", ErrorCodes::LOGICAL_ERROR);
++                    if (zookeeper->exists(status.zookeeper_path + "/replicas/" + query.replica + "/is_active"))
++                        throw Exception("Can't drop replica: " + query.replica + ", because it's active",
++                            ErrorCodes::LOGICAL_ERROR);
++                    storage_replicated->dropReplica(zookeeper, status.zookeeper_path, query.replica, status.is_readonly);
++                }
++            }
++            LOG_TRACE(log, "DROP REPLICA " + query.replica + " DATABSE " +  database->getDatabaseName() + ": OK");
++        }
++    }
++}
++
+ void InterpreterSystemQuery::syncReplica(ASTSystemQuery &)
+ {
+     context.checkAccess(AccessType::SYSTEM_SYNC_REPLICA, table_id);
+@@ -530,6 +644,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster()
+                 required_access.emplace_back(AccessType::SYSTEM_REPLICATION_QUEUES, query.database, query.table);
+             break;
+         }
++        case Type::DROP_REPLICA:
++        {
++            required_access.emplace_back(AccessType::SYSTEM_DROP_REPLICA, query.database, query.table);
++            break;
++        }
+         case Type::SYNC_REPLICA:
+         {
+             required_access.emplace_back(AccessType::SYSTEM_SYNC_REPLICA, query.database, query.table);
+diff --git a/src/Interpreters/InterpreterSystemQuery.h b/src/Interpreters/InterpreterSystemQuery.h
+index b55d1bda09bc..c57a6d95760d 100644
+--- a/src/Interpreters/InterpreterSystemQuery.h
++++ b/src/Interpreters/InterpreterSystemQuery.h
+@@ -51,6 +51,7 @@ class InterpreterSystemQuery : public IInterpreter
+ 
+     void restartReplicas(Context & system_context);
+     void syncReplica(ASTSystemQuery & query);
++    void dropReplica(ASTSystemQuery & query);
+     void flushDistributed(ASTSystemQuery & query);
+ 
+     AccessRightsElements getRequiredAccessForDDLOnCluster() const;
+diff --git a/src/Parsers/ASTSystemQuery.cpp b/src/Parsers/ASTSystemQuery.cpp
+index deaed0704846..52de931d50ea 100644
+--- a/src/Parsers/ASTSystemQuery.cpp
++++ b/src/Parsers/ASTSystemQuery.cpp
+@@ -39,6 +39,8 @@ const char * ASTSystemQuery::typeToString(Type type)
+             return "RESTART REPLICAS";
+         case Type::RESTART_REPLICA:
+             return "RESTART REPLICA";
++        case Type::DROP_REPLICA:
++            return "DROP REPLICA";
+         case Type::SYNC_REPLICA:
+             return "SYNC REPLICA";
+         case Type::FLUSH_DISTRIBUTED:
+@@ -116,6 +118,26 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState &,
+                       << (settings.hilite ? hilite_none : "");
+     };
+ 
++    auto print_drop_replica = [&] {
++        settings.ostr << " " << quoteString(replica) << (settings.hilite ? hilite_none : "");
++        if (!table.empty())
++        {
++            settings.ostr << " FROM TABLE";
++            print_database_table();
++        }
++        else if (!replica_zk_path.empty())
++        {
++            settings.ostr << " FROM ZKPATH " << (settings.hilite ? hilite_identifier : "") << quoteString(replica_zk_path)
++                      << (settings.hilite ? hilite_none : "");
++        }
++        else if (!database.empty())
++        {
++            settings.ostr << " FROM DATABASE ";
++            settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(database)
++                        << (settings.hilite ? hilite_none : "");
++        }
++    };
++
+     if (!cluster.empty())
+         formatOnCluster(settings);
+ 
+@@ -143,6 +165,8 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState &,
+     }
+     else if (type == Type::RELOAD_DICTIONARY)
+         print_database_dictionary();
++    else if (type == Type::DROP_REPLICA)
++        print_drop_replica();
+ }
+ 
+ 
+diff --git a/src/Parsers/ASTSystemQuery.h b/src/Parsers/ASTSystemQuery.h
+index eac96e50cb10..b2ffa706e196 100644
+--- a/src/Parsers/ASTSystemQuery.h
++++ b/src/Parsers/ASTSystemQuery.h
+@@ -30,6 +30,7 @@ class ASTSystemQuery : public IAST, public ASTQueryWithOnCluster
+         START_LISTEN_QUERIES,
+         RESTART_REPLICAS,
+         RESTART_REPLICA,
++        DROP_REPLICA,
+         SYNC_REPLICA,
+         RELOAD_DICTIONARY,
+         RELOAD_DICTIONARIES,
+@@ -61,6 +62,9 @@ class ASTSystemQuery : public IAST, public ASTQueryWithOnCluster
+     String target_dictionary;
+     String database;
+     String table;
++    String replica;
++    String replica_zk_path;
++    bool is_drop_whole_replica;
+ 
+     String getID(char) const override { return "SYSTEM query"; }
+ 
+diff --git a/src/Parsers/ParserSystemQuery.cpp b/src/Parsers/ParserSystemQuery.cpp
+index 70a2b339f28e..a98ca2d4922c 100644
+--- a/src/Parsers/ParserSystemQuery.cpp
++++ b/src/Parsers/ParserSystemQuery.cpp
+@@ -2,6 +2,7 @@
+ #include <Parsers/ASTSystemQuery.h>
+ #include <Parsers/CommonParsers.h>
+ #include <Parsers/ExpressionElementParsers.h>
++#include <Parsers/ASTIdentifier.h>
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/parseDatabaseAndTableName.h>
+ 
+@@ -57,6 +58,48 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected &
+             break;
+         }
+ 
++        case Type::DROP_REPLICA:
++        {
++            ASTPtr ast;
++            if (!ParserStringLiteral{}.parse(pos, ast, expected))
++                return false;
++            res->replica = ast->as<ASTLiteral &>().value.safeGet<String>();
++            if (ParserKeyword{"FROM"}.ignore(pos, expected))
++            {
++                // way 1. parse replica database
++                // way 2. parse replica tables
++                // way 3. parse replica zkpath
++                if (ParserKeyword{"DATABASE"}.ignore(pos, expected))
++                {
++                    ParserIdentifier database_parser;
++                    ASTPtr database;
++                    if (!database_parser.parse(pos, database, expected))
++                        return false;
++                    tryGetIdentifierNameInto(database, res->database);
++                }
++                else if (ParserKeyword{"TABLE"}.ignore(pos, expected))
++                {
++                    parseDatabaseAndTableName(pos, expected, res->database, res->table);
++                }
++                else if (ParserKeyword{"ZKPATH"}.ignore(pos, expected))
++                {
++                    ASTPtr path_ast;
++                    if (!ParserStringLiteral{}.parse(pos, path_ast, expected))
++                        return false;
++                    String zk_path = path_ast->as<ASTLiteral &>().value.safeGet<String>();
++                    if (!zk_path.empty() && zk_path[zk_path.size() - 1] == '/')
++                        zk_path.pop_back();
++                    res->replica_zk_path = zk_path;
++                }
++                else
++                    return false;
++            }
++            else
++                res->is_drop_whole_replica = true;
++
++            break;
++        }
++
+         case Type::RESTART_REPLICA:
+         case Type::SYNC_REPLICA:
+             if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 9b69db31ad6a..a9f68a54ce4e 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -632,98 +632,12 @@ void StorageReplicatedMergeTree::drop()
+             throw Exception("Can't drop readonly replicated table (need to drop data in ZooKeeper as well)", ErrorCodes::TABLE_IS_READ_ONLY);
+ 
+         shutdown();
+-
+-        if (zookeeper->expired())
+-            throw Exception("Table was not dropped because ZooKeeper session has expired.", ErrorCodes::TABLE_WAS_NOT_DROPPED);
+-
+-        LOG_INFO(log, "Removing replica {}", replica_path);
+-        replica_is_active_node = nullptr;
+-        /// It may left some garbage if replica_path subtree are concurently modified
+-        zookeeper->tryRemoveRecursive(replica_path);
+-        if (zookeeper->exists(replica_path))
+-            LOG_ERROR(log, "Replica was not completely removed from ZooKeeper, {} still exists and may contain some garbage.", replica_path);
+-
+-        /// Check that `zookeeper_path` exists: it could have been deleted by another replica after execution of previous line.
+-        Strings replicas;
+-        if (Coordination::Error::ZOK == zookeeper->tryGetChildren(zookeeper_path + "/replicas", replicas) && replicas.empty())
+-        {
+-            LOG_INFO(log, "{} is the last replica, will remove table", replica_path);
+-
+-            /** At this moment, another replica can be created and we cannot remove the table.
+-              * Try to remove /replicas node first. If we successfully removed it,
+-              * it guarantees that we are the only replica that proceed to remove the table
+-              * and no new replicas can be created after that moment (it requires the existence of /replicas node).
+-              * and table cannot be recreated with new /replicas node on another servers while we are removing data,
+-              * because table creation is executed in single transaction that will conflict with remaining nodes.
+-              */
+-
+-            Coordination::Requests ops;
+-            Coordination::Responses responses;
+-            ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path + "/replicas", -1));
+-            ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/dropped", "", zkutil::CreateMode::Persistent));
+-            Coordination::Error code = zookeeper->tryMulti(ops, responses);
+-
+-            if (code == Coordination::Error::ZNONODE || code == Coordination::Error::ZNODEEXISTS)
+-            {
+-                LOG_WARNING(log, "Table {} is already started to be removing by another replica right now", replica_path);
+-            }
+-            else if (code == Coordination::Error::ZNOTEMPTY)
+-            {
+-                LOG_WARNING(log, "Another replica was suddenly created, will keep the table {}", replica_path);
+-            }
+-            else if (code != Coordination::Error::ZOK)
+-            {
+-                zkutil::KeeperMultiException::check(code, ops, responses);
+-            }
+-            else
+-            {
+-                LOG_INFO(log, "Removing table {} (this might take several minutes)", zookeeper_path);
+-
+-                Strings children;
+-                code = zookeeper->tryGetChildren(zookeeper_path, children);
+-                if (code == Coordination::Error::ZNONODE)
+-                {
+-                    LOG_WARNING(log, "Table {} is already finished removing by another replica right now", replica_path);
+-                }
+-                else
+-                {
+-                    for (const auto & child : children)
+-                        if (child != "dropped")
+-                            zookeeper->tryRemoveRecursive(zookeeper_path + "/" + child);
+-
+-                    ops.clear();
+-                    responses.clear();
+-                    ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path + "/dropped", -1));
+-                    ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path, -1));
+-                    code = zookeeper->tryMulti(ops, responses);
+-
+-                    if (code == Coordination::Error::ZNONODE)
+-                    {
+-                        LOG_WARNING(log, "Table {} is already finished removing by another replica right now", replica_path);
+-                    }
+-                    else if (code == Coordination::Error::ZNOTEMPTY)
+-                    {
+-                        LOG_ERROR(log, "Table was not completely removed from ZooKeeper, {} still exists and may contain some garbage.",
+-                            zookeeper_path);
+-                    }
+-                    else if (code != Coordination::Error::ZOK)
+-                    {
+-                        /// It is still possible that ZooKeeper session is expired or server is killed in the middle of the delete operation.
+-                        zkutil::KeeperMultiException::check(code, ops, responses);
+-                    }
+-                    else
+-                    {
+-                        LOG_INFO(log, "Table {} was successfully removed from ZooKeeper", zookeeper_path);
+-                    }
+-                }
+-            }
+-        }
++        dropReplica(zookeeper, zookeeper_path, replica_name, is_readonly);
+     }
+ 
+     dropAllData();
+ }
+ 
+-
+ /** Verify that list of columns and table storage_settings_ptr match those specified in ZK (/ metadata).
+     * If not, throw an exception.
+     */
+@@ -836,6 +750,100 @@ static time_t tryGetPartCreateTime(zkutil::ZooKeeperPtr & zookeeper, const Strin
+     return res;
+ }
+ 
++void StorageReplicatedMergeTree::dropReplica(zkutil::ZooKeeperPtr zookeeper, const String & zookeeper_path, const String & replica, bool is_readonly)
++{
++    static Poco::Logger * log = &Poco::Logger::get("StorageReplicatedMergeTree::dropReplica");
++
++    /// If probably there is metadata in ZooKeeper, we don't allow to drop the table.
++    if (is_readonly || !zookeeper)
++        throw Exception("Can't drop readonly replicated table (need to drop data in ZooKeeper as well)", ErrorCodes::TABLE_IS_READ_ONLY);
++
++    if (zookeeper->expired())
++        throw Exception("Table was not dropped because ZooKeeper session has expired.", ErrorCodes::TABLE_WAS_NOT_DROPPED);
++
++    auto remote_replica_path = zookeeper_path + "/replicas" + "/" + replica;
++    LOG_INFO(log, "Removing replica {}", remote_replica_path);
++    /// It may left some garbage if replica_path subtree are concurently modified
++    zookeeper->tryRemoveRecursive(remote_replica_path);
++    if (zookeeper->exists(remote_replica_path))
++        LOG_ERROR(log, "Replica was not completely removed from ZooKeeper, {} still exists and may contain some garbage.", remote_replica_path);
++
++    /// Check that `zookeeper_path` exists: it could have been deleted by another replica after execution of previous line.
++    Strings replicas;
++    if (Coordination::Error::ZOK == zookeeper->tryGetChildren(zookeeper_path + "/replicas", replicas) && replicas.empty())
++    {
++        LOG_INFO(log, "{} is the last replica, will remove table", remote_replica_path);
++
++        /** At this moment, another replica can be created and we cannot remove the table.
++          * Try to remove /replicas node first. If we successfully removed it,
++          * it guarantees that we are the only replica that proceed to remove the table
++          * and no new replicas can be created after that moment (it requires the existence of /replicas node).
++          * and table cannot be recreated with new /replicas node on another servers while we are removing data,
++          * because table creation is executed in single transaction that will conflict with remaining nodes.
++          */
++
++        Coordination::Requests ops;
++        Coordination::Responses responses;
++        ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path + "/replicas", -1));
++        ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/dropped", "", zkutil::CreateMode::Persistent));
++        Coordination::Error code = zookeeper->tryMulti(ops, responses);
++
++        if (code == Coordination::Error::ZNONODE || code == Coordination::Error::ZNODEEXISTS)
++        {
++            LOG_WARNING(log, "Table {} is already started to be removing by another replica right now", remote_replica_path);
++        }
++        else if (code == Coordination::Error::ZNOTEMPTY)
++        {
++            LOG_WARNING(log, "Another replica was suddenly created, will keep the table {}", remote_replica_path);
++        }
++        else if (code != Coordination::Error::ZOK)
++        {
++            zkutil::KeeperMultiException::check(code, ops, responses);
++        }
++        else
++        {
++            LOG_INFO(log, "Removing table {} (this might take several minutes)", zookeeper_path);
++
++            Strings children;
++            code = zookeeper->tryGetChildren(zookeeper_path, children);
++            if (code == Coordination::Error::ZNONODE)
++            {
++                LOG_WARNING(log, "Table {} is already finished removing by another replica right now", remote_replica_path);
++            }
++            else
++            {
++                for (const auto & child : children)
++                    if (child != "dropped")
++                        zookeeper->tryRemoveRecursive(zookeeper_path + "/" + child);
++
++                ops.clear();
++                responses.clear();
++                ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path + "/dropped", -1));
++                ops.emplace_back(zkutil::makeRemoveRequest(zookeeper_path, -1));
++                code = zookeeper->tryMulti(ops, responses);
++
++                if (code == Coordination::Error::ZNONODE)
++                {
++                    LOG_WARNING(log, "Table {} is already finished removing by another replica right now", remote_replica_path);
++                }
++                else if (code == Coordination::Error::ZNOTEMPTY)
++                {
++                    LOG_ERROR(log, "Table was not completely removed from ZooKeeper, {} still exists and may contain some garbage.",
++                        zookeeper_path);
++                }
++                else if (code != Coordination::Error::ZOK)
++                {
++                    /// It is still possible that ZooKeeper session is expired or server is killed in the middle of the delete operation.
++                    zkutil::KeeperMultiException::check(code, ops, responses);
++                }
++                else
++                {
++                    LOG_INFO(log, "Table {} was successfully removed from ZooKeeper", zookeeper_path);
++                }
++            }
++        }
++    }
++}
+ 
+ void StorageReplicatedMergeTree::checkParts(bool skip_sanity_checks)
+ {
+@@ -4038,7 +4046,6 @@ void StorageReplicatedMergeTree::checkPartitionCanBeDropped(const ASTPtr & parti
+     global_context.checkPartitionCanBeDropped(table_id.database_name, table_id.table_name, partition_size);
+ }
+ 
+-
+ void StorageReplicatedMergeTree::rename(const String & new_path_to_table_data, const StorageID & new_table_id)
+ {
+     MergeTreeData::rename(new_path_to_table_data, new_table_id);
+diff --git a/src/Storages/StorageReplicatedMergeTree.h b/src/Storages/StorageReplicatedMergeTree.h
+index 7d81d7a1d19c..3dcfbb973b4d 100644
+--- a/src/Storages/StorageReplicatedMergeTree.h
++++ b/src/Storages/StorageReplicatedMergeTree.h
+@@ -180,6 +180,10 @@ class StorageReplicatedMergeTree final : public ext::shared_ptr_helper<StorageRe
+ 
+     int getMetadataVersion() const { return metadata_version; }
+ 
++    /** Remove a specific replica from zookeeper.
++     */
++    static void dropReplica(zkutil::ZooKeeperPtr zookeeper, const String & zookeeper_path, const String & replica, bool is_readonly);
++
+ private:
+ 
+     /// Get a sequential consistent view of current parts.

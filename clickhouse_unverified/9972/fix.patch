@@ -1,0 +1,155 @@
+diff --git a/dbms/src/Interpreters/QueryNormalizer.cpp b/dbms/src/Interpreters/QueryNormalizer.cpp
+index 568b08b8f5af..86fbd108f514 100644
+--- a/dbms/src/Interpreters/QueryNormalizer.cpp
++++ b/dbms/src/Interpreters/QueryNormalizer.cpp
+@@ -76,20 +76,7 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
+     if (it_alias != data.aliases.end() && current_alias != node.name)
+     {
+         if (!IdentifierSemantic::canBeAlias(node))
+-        {
+-            /// This means that column had qualified name, which was translated (so, canBeAlias() returns false).
+-            /// But there is an alias with the same name. So, let's use original name for that column.
+-            /// If alias wasn't set, use original column name as alias.
+-            /// That helps to avoid result set with columns which have same names but different values.
+-            if (node.alias.empty())
+-            {
+-                node.name.swap(node.alias);
+-                node.restoreCompoundName();
+-                node.name.swap(node.alias);
+-            }
+-
+             return;
+-        }
+ 
+         /// We are alias for other column (node.name), but we are alias by
+         /// ourselves to some other column
+diff --git a/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.cpp b/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.cpp
+index a0f411dcc96f..17b1bc004f88 100644
+--- a/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.cpp
++++ b/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.cpp
+@@ -300,14 +300,45 @@ void TranslateQualifiedNamesMatcher::extractJoinUsingColumns(const ASTPtr ast, D
+     }
+ }
+ 
+-void RestoreQualifiedNamesData::visit(ASTIdentifier & identifier, ASTPtr & ast)
++
++void RestoreQualifiedNamesMatcher::Data::changeTable(ASTIdentifier & identifier) const
++{
++    auto match = IdentifierSemantic::canReferColumnToTable(identifier, distributed_table);
++    switch (match)
++    {
++        case IdentifierSemantic::ColumnMatch::AliasedTableName:
++        case IdentifierSemantic::ColumnMatch::TableName:
++        case IdentifierSemantic::ColumnMatch::DbAndTable:
++            IdentifierSemantic::setColumnLongName(identifier, remote_table);
++            break;
++        default:
++            break;
++    }
++}
++
++bool RestoreQualifiedNamesMatcher::needChildVisit(ASTPtr &, const ASTPtr & child)
++{
++    /// Do not go into subqueries
++    if (child->as<ASTSelectWithUnionQuery>())
++        return false; // NOLINT
++    return true;
++}
++
++void RestoreQualifiedNamesMatcher::visit(ASTPtr & ast, Data & data)
++{
++    if (auto * t = ast->as<ASTIdentifier>())
++        visit(*t, ast, data);
++}
++
++void RestoreQualifiedNamesMatcher::visit(ASTIdentifier & identifier, ASTPtr &, Data & data)
+ {
+     if (IdentifierSemantic::getColumnName(identifier))
+     {
+         if (IdentifierSemantic::getMembership(identifier))
+         {
+-            ast = identifier.clone();
+-            ast->as<ASTIdentifier>()->restoreCompoundName();
++            identifier.restoreCompoundName();
++            if (data.rename)
++                data.changeTable(identifier);
+         }
+     }
+ }
+diff --git a/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.h b/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.h
+index 51c6c2c42f0e..e8c320671bfc 100644
+--- a/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.h
++++ b/dbms/src/Interpreters/TranslateQualifiedNamesVisitor.h
+@@ -59,15 +59,24 @@ class TranslateQualifiedNamesMatcher
+ /// It finds columns and translate their names to the normal form. Expand asterisks and qualified asterisks with column names.
+ using TranslateQualifiedNamesVisitor = TranslateQualifiedNamesMatcher::Visitor;
+ 
+-/// Restore ASTIdentifiers to long form
+-struct RestoreQualifiedNamesData
++
++/// Restore ASTIdentifiers to long form, change table name in case of distributed.
++struct RestoreQualifiedNamesMatcher
+ {
+-    using TypeToVisit = ASTIdentifier;
++    struct Data
++    {
++        DatabaseAndTableWithAlias distributed_table;
++        DatabaseAndTableWithAlias remote_table;
++        bool rename = false;
+ 
+-    static void visit(ASTIdentifier & identifier, ASTPtr & ast);
++        void changeTable(ASTIdentifier & identifier) const;
++    };
++
++    static bool needChildVisit(ASTPtr & node, const ASTPtr & child);
++    static void visit(ASTPtr & ast, Data & data);
++    static void visit(ASTIdentifier & identifier, ASTPtr & ast, Data & data);
+ };
+ 
+-using RestoreQualifiedNamesMatcher = OneTypeMatcher<RestoreQualifiedNamesData>;
+ using RestoreQualifiedNamesVisitor = InDepthNodeVisitor<RestoreQualifiedNamesMatcher, true>;
+ 
+ }
+diff --git a/dbms/src/Storages/StorageDistributed.cpp b/dbms/src/Storages/StorageDistributed.cpp
+index 6f98d282e8ce..b4375dd5b0a5 100644
+--- a/dbms/src/Storages/StorageDistributed.cpp
++++ b/dbms/src/Storages/StorageDistributed.cpp
+@@ -40,6 +40,7 @@
+ #include <Interpreters/createBlockSelector.h>
+ #include <Interpreters/evaluateConstantExpression.h>
+ #include <Interpreters/getClusterName.h>
++#include <Interpreters/getTableExpressions.h>
+ 
+ #include <Core/Field.h>
+ 
+@@ -89,18 +90,23 @@ ASTPtr rewriteSelectQuery(const ASTPtr & query, const std::string & database, co
+     auto modified_query_ast = query->clone();
+ 
+     ASTSelectQuery & select_query = modified_query_ast->as<ASTSelectQuery &>();
++    if (table_function_ptr)
++        select_query.addTableFunction(table_function_ptr);
++    else
++        select_query.replaceDatabaseAndTable(database, table);
+ 
+-    /// restore long column names in JOIN ON expressions
+-    if (auto tables = select_query.tables())
++    /// Restore long column names (cause our short names are ambiguous).
++    /// TODO: aliased table functions & CREATE TABLE AS table function cases
++    if (!table_function_ptr)
+     {
+         RestoreQualifiedNamesVisitor::Data data;
+-        RestoreQualifiedNamesVisitor(data).visit(tables);
++        data.distributed_table = DatabaseAndTableWithAlias(*getTableExpression(query->as<ASTSelectQuery &>(), 0));
++        data.remote_table.database = database;
++        data.remote_table.table = table;
++        data.rename = true;
++        RestoreQualifiedNamesVisitor(data).visit(modified_query_ast);
+     }
+ 
+-    if (table_function_ptr)
+-        select_query.addTableFunction(table_function_ptr);
+-    else
+-        select_query.replaceDatabaseAndTable(database, table);
+     return modified_query_ast;
+ }
+ 

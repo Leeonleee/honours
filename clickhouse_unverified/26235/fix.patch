@@ -1,0 +1,165 @@
+diff --git a/src/Functions/IFunction.h b/src/Functions/IFunction.h
+index 58cdb68d1005..c00baf2850b1 100644
+--- a/src/Functions/IFunction.h
++++ b/src/Functions/IFunction.h
+@@ -113,7 +113,8 @@ class IFunctionBase
+ 
+     virtual ~IFunctionBase() = default;
+ 
+-    virtual ColumnPtr execute(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run = false) const
++    virtual ColumnPtr execute(
++        const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run = false) const
+     {
+         return prepare(arguments)->execute(arguments, result_type, input_rows_count, dry_run);
+     }
+@@ -161,7 +162,8 @@ class IFunctionBase
+       * Arguments are passed without modifications, useDefaultImplementationForNulls, useDefaultImplementationForConstants,
+       * useDefaultImplementationForLowCardinality are not applied.
+       */
+-    virtual ColumnPtr getConstantResultForNonConstArguments(const ColumnsWithTypeAndName & /* arguments */, const DataTypePtr & /* result_type */) const { return nullptr; }
++    virtual ColumnPtr getConstantResultForNonConstArguments(
++        const ColumnsWithTypeAndName & /* arguments */, const DataTypePtr & /* result_type */) const { return nullptr; }
+ 
+     /** Function is called "injective" if it returns different result for different values of arguments.
+       * Example: hex, negate, tuple...
+diff --git a/src/Interpreters/ActionsDAG.cpp b/src/Interpreters/ActionsDAG.cpp
+index 1518706f0a64..63b0345b3727 100644
+--- a/src/Interpreters/ActionsDAG.cpp
++++ b/src/Interpreters/ActionsDAG.cpp
+@@ -26,6 +26,7 @@ namespace ErrorCodes
+     extern const int THERE_IS_NO_COLUMN;
+     extern const int ILLEGAL_COLUMN;
+     extern const int NOT_FOUND_COLUMN_IN_BLOCK;
++    extern const int BAD_ARGUMENTS;
+ }
+ 
+ const char * ActionsDAG::typeToString(ActionsDAG::ActionType type)
+@@ -202,6 +203,7 @@ const ActionsDAG::Node & ActionsDAG::addFunction(
+     node.function_base = function->build(arguments);
+     node.result_type = node.function_base->getResultType();
+     node.function = node.function_base->prepare(arguments);
++    node.is_deterministic = node.function_base->isDeterministic();
+ 
+     /// If all arguments are constants, and function is suitable to be executed in 'prepare' stage - execute function.
+     if (node.function_base->isSuitableForConstantFolding())
+@@ -426,6 +428,16 @@ void ActionsDAG::removeUnusedActions(bool allow_remove_inputs)
+         {
+             /// Constant folding.
+             node->type = ActionsDAG::ActionType::COLUMN;
++
++            for (const auto & child : node->children)
++            {
++                if (!child->is_deterministic)
++                {
++                    node->is_deterministic = false;
++                    break;
++                }
++            }
++
+             node->children.clear();
+         }
+ 
+@@ -981,6 +993,14 @@ bool ActionsDAG::trivial() const
+     return true;
+ }
+ 
++void ActionsDAG::assertDeterministic() const
++{
++    for (const auto & node : nodes)
++        if (!node.is_deterministic)
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                "Expression must be deterministic but it contains non-deterministic part `{}`", node.result_name);
++}
++
+ void ActionsDAG::addMaterializingOutputActions()
+ {
+     for (auto & node : index)
+diff --git a/src/Interpreters/ActionsDAG.h b/src/Interpreters/ActionsDAG.h
+index 9cd0057bb1a0..bfb5b177ac7d 100644
+--- a/src/Interpreters/ActionsDAG.h
++++ b/src/Interpreters/ActionsDAG.h
+@@ -83,6 +83,9 @@ class ActionsDAG
+         ExecutableFunctionPtr function;
+         /// If function is a compiled statement.
+         bool is_function_compiled = false;
++        /// It is deterministic (See IFunction::isDeterministic).
++        /// This property is kept after constant folding of non-deterministic functions like 'now', 'today'.
++        bool is_deterministic = true;
+ 
+         /// For COLUMN node and propagated constants.
+         ColumnPtr column;
+@@ -175,6 +178,7 @@ class ActionsDAG
+     bool hasArrayJoin() const;
+     bool hasStatefulFunctions() const;
+     bool trivial() const; /// If actions has no functions or array join.
++    void assertDeterministic() const; /// Throw if not isDeterministic.
+ 
+ #if USE_EMBEDDED_COMPILER
+     void compileExpressions(size_t min_count_to_compile_expression);
+diff --git a/src/Interpreters/ExpressionActions.cpp b/src/Interpreters/ExpressionActions.cpp
+index bd06c7533196..905fcf0331c2 100644
+--- a/src/Interpreters/ExpressionActions.cpp
++++ b/src/Interpreters/ExpressionActions.cpp
+@@ -531,11 +531,12 @@ Names ExpressionActions::getRequiredColumns() const
+ 
+ bool ExpressionActions::hasArrayJoin() const
+ {
+-    for (const auto & action : actions)
+-        if (action.node->type == ActionsDAG::ActionType::ARRAY_JOIN)
+-            return true;
++    return getActionsDAG().hasArrayJoin();
++}
+ 
+-    return false;
++void ExpressionActions::assertDeterministic() const
++{
++    getActionsDAG().assertDeterministic();
+ }
+ 
+ 
+diff --git a/src/Interpreters/ExpressionActions.h b/src/Interpreters/ExpressionActions.h
+index 7699e82a73bd..4fddd1fd27e2 100644
+--- a/src/Interpreters/ExpressionActions.h
++++ b/src/Interpreters/ExpressionActions.h
+@@ -103,6 +103,7 @@ class ExpressionActions
+     void execute(Block & block, bool dry_run = false) const;
+ 
+     bool hasArrayJoin() const;
++    void assertDeterministic() const;
+ 
+     /// Obtain a sample block that contains the names and types of result columns.
+     const Block & getSampleBlock() const { return sample_block; }
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 06838a077f76..88a4ea5df901 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -270,19 +270,17 @@ StoragePolicyPtr MergeTreeData::getStoragePolicy() const
+ 
+ static void checkKeyExpression(const ExpressionActions & expr, const Block & sample_block, const String & key_name, bool allow_nullable_key)
+ {
+-    for (const auto & action : expr.getActions())
+-    {
+-        if (action.node->type == ActionsDAG::ActionType::ARRAY_JOIN)
+-            throw Exception(key_name + " key cannot contain array joins", ErrorCodes::ILLEGAL_COLUMN);
++    if (expr.hasArrayJoin())
++        throw Exception(key_name + " key cannot contain array joins", ErrorCodes::ILLEGAL_COLUMN);
+ 
+-        if (action.node->type == ActionsDAG::ActionType::FUNCTION)
+-        {
+-            IFunctionBase & func = *action.node->function_base;
+-            if (!func.isDeterministic())
+-                throw Exception(key_name + " key cannot contain non-deterministic functions, "
+-                    "but contains function " + func.getName(),
+-                    ErrorCodes::BAD_ARGUMENTS);
+-        }
++    try
++    {
++        expr.assertDeterministic();
++    }
++    catch (Exception & e)
++    {
++        e.addMessage(fmt::format("for {} key", key_name));
++        throw;
+     }
+ 
+     for (const ColumnWithTypeAndName & element : sample_block)

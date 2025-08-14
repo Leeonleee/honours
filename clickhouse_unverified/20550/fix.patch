@@ -1,0 +1,196 @@
+diff --git a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+index e6061aabe947..7ee7bb1f3017 100644
+--- a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
++++ b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+@@ -21,7 +21,7 @@
+ 
+ #include <IO/WriteHelpers.h>
+ 
+-#include <Processors/Executors/PullingPipelineExecutor.h>
++#include <Processors/Executors/PullingAsyncPipelineExecutor.h>
+ 
+ namespace DB
+ {
+@@ -122,8 +122,10 @@ void ExecuteScalarSubqueriesMatcher::visit(const ASTSubquery & subquery, ASTPtr
+ 
+             try
+             {
+-                PullingPipelineExecutor executor(io.pipeline);
+-                if (!executor.pull(block))
++                PullingAsyncPipelineExecutor executor(io.pipeline);
++                while (block.rows() == 0 && executor.pull(block));
++
++                if (block.rows() == 0)
+                 {
+                     /// Interpret subquery with empty result as Null literal
+                     auto ast_new = std::make_unique<ASTLiteral>(Null());
+@@ -132,7 +134,13 @@ void ExecuteScalarSubqueriesMatcher::visit(const ASTSubquery & subquery, ASTPtr
+                     return;
+                 }
+ 
+-                if (block.rows() != 1 || executor.pull(block))
++                if (block.rows() != 1)
++                    throw Exception("Scalar subquery returned more than one row", ErrorCodes::INCORRECT_RESULT_OF_SCALAR_SUBQUERY);
++
++                Block tmp_block;
++                while (tmp_block.rows() == 0 && executor.pull(tmp_block));
++
++                if (tmp_block.rows() != 0)
+                     throw Exception("Scalar subquery returned more than one row", ErrorCodes::INCORRECT_RESULT_OF_SCALAR_SUBQUERY);
+             }
+             catch (const Exception & e)
+diff --git a/src/Interpreters/ExpressionAnalyzer.cpp b/src/Interpreters/ExpressionAnalyzer.cpp
+index 660718549b34..4a43b52f2397 100644
+--- a/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -54,7 +54,7 @@
+ #include <IO/Operators.h>
+ #include <IO/WriteBufferFromString.h>
+ 
+-#include <Processors/Executors/PullingPipelineExecutor.h>
++#include <Processors/Executors/PullingAsyncPipelineExecutor.h>
+ #include <Parsers/formatAST.h>
+ 
+ namespace DB
+@@ -320,7 +320,7 @@ void SelectQueryExpressionAnalyzer::tryMakeSetForIndexFromSubquery(const ASTPtr
+ 
+     auto interpreter_subquery = interpretSubquery(subquery_or_table_name, context, {}, query_options);
+     auto io = interpreter_subquery->execute();
+-    PullingPipelineExecutor executor(io.pipeline);
++    PullingAsyncPipelineExecutor executor(io.pipeline);
+ 
+     SetPtr set = std::make_shared<Set>(settings.size_limits_for_set, true, context.getSettingsRef().transform_null_in);
+     set->setHeader(executor.getHeader());
+@@ -328,6 +328,9 @@ void SelectQueryExpressionAnalyzer::tryMakeSetForIndexFromSubquery(const ASTPtr
+     Block block;
+     while (executor.pull(block))
+     {
++        if (block.rows() == 0)
++            continue;
++
+         /// If the limits have been exceeded, give up and let the default subquery processing actions take place.
+         if (!set->insertFromBlock(block))
+             return;
+diff --git a/src/Processors/Executors/PullingAsyncPipelineExecutor.cpp b/src/Processors/Executors/PullingAsyncPipelineExecutor.cpp
+index e4bcf6dc0ab1..c975153d317c 100644
+--- a/src/Processors/Executors/PullingAsyncPipelineExecutor.cpp
++++ b/src/Processors/Executors/PullingAsyncPipelineExecutor.cpp
+@@ -14,6 +14,7 @@ struct PullingAsyncPipelineExecutor::Data
+ {
+     PipelineExecutorPtr executor;
+     std::exception_ptr exception;
++    LazyOutputFormat * lazy_format = nullptr;
+     std::atomic_bool is_finished = false;
+     std::atomic_bool has_exception = false;
+     ThreadFromGlobalPool thread;
+@@ -82,6 +83,10 @@ static void threadFunction(PullingAsyncPipelineExecutor::Data & data, ThreadGrou
+     {
+         data.exception = std::current_exception();
+         data.has_exception = true;
++
++        /// Finish lazy format in case of exception. Otherwise thread.join() may hung.
++        if (data.lazy_format)
++            data.lazy_format->finalize();
+     }
+ 
+     data.is_finished = true;
+@@ -95,6 +100,7 @@ bool PullingAsyncPipelineExecutor::pull(Chunk & chunk, uint64_t milliseconds)
+     {
+         data = std::make_unique<Data>();
+         data->executor = pipeline.execute();
++        data->lazy_format = lazy_format.get();
+ 
+         auto func = [&, thread_group = CurrentThread::getGroup()]()
+         {
+@@ -105,14 +111,7 @@ bool PullingAsyncPipelineExecutor::pull(Chunk & chunk, uint64_t milliseconds)
+     }
+ 
+     if (data->has_exception)
+-    {
+-        /// Finish lazy format in case of exception. Otherwise thread.join() may hung.
+-        if (lazy_format)
+-            lazy_format->finish();
+-
+-        data->has_exception = false;
+         std::rethrow_exception(std::move(data->exception));
+-    }
+ 
+     bool is_execution_finished = lazy_format ? lazy_format->isFinished()
+                                              : data->is_finished.load();
+@@ -121,7 +120,7 @@ bool PullingAsyncPipelineExecutor::pull(Chunk & chunk, uint64_t milliseconds)
+     {
+         /// If lazy format is finished, we don't cancel pipeline but wait for main thread to be finished.
+         data->is_finished = true;
+-        /// Wait thread ant rethrow exception if any.
++        /// Wait thread and rethrow exception if any.
+         cancel();
+         return false;
+     }
+@@ -133,7 +132,12 @@ bool PullingAsyncPipelineExecutor::pull(Chunk & chunk, uint64_t milliseconds)
+     }
+ 
+     chunk.clear();
+-    data->finish_event.tryWait(milliseconds);
++
++    if (milliseconds)
++        data->finish_event.tryWait(milliseconds);
++    else
++        data->finish_event.wait();
++
+     return true;
+ }
+ 
+diff --git a/src/Processors/Formats/LazyOutputFormat.cpp b/src/Processors/Formats/LazyOutputFormat.cpp
+index 46287d1cce9e..0663ff28f84e 100644
+--- a/src/Processors/Formats/LazyOutputFormat.cpp
++++ b/src/Processors/Formats/LazyOutputFormat.cpp
+@@ -16,8 +16,13 @@ Chunk LazyOutputFormat::getChunk(UInt64 milliseconds)
+     }
+ 
+     Chunk chunk;
+-    if (!queue.tryPop(chunk, milliseconds))
+-        return {};
++    if (milliseconds)
++    {
++        if (!queue.tryPop(chunk, milliseconds))
++            return {};
++    }
++    else
++        queue.pop(chunk);
+ 
+     if (chunk)
+         info.update(chunk.getNumRows(), chunk.allocatedBytes());
+diff --git a/src/Processors/Formats/LazyOutputFormat.h b/src/Processors/Formats/LazyOutputFormat.h
+index 06ec116f3dde..15ea5022f825 100644
+--- a/src/Processors/Formats/LazyOutputFormat.h
++++ b/src/Processors/Formats/LazyOutputFormat.h
+@@ -36,6 +36,14 @@ class LazyOutputFormat : public IOutputFormat
+         queue.clear();
+     }
+ 
++    void finalize() override
++    {
++        finished_processing = true;
++
++        /// In case we are waiting for result.
++        queue.emplace(Chunk());
++    }
++
+ protected:
+     void consume(Chunk chunk) override
+     {
+@@ -46,14 +54,6 @@ class LazyOutputFormat : public IOutputFormat
+     void consumeTotals(Chunk chunk) override { totals = std::move(chunk); }
+     void consumeExtremes(Chunk chunk) override { extremes = std::move(chunk); }
+ 
+-    void finalize() override
+-    {
+-        finished_processing = true;
+-
+-        /// In case we are waiting for result.
+-        queue.emplace(Chunk());
+-    }
+-
+ private:
+ 
+     ConcurrentBoundedQueue<Chunk> queue;

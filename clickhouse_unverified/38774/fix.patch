@@ -1,0 +1,274 @@
+diff --git a/src/Columns/ColumnDecimal.h b/src/Columns/ColumnDecimal.h
+index 1383f5834276..038751216376 100644
+--- a/src/Columns/ColumnDecimal.h
++++ b/src/Columns/ColumnDecimal.h
+@@ -104,7 +104,7 @@ class ColumnDecimal final : public COWHelper<ColumnVectorHelper, ColumnDecimal<T
+     Field operator[](size_t n) const override { return DecimalField(data[n], scale); }
+     void get(size_t n, Field & res) const override { res = (*this)[n]; }
+     bool getBool(size_t n) const override { return bool(data[n].value); }
+-    Int64 getInt(size_t n) const override { return Int64(data[n].value) * scale; }
++    Int64 getInt(size_t n) const override { return Int64(data[n].value); }
+     UInt64 get64(size_t n) const override;
+     bool isDefaultAt(size_t n) const override { return data[n].value == 0; }
+ 
+diff --git a/src/Common/IntervalKind.cpp b/src/Common/IntervalKind.cpp
+index d3cd4eeff8fe..4e923fdba554 100644
+--- a/src/Common/IntervalKind.cpp
++++ b/src/Common/IntervalKind.cpp
+@@ -7,6 +7,7 @@ namespace DB
+ namespace ErrorCodes
+ {
+     extern const int SYNTAX_ERROR;
++    extern const int BAD_ARGUMENTS;
+ }
+ 
+ Int32 IntervalKind::toAvgSeconds() const
+@@ -15,7 +16,7 @@ Int32 IntervalKind::toAvgSeconds() const
+     {
+         case IntervalKind::Nanosecond:
+         case IntervalKind::Microsecond:
+-        case IntervalKind::Millisecond: return 0; /// fractional parts of seconds have 0 seconds
++        case IntervalKind::Millisecond: return 0;
+         case IntervalKind::Second: return 1;
+         case IntervalKind::Minute: return 60;
+         case IntervalKind::Hour: return 3600;
+@@ -28,6 +29,51 @@ Int32 IntervalKind::toAvgSeconds() const
+     __builtin_unreachable();
+ }
+ 
++Float64 IntervalKind::toSeconds() const
++{
++    switch (kind)
++    {
++        case IntervalKind::Nanosecond:
++            return 0.000000001;
++        case IntervalKind::Microsecond:
++            return 0.000001;
++        case IntervalKind::Millisecond:
++            return 0.001;
++        case IntervalKind::Second:
++            return 1;
++        case IntervalKind::Minute:
++            return 60;
++        case IntervalKind::Hour:
++            return 3600;
++        case IntervalKind::Day:
++            return 86400;
++        case IntervalKind::Week:
++            return 604800;
++        default:
++            throw Exception("Not possible to get precise number of seconds in non-precise interval", ErrorCodes::BAD_ARGUMENTS);
++    }
++    __builtin_unreachable();
++}
++
++bool IntervalKind::isFixedLength() const
++{
++    switch (kind)
++    {
++        case IntervalKind::Nanosecond:
++        case IntervalKind::Microsecond:
++        case IntervalKind::Millisecond:
++        case IntervalKind::Second:
++        case IntervalKind::Minute:
++        case IntervalKind::Hour:
++        case IntervalKind::Day:
++        case IntervalKind::Week: return true;
++        case IntervalKind::Month:
++        case IntervalKind::Quarter:
++        case IntervalKind::Year: return false;
++    }
++    __builtin_unreachable();
++}
++
+ IntervalKind IntervalKind::fromAvgSeconds(Int64 num_seconds)
+ {
+     if (num_seconds)
+diff --git a/src/Common/IntervalKind.h b/src/Common/IntervalKind.h
+index d5f2b5672cdd..59e8d32f3e71 100644
+--- a/src/Common/IntervalKind.h
++++ b/src/Common/IntervalKind.h
+@@ -33,10 +33,17 @@ struct IntervalKind
+     /// For `Month`, `Quarter` and `Year` the function returns an average number of seconds.
+     Int32 toAvgSeconds() const;
+ 
++    /// Returns exact number of seconds in one interval.
++    /// For `Month`, `Quarter` and `Year` the function raises an error.
++    Float64 toSeconds() const;
++
+     /// Chooses an interval kind based on number of seconds.
+     /// For example, `IntervalKind::fromAvgSeconds(3600)` returns `IntervalKind::Hour`.
+     static IntervalKind fromAvgSeconds(Int64 num_seconds);
+ 
++    /// Returns whether IntervalKind has a fixed number of seconds (e.g. Day) or non-fixed(e.g. Month)
++    bool isFixedLength() const;
++
+     /// Returns an uppercased version of what `toString()` returns.
+     const char * toKeyword() const;
+ 
+diff --git a/src/Processors/Transforms/WindowTransform.cpp b/src/Processors/Transforms/WindowTransform.cpp
+index 3eb0f62cb017..5c833cf8f69c 100644
+--- a/src/Processors/Transforms/WindowTransform.cpp
++++ b/src/Processors/Transforms/WindowTransform.cpp
+@@ -13,8 +13,10 @@
+ #include <DataTypes/DataTypesNumber.h>
+ #include <DataTypes/getLeastSupertype.h>
+ #include <DataTypes/DataTypeLowCardinality.h>
++#include <DataTypes/DataTypeInterval.h>
+ #include <Interpreters/ExpressionActions.h>
+ #include <Interpreters/convertFieldToType.h>
++#include <DataTypes/DataTypeDateTime64.h>
+ 
+ 
+ namespace DB
+@@ -27,6 +29,7 @@ namespace ErrorCodes
+     extern const int BAD_ARGUMENTS;
+     extern const int NOT_IMPLEMENTED;
+     extern const int ILLEGAL_COLUMN;
++    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+ }
+ 
+ // Interface for true window functions. It's not much of an interface, they just
+@@ -2200,6 +2203,128 @@ struct WindowFunctionNthValue final : public WindowFunction
+     }
+ };
+ 
++struct NonNegativeDerivativeState
++{
++    Float64 previous_metric = 0;
++    Float64 previous_timestamp = 0;
++};
++
++// nonNegativeDerivative(metric_column, timestamp_column[, INTERVAL 1 SECOND])
++struct WindowFunctionNonNegativeDerivative final : public StatefulWindowFunction<NonNegativeDerivativeState>
++{
++    static constexpr size_t ARGUMENT_METRIC = 0;
++    static constexpr size_t ARGUMENT_TIMESTAMP = 1;
++    static constexpr size_t ARGUMENT_INTERVAL = 2;
++
++    WindowFunctionNonNegativeDerivative(const std::string & name_,
++                                            const DataTypes & argument_types_, const Array & parameters_)
++        : StatefulWindowFunction(name_, argument_types_, parameters_)
++    {
++        if (!parameters.empty())
++        {
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                            "Function {} cannot be parameterized", name_);
++        }
++
++        if (argument_types.size() != 2 && argument_types.size() != 3)
++        {
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                            "Function {} takes 2 or 3 arguments", name_);
++        }
++
++        if (!isNumber(argument_types[ARGUMENT_METRIC]))
++        {
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                            "Argument {} must be a number, '{}' given",
++                            ARGUMENT_METRIC,
++                            argument_types[ARGUMENT_METRIC]->getName());
++        }
++
++        if (!isDateTime(argument_types[ARGUMENT_TIMESTAMP]) && !isDateTime64(argument_types[ARGUMENT_TIMESTAMP]))
++        {
++            throw Exception(ErrorCodes::BAD_ARGUMENTS,
++                            "Argument {} must be DateTime or DateTime64, '{}' given",
++                            ARGUMENT_TIMESTAMP,
++                            argument_types[ARGUMENT_TIMESTAMP]->getName());
++        }
++
++        if (isDateTime64(argument_types[ARGUMENT_TIMESTAMP]))
++        {
++            const auto & datetime64_type = assert_cast<const DataTypeDateTime64 &>(*argument_types[ARGUMENT_TIMESTAMP]);
++            ts_scale_multiplier = DecimalUtils::scaleMultiplier<DateTime64>(datetime64_type.getScale());
++        }
++
++        if (argument_types.size() == 3)
++        {
++            const DataTypeInterval * interval_datatype = checkAndGetDataType<DataTypeInterval>(argument_types[ARGUMENT_INTERVAL].get());
++            if (!interval_datatype)
++            {
++                throw Exception(
++                    ErrorCodes::BAD_ARGUMENTS,
++                    "Argument {} must be an INTERVAL, '{}' given",
++                    ARGUMENT_INTERVAL,
++                    argument_types[ARGUMENT_INTERVAL]->getName());
++            }
++            if (!interval_datatype->getKind().isFixedLength())
++            {
++                throw Exception(
++                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
++                    "The INTERVAL must be a week or shorter, '{}' given",
++                    argument_types[ARGUMENT_INTERVAL]->getName());
++            }
++            interval_length = interval_datatype->getKind().toSeconds();
++            interval_specified = true;
++        }
++    }
++
++
++    DataTypePtr getReturnType() const override { return std::make_shared<DataTypeFloat64>(); }
++
++    bool allocatesMemoryInArena() const override { return false; }
++
++    void windowInsertResultInto(const WindowTransform * transform,
++                                size_t function_index) override
++    {
++        const auto & current_block = transform->blockAt(transform->current_row);
++        const auto & workspace = transform->workspaces[function_index];
++        auto & state = getState(workspace);
++
++        auto interval_duration = interval_specified ? interval_length *
++            (*current_block.input_columns[workspace.argument_column_indices[ARGUMENT_INTERVAL]]).getFloat64(0) : 1;
++
++        Float64 curr_metric = WindowFunctionHelpers::getValue<Float64>(transform, function_index, ARGUMENT_METRIC, transform->current_row);
++        Float64 metric_diff = curr_metric - state.previous_metric;
++        Float64 result;
++
++        if (ts_scale_multiplier)
++        {
++            const auto & column = transform->blockAt(transform->current_row.block).input_columns[workspace.argument_column_indices[ARGUMENT_TIMESTAMP]];
++            const auto & curr_timestamp = checkAndGetColumn<DataTypeDateTime64::ColumnType>(column.get())->getInt(transform->current_row.row);
++
++            Float64 time_elapsed = curr_timestamp - state.previous_timestamp;
++            result = (time_elapsed > 0) ? (metric_diff * ts_scale_multiplier / time_elapsed  * interval_duration) : 0;
++            state.previous_timestamp = curr_timestamp;
++        }
++        else
++        {
++            Float64 curr_timestamp = WindowFunctionHelpers::getValue<Float64>(transform, function_index, ARGUMENT_TIMESTAMP, transform->current_row);
++            Float64 time_elapsed = curr_timestamp - state.previous_timestamp;
++            result = (time_elapsed > 0) ? (metric_diff / time_elapsed * interval_duration) : 0;
++            state.previous_timestamp = curr_timestamp;
++        }
++        state.previous_metric = curr_metric;
++
++        if (unlikely(!transform->current_row.row))
++            result = 0;
++
++        WindowFunctionHelpers::setValueToOutputColumn<Float64>(transform, function_index, result >= 0 ? result : 0);
++    }
++private:
++    Float64 interval_length = 1;
++    bool interval_specified = false;
++    Int64 ts_scale_multiplier = 0;
++};
++
+ 
+ void registerWindowFunctions(AggregateFunctionFactory & factory)
+ {
+@@ -2299,6 +2424,13 @@ void registerWindowFunctions(AggregateFunctionFactory & factory)
+             return std::make_shared<WindowFunctionExponentialTimeDecayedAvg>(
+                 name, argument_types, parameters);
+         }, properties});
++
++    factory.registerFunction("nonNegativeDerivative", {[](const std::string & name,
++           const DataTypes & argument_types, const Array & parameters, const Settings *)
++        {
++            return std::make_shared<WindowFunctionNonNegativeDerivative>(
++                name, argument_types, parameters);
++        }, properties});
+ }
+ 
+ }

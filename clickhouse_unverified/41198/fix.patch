@@ -1,0 +1,1036 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index d1f1df24398f..3d447d6bbb8f 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -82,13 +82,17 @@
+ #if USE_BORINGSSL
+ #include <Compression/CompressionCodecEncrypted.h>
+ #endif
++#include <Server/HTTP/HTTPServerConnectionFactory.h>
+ #include <Server/MySQLHandlerFactory.h>
+ #include <Server/PostgreSQLHandlerFactory.h>
++#include <Server/ProxyV1HandlerFactory.h>
++#include <Server/TLSHandlerFactory.h>
+ #include <Server/CertificateReloader.h>
+ #include <Server/ProtocolServerAdapter.h>
+ #include <Server/HTTP/HTTPServer.h>
+ #include <Interpreters/AsynchronousInsertQueue.h>
+ #include <filesystem>
++#include <unordered_set>
+ 
+ #include "config.h"
+ #include "config_version.h"
+@@ -387,7 +391,16 @@ bool getListenTry(const Poco::Util::AbstractConfiguration & config)
+ {
+     bool listen_try = config.getBool("listen_try", false);
+     if (!listen_try)
+-        listen_try = DB::getMultipleValuesFromConfig(config, "", "listen_host").empty();
++    {
++        Poco::Util::AbstractConfiguration::Keys protocols;
++        config.keys("protocols", protocols);
++        listen_try =
++            DB::getMultipleValuesFromConfig(config, "", "listen_host").empty() &&
++            std::none_of(protocols.begin(), protocols.end(), [&](const auto & protocol)
++            {
++                return config.has("protocols." + protocol + ".host") && config.has("protocols." + protocol + ".port");
++            });
++    }
+     return listen_try;
+ }
+ 
+@@ -1853,6 +1866,82 @@ int Server::main(const std::vector<std::string> & /*args*/)
+     return Application::EXIT_OK;
+ }
+ 
++std::unique_ptr<TCPProtocolStackFactory> Server::buildProtocolStackFromConfig(
++    const Poco::Util::AbstractConfiguration & config,
++    const std::string & protocol,
++    Poco::Net::HTTPServerParams::Ptr http_params,
++    AsynchronousMetrics & async_metrics,
++    bool & is_secure)
++{
++    auto create_factory = [&](const std::string & type, const std::string & conf_name) -> TCPServerConnectionFactory::Ptr
++    {
++        if (type == "tcp")
++            return TCPServerConnectionFactory::Ptr(new TCPHandlerFactory(*this, false, false));
++
++        if (type == "tls")
++#if USE_SSL
++            return TCPServerConnectionFactory::Ptr(new TLSHandlerFactory(*this, conf_name));
++#else
++            throw Exception{"SSL support for TCP protocol is disabled because Poco library was built without NetSSL support.",
++                            ErrorCodes::SUPPORT_IS_DISABLED};
++#endif
++
++        if (type == "proxy1")
++            return TCPServerConnectionFactory::Ptr(new ProxyV1HandlerFactory(*this, conf_name));
++        if (type == "mysql")
++            return TCPServerConnectionFactory::Ptr(new MySQLHandlerFactory(*this));
++        if (type == "postgres")
++            return TCPServerConnectionFactory::Ptr(new PostgreSQLHandlerFactory(*this));
++        if (type == "http")
++            return TCPServerConnectionFactory::Ptr(
++                new HTTPServerConnectionFactory(context(), http_params, createHandlerFactory(*this, config, async_metrics, "HTTPHandler-factory"))
++            );
++        if (type == "prometheus")
++            return TCPServerConnectionFactory::Ptr(
++                new HTTPServerConnectionFactory(context(), http_params, createHandlerFactory(*this, config, async_metrics, "PrometheusHandler-factory"))
++            );
++        if (type == "interserver")
++            return TCPServerConnectionFactory::Ptr(
++                new HTTPServerConnectionFactory(context(), http_params, createHandlerFactory(*this, config, async_metrics, "InterserverIOHTTPHandler-factory"))
++            );
++
++        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Protocol configuration error, unknown protocol name '{}'", type);
++    };
++
++    std::string conf_name = "protocols." + protocol;
++    std::string prefix = conf_name + ".";
++    std::unordered_set<std::string> pset {conf_name};
++
++    auto stack = std::make_unique<TCPProtocolStackFactory>(*this, conf_name);
++
++    while (true)
++    {
++        // if there is no "type" - it's a reference to another protocol and this is just an endpoint
++        if (config.has(prefix + "type"))
++        {
++            std::string type = config.getString(prefix + "type");
++            if (type == "tls")
++            {
++                if (is_secure)
++                    throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Protocol '{}' contains more than one TLS layer", protocol);
++                is_secure = true;
++            }
++
++            stack->append(create_factory(type, conf_name));
++        }
++
++        if (!config.has(prefix + "impl"))
++            break;
++
++        conf_name = "protocols." + config.getString(prefix + "impl");
++        prefix = conf_name + ".";
++
++        if (!pset.insert(conf_name).second)
++            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Protocol '{}' configuration contains a loop on '{}'", protocol, conf_name);
++    }
++
++    return stack;
++}
+ 
+ void Server::createServers(
+     Poco::Util::AbstractConfiguration & config,
+@@ -1871,6 +1960,55 @@ void Server::createServers(
+     http_params->setTimeout(settings.http_receive_timeout);
+     http_params->setKeepAliveTimeout(keep_alive_timeout);
+ 
++    Poco::Util::AbstractConfiguration::Keys protocols;
++    config.keys("protocols", protocols);
++
++    for (const auto & protocol : protocols)
++    {
++        std::vector<std::string> hosts;
++        if (config.has("protocols." + protocol + ".host"))
++            hosts.push_back(config.getString("protocols." + protocol + ".host"));
++        else
++            hosts = listen_hosts;
++
++        for (const auto & host : hosts)
++        {
++            std::string conf_name = "protocols." + protocol;
++            std::string prefix = conf_name + ".";
++
++            if (!config.has(prefix + "port"))
++                continue;
++
++            std::string description {"<undefined> protocol"};
++            if (config.has(prefix + "description"))
++                description = config.getString(prefix + "description");
++            std::string port_name = prefix + "port";
++            bool is_secure = false;
++            auto stack = buildProtocolStackFromConfig(config, protocol, http_params, async_metrics, is_secure);
++
++            if (stack->empty())
++                throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Protocol '{}' stack empty", protocol);
++
++            createServer(config, host, port_name.c_str(), listen_try, start_servers, servers, [&](UInt16 port) -> ProtocolServerAdapter
++            {
++                Poco::Net::ServerSocket socket;
++                auto address = socketBindListen(config, socket, host, port, is_secure);
++                socket.setReceiveTimeout(settings.receive_timeout);
++                socket.setSendTimeout(settings.send_timeout);
++
++                return ProtocolServerAdapter(
++                    host,
++                    port_name.c_str(),
++                    description + ": " + address.toString(),
++                    std::make_unique<TCPServer>(
++                        stack.release(),
++                        server_pool,
++                        socket,
++                        new Poco::Net::TCPServerParams));
++            });
++        }
++    }
++
+     for (const auto & listen_host : listen_hosts)
+     {
+         /// HTTP
+@@ -2118,13 +2256,50 @@ void Server::updateServers(
+     {
+         if (!server.isStopping())
+         {
+-            bool has_host = std::find(listen_hosts.begin(), listen_hosts.end(), server.getListenHost()) != listen_hosts.end();
+-            bool has_port = !config.getString(server.getPortName(), "").empty();
++            std::string port_name = server.getPortName();
++            bool has_host = false;
++            bool is_http = false;
++            if (port_name.starts_with("protocols."))
++            {
++                std::string protocol = port_name.substr(0, port_name.find_last_of('.'));
++                has_host = config.has(protocol + ".host");
++
++                std::string conf_name = protocol;
++                std::string prefix = protocol + ".";
++                std::unordered_set<std::string> pset {conf_name};
++                while (true)
++                {
++                    if (config.has(prefix + "type"))
++                    {
++                        std::string type = config.getString(prefix + "type");
++                        if (type == "http")
++                        {
++                            is_http = true;
++                            break;
++                        }
++                    }
++
++                    if (!config.has(prefix + "impl"))
++                        break;
++
++                    conf_name = "protocols." + config.getString(prefix + "impl");
++                    prefix = conf_name + ".";
++
++                    if (!pset.insert(conf_name).second)
++                        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Protocol '{}' configuration contains a loop on '{}'", protocol, conf_name);
++                }
++            }
++            else
++            {
++                /// NOTE: better to compare using getPortName() over using
++                /// dynamic_cast<> since HTTPServer is also used for prometheus and
++                /// internal replication communications.
++                is_http = server.getPortName() == "http_port" || server.getPortName() == "https_port";
++            }
+ 
+-            /// NOTE: better to compare using getPortName() over using
+-            /// dynamic_cast<> since HTTPServer is also used for prometheus and
+-            /// internal replication communications.
+-            bool is_http = server.getPortName() == "http_port" || server.getPortName() == "https_port";
++            if (!has_host)
++                has_host = std::find(listen_hosts.begin(), listen_hosts.end(), server.getListenHost()) != listen_hosts.end();
++            bool has_port = !config.getString(port_name, "").empty();
+             bool force_restart = is_http && !isSameConfiguration(previous_config, config, "http_handlers");
+             if (force_restart)
+                 LOG_TRACE(log, "<http_handlers> had been changed, will reload {}", server.getDescription());
+diff --git a/programs/server/Server.h b/programs/server/Server.h
+index 44a5a441e435..53841b1fcd45 100644
+--- a/programs/server/Server.h
++++ b/programs/server/Server.h
+@@ -3,6 +3,8 @@
+ #include <Server/IServer.h>
+ 
+ #include <Daemon/BaseDaemon.h>
++#include <Server/TCPProtocolStackFactory.h>
++#include <Poco/Net/HTTPServerParams.h>
+ 
+ /** Server provides three interfaces:
+   * 1. HTTP - simple interface for any applications.
+@@ -77,6 +79,13 @@ class Server : public BaseDaemon, public IServer
+         UInt16 port,
+         [[maybe_unused]] bool secure = false) const;
+ 
++    std::unique_ptr<TCPProtocolStackFactory> buildProtocolStackFromConfig(
++        const Poco::Util::AbstractConfiguration & config,
++        const std::string & protocol,
++        Poco::Net::HTTPServerParams::Ptr http_params,
++        AsynchronousMetrics & async_metrics,
++        bool & is_secure);
++
+     using CreateServerFunc = std::function<ProtocolServerAdapter(UInt16)>;
+     void createServer(
+         Poco::Util::AbstractConfiguration & config,
+diff --git a/src/Functions/FunctionShowCertificate.h b/src/Functions/FunctionShowCertificate.h
+index 32041e55b008..3c30d8138e5a 100644
+--- a/src/Functions/FunctionShowCertificate.h
++++ b/src/Functions/FunctionShowCertificate.h
+@@ -2,6 +2,9 @@
+ 
+ #include "config.h"
+ 
++#include <memory>
++#include <string>
++
+ #include <Columns/ColumnMap.h>
+ #include <Columns/ColumnArray.h>
+ #include <Columns/ColumnString.h>
+@@ -33,14 +36,18 @@ class FunctionShowCertificate : public IFunction
+ public:
+     static constexpr auto name = "showCertificate";
+ 
+-    static FunctionPtr create(ContextPtr)
++    static FunctionPtr create(ContextPtr ctx)
+     {
+ #if !defined(USE_SSL) || USE_SSL == 0
+         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "SSL support is disabled");
+ #endif
+-        return std::make_shared<FunctionShowCertificate>();
++        return std::make_shared<FunctionShowCertificate>(ctx->getQueryContext()->getClientInfo().certificate);
+     }
+ 
++    std::string certificate;
++
++    explicit FunctionShowCertificate(const std::string & certificate_ = "") : certificate(certificate_) {}
++
+     String getName() const override { return name; }
+ 
+     size_t getNumberOfArguments() const override { return 0; }
+@@ -61,7 +68,15 @@ class FunctionShowCertificate : public IFunction
+         if (input_rows_count)
+         {
+ #if USE_SSL
+-            if (const X509 * cert = SSL_CTX_get0_certificate(Poco::Net::SSLManager::instance().defaultServerContext()->sslContext()))
++            std::unique_ptr<Poco::Crypto::X509Certificate> x509_cert;
++            if (!certificate.empty())
++                x509_cert = std::make_unique<Poco::Crypto::X509Certificate>(certificate);
++
++            const X509 * cert = x509_cert ?
++                x509_cert->certificate() :
++                SSL_CTX_get0_certificate(Poco::Net::SSLManager::instance().defaultServerContext()->sslContext());
++
++            if (cert)
+             {
+                 BIO * b = BIO_new(BIO_s_mem());
+                 SCOPE_EXIT(
+diff --git a/src/Interpreters/ClientInfo.h b/src/Interpreters/ClientInfo.h
+index a1096b993256..f7a172b226de 100644
+--- a/src/Interpreters/ClientInfo.h
++++ b/src/Interpreters/ClientInfo.h
+@@ -69,6 +69,7 @@ class ClientInfo
+ 
+     Interface interface = Interface::TCP;
+     bool is_secure = false;
++    String certificate;
+ 
+     /// For tcp
+     String os_user;
+diff --git a/src/Interpreters/Session.cpp b/src/Interpreters/Session.cpp
+index 52588a5f4cc4..7639dec813d1 100644
+--- a/src/Interpreters/Session.cpp
++++ b/src/Interpreters/Session.cpp
+@@ -244,7 +244,7 @@ void Session::shutdownNamedSessions()
+     NamedSessionsStorage::instance().shutdown();
+ }
+ 
+-Session::Session(const ContextPtr & global_context_, ClientInfo::Interface interface_, bool is_secure)
++Session::Session(const ContextPtr & global_context_, ClientInfo::Interface interface_, bool is_secure, const std::string & certificate)
+     : auth_id(UUIDHelpers::generateV4()),
+       global_context(global_context_),
+       log(&Poco::Logger::get(String{magic_enum::enum_name(interface_)} + "-Session"))
+@@ -252,6 +252,7 @@ Session::Session(const ContextPtr & global_context_, ClientInfo::Interface inter
+     prepared_client_info.emplace();
+     prepared_client_info->interface = interface_;
+     prepared_client_info->is_secure = is_secure;
++    prepared_client_info->certificate = certificate;
+ }
+ 
+ Session::~Session()
+diff --git a/src/Interpreters/Session.h b/src/Interpreters/Session.h
+index ed4f7809dee6..0f17c378915e 100644
+--- a/src/Interpreters/Session.h
++++ b/src/Interpreters/Session.h
+@@ -32,7 +32,7 @@ class Session
+     /// Stops using named sessions. The method must be called at the server shutdown.
+     static void shutdownNamedSessions();
+ 
+-    Session(const ContextPtr & global_context_, ClientInfo::Interface interface_, bool is_secure = false);
++    Session(const ContextPtr & global_context_, ClientInfo::Interface interface_, bool is_secure = false, const std::string & certificate = "");
+     ~Session();
+ 
+     Session(const Session &&) = delete;
+diff --git a/src/Server/ProxyV1Handler.cpp b/src/Server/ProxyV1Handler.cpp
+new file mode 100644
+index 000000000000..838a1de1c04a
+--- /dev/null
++++ b/src/Server/ProxyV1Handler.cpp
+@@ -0,0 +1,123 @@
++#include <Server/ProxyV1Handler.h>
++#include <Poco/Net/NetException.h>
++#include <Common/NetException.h>
++#include <Interpreters/Context.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int NETWORK_ERROR;
++    extern const int SOCKET_TIMEOUT;
++    extern const int CANNOT_READ_FROM_SOCKET;
++    extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
++}
++
++void ProxyV1Handler::run()
++{
++    const auto & settings = server.context()->getSettingsRef();
++    socket().setReceiveTimeout(settings.receive_timeout);
++
++    std::string word;
++    bool eol;
++
++    // Read PROXYv1 protocol header
++    // http://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
++
++    // read "PROXY"
++    if (!readWord(5, word, eol) || word != "PROXY" || eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    // read "TCP4" or "TCP6" or "UNKNOWN"
++    if (!readWord(7, word, eol))
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    if (word != "TCP4" && word != "TCP6" && word != "UNKNOWN")
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    if (word == "UNKNOWN" && eol)
++        return;
++
++    if (eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    // read address
++    if (!readWord(39, word, eol) || eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    stack_data.forwarded_for = std::move(word);
++
++    // read address
++    if (!readWord(39, word, eol) || eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    // read port
++    if (!readWord(5, word, eol) || eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++
++    // read port and "\r
+"
++    if (!readWord(5, word, eol) || !eol)
++        throw ParsingException("PROXY protocol violation", ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
++}
++
++bool ProxyV1Handler::readWord(int max_len, std::string & word, bool & eol)
++{
++    word.clear();
++    eol = false;
++
++    char ch = 0;
++    int n = 0;
++    bool is_cr = false;
++    try
++    {
++        for (++max_len; max_len > 0 || is_cr; --max_len)
++        {
++            n = socket().receiveBytes(&ch, 1);
++            if (n == 0)
++            {
++                socket().shutdown();
++                return false;
++            }
++            if (n < 0)
++                break;
++
++            if (is_cr)
++                return ch == 0x0A;
++
++            if (ch == 0x0D)
++            {
++                is_cr = true;
++                eol = true;
++                continue;
++            }
++
++            if (ch == ' ')
++                return true;
++
++            word.push_back(ch);
++        }
++    }
++    catch (const Poco::Net::NetException & e)
++    {
++        throw NetException(e.displayText() + ", while reading from socket (" + socket().peerAddress().toString() + ")", ErrorCodes::NETWORK_ERROR);
++    }
++    catch (const Poco::TimeoutException &)
++    {
++        throw NetException(fmt::format("Timeout exceeded while reading from socket ({}, {} ms)",
++            socket().peerAddress().toString(),
++            socket().getReceiveTimeout().totalMilliseconds()), ErrorCodes::SOCKET_TIMEOUT);
++    }
++    catch (const Poco::IOException & e)
++    {
++        throw NetException(e.displayText() + ", while reading from socket (" + socket().peerAddress().toString() + ")", ErrorCodes::NETWORK_ERROR);
++    }
++
++    if (n < 0)
++        throw NetException("Cannot read from socket (" + socket().peerAddress().toString() + ")", ErrorCodes::CANNOT_READ_FROM_SOCKET);
++
++    return false;
++}
++
++}
+diff --git a/src/Server/ProxyV1Handler.h b/src/Server/ProxyV1Handler.h
+new file mode 100644
+index 000000000000..062cc0e291a6
+--- /dev/null
++++ b/src/Server/ProxyV1Handler.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <Poco/Net/TCPServerConnection.h>
++#include <Server/IServer.h>
++#include <Server/TCPProtocolStackData.h>
++
++
++namespace DB
++{
++
++class ProxyV1Handler : public Poco::Net::TCPServerConnection
++{
++    using StreamSocket = Poco::Net::StreamSocket;
++public:
++    explicit ProxyV1Handler(const StreamSocket & socket, IServer & server_, const std::string & conf_name_, TCPProtocolStackData & stack_data_)
++        : Poco::Net::TCPServerConnection(socket), server(server_), conf_name(conf_name_), stack_data(stack_data_) {}
++
++    void run() override;
++
++protected:
++    bool readWord(int max_len, std::string & word, bool & eol);
++
++private:
++    IServer & server;
++    std::string conf_name;
++    TCPProtocolStackData & stack_data;
++};
++
++}
+diff --git a/src/Server/ProxyV1HandlerFactory.h b/src/Server/ProxyV1HandlerFactory.h
+new file mode 100644
+index 000000000000..028596d745d0
+--- /dev/null
++++ b/src/Server/ProxyV1HandlerFactory.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include <Poco/Net/NetException.h>
++#include <Poco/Net/TCPServerConnection.h>
++#include <Server/ProxyV1Handler.h>
++#include <Common/logger_useful.h>
++#include <Server/IServer.h>
++#include <Server/TCPServer.h>
++#include <Server/TCPProtocolStackData.h>
++
++
++namespace DB
++{
++
++class ProxyV1HandlerFactory : public TCPServerConnectionFactory
++{
++private:
++    IServer & server;
++    Poco::Logger * log;
++    std::string conf_name;
++
++    class DummyTCPHandler : public Poco::Net::TCPServerConnection
++    {
++    public:
++        using Poco::Net::TCPServerConnection::TCPServerConnection;
++        void run() override {}
++    };
++
++public:
++    explicit ProxyV1HandlerFactory(IServer & server_, const std::string & conf_name_)
++        : server(server_), log(&Poco::Logger::get("ProxyV1HandlerFactory")), conf_name(conf_name_)
++    {
++    }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server) override
++    {
++        TCPProtocolStackData stack_data;
++        return createConnection(socket, tcp_server, stack_data);
++    }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer &/* tcp_server*/, TCPProtocolStackData & stack_data) override
++    {
++        try
++        {
++            LOG_TRACE(log, "TCP Request. Address: {}", socket.peerAddress().toString());
++            return new ProxyV1Handler(socket, server, conf_name, stack_data);
++        }
++        catch (const Poco::Net::NetException &)
++        {
++            LOG_TRACE(log, "TCP Request. Client is not connected (most likely RST packet was sent).");
++            return new DummyTCPHandler(socket);
++        }
++    }
++};
++
++}
+diff --git a/src/Server/TCPHandler.cpp b/src/Server/TCPHandler.cpp
+index df22afebb1db..bcf675fbe824 100644
+--- a/src/Server/TCPHandler.cpp
++++ b/src/Server/TCPHandler.cpp
+@@ -109,6 +109,18 @@ TCPHandler::TCPHandler(IServer & server_, TCPServer & tcp_server_, const Poco::N
+ {
+ }
+ 
++TCPHandler::TCPHandler(IServer & server_, TCPServer & tcp_server_, const Poco::Net::StreamSocket & socket_, TCPProtocolStackData & stack_data, std::string server_display_name_)
++: Poco::Net::TCPServerConnection(socket_)
++    , server(server_)
++    , tcp_server(tcp_server_)
++    , log(&Poco::Logger::get("TCPHandler"))
++    , forwarded_for(stack_data.forwarded_for)
++    , certificate(stack_data.certificate)
++    , default_database(stack_data.default_database)
++    , server_display_name(std::move(server_display_name_))
++{
++}
++
+ TCPHandler::~TCPHandler()
+ {
+     try
+@@ -1055,7 +1067,7 @@ std::unique_ptr<Session> TCPHandler::makeSession()
+ {
+     auto interface = is_interserver_mode ? ClientInfo::Interface::TCP_INTERSERVER : ClientInfo::Interface::TCP;
+ 
+-    auto res = std::make_unique<Session>(server.context(), interface, socket().secure());
++    auto res = std::make_unique<Session>(server.context(), interface, socket().secure(), certificate);
+ 
+     auto & client_info = res->getClientInfo();
+     client_info.forwarded_for = forwarded_for;
+@@ -1082,6 +1094,7 @@ void TCPHandler::receiveHello()
+     UInt64 packet_type = 0;
+     String user;
+     String password;
++    String default_db;
+ 
+     readVarUInt(packet_type, *in);
+     if (packet_type != Protocol::Client::Hello)
+@@ -1103,7 +1116,9 @@ void TCPHandler::receiveHello()
+     readVarUInt(client_version_minor, *in);
+     // NOTE For backward compatibility of the protocol, client cannot send its version_patch.
+     readVarUInt(client_tcp_protocol_version, *in);
+-    readStringBinary(default_database, *in);
++    readStringBinary(default_db, *in);
++    if (!default_db.empty())
++        default_database = default_db;
+     readStringBinary(user, *in);
+     readStringBinary(password, *in);
+ 
+diff --git a/src/Server/TCPHandler.h b/src/Server/TCPHandler.h
+index ea5fb2f9fe03..c36ce1e93780 100644
+--- a/src/Server/TCPHandler.h
++++ b/src/Server/TCPHandler.h
+@@ -22,6 +22,7 @@
+ #include <Storages/MergeTree/ParallelReplicasReadingCoordinator.h>
+ 
+ #include "IServer.h"
++#include "Server/TCPProtocolStackData.h"
+ #include "base/types.h"
+ 
+ 
+@@ -137,6 +138,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+       * Proxy-forwarded (original client) IP address is used for quota accounting if quota is keyed by forwarded IP.
+       */
+     TCPHandler(IServer & server_, TCPServer & tcp_server_, const Poco::Net::StreamSocket & socket_, bool parse_proxy_protocol_, std::string server_display_name_);
++    TCPHandler(IServer & server_, TCPServer & tcp_server_, const Poco::Net::StreamSocket & socket_, TCPProtocolStackData & stack_data, std::string server_display_name_);
+     ~TCPHandler() override;
+ 
+     void run() override;
+@@ -151,6 +153,7 @@ class TCPHandler : public Poco::Net::TCPServerConnection
+     Poco::Logger * log;
+ 
+     String forwarded_for;
++    String certificate;
+ 
+     String client_name;
+     UInt64 client_version_major = 0;
+diff --git a/src/Server/TCPHandlerFactory.h b/src/Server/TCPHandlerFactory.h
+index 354c886f4c09..fde04c6e0ab4 100644
+--- a/src/Server/TCPHandlerFactory.h
++++ b/src/Server/TCPHandlerFactory.h
+@@ -3,6 +3,7 @@
+ #include <Poco/Net/NetException.h>
+ #include <Poco/Util/LayeredConfiguration.h>
+ #include <Common/logger_useful.h>
++#include "Server/TCPProtocolStackData.h"
+ #include <Server/IServer.h>
+ #include <Server/TCPHandler.h>
+ #include <Server/TCPServerConnectionFactory.h>
+@@ -53,6 +54,21 @@ class TCPHandlerFactory : public TCPServerConnectionFactory
+             return new DummyTCPHandler(socket);
+         }
+     }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server, TCPProtocolStackData & stack_data) override
++    {
++        try
++        {
++            LOG_TRACE(log, "TCP Request. Address: {}", socket.peerAddress().toString());
++
++            return new TCPHandler(server, tcp_server, socket, stack_data, server_display_name);
++        }
++        catch (const Poco::Net::NetException &)
++        {
++            LOG_TRACE(log, "TCP Request. Client is not connected (most likely RST packet was sent).");
++            return new DummyTCPHandler(socket);
++        }
++    }
+ };
+ 
+ }
+diff --git a/src/Server/TCPProtocolStackData.h b/src/Server/TCPProtocolStackData.h
+new file mode 100644
+index 000000000000..4ad401e723f8
+--- /dev/null
++++ b/src/Server/TCPProtocolStackData.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <string>
++#include <Poco/Net/StreamSocket.h>
++
++namespace DB
++{
++
++// Data to communicate between protocol layers
++struct TCPProtocolStackData
++{
++    // socket implementation can be replaced by some layer - TLS as an example
++    Poco::Net::StreamSocket socket;
++    // host from PROXY layer
++    std::string forwarded_for;
++    // certificate path from TLS layer to TCP layer
++    std::string certificate;
++    // default database from endpoint configuration to TCP layer
++    std::string default_database;
++};
++
++}
+diff --git a/src/Server/TCPProtocolStackFactory.h b/src/Server/TCPProtocolStackFactory.h
+new file mode 100644
+index 000000000000..16b57649a725
+--- /dev/null
++++ b/src/Server/TCPProtocolStackFactory.h
+@@ -0,0 +1,92 @@
++#pragma once
++
++#include <Server/TCPServerConnectionFactory.h>
++#include <Server/IServer.h>
++#include <Server/TCPProtocolStackHandler.h>
++#include <Poco/Logger.h>
++#include <Poco/Net/NetException.h>
++#include <Common/logger_useful.h>
++#include <Access/Common/AllowedClientHosts.h>
++
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int UNKNOWN_ADDRESS_PATTERN_TYPE;
++    extern const int IP_ADDRESS_NOT_ALLOWED;
++}
++
++
++class TCPProtocolStackFactory : public TCPServerConnectionFactory
++{
++private:
++    IServer & server [[maybe_unused]];
++    Poco::Logger * log;
++    std::string conf_name;
++    std::vector<TCPServerConnectionFactory::Ptr> stack;
++    AllowedClientHosts allowed_client_hosts;
++
++    class DummyTCPHandler : public Poco::Net::TCPServerConnection
++    {
++    public:
++        using Poco::Net::TCPServerConnection::TCPServerConnection;
++        void run() override {}
++    };
++
++public:
++    template <typename... T>
++    explicit TCPProtocolStackFactory(IServer & server_, const std::string & conf_name_, T... factory)
++        : server(server_), log(&Poco::Logger::get("TCPProtocolStackFactory")), conf_name(conf_name_), stack({factory...})
++    {
++        const auto & config = server.config();
++        /// Fill list of allowed hosts.
++        const auto networks_config = conf_name + ".networks";
++        if (config.has(networks_config))
++        {
++            Poco::Util::AbstractConfiguration::Keys keys;
++            config.keys(networks_config, keys);
++            for (const String & key : keys)
++            {
++                String value = config.getString(networks_config + "." + key);
++                if (key.starts_with("ip"))
++                    allowed_client_hosts.addSubnet(value);
++                else if (key.starts_with("host_regexp"))
++                    allowed_client_hosts.addNameRegexp(value);
++                else if (key.starts_with("host"))
++                    allowed_client_hosts.addName(value);
++                else
++                    throw Exception("Unknown address pattern type: " + key, ErrorCodes::UNKNOWN_ADDRESS_PATTERN_TYPE);
++            }
++        }
++    }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server) override
++    {
++        if (!allowed_client_hosts.empty() && !allowed_client_hosts.contains(socket.peerAddress().host()))
++            throw Exception("Connections from " + socket.peerAddress().toString() + " are not allowed", ErrorCodes::IP_ADDRESS_NOT_ALLOWED);
++
++        try
++        {
++            LOG_TRACE(log, "TCP Request. Address: {}", socket.peerAddress().toString());
++            return new TCPProtocolStackHandler(server, tcp_server, socket, stack, conf_name);
++        }
++        catch (const Poco::Net::NetException &)
++        {
++            LOG_TRACE(log, "TCP Request. Client is not connected (most likely RST packet was sent).");
++            return new DummyTCPHandler(socket);
++        }
++    }
++
++    void append(TCPServerConnectionFactory::Ptr factory)
++    {
++        stack.push_back(std::move(factory));
++    }
++
++    size_t size() { return stack.size(); }
++    bool empty() { return stack.empty(); }
++};
++
++
++}
+diff --git a/src/Server/TCPProtocolStackHandler.h b/src/Server/TCPProtocolStackHandler.h
+new file mode 100644
+index 000000000000..e16a6b6b2cae
+--- /dev/null
++++ b/src/Server/TCPProtocolStackHandler.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <Server/TCPServerConnectionFactory.h>
++#include <Server/TCPServer.h>
++#include <Poco/Util/LayeredConfiguration.h>
++#include <Server/IServer.h>
++#include <Server/TCPProtocolStackData.h>
++
++
++namespace DB
++{
++
++
++class TCPProtocolStackHandler : public Poco::Net::TCPServerConnection
++{
++    using StreamSocket = Poco::Net::StreamSocket;
++    using TCPServerConnection = Poco::Net::TCPServerConnection;
++private:
++    IServer & server;
++    TCPServer & tcp_server;
++    std::vector<TCPServerConnectionFactory::Ptr> stack;
++    std::string conf_name;
++
++public:
++    TCPProtocolStackHandler(IServer & server_, TCPServer & tcp_server_, const StreamSocket & socket, const std::vector<TCPServerConnectionFactory::Ptr> & stack_, const std::string & conf_name_)
++        : TCPServerConnection(socket), server(server_), tcp_server(tcp_server_), stack(stack_), conf_name(conf_name_)
++    {}
++
++    void run() override
++    {
++        const auto & conf = server.config();
++        TCPProtocolStackData stack_data;
++        stack_data.socket = socket();
++        stack_data.default_database = conf.getString(conf_name + ".default_database", "");
++        for (auto & factory : stack)
++        {
++            std::unique_ptr<TCPServerConnection> connection(factory->createConnection(socket(), tcp_server, stack_data));
++            connection->run();
++            if (stack_data.socket != socket())
++                socket() = stack_data.socket;
++        }
++    }
++};
++
++
++}
+diff --git a/src/Server/TCPServerConnectionFactory.h b/src/Server/TCPServerConnectionFactory.h
+index 613f98352bdf..18b30557b000 100644
+--- a/src/Server/TCPServerConnectionFactory.h
++++ b/src/Server/TCPServerConnectionFactory.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <Poco/SharedPtr.h>
++#include <Server/TCPProtocolStackData.h>
+ 
+ namespace Poco
+ {
+@@ -23,5 +24,9 @@ class TCPServerConnectionFactory
+ 
+     /// Same as Poco::Net::TCPServerConnectionFactory except we can pass the TCPServer
+     virtual Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server) = 0;
++    virtual Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server, TCPProtocolStackData &/* stack_data */)
++    {
++        return createConnection(socket, tcp_server);
++    }
+ };
+ }
+diff --git a/src/Server/TLSHandler.h b/src/Server/TLSHandler.h
+new file mode 100644
+index 000000000000..5b7377515c14
+--- /dev/null
++++ b/src/Server/TLSHandler.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <Poco/Net/TCPServerConnection.h>
++#include <Poco/SharedPtr.h>
++#include <Common/Exception.h>
++#include <Server/TCPProtocolStackData.h>
++
++#if USE_SSL
++#   include <Poco/Net/Context.h>
++#   include <Poco/Net/SecureStreamSocket.h>
++#   include <Poco/Net/SSLManager.h>
++#endif
++
++namespace DB
++{
++
++namespace ErrorCodes
++{
++    extern const int SUPPORT_IS_DISABLED;
++}
++
++class TLSHandler : public Poco::Net::TCPServerConnection
++{
++#if USE_SSL
++    using SecureStreamSocket = Poco::Net::SecureStreamSocket;
++    using SSLManager = Poco::Net::SSLManager;
++    using Context = Poco::Net::Context;
++#endif
++    using StreamSocket = Poco::Net::StreamSocket;
++public:
++    explicit TLSHandler(const StreamSocket & socket, const std::string & key_, const std::string & certificate_, TCPProtocolStackData & stack_data_)
++        : Poco::Net::TCPServerConnection(socket)
++        , key(key_)
++        , certificate(certificate_)
++        , stack_data(stack_data_)
++    {}
++
++    void run() override
++    {
++#if USE_SSL
++        auto ctx = SSLManager::instance().defaultServerContext();
++        if (!key.empty() && !certificate.empty())
++            ctx = new Context(Context::Usage::SERVER_USE, key, certificate, ctx->getCAPaths().caLocation);
++        socket() = SecureStreamSocket::attach(socket(), ctx);
++        stack_data.socket = socket();
++        stack_data.certificate = certificate;
++#else
++        throw Exception{"SSL support for TCP protocol is disabled because Poco library was built without NetSSL support.",
++                        ErrorCodes::SUPPORT_IS_DISABLED};
++#endif
++    }
++private:
++    std::string key [[maybe_unused]];
++    std::string certificate [[maybe_unused]];
++    TCPProtocolStackData & stack_data [[maybe_unused]];
++};
++
++
++}
+diff --git a/src/Server/TLSHandlerFactory.h b/src/Server/TLSHandlerFactory.h
+new file mode 100644
+index 000000000000..9e3002d29719
+--- /dev/null
++++ b/src/Server/TLSHandlerFactory.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <Poco/Logger.h>
++#include <Poco/Net/TCPServerConnection.h>
++#include <Poco/Net/NetException.h>
++#include <Poco/Util/LayeredConfiguration.h>
++#include <Server/TLSHandler.h>
++#include <Server/IServer.h>
++#include <Server/TCPServer.h>
++#include <Server/TCPProtocolStackData.h>
++#include <Common/logger_useful.h>
++
++
++namespace DB
++{
++
++
++class TLSHandlerFactory : public TCPServerConnectionFactory
++{
++private:
++    IServer & server;
++    Poco::Logger * log;
++    std::string conf_name;
++
++    class DummyTCPHandler : public Poco::Net::TCPServerConnection
++    {
++    public:
++        using Poco::Net::TCPServerConnection::TCPServerConnection;
++        void run() override {}
++    };
++
++public:
++    explicit TLSHandlerFactory(IServer & server_, const std::string & conf_name_)
++        : server(server_), log(&Poco::Logger::get("TLSHandlerFactory")), conf_name(conf_name_)
++    {
++    }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer & tcp_server) override
++    {
++        TCPProtocolStackData stack_data;
++        return createConnection(socket, tcp_server, stack_data);
++    }
++
++    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket, TCPServer &/* tcp_server*/, TCPProtocolStackData & stack_data) override
++    {
++        try
++        {
++            LOG_TRACE(log, "TCP Request. Address: {}", socket.peerAddress().toString());
++            return new TLSHandler(
++                socket,
++                server.config().getString(conf_name + ".privateKeyFile", ""),
++                server.config().getString(conf_name + ".certificateFile", ""),
++                stack_data);
++        }
++        catch (const Poco::Net::NetException &)
++        {
++            LOG_TRACE(log, "TCP Request. Client is not connected (most likely RST packet was sent).");
++            return new DummyTCPHandler(socket);
++        }
++    }
++};
++
++
++}

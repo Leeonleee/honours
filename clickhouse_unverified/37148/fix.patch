@@ -1,0 +1,1324 @@
+diff --git a/src/Dictionaries/DictionaryStructure.cpp b/src/Dictionaries/DictionaryStructure.cpp
+index 012750bde60f..5624f9595d7b 100644
+--- a/src/Dictionaries/DictionaryStructure.cpp
++++ b/src/Dictionaries/DictionaryStructure.cpp
+@@ -252,7 +252,7 @@ Strings DictionaryStructure::getKeysNames() const
+ static void checkAttributeKeys(const Poco::Util::AbstractConfiguration::Keys & keys)
+ {
+     static const std::unordered_set<std::string_view> valid_keys
+-        = {"name", "type", "expression", "null_value", "hierarchical", "injective", "is_object_id"};
++        = {"name", "type", "expression", "null_value", "hierarchical", "bidirectional", "injective", "is_object_id"};
+ 
+     for (const auto & key : keys)
+     {
+@@ -350,6 +350,7 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+         }
+ 
+         const auto hierarchical = config.getBool(prefix + "hierarchical", false);
++        const auto bidirectional = config.getBool(prefix + "bidirectional", false);
+         const auto injective = config.getBool(prefix + "injective", false);
+         const auto is_object_id = config.getBool(prefix + "is_object_id", false);
+ 
+@@ -362,6 +363,9 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+         if (has_hierarchy && hierarchical)
+             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Only one hierarchical attribute supported");
+ 
++        if (bidirectional && !hierarchical)
++            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Bidirectional can only be applied to hierarchical attributes");
++
+         has_hierarchy = has_hierarchy || hierarchical;
+ 
+         res_attributes.emplace_back(DictionaryAttribute{
+@@ -372,6 +376,7 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
+             expression,
+             null_value,
+             hierarchical,
++            bidirectional,
+             injective,
+             is_object_id,
+             is_nullable});
+diff --git a/src/Dictionaries/DictionaryStructure.h b/src/Dictionaries/DictionaryStructure.h
+index 50cfba01894c..bb4c306affac 100644
+--- a/src/Dictionaries/DictionaryStructure.h
++++ b/src/Dictionaries/DictionaryStructure.h
+@@ -67,6 +67,7 @@ struct DictionaryAttribute final
+     const std::string expression;
+     const Field null_value;
+     const bool hierarchical;
++    const bool bidirectional;
+     const bool injective;
+     const bool is_object_id;
+     const bool is_nullable;
+diff --git a/src/Dictionaries/FlatDictionary.cpp b/src/Dictionaries/FlatDictionary.cpp
+index 2fe9f09741b8..d0d9fba763cc 100644
+--- a/src/Dictionaries/FlatDictionary.cpp
++++ b/src/Dictionaries/FlatDictionary.cpp
+@@ -43,6 +43,7 @@ FlatDictionary::FlatDictionary(
+ {
+     createAttributes();
+     loadData();
++    buildHierarchyParentToChildIndexIfNeeded();
+     calculateBytesAllocated();
+ }
+ 
+@@ -244,30 +245,43 @@ ColumnUInt8::Ptr FlatDictionary::isInHierarchy(
+     return result;
+ }
+ 
+-ColumnPtr FlatDictionary::getDescendants(
+-    ColumnPtr key_column,
+-    const DataTypePtr &,
+-    size_t level) const
++DictionaryHierarchyParentToChildIndexPtr FlatDictionary::getHierarchicalIndex() const
+ {
+-    PaddedPODArray<UInt64> keys_backup;
+-    const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++    if (hierarhical_index)
++        return hierarhical_index;
+ 
+     size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
+     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
+     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
+ 
+     HashMap<UInt64, PaddedPODArray<UInt64>> parent_to_child;
++    parent_to_child.reserve(element_count);
++
++    UInt64 child_keys_size = static_cast<UInt64>(parent_keys.size());
+ 
+-    for (size_t i = 0; i < parent_keys.size(); ++i)
++    for (UInt64 child_key = 0; child_key < child_keys_size; ++child_key)
+     {
+-        auto parent_key = parent_keys[i];
++        if (!loaded_keys[child_key])
++            continue;
+ 
+-        if (loaded_keys[i])
+-            parent_to_child[parent_key].emplace_back(static_cast<UInt64>(i));
++        auto parent_key = parent_keys[child_key];
++        parent_to_child[parent_key].emplace_back(child_key);
+     }
+ 
++    return std::make_shared<DictionaryHierarchicalParentToChildIndex>(parent_to_child);
++}
++
++ColumnPtr FlatDictionary::getDescendants(
++    ColumnPtr key_column,
++    const DataTypePtr &,
++    size_t level,
++    DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const
++{
++    PaddedPODArray<UInt64> keys_backup;
++    const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++
+     size_t keys_found;
+-    auto result = getKeysDescendantsArray(keys, parent_to_child, level, keys_found);
++    auto result = getKeysDescendantsArray(keys, *parent_to_child_index, level, keys_found);
+ 
+     query_count.fetch_add(keys.size(), std::memory_order_relaxed);
+     found_count.fetch_add(keys_found, std::memory_order_relaxed);
+@@ -400,6 +414,15 @@ void FlatDictionary::loadData()
+         throw Exception(ErrorCodes::DICTIONARY_IS_EMPTY, "{}: dictionary source is empty and 'require_nonempty' property is set.", getFullName());
+ }
+ 
++void FlatDictionary::buildHierarchyParentToChildIndexIfNeeded()
++{
++    if (!dict_struct.hierarchical_attribute_index)
++        return;
++
++    if (dict_struct.attributes[*dict_struct.hierarchical_attribute_index].bidirectional)
++        hierarhical_index = getHierarchicalIndex();
++}
++
+ void FlatDictionary::calculateBytesAllocated()
+ {
+     bytes_allocated += attributes.size() * sizeof(attributes.front());
+@@ -439,6 +462,12 @@ void FlatDictionary::calculateBytesAllocated()
+     if (update_field_loaded_block)
+         bytes_allocated += update_field_loaded_block->allocatedBytes();
+ 
++    if (hierarhical_index)
++    {
++        hierarchical_index_bytes_allocated = hierarhical_index->getSizeInBytes();
++        bytes_allocated += hierarchical_index_bytes_allocated;
++    }
++
+     bytes_allocated += string_arena.size();
+ }
+ 
+diff --git a/src/Dictionaries/FlatDictionary.h b/src/Dictionaries/FlatDictionary.h
+index f342c38802db..9ae3e9a2e711 100644
+--- a/src/Dictionaries/FlatDictionary.h
++++ b/src/Dictionaries/FlatDictionary.h
+@@ -92,10 +92,15 @@ class FlatDictionary final : public IDictionary
+         ColumnPtr in_key_column,
+         const DataTypePtr & key_type) const override;
+ 
++    DictionaryHierarchicalParentToChildIndexPtr getHierarchicalIndex() const override;
++
++    size_t getHierarchicalIndexBytesAllocated() const override { return hierarchical_index_bytes_allocated; }
++
+     ColumnPtr getDescendants(
+         ColumnPtr key_column,
+         const DataTypePtr & key_type,
+-        size_t level) const override;
++        size_t level,
++        DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const override;
+ 
+     Pipe read(const Names & column_names, size_t max_block_size, size_t num_streams) const override;
+ 
+@@ -137,10 +142,15 @@ class FlatDictionary final : public IDictionary
+     };
+ 
+     void createAttributes();
++
+     void blockToAttributes(const Block & block);
++
+     void updateData();
++
+     void loadData();
+ 
++    void buildHierarchyParentToChildIndexIfNeeded();
++
+     void calculateBytesAllocated();
+ 
+     Attribute createAttribute(const DictionaryAttribute & attribute);
+@@ -165,6 +175,7 @@ class FlatDictionary final : public IDictionary
+     std::vector<bool> loaded_keys;
+ 
+     size_t bytes_allocated = 0;
++    size_t hierarchical_index_bytes_allocated = 0;
+     size_t element_count = 0;
+     size_t bucket_count = 0;
+     mutable std::atomic<size_t> query_count{0};
+@@ -172,6 +183,7 @@ class FlatDictionary final : public IDictionary
+ 
+     BlockPtr update_field_loaded_block;
+     Arena string_arena;
++    DictionaryHierarchicalParentToChildIndexPtr hierarhical_index;
+ };
+ 
+ }
+diff --git a/src/Dictionaries/HashedArrayDictionary.cpp b/src/Dictionaries/HashedArrayDictionary.cpp
+index 5a2586147b8b..66c63b7330d2 100644
+--- a/src/Dictionaries/HashedArrayDictionary.cpp
++++ b/src/Dictionaries/HashedArrayDictionary.cpp
+@@ -37,6 +37,7 @@ HashedArrayDictionary<dictionary_key_type>::HashedArrayDictionary(
+ {
+     createAttributes();
+     loadData();
++    buildHierarchyParentToChildIndexIfNeeded();
+     calculateBytesAllocated();
+ }
+ 
+@@ -282,18 +283,14 @@ ColumnUInt8::Ptr HashedArrayDictionary<dictionary_key_type>::isInHierarchy(
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type>
+-ColumnPtr HashedArrayDictionary<dictionary_key_type>::getDescendants(
+-    ColumnPtr key_column [[maybe_unused]],
+-    const DataTypePtr &,
+-    size_t level [[maybe_unused]]) const
++DictionaryHierarchicalParentToChildIndexPtr HashedArrayDictionary<dictionary_key_type>::getHierarchicalIndex() const
+ {
+     if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
+     {
+-        PaddedPODArray<UInt64> keys_backup;
+-        const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++        if (hierarchical_index)
++            return hierarchical_index;
+ 
+         size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
+-
+         const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
+         const AttributeContainerType<UInt64> & parent_keys_container = std::get<AttributeContainerType<UInt64>>(hierarchical_attribute.container);
+ 
+@@ -306,6 +303,7 @@ ColumnPtr HashedArrayDictionary<dictionary_key_type>::getDescendants(
+             index_to_key[value] = key;
+ 
+         HashMap<UInt64, PaddedPODArray<UInt64>> parent_to_child;
++        parent_to_child.reserve(index_to_key.size());
+ 
+         for (size_t i = 0; i < parent_keys_container.size(); ++i)
+         {
+@@ -313,13 +311,33 @@ ColumnPtr HashedArrayDictionary<dictionary_key_type>::getDescendants(
+             if (it == index_to_key.end())
+                 continue;
+ 
+-            auto parent_key = it->getMapped();
+-            auto child_key = parent_keys_container[i];
++            auto child_key = it->getMapped();
++            auto parent_key = parent_keys_container[i];
+             parent_to_child[parent_key].emplace_back(child_key);
+         }
+ 
++        return std::make_shared<DictionaryHierarchicalParentToChildIndex>(parent_to_child);
++    }
++    else
++    {
++        return nullptr;
++    }
++}
++
++template <DictionaryKeyType dictionary_key_type>
++ColumnPtr HashedArrayDictionary<dictionary_key_type>::getDescendants(
++    ColumnPtr key_column [[maybe_unused]],
++    const DataTypePtr &,
++    size_t level [[maybe_unused]],
++    DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index [[maybe_unused]]) const
++{
++    if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
++    {
++        PaddedPODArray<UInt64> keys_backup;
++        const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++
+         size_t keys_found = 0;
+-        auto result = getKeysDescendantsArray(keys, parent_to_child, level, keys_found);
++        auto result = getKeysDescendantsArray(keys, *parent_to_child_index, level, keys_found);
+ 
+         query_count.fetch_add(keys.size(), std::memory_order_relaxed);
+         found_count.fetch_add(keys_found, std::memory_order_relaxed);
+@@ -693,6 +711,16 @@ void HashedArrayDictionary<dictionary_key_type>::loadData()
+             getFullName());
+ }
+ 
++template <DictionaryKeyType dictionary_key_type>
++void HashedArrayDictionary<dictionary_key_type>::buildHierarchyParentToChildIndexIfNeeded()
++{
++    if (!dict_struct.hierarchical_attribute_index)
++        return;
++
++    if (dict_struct.attributes[*dict_struct.hierarchical_attribute_index].bidirectional)
++        hierarchical_index = getHierarchicalIndex();
++}
++
+ template <DictionaryKeyType dictionary_key_type>
+ void HashedArrayDictionary<dictionary_key_type>::calculateBytesAllocated()
+ {
+@@ -730,10 +758,16 @@ void HashedArrayDictionary<dictionary_key_type>::calculateBytesAllocated()
+             bytes_allocated += (*attribute.is_index_null).size();
+     }
+ 
+-    bytes_allocated += string_arena.size();
+-
+     if (update_field_loaded_block)
+         bytes_allocated += update_field_loaded_block->allocatedBytes();
++
++    if (hierarchical_index)
++    {
++        hierarchical_index_bytes_allocated = hierarchical_index->getSizeInBytes();
++        bytes_allocated += hierarchical_index_bytes_allocated;
++    }
++
++    bytes_allocated += string_arena.size();
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type>
+diff --git a/src/Dictionaries/HashedArrayDictionary.h b/src/Dictionaries/HashedArrayDictionary.h
+index a649fddcc39f..8df9ce4c1f79 100644
+--- a/src/Dictionaries/HashedArrayDictionary.h
++++ b/src/Dictionaries/HashedArrayDictionary.h
+@@ -109,10 +109,15 @@ class HashedArrayDictionary final : public IDictionary
+         ColumnPtr in_key_column,
+         const DataTypePtr & key_type) const override;
+ 
++    DictionaryHierarchicalParentToChildIndexPtr getHierarchicalIndex() const override;
++
++    size_t getHierarchicalIndexBytesAllocated() const override { return hierarchical_index_bytes_allocated; }
++
+     ColumnPtr getDescendants(
+         ColumnPtr key_column,
+         const DataTypePtr & key_type,
+-        size_t level) const override;
++        size_t level,
++        DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const override;
+ 
+     Pipe read(const Names & column_names, size_t max_block_size, size_t num_streams) const override;
+ 
+@@ -173,6 +178,8 @@ class HashedArrayDictionary final : public IDictionary
+ 
+     void loadData();
+ 
++    void buildHierarchyParentToChildIndexIfNeeded();
++
+     void calculateBytesAllocated();
+ 
+     template <typename KeysProvider>
+@@ -214,6 +221,7 @@ class HashedArrayDictionary final : public IDictionary
+     KeyAttribute key_attribute;
+ 
+     size_t bytes_allocated = 0;
++    size_t hierarchical_index_bytes_allocated = 0;
+     size_t element_count = 0;
+     size_t bucket_count = 0;
+     mutable std::atomic<size_t> query_count{0};
+@@ -221,6 +229,7 @@ class HashedArrayDictionary final : public IDictionary
+ 
+     BlockPtr update_field_loaded_block;
+     Arena string_arena;
++    DictionaryHierarchicalParentToChildIndexPtr hierarchical_index;
+ };
+ 
+ extern template class HashedArrayDictionary<DictionaryKeyType::Simple>;
+diff --git a/src/Dictionaries/HashedDictionary.cpp b/src/Dictionaries/HashedDictionary.cpp
+index 7025922da12c..81d3d42617b2 100644
+--- a/src/Dictionaries/HashedDictionary.cpp
++++ b/src/Dictionaries/HashedDictionary.cpp
+@@ -54,6 +54,7 @@ HashedDictionary<dictionary_key_type, sparse>::HashedDictionary(
+ {
+     createAttributes();
+     loadData();
++    buildHierarchyParentToChildIndexIfNeeded();
+     calculateBytesAllocated();
+ }
+ 
+@@ -318,28 +319,45 @@ ColumnUInt8::Ptr HashedDictionary<dictionary_key_type, sparse>::isInHierarchy(
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type, bool sparse>
+-ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getDescendants(
+-    ColumnPtr key_column [[maybe_unused]],
+-    const DataTypePtr &,
+-    size_t level [[maybe_unused]]) const
++DictionaryHierarchyParentToChildIndexPtr HashedDictionary<dictionary_key_type, sparse>::getHierarchicalIndex() const
+ {
+     if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
+     {
+-        PaddedPODArray<UInt64> keys_backup;
+-        const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++        if (hierarchical_index)
++            return hierarchical_index;
+ 
+         size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
+-
+         const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
+         const CollectionType<UInt64> & parent_keys = std::get<CollectionType<UInt64>>(hierarchical_attribute.container);
+ 
+         HashMap<UInt64, PaddedPODArray<UInt64>> parent_to_child;
++        parent_to_child.reserve(parent_keys.size());
+ 
+         for (const auto & [key, value] : parent_keys)
+             parent_to_child[value].emplace_back(key);
+ 
++        return std::make_shared<DictionaryHierarchicalParentToChildIndex>(parent_to_child);
++    }
++    else
++    {
++        return nullptr;
++    }
++}
++
++template <DictionaryKeyType dictionary_key_type, bool sparse>
++ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getDescendants(
++    ColumnPtr key_column [[maybe_unused]],
++    const DataTypePtr &,
++    size_t level [[maybe_unused]],
++    DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index [[maybe_unused]]) const
++{
++    if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
++    {
++        PaddedPODArray<UInt64> keys_backup;
++        const auto & keys = getColumnVectorData(this, key_column, keys_backup);
++
+         size_t keys_found;
+-        auto result = getKeysDescendantsArray(keys, parent_to_child, level, keys_found);
++        auto result = getKeysDescendantsArray(keys, *parent_to_child_index, level, keys_found);
+ 
+         query_count.fetch_add(keys.size(), std::memory_order_relaxed);
+         found_count.fetch_add(keys_found, std::memory_order_relaxed);
+@@ -347,7 +365,9 @@ ColumnPtr HashedDictionary<dictionary_key_type, sparse>::getDescendants(
+         return result;
+     }
+     else
++    {
+         return nullptr;
++    }
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type, bool sparse>
+@@ -631,6 +651,16 @@ void HashedDictionary<dictionary_key_type, sparse>::loadData()
+             getFullName());
+ }
+ 
++template <DictionaryKeyType dictionary_key_type, bool sparse>
++void HashedDictionary<dictionary_key_type, sparse>::buildHierarchyParentToChildIndexIfNeeded()
++{
++    if (!dict_struct.hierarchical_attribute_index)
++        return;
++
++    if (dict_struct.attributes[*dict_struct.hierarchical_attribute_index].bidirectional)
++        hierarchical_index = getHierarchicalIndex();
++}
++
+ template <DictionaryKeyType dictionary_key_type, bool sparse>
+ void HashedDictionary<dictionary_key_type, sparse>::calculateBytesAllocated()
+ {
+@@ -684,10 +714,16 @@ void HashedDictionary<dictionary_key_type, sparse>::calculateBytesAllocated()
+         }
+     }
+ 
+-    bytes_allocated += string_arena.size();
+-
+     if (update_field_loaded_block)
+         bytes_allocated += update_field_loaded_block->allocatedBytes();
++
++    if (hierarchical_index)
++    {
++        hierarchical_index_bytes_allocated = hierarchical_index->getSizeInBytes();
++        bytes_allocated += hierarchical_index_bytes_allocated;
++    }
++
++    bytes_allocated += string_arena.size();
+ }
+ 
+ template <DictionaryKeyType dictionary_key_type, bool sparse>
+diff --git a/src/Dictionaries/HashedDictionary.h b/src/Dictionaries/HashedDictionary.h
+index 1ef1c58b67c3..ba5d284466a8 100644
+--- a/src/Dictionaries/HashedDictionary.h
++++ b/src/Dictionaries/HashedDictionary.h
+@@ -110,10 +110,15 @@ class HashedDictionary final : public IDictionary
+         ColumnPtr in_key_column,
+         const DataTypePtr & key_type) const override;
+ 
++    DictionaryHierarchicalParentToChildIndexPtr getHierarchicalIndex() const override;
++
++    size_t getHierarchicalIndexBytesAllocated() const override { return hierarchical_index_bytes_allocated; }
++
+     ColumnPtr getDescendants(
+         ColumnPtr key_column,
+         const DataTypePtr & key_type,
+-        size_t level) const override;
++        size_t level,
++        DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const override;
+ 
+     Pipe read(const Names & column_names, size_t max_block_size, size_t num_streams) const override;
+ 
+@@ -194,6 +199,8 @@ class HashedDictionary final : public IDictionary
+ 
+     void loadData();
+ 
++    void buildHierarchyParentToChildIndexIfNeeded();
++
+     void calculateBytesAllocated();
+ 
+     template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
+@@ -218,6 +225,7 @@ class HashedDictionary final : public IDictionary
+     std::vector<Attribute> attributes;
+ 
+     size_t bytes_allocated = 0;
++    size_t hierarchical_index_bytes_allocated = 0;
+     size_t element_count = 0;
+     size_t bucket_count = 0;
+     mutable std::atomic<size_t> query_count{0};
+@@ -226,6 +234,7 @@ class HashedDictionary final : public IDictionary
+     BlockPtr update_field_loaded_block;
+     Arena string_arena;
+     NoAttributesCollectionType no_attributes_container;
++    DictionaryHierarchicalParentToChildIndexPtr hierarchical_index;
+ };
+ 
+ extern template class HashedDictionary<DictionaryKeyType::Simple, false>;
+diff --git a/src/Dictionaries/HierarchyDictionariesUtils.cpp b/src/Dictionaries/HierarchyDictionariesUtils.cpp
+index dd729fe636c7..0b5f8478f7a8 100644
+--- a/src/Dictionaries/HierarchyDictionariesUtils.cpp
++++ b/src/Dictionaries/HierarchyDictionariesUtils.cpp
+@@ -8,6 +8,22 @@ namespace ErrorCodes
+     extern const int UNSUPPORTED_METHOD;
+ }
+ 
++namespace detail
++{
++    ColumnPtr convertElementsAndOffsetsIntoArray(ElementsAndOffsets && elements_and_offsets)
++    {
++        auto elements_column = ColumnVector<UInt64>::create();
++        elements_column->getData() = std::move(elements_and_offsets.elements);
++
++        auto offsets_column = ColumnVector<IColumn::Offset>::create();
++        offsets_column->getData() = std::move(elements_and_offsets.offsets);
++
++        auto column_array = ColumnArray::create(std::move(elements_column), std::move(offsets_column));
++
++        return column_array;
++    }
++}
++
+ namespace
+ {
+     /** In case of cache or direct dictionary we does not have structure with child to parent representation.
+@@ -84,6 +100,26 @@ namespace
+     }
+ }
+ 
++ColumnPtr getKeysDescendantsArray(
++    const PaddedPODArray<UInt64> & requested_keys,
++    const DictionaryHierarchicalParentToChildIndex & parent_to_child_index,
++    size_t level,
++    size_t & valid_keys)
++{
++    if (level == 0)
++    {
++        detail::GetAllDescendantsStrategy strategy { .level = level };
++        auto elements_and_offsets = detail::getDescendants(requested_keys, parent_to_child_index, strategy, valid_keys);
++        return detail::convertElementsAndOffsetsIntoArray(std::move(elements_and_offsets));
++    }
++    else
++    {
++        detail::GetDescendantsAtSpecificLevelStrategy strategy { .level = level };
++        auto elements_and_offsets = detail::getDescendants(requested_keys, parent_to_child_index, strategy, valid_keys);
++        return detail::convertElementsAndOffsetsIntoArray(std::move(elements_and_offsets));
++    }
++}
++
+ ColumnPtr getKeysHierarchyDefaultImplementation(
+     const IDictionary * dictionary,
+     ColumnPtr key_column,
+diff --git a/src/Dictionaries/HierarchyDictionariesUtils.h b/src/Dictionaries/HierarchyDictionariesUtils.h
+index f0c6b4b1a0f7..6a59a37b5e7a 100644
+--- a/src/Dictionaries/HierarchyDictionariesUtils.h
++++ b/src/Dictionaries/HierarchyDictionariesUtils.h
+@@ -14,25 +14,65 @@
+ namespace DB
+ {
+ 
++class DictionaryHierarchicalParentToChildIndex;
++using DictionaryHierarchyParentToChildIndexPtr = std::shared_ptr<DictionaryHierarchicalParentToChildIndex>;
++
++class DictionaryHierarchicalParentToChildIndex
++{
++public:
++    struct KeysRange
++    {
++        UInt32 start_index;
++        UInt32 end_index;
++    };
++
++    explicit DictionaryHierarchicalParentToChildIndex(const HashMap<UInt64, PaddedPODArray<UInt64>> & parent_to_children_map_)
++    {
++        size_t parent_to_children_map_size = parent_to_children_map_.size();
++
++        keys.reserve(parent_to_children_map_size);
++        parent_to_children_keys_range.reserve(parent_to_children_map_size);
++
++        for (auto & [parent, children] : parent_to_children_map_)
++        {
++            size_t keys_size = keys.size();
++            UInt32 start_index = static_cast<UInt32>(keys_size);
++            UInt32 end_index = start_index + static_cast<UInt32>(children.size());
++
++            keys.insert(children.begin(), children.end());
++
++            parent_to_children_keys_range[parent] = KeysRange{start_index, end_index};
++        }
++    }
++
++    size_t getSizeInBytes() const
++    {
++        return parent_to_children_keys_range.getBufferSizeInBytes() + (keys.size() * sizeof(UInt64));
++    }
++
++    /// Map parent key to range of children from keys array
++    HashMap<UInt64, KeysRange> parent_to_children_keys_range;
++
++    /// Array of keys in hierarchy
++    PaddedPODArray<UInt64> keys;
++};
++
+ namespace detail
+ {
+-    template <typename KeyType>
+     struct ElementsAndOffsets
+     {
+-        PaddedPODArray<KeyType> elements;
++        PaddedPODArray<UInt64> elements;
+         PaddedPODArray<IColumn::Offset> offsets;
+     };
+ 
+-    template <typename T>
+     struct IsKeyValidFuncInterface
+     {
+-        bool operator()(T key [[maybe_unused]]) { return false; }
++        bool operator()(UInt64 key [[maybe_unused]]) { return false; }
+     };
+ 
+-    template <typename T>
+     struct GetParentKeyFuncInterface
+     {
+-        std::optional<T> operator()(T key [[maybe_unused]]) { return {}; }
++        std::optional<UInt64> operator()(UInt64 key [[maybe_unused]]) { return {}; }
+     };
+ 
+     /** Calculate hierarchy for keys iterating the hierarchy from child to parent using get_parent_key_func provided by client.
+@@ -54,16 +94,16 @@ namespace detail
+       * Elements: [1, 2, 1, 3, 1, 4, 2, 1]
+       * Offsets: [1, 3, 5, 8, 8]
+       */
+-    template <typename KeyType, typename IsKeyValidFunc, typename GetParentKeyFunc>
+-    ElementsAndOffsets<KeyType> getHierarchy(
+-        const PaddedPODArray<KeyType> & keys,
+-        const KeyType & hierarchy_null_value,
++    template <typename IsKeyValidFunc, typename GetParentKeyFunc>
++    ElementsAndOffsets getHierarchy(
++        const PaddedPODArray<UInt64> & keys,
++        const UInt64 & hierarchy_null_value,
+         IsKeyValidFunc && is_key_valid_func,
+         GetParentKeyFunc && get_parent_key_func)
+     {
+         size_t hierarchy_keys_size = keys.size();
+ 
+-        PaddedPODArray<KeyType> elements;
++        PaddedPODArray<UInt64> elements;
+         elements.reserve(hierarchy_keys_size);
+ 
+         PaddedPODArray<IColumn::Offset> offsets;
+@@ -75,7 +115,7 @@ namespace detail
+             size_t array_element_offset;
+         };
+ 
+-        HashMap<KeyType, OffsetInArray> already_processes_keys_to_offset;
++        HashMap<UInt64, OffsetInArray> already_processes_keys_to_offset;
+         already_processes_keys_to_offset.reserve(hierarchy_keys_size);
+ 
+         for (size_t i = 0; i < hierarchy_keys_size; ++i)
+@@ -123,7 +163,7 @@ namespace detail
+                 elements.emplace_back(hierarchy_key);
+                 ++current_hierarchy_depth;
+ 
+-                std::optional<KeyType> parent_key = std::forward<GetParentKeyFunc>(get_parent_key_func)(hierarchy_key);
++                std::optional<UInt64> parent_key = std::forward<GetParentKeyFunc>(get_parent_key_func)(hierarchy_key);
+ 
+                 if (!parent_key.has_value())
+                     break;
+@@ -134,7 +174,7 @@ namespace detail
+             offsets.emplace_back(elements.size());
+         }
+ 
+-        ElementsAndOffsets<KeyType> result = {std::move(elements), std::move(offsets)};
++        ElementsAndOffsets result = {std::move(elements), std::move(offsets)};
+ 
+         return result;
+     }
+@@ -146,11 +186,11 @@ namespace detail
+       *
+       * Not: keys size must be equal to in_keys_size.
+       */
+-    template <typename KeyType, typename IsKeyValidFunc, typename GetParentKeyFunc>
++    template <typename IsKeyValidFunc, typename GetParentKeyFunc>
+     PaddedPODArray<UInt8> getIsInHierarchy(
+-        const PaddedPODArray<KeyType> & keys,
+-        const PaddedPODArray<KeyType> & in_keys,
+-        const KeyType & hierarchy_null_value,
++        const PaddedPODArray<UInt64> & keys,
++        const PaddedPODArray<UInt64> & in_keys,
++        const UInt64 & hierarchy_null_value,
+         IsKeyValidFunc && is_key_valid_func,
+         GetParentKeyFunc && get_parent_func)
+     {
+@@ -159,7 +199,7 @@ namespace detail
+         PaddedPODArray<UInt8> result;
+         result.resize_fill(keys.size());
+ 
+-        detail::ElementsAndOffsets<KeyType> hierarchy = detail::getHierarchy(
++        detail::ElementsAndOffsets hierarchy = detail::getHierarchy(
+             keys,
+             hierarchy_null_value,
+             std::forward<IsKeyValidFunc>(is_key_valid_func),
+@@ -216,19 +256,22 @@ namespace detail
+       * Result: [1], [2, 3], [4], [], [];
+       * Offsets: [1, 3, 4, 4, 4];
+       */
+-    template <typename KeyType, typename Strategy>
+-    ElementsAndOffsets<KeyType> getDescendants(
+-        const PaddedPODArray<KeyType> & keys,
+-        const HashMap<KeyType, PaddedPODArray<KeyType>> & parent_to_child,
++    template <typename Strategy>
++    ElementsAndOffsets getDescendants(
++        const PaddedPODArray<UInt64> & keys,
++        const DictionaryHierarchicalParentToChildIndex & parent_to_child_index,
+         Strategy strategy,
+         size_t & valid_keys)
+     {
++        auto & parent_to_children_keys_range = parent_to_child_index.parent_to_children_keys_range;
++        auto & children_keys = parent_to_child_index.keys;
++
+         /// If strategy is GetAllDescendantsStrategy we try to cache and later reuse previously calculated descendants.
+         /// If strategy is GetDescendantsAtSpecificLevelStrategy we does not use cache strategy.
+         size_t keys_size = keys.size();
+         valid_keys = 0;
+ 
+-        PaddedPODArray<KeyType> descendants;
++        PaddedPODArray<UInt64> descendants;
+         descendants.reserve(keys_size);
+ 
+         PaddedPODArray<IColumn::Offset> descendants_offsets;
+@@ -241,18 +284,18 @@ namespace detail
+         };
+ 
+         static constexpr Int64 key_range_requires_update = -1;
+-        HashMap<KeyType, Range> already_processed_keys_to_range [[maybe_unused]];
++        HashMap<UInt64, Range> already_processed_keys_to_range [[maybe_unused]];
+ 
+         if constexpr (std::is_same_v<Strategy, GetAllDescendantsStrategy>)
+             already_processed_keys_to_range.reserve(keys_size);
+ 
+         struct KeyAndDepth
+         {
+-            KeyType key;
++            UInt64 key;
+             Int64 depth;
+         };
+ 
+-        HashSet<KeyType> already_processed_keys_during_loop;
++        HashSet<UInt64> already_processed_keys_during_loop;
+         already_processed_keys_during_loop.reserve(keys_size);
+ 
+         PaddedPODArray<KeyAndDepth> next_keys_to_process_stack;
+@@ -262,9 +305,9 @@ namespace detail
+ 
+         for (size_t i = 0; i < keys_size; ++i)
+         {
+-            const KeyType & requested_key = keys[i];
++            const UInt64 & requested_key = keys[i];
+ 
+-            if (parent_to_child.find(requested_key) == nullptr)
++            if (parent_to_children_keys_range.find(requested_key) == nullptr)
+             {
+                 descendants_offsets.emplace_back(descendants.size());
+                 continue;
+@@ -282,7 +325,7 @@ namespace detail
+             {
+                 KeyAndDepth key_to_process = next_keys_to_process_stack.back();
+ 
+-                KeyType key = key_to_process.key;
++                UInt64 key = key_to_process.key;
+                 Int64 depth = key_to_process.depth;
+                 next_keys_to_process_stack.pop_back();
+ 
+@@ -329,7 +372,7 @@ namespace detail
+                     }
+                 }
+ 
+-                const auto * it = parent_to_child.find(key);
++                const auto * it = parent_to_children_keys_range.find(key);
+ 
+                 if (!it || depth >= DBMS_HIERARCHICAL_DICTIONARY_MAX_DEPTH)
+                     continue;
+@@ -352,15 +395,26 @@ namespace detail
+ 
+                 ++depth;
+ 
+-                const auto & children = it->getMapped();
++                DictionaryHierarchicalParentToChildIndex::KeysRange children_range = it->getMapped();
+ 
+-                for (auto child_key : children)
++                for (; children_range.start_index < children_range.end_index; ++children_range.start_index)
+                 {
++                    auto child_key = children_keys[children_range.start_index];
++
+                     /// In case of GetAllDescendantsStrategy we add any descendant to result array
+                     /// If strategy is GetDescendantsAtSpecificLevelStrategy we require depth == level
+-                    if (std::is_same_v<Strategy, GetAllDescendantsStrategy> || depth == level)
++                    if constexpr (std::is_same_v<Strategy, GetAllDescendantsStrategy>)
+                         descendants.emplace_back(child_key);
+ 
++                    if constexpr (std::is_same_v<Strategy, GetDescendantsAtSpecificLevelStrategy>)
++                    {
++                        if (depth == level)
++                        {
++                            descendants.emplace_back(child_key);
++                            continue;
++                        }
++                    }
++
+                     next_keys_to_process_stack.emplace_back(KeyAndDepth{child_key, depth});
+                 }
+             }
+@@ -370,24 +424,12 @@ namespace detail
+             descendants_offsets.emplace_back(descendants.size());
+         }
+ 
+-        ElementsAndOffsets<KeyType> result = {std::move(descendants), std::move(descendants_offsets)};
++        ElementsAndOffsets result = {std::move(descendants), std::move(descendants_offsets)};
+         return result;
+     }
+ 
+     /// Converts ElementAndOffsets structure into ArrayColumn
+-    template<typename KeyType>
+-    ColumnPtr convertElementsAndOffsetsIntoArray(ElementsAndOffsets<KeyType> && elements_and_offsets)
+-    {
+-        auto elements_column = ColumnVector<KeyType>::create();
+-        elements_column->getData() = std::move(elements_and_offsets.elements);
+-
+-        auto offsets_column = ColumnVector<IColumn::Offset>::create();
+-        offsets_column->getData() = std::move(elements_and_offsets.offsets);
+-
+-        auto column_array = ColumnArray::create(std::move(elements_column), std::move(offsets_column));
+-
+-        return column_array;
+-    }
++    ColumnPtr convertElementsAndOffsetsIntoArray(ElementsAndOffsets && elements_and_offsets);
+ }
+ 
+ /// Returns hierarchy array column for keys
+@@ -432,26 +474,11 @@ ColumnUInt8::Ptr getKeysIsInHierarchyColumn(
+ /// Returns descendants array column for keys
+ ///
+ /// @param valid_keys - number of keys that are valid in parent_to_child map
+-template <typename KeyType>
+ ColumnPtr getKeysDescendantsArray(
+-    const PaddedPODArray<KeyType> & requested_keys,
+-    const HashMap<KeyType, PaddedPODArray<KeyType>> & parent_to_child,
++    const PaddedPODArray<UInt64> & requested_keys,
++    const DictionaryHierarchicalParentToChildIndex & parent_to_child_index,
+     size_t level,
+-    size_t & valid_keys)
+-{
+-    if (level == 0)
+-    {
+-        detail::GetAllDescendantsStrategy strategy { .level = level };
+-        auto elements_and_offsets = detail::getDescendants(requested_keys, parent_to_child, strategy, valid_keys);
+-        return detail::convertElementsAndOffsetsIntoArray(std::move(elements_and_offsets));
+-    }
+-    else
+-    {
+-        detail::GetDescendantsAtSpecificLevelStrategy strategy { .level = level };
+-        auto elements_and_offsets = detail::getDescendants(requested_keys, parent_to_child, strategy, valid_keys);
+-        return detail::convertElementsAndOffsetsIntoArray(std::move(elements_and_offsets));
+-    }
+-}
++    size_t & valid_keys);
+ 
+ /** Default getHierarchy implementation for dictionaries that does not have structure with child to parent representation.
+   * Implementation will build such structure with getColumn calls, and then getHierarchy for such structure.
+diff --git a/src/Dictionaries/IDictionary.h b/src/Dictionaries/IDictionary.h
+index c18dbcfbea70..32c81beee6f2 100644
+--- a/src/Dictionaries/IDictionary.h
++++ b/src/Dictionaries/IDictionary.h
+@@ -24,6 +24,9 @@ namespace ErrorCodes
+ class IDictionary;
+ using DictionaryPtr = std::unique_ptr<IDictionary>;
+ 
++class DictionaryHierarchicalParentToChildIndex;
++using DictionaryHierarchicalParentToChildIndexPtr = std::shared_ptr<DictionaryHierarchicalParentToChildIndex>;
++
+ /** DictionaryKeyType provides IDictionary client information about
+   * which key type is supported by dictionary.
+   *
+@@ -228,10 +231,23 @@ class IDictionary : public IExternalLoadable
+                         getDictionaryID().getNameForLogs());
+     }
+ 
++    virtual DictionaryHierarchicalParentToChildIndexPtr getHierarchicalIndex() const
++    {
++        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
++                        "Method getHierarchicalIndex is not supported for {} dictionary.",
++                        getDictionaryID().getNameForLogs());
++    }
++
++    virtual size_t getHierarchicalIndexBytesAllocated() const
++    {
++        return 0;
++    }
++
+     virtual ColumnPtr getDescendants(
+         ColumnPtr key_column [[maybe_unused]],
+         const DataTypePtr & key_type [[maybe_unused]],
+-        size_t level [[maybe_unused]]) const
++        size_t level [[maybe_unused]],
++        DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index [[maybe_unused]]) const
+     {
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                         "Method getDescendants is not supported for {} dictionary.",
+diff --git a/src/Dictionaries/getDictionaryConfigurationFromAST.cpp b/src/Dictionaries/getDictionaryConfigurationFromAST.cpp
+index 28a842ccd8c4..edc3c34fe816 100644
+--- a/src/Dictionaries/getDictionaryConfigurationFromAST.cpp
++++ b/src/Dictionaries/getDictionaryConfigurationFromAST.cpp
+@@ -290,6 +290,14 @@ void buildSingleAttribute(
+         attribute_element->appendChild(hierarchical_element);
+     }
+ 
++    if (dict_attr->bidirectional)
++    {
++        AutoPtr<Element> bidirectional_element(doc->createElement("bidirectional"));
++        AutoPtr<Text> bidirectional(doc->createTextNode("true"));
++        bidirectional_element->appendChild(bidirectional);
++        attribute_element->appendChild(bidirectional_element);
++    }
++
+     if (dict_attr->injective)
+     {
+         AutoPtr<Element> injective_element(doc->createElement("injective"));
+diff --git a/src/Functions/FunctionsExternalDictionaries.cpp b/src/Functions/FunctionsExternalDictionaries.cpp
+index 6b83f7610864..0cd56f87df4c 100644
+--- a/src/Functions/FunctionsExternalDictionaries.cpp
++++ b/src/Functions/FunctionsExternalDictionaries.cpp
+@@ -24,8 +24,8 @@ void registerFunctionsExternalDictionaries(FunctionFactory & factory)
+     factory.registerFunction<FunctionDictGetString>();
+     factory.registerFunction<FunctionDictGetHierarchy>();
+     factory.registerFunction<FunctionDictIsIn>();
+-    factory.registerFunction<FunctionDictGetChildren>();
+-    factory.registerFunction<FunctionDictGetDescendants>();
++    factory.registerFunction<FunctionDictGetChildrenOverloadResolver>();
++    factory.registerFunction<FunctionDictGetDescendantsOverloadResolver>();
+     factory.registerFunction<FunctionDictGetUInt8OrDefault>();
+     factory.registerFunction<FunctionDictGetUInt16OrDefault>();
+     factory.registerFunction<FunctionDictGetUInt32OrDefault>();
+diff --git a/src/Functions/FunctionsExternalDictionaries.h b/src/Functions/FunctionsExternalDictionaries.h
+index 189ec7321c1a..03833f9a2b29 100644
+--- a/src/Functions/FunctionsExternalDictionaries.h
++++ b/src/Functions/FunctionsExternalDictionaries.h
+@@ -1053,85 +1053,158 @@ class FunctionDictIsIn final : public IFunction
+     mutable FunctionDictHelper helper;
+ };
+ 
+-class FunctionDictGetChildren final : public IFunction
++class FunctionDictGetDescendantsExecutable final : public IExecutableFunction
+ {
+ public:
+-    static constexpr auto name = "dictGetChildren";
+-
+-    static FunctionPtr create(ContextPtr context)
+-    {
+-        return std::make_shared<FunctionDictGetChildren>(context);
+-    }
+-
+-    explicit FunctionDictGetChildren(ContextPtr context_)
+-        : helper(context_) {}
++    FunctionDictGetDescendantsExecutable(
++        String name_,
++        size_t level_,
++        DictionaryHierarchicalParentToChildIndexPtr hierarchical_parent_to_child_index,
++        std::shared_ptr<FunctionDictHelper> dictionary_helper_)
++        : name(std::move(name_))
++        , level(level_)
++        , hierarchical_parent_to_child_index(std::move(hierarchical_parent_to_child_index))
++        , dictionary_helper(std::move(dictionary_helper_))
++    {}
+ 
+     String getName() const override { return name; }
+ 
+-private:
+-    size_t getNumberOfArguments() const override { return 2; }
+-
+-    bool useDefaultImplementationForConstants() const final { return true; }
+-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const final { return {0}; }
+-    bool isDeterministic() const override { return false; }
+-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+-
+-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+-    {
+-        if (!isString(arguments[0].type))
+-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                "Illegal type of first argument of function {}. Expected String. Actual type {}",
+-                getName(),
+-                arguments[0].type->getName());
+-
+-        auto dictionary = helper.getDictionary(arguments[0].column);
+-        const auto & hierarchical_attribute = helper.getDictionaryHierarchicalAttribute(dictionary);
++    bool useDefaultImplementationForConstants() const override { return true; }
+ 
+-        return std::make_shared<DataTypeArray>(hierarchical_attribute.type);
+-    }
++    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0, 2}; }
+ 
+     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+     {
+         if (input_rows_count == 0)
+             return result_type->createColumn();
+ 
+-        auto dictionary = helper.getDictionary(arguments[0].column);
+-        const auto & hierarchical_attribute = helper.getDictionaryHierarchicalAttribute(dictionary);
++        auto dictionary = dictionary_helper->getDictionary(arguments[0].column);
++        const auto & hierarchical_attribute = dictionary_helper->getDictionaryHierarchicalAttribute(dictionary);
+ 
+         auto key_column = ColumnWithTypeAndName{arguments[1].column->convertToFullColumnIfConst(), arguments[1].type, arguments[1].name};
+         auto key_column_casted = castColumnAccurate(key_column, hierarchical_attribute.type);
+ 
+-        ColumnPtr result = dictionary->getDescendants(key_column_casted, hierarchical_attribute.type, 1);
+-
++        ColumnPtr result = dictionary->getDescendants(key_column_casted, hierarchical_attribute.type, level, hierarchical_parent_to_child_index);
+         return result;
+     }
+ 
+-    mutable FunctionDictHelper helper;
++    String name;
++    size_t level;
++    DictionaryHierarchicalParentToChildIndexPtr hierarchical_parent_to_child_index;
++    std::shared_ptr<FunctionDictHelper> dictionary_helper;
+ };
+ 
+-class FunctionDictGetDescendants final : public IFunction
++class FunctionDictGetDescendantsBase final : public IFunctionBase
+ {
+ public:
+-    static constexpr auto name = "dictGetDescendants";
++    FunctionDictGetDescendantsBase(
++        String name_,
++        const DataTypes & argument_types_,
++        const DataTypePtr & result_type_,
++        size_t level_,
++        DictionaryHierarchicalParentToChildIndexPtr hierarchical_parent_to_child_index,
++        std::shared_ptr<FunctionDictHelper> helper_)
++        : name(std::move(name_))
++        , argument_types(argument_types_)
++        , result_type(result_type_)
++        , level(level_)
++        , hierarchical_parent_to_child_index(std::move(hierarchical_parent_to_child_index))
++        , helper(std::move(helper_))
++    {}
+ 
+-    static FunctionPtr create(ContextPtr context)
++    String getName() const override { return name; }
++
++    const DataTypes & getArgumentTypes() const override { return argument_types; }
++
++    const DataTypePtr & getResultType() const override { return result_type; }
++
++    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
++
++    ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName &) const override
+     {
+-        return std::make_shared<FunctionDictGetDescendants>(context);
++        return std::make_shared<FunctionDictGetDescendantsExecutable>(name, level, hierarchical_parent_to_child_index, helper);
+     }
+ 
+-    explicit FunctionDictGetDescendants(ContextPtr context_)
+-        : helper(context_) {}
++    String name;
++    DataTypes argument_types;
++    DataTypePtr result_type;
++    size_t level;
++    DictionaryHierarchicalParentToChildIndexPtr hierarchical_parent_to_child_index;
++    std::shared_ptr<FunctionDictHelper> helper;
++};
++
++struct FunctionDictGetDescendantsStrategy
++{
++    static constexpr auto name = "dictGetDescendants";
++    static constexpr size_t default_level = 0;
++    static constexpr size_t number_of_arguments = 0;
++    static constexpr bool is_variadic = true;
++};
++
++struct FunctionDictGetChildrenStrategy
++{
++    static constexpr auto name = "dictGetChildren";
++    static constexpr size_t default_level = 1;
++    static constexpr size_t number_of_arguments = 2;
++    static constexpr bool is_variadic = false;
++};
++
++template <typename Strategy>
++class FunctionDictGetDescendantsOverloadResolverImpl final : public IFunctionOverloadResolver
++{
++public:
++    static constexpr auto name = Strategy::name;
+ 
+     String getName() const override { return name; }
+ 
+-private:
+-    size_t getNumberOfArguments() const override { return 0; }
+-    bool isVariadic() const override { return true; }
++    size_t getNumberOfArguments() const override { return Strategy::number_of_arguments; }
++
++    bool isVariadic() const override { return Strategy::is_variadic; }
++
++    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0, 2}; }
+ 
+-    bool useDefaultImplementationForConstants() const final { return true; }
+-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const final { return {0, 2}; }
+     bool isDeterministic() const override { return false; }
+-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
++
++    explicit FunctionDictGetDescendantsOverloadResolverImpl(ContextPtr context)
++        : dictionary_helper(std::make_shared<FunctionDictHelper>(std::move(context)))
++    {}
++
++    static FunctionOverloadResolverPtr create(ContextPtr context)
++    {
++        return std::make_shared<FunctionDictGetDescendantsOverloadResolverImpl>(std::move(context));
++    }
++
++    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const override
++    {
++        auto dictionary = dictionary_helper->getDictionary(arguments[0].column);
++        auto hierarchical_parent_to_child_index = dictionary->getHierarchicalIndex();
++
++        size_t level = Strategy::default_level;
++
++        if (arguments.size() == 3)
++        {
++            if (!arguments[2].column || !isColumnConst(*arguments[2].column))
++                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
++                    "Illegal type of third argument of function {}. Expected const unsigned integer.",
++                    getName());
++
++            auto value = static_cast<Int64>(arguments[2].column->getInt(0));
++            if (value < 0)
++                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
++                    "Illegal type of third argument of function {}. Expected const unsigned integer.",
++                    getName());
++
++            level = static_cast<size_t>(value);
++        }
++
++        DataTypes argument_types;
++        argument_types.reserve(arguments.size());
++
++        for (const auto & argument : arguments)
++            argument_types.emplace_back(argument.type);
++
++        return std::make_shared<FunctionDictGetDescendantsBase>(name, argument_types, result_type, level, hierarchical_parent_to_child_index, dictionary_helper);
++    }
+ 
+     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+     {
+@@ -1158,47 +1231,16 @@ class FunctionDictGetDescendants final : public IFunction
+                 arguments[2].type->getName());
+         }
+ 
+-        auto dictionary = helper.getDictionary(arguments[0].column);
+-        const auto & hierarchical_attribute = helper.getDictionaryHierarchicalAttribute(dictionary);
++        auto dictionary = dictionary_helper->getDictionary(arguments[0].column);
++        const auto & hierarchical_attribute = dictionary_helper->getDictionaryHierarchicalAttribute(dictionary);
+ 
+         return std::make_shared<DataTypeArray>(hierarchical_attribute.type);
+     }
+ 
+-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+-    {
+-        if (input_rows_count == 0)
+-            return result_type->createColumn();
+-
+-        auto dictionary = helper.getDictionary(arguments[0].column);
+-        const auto & hierarchical_attribute = helper.getDictionaryHierarchicalAttribute(dictionary);
+-
+-        size_t level = 0;
+-
+-        if (arguments.size() == 3)
+-        {
+-            if (!isColumnConst(*arguments[2].column))
+-                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                    "Illegal type of third argument of function {}. Expected const unsigned integer.",
+-                    getName());
+-
+-            auto value = static_cast<Int64>(arguments[2].column->getInt(0));
+-            if (value < 0)
+-                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                    "Illegal type of third argument of function {}. Expected const unsigned integer.",
+-                    getName());
+-
+-            level = static_cast<size_t>(value);
+-        }
+-
+-        auto key_column = ColumnWithTypeAndName{arguments[1].column->convertToFullColumnIfConst(), arguments[1].type, arguments[1].name};
+-        auto key_column_casted = castColumnAccurate(key_column, hierarchical_attribute.type);
+-
+-        ColumnPtr result = dictionary->getDescendants(key_column_casted, hierarchical_attribute.type, level);
+-
+-        return result;
+-    }
+-
+-    mutable FunctionDictHelper helper;
++    std::shared_ptr<FunctionDictHelper> dictionary_helper;
+ };
+ 
++using FunctionDictGetDescendantsOverloadResolver = FunctionDictGetDescendantsOverloadResolverImpl<FunctionDictGetDescendantsStrategy>;
++using FunctionDictGetChildrenOverloadResolver = FunctionDictGetDescendantsOverloadResolverImpl<FunctionDictGetChildrenStrategy>;
++
+ }
+diff --git a/src/Parsers/ASTDictionaryAttributeDeclaration.cpp b/src/Parsers/ASTDictionaryAttributeDeclaration.cpp
+index e9c50839a987..760b96b09271 100644
+--- a/src/Parsers/ASTDictionaryAttributeDeclaration.cpp
++++ b/src/Parsers/ASTDictionaryAttributeDeclaration.cpp
+@@ -58,6 +58,9 @@ void ASTDictionaryAttributeDeclaration::formatImpl(const FormatSettings & settin
+     if (hierarchical)
+         settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "HIERARCHICAL";
+ 
++    if (bidirectional)
++        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "BIDIRECTIONAL";
++
+     if (injective)
+         settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "INJECTIVE";
+ 
+diff --git a/src/Parsers/ASTDictionaryAttributeDeclaration.h b/src/Parsers/ASTDictionaryAttributeDeclaration.h
+index b34ebc539ec4..b6572e89d16a 100644
+--- a/src/Parsers/ASTDictionaryAttributeDeclaration.h
++++ b/src/Parsers/ASTDictionaryAttributeDeclaration.h
+@@ -20,6 +20,8 @@ class ASTDictionaryAttributeDeclaration : public IAST
+     ASTPtr expression;
+     /// Is attribute mirrored to the parent identifier
+     bool hierarchical;
++    /// Is hierarchical attribute bidirectional
++    bool bidirectional;
+     /// Flag that shows whether the id->attribute image is injective
+     bool injective;
+     /// MongoDB object ID
+diff --git a/src/Parsers/ParserDictionaryAttributeDeclaration.cpp b/src/Parsers/ParserDictionaryAttributeDeclaration.cpp
+index a248c9def071..44bb7fb60577 100644
+--- a/src/Parsers/ParserDictionaryAttributeDeclaration.cpp
++++ b/src/Parsers/ParserDictionaryAttributeDeclaration.cpp
+@@ -15,6 +15,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
+     ParserKeyword s_default{"DEFAULT"};
+     ParserKeyword s_expression{"EXPRESSION"};
+     ParserKeyword s_hierarchical{"HIERARCHICAL"};
++    ParserKeyword s_bidirectional{"BIDIRECTIONAL"};
+     ParserKeyword s_injective{"INJECTIVE"};
+     ParserKeyword s_is_object_id{"IS_OBJECT_ID"};
+     ParserLiteral default_parser;
+@@ -30,6 +31,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
+     ASTPtr default_value;
+     ASTPtr expression;
+     bool hierarchical = false;
++    bool bidirectional = false;
+     bool injective = false;
+     bool is_object_id = false;
+ 
+@@ -63,6 +65,12 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
+             continue;
+         }
+ 
++        if (!bidirectional && s_bidirectional.ignore(pos, expected))
++        {
++            bidirectional = true;
++            continue;
++        }
++
+         if (!injective && s_injective.ignore(pos, expected))
+         {
+             injective = true;
+@@ -101,6 +109,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
+     }
+ 
+     attribute_declaration->hierarchical = hierarchical;
++    attribute_declaration->bidirectional = bidirectional;
+     attribute_declaration->injective = injective;
+     attribute_declaration->is_object_id = is_object_id;
+ 
+diff --git a/src/Storages/System/StorageSystemDictionaries.cpp b/src/Storages/System/StorageSystemDictionaries.cpp
+index c0d7d8cc4edb..5d6f288ab11d 100644
+--- a/src/Storages/System/StorageSystemDictionaries.cpp
++++ b/src/Storages/System/StorageSystemDictionaries.cpp
+@@ -35,6 +35,7 @@ NamesAndTypesList StorageSystemDictionaries::getNamesAndTypes()
+         {"attribute.names", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+         {"attribute.types", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+         {"bytes_allocated", std::make_shared<DataTypeUInt64>()},
++        {"hierarchical_index_bytes_allocated", std::make_shared<DataTypeUInt64>()},
+         {"query_count", std::make_shared<DataTypeUInt64>()},
+         {"hit_rate", std::make_shared<DataTypeFloat64>()},
+         {"found_rate", std::make_shared<DataTypeFloat64>()},
+@@ -113,6 +114,7 @@ void StorageSystemDictionaries::fillData(MutableColumns & res_columns, ContextPt
+         if (dict_ptr)
+         {
+             res_columns[i++]->insert(dict_ptr->getBytesAllocated());
++            res_columns[i++]->insert(dict_ptr->getHierarchicalIndexBytesAllocated());
+             res_columns[i++]->insert(dict_ptr->getQueryCount());
+             res_columns[i++]->insert(dict_ptr->getHitRate());
+             res_columns[i++]->insert(dict_ptr->getFoundRate());
+@@ -128,7 +130,7 @@ void StorageSystemDictionaries::fillData(MutableColumns & res_columns, ContextPt
+         }
+         else
+         {
+-            for (size_t j = 0; j != 9; ++j) // Number of empty fields if dict_ptr is null
++            for (size_t j = 0; j != 10; ++j) // Number of empty fields if dict_ptr is null
+                 res_columns[i++]->insertDefault();
+         }
+ 

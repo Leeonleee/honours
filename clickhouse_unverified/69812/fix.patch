@@ -1,0 +1,142 @@
+diff --git a/src/Analyzer/Resolve/IdentifierResolver.cpp b/src/Analyzer/Resolve/IdentifierResolver.cpp
+index 083b3a8f462e..e46c301f9ea3 100644
+--- a/src/Analyzer/Resolve/IdentifierResolver.cpp
++++ b/src/Analyzer/Resolve/IdentifierResolver.cpp
+@@ -423,6 +423,14 @@ QueryTreeNodePtr IdentifierResolver::tryResolveTableIdentifierFromDatabaseCatalo
+     else
+         storage = DatabaseCatalog::instance().tryGetTable(storage_id, context);
+ 
++    if (!storage && storage_id.hasUUID())
++    {
++        // If `storage_id` has UUID, it is possible that the UUID is removed from `DatabaseCatalog` after `context->resolveStorageID(storage_id)`
++        // We try to get the table with the database name and the table name.
++        auto database = DatabaseCatalog::instance().tryGetDatabase(storage_id.getDatabaseName());
++        if (database)
++            storage = database->tryGetTable(table_name, context);
++    }
+     if (!storage)
+         return {};
+ 
+diff --git a/src/Common/ErrorCodes.cpp b/src/Common/ErrorCodes.cpp
+index 09a5375191b8..9f07c3ed5d5d 100644
+--- a/src/Common/ErrorCodes.cpp
++++ b/src/Common/ErrorCodes.cpp
+@@ -452,7 +452,7 @@
+     M(553, LZMA_STREAM_ENCODER_FAILED) \
+     M(554, LZMA_STREAM_DECODER_FAILED) \
+     M(555, ROCKSDB_ERROR) \
+-    M(556, SYNC_MYSQL_USER_ACCESS_ERROR)\
++    M(556, SYNC_MYSQL_USER_ACCESS_ERROR) \
+     M(557, UNKNOWN_UNION) \
+     M(558, EXPECTED_ALL_OR_DISTINCT) \
+     M(559, INVALID_GRPC_QUERY_INFO) \
+@@ -578,7 +578,7 @@
+     M(697, CANNOT_RESTORE_TO_NONENCRYPTED_DISK) \
+     M(698, INVALID_REDIS_STORAGE_TYPE) \
+     M(699, INVALID_REDIS_TABLE_STRUCTURE) \
+-    M(700, USER_SESSION_LIMIT_EXCEEDED)  \
++    M(700, USER_SESSION_LIMIT_EXCEEDED) \
+     M(701, CLUSTER_DOESNT_EXIST) \
+     M(702, CLIENT_INFO_DOES_NOT_MATCH) \
+     M(703, INVALID_IDENTIFIER) \
+@@ -610,15 +610,16 @@
+     M(729, ILLEGAL_TIME_SERIES_TAGS) \
+     M(730, REFRESH_FAILED) \
+     M(731, QUERY_CACHE_USED_WITH_NON_THROW_OVERFLOW_MODE) \
+-    \
++    M(733, TABLE_IS_BEING_RESTARTED) \
++\
+     M(900, DISTRIBUTED_CACHE_ERROR) \
+     M(901, CANNOT_USE_DISTRIBUTED_CACHE) \
+-    \
++\
+     M(999, KEEPER_EXCEPTION) \
+     M(1000, POCO_EXCEPTION) \
+     M(1001, STD_EXCEPTION) \
+     M(1002, UNKNOWN_EXCEPTION) \
+-/* See END */
++    /* See END */
+ 
+ #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
+     #define APPLY_FOR_ERROR_CODES(M) APPLY_FOR_BUILTIN_ERROR_CODES(M) APPLY_FOR_EXTERNAL_ERROR_CODES(M)
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index e161c0455b96..ac7fdb740335 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -1588,7 +1588,8 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+     if (need_add_to_database && !database)
+         throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database {} does not exist", backQuoteIfNeed(database_name));
+ 
+-    if (create.replace_table)
++    if (create.replace_table
++        || (create.replace_view && (database->getEngineName() == "Atomic" || database->getEngineName() == "Replicated")))
+     {
+         chassert(!ddl_guard);
+         return doCreateOrReplaceTable(create, properties, mode);
+@@ -1941,16 +1942,16 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
+ 
+         auto ast_rename = std::make_shared<ASTRenameQuery>(ASTRenameQuery::Elements{std::move(elem)});
+         ast_rename->dictionary = create.is_dictionary;
+-        if (create.create_or_replace)
++        if (create.create_or_replace || create.replace_view)
+         {
+-            /// CREATE OR REPLACE TABLE
++            /// CREATE OR REPLACE TABLE/VIEW
+             /// Will execute ordinary RENAME instead of EXCHANGE if the target table does not exist
+             ast_rename->rename_if_cannot_exchange = true;
+             ast_rename->exchange = false;
+         }
+         else
+         {
+-            /// REPLACE TABLE
++            /// REPLACE TABLE/VIEW
+             /// Will execute EXCHANGE query and fail if the target table does not exist
+             ast_rename->exchange = true;
+         }
+diff --git a/src/Storages/IStorage.cpp b/src/Storages/IStorage.cpp
+index 79d87a6e3cbb..f56b959435cb 100644
+--- a/src/Storages/IStorage.cpp
++++ b/src/Storages/IStorage.cpp
+@@ -31,6 +31,7 @@ namespace ErrorCodes
+     extern const int NOT_IMPLEMENTED;
+     extern const int DEADLOCK_AVOIDED;
+     extern const int CANNOT_RESTORE_TABLE;
++    extern const int TABLE_IS_BEING_RESTARTED;
+ }
+ 
+ IStorage::IStorage(StorageID storage_id_, std::unique_ptr<StorageInMemoryMetadata> metadata_)
+@@ -66,12 +67,13 @@ RWLockImpl::LockHolder IStorage::tryLockTimed(
+ TableLockHolder IStorage::lockForShare(const String & query_id, const std::chrono::milliseconds & acquire_timeout)
+ {
+     TableLockHolder result = tryLockTimed(drop_lock, RWLockImpl::Read, query_id, acquire_timeout);
+-
+-    if (is_dropped || is_detached)
+-    {
+-        auto table_id = getStorageID();
++    auto table_id = getStorageID();
++    if (!table_id.hasUUID() && (is_dropped || is_detached))
+         throw Exception(ErrorCodes::TABLE_IS_DROPPED, "Table {}.{} is dropped or detached", table_id.database_name, table_id.table_name);
+-    }
++
++    if (is_being_restarted)
++        throw Exception(
++            ErrorCodes::TABLE_IS_BEING_RESTARTED, "Table {}.{} is being restarted", table_id.database_name, table_id.table_name);
+     return result;
+ }
+ 
+@@ -79,12 +81,10 @@ TableLockHolder IStorage::tryLockForShare(const String & query_id, const std::ch
+ {
+     TableLockHolder result = tryLockTimed(drop_lock, RWLockImpl::Read, query_id, acquire_timeout);
+ 
+-    if (is_dropped || is_detached)
+-    {
+-        // Table was dropped while acquiring the lock
++    auto table_id = getStorageID();
++    if (is_being_restarted || (!table_id.hasUUID() && (is_dropped || is_detached)))
++        // Table was dropped or is being restarted while acquiring the lock
+         result = nullptr;
+-    }
+-
+     return result;
+ }
+ 

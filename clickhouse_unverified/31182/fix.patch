@@ -1,0 +1,795 @@
+diff --git a/programs/server/Server.cpp b/programs/server/Server.cpp
+index 9fa36e3de89d..79837310ec4a 100644
+--- a/programs/server/Server.cpp
++++ b/programs/server/Server.cpp
+@@ -22,6 +22,7 @@
+ #include <base/getMemoryAmount.h>
+ #include <base/errnoToString.h>
+ #include <base/coverage.h>
++#include <Common/MemoryTracker.h>
+ #include <Common/ClickHouseRevision.h>
+ #include <Common/DNSResolver.h>
+ #include <Common/CurrentMetrics.h>
+@@ -925,6 +926,14 @@ if (ThreadFuzzer::instance().isEffective())
+             total_memory_tracker.setDescription("(total)");
+             total_memory_tracker.setMetric(CurrentMetrics::MemoryTracking);
+ 
++            auto * global_overcommit_tracker = global_context->getGlobalOvercommitTracker();
++            if (config->has("global_memory_usage_overcommit_max_wait_microseconds"))
++            {
++                UInt64 max_overcommit_wait_time = config->getUInt64("global_memory_usage_overcommit_max_wait_microseconds", 0);
++                global_overcommit_tracker->setMaxWaitTime(max_overcommit_wait_time);
++            }
++            total_memory_tracker.setOvercommitTracker(global_overcommit_tracker);
++
+             // FIXME logging-related things need synchronization -- see the 'Logger * log' saved
+             // in a lot of places. For now, disable updating log configuration without server restart.
+             //setTextLog(global_context->getTextLog());
+diff --git a/src/Common/MemoryTracker.cpp b/src/Common/MemoryTracker.cpp
+index ba98ede221a7..4c8af23791eb 100644
+--- a/src/Common/MemoryTracker.cpp
++++ b/src/Common/MemoryTracker.cpp
+@@ -1,6 +1,7 @@
+ #include "MemoryTracker.h"
+ 
+ #include <IO/WriteHelpers.h>
++#include <Common/VariableContext.h>
+ #include <Interpreters/TraceCollector.h>
+ #include <Common/Exception.h>
+ #include <Common/LockMemoryExceptionInThread.h>
+@@ -8,6 +9,7 @@
+ #include <Common/formatReadable.h>
+ #include <Common/ProfileEvents.h>
+ #include <Common/thread_local_rng.h>
++#include <Common/OvercommitTracker.h>
+ #include <base/logger_useful.h>
+ 
+ #include <atomic>
+@@ -95,7 +97,7 @@ void MemoryTracker::logMemoryUsage(Int64 current) const
+ }
+ 
+ 
+-void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded)
++void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded, MemoryTracker * query_tracker)
+ {
+     if (size < 0)
+         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Negative size ({}) is passed to MemoryTracker. It is a bug.", size);
+@@ -104,7 +106,8 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded)
+     {
+         /// Since the MemoryTrackerBlockerInThread should respect the level, we should go to the next parent.
+         if (auto * loaded_next = parent.load(std::memory_order_relaxed))
+-            loaded_next->allocImpl(size, throw_if_memory_exceeded);
++            loaded_next->allocImpl(size, throw_if_memory_exceeded,
++                level == VariableContext::Process ? this : query_tracker);
+         return;
+     }
+ 
+@@ -186,18 +189,30 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded)
+ 
+     if (unlikely(current_hard_limit && will_be > current_hard_limit) && memoryTrackerCanThrow(level, false) && throw_if_memory_exceeded)
+     {
+-        /// Prevent recursion. Exception::ctor -> std::string -> new[] -> MemoryTracker::alloc
+-        MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
+-        ProfileEvents::increment(ProfileEvents::QueryMemoryLimitExceeded);
+-        const auto * description = description_ptr.load(std::memory_order_relaxed);
+-        throw DB::Exception(
+-            DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+-            "Memory limit{}{} exceeded: would use {} (attempt to allocate chunk of {} bytes), maximum: {}",
+-            description ? " " : "",
+-            description ? description : "",
+-            formatReadableSizeWithBinarySuffix(will_be),
+-            size,
+-            formatReadableSizeWithBinarySuffix(current_hard_limit));
++        bool need_to_throw = true;
++        bool try_to_free_memory = overcommit_tracker != nullptr && query_tracker != nullptr;
++        if (try_to_free_memory)
++            need_to_throw = overcommit_tracker->needToStopQuery(query_tracker);
++
++        if (need_to_throw)
++        {
++            /// Prevent recursion. Exception::ctor -> std::string -> new[] -> MemoryTracker::alloc
++            MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
++            ProfileEvents::increment(ProfileEvents::QueryMemoryLimitExceeded);
++            const auto * description = description_ptr.load(std::memory_order_relaxed);
++            throw DB::Exception(
++                DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
++                "Memory limit{}{} exceeded: would use {} (attempt to allocate chunk of {} bytes), maximum: {}",
++                description ? " " : "",
++                description ? description : "",
++                formatReadableSizeWithBinarySuffix(will_be),
++                size,
++                formatReadableSizeWithBinarySuffix(current_hard_limit));
++        }
++        else
++        {
++            will_be = amount.load(std::memory_order_relaxed);
++        }
+     }
+ 
+     bool peak_updated;
+@@ -221,7 +236,8 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded)
+     }
+ 
+     if (auto * loaded_next = parent.load(std::memory_order_relaxed))
+-        loaded_next->allocImpl(size, throw_if_memory_exceeded);
++        loaded_next->allocImpl(size, throw_if_memory_exceeded,
++            level == VariableContext::Process ? this : query_tracker);
+ }
+ 
+ void MemoryTracker::alloc(Int64 size)
+@@ -302,10 +318,23 @@ void MemoryTracker::free(Int64 size)
+ }
+ 
+ 
++OvercommitRatio MemoryTracker::getOvercommitRatio()
++{
++    return { amount.load(std::memory_order_relaxed), soft_limit.load(std::memory_order_relaxed) };
++}
++
++
++OvercommitRatio MemoryTracker::getOvercommitRatio(Int64 limit)
++{
++    return { amount.load(std::memory_order_relaxed), limit };
++}
++
++
+ void MemoryTracker::resetCounters()
+ {
+     amount.store(0, std::memory_order_relaxed);
+     peak.store(0, std::memory_order_relaxed);
++    soft_limit.store(0, std::memory_order_relaxed);
+     hard_limit.store(0, std::memory_order_relaxed);
+     profiler_limit.store(0, std::memory_order_relaxed);
+ }
+@@ -330,6 +359,12 @@ void MemoryTracker::set(Int64 to)
+ }
+ 
+ 
++void MemoryTracker::setSoftLimit(Int64 value)
++{
++    soft_limit.store(value, std::memory_order_relaxed);
++}
++
++
+ void MemoryTracker::setHardLimit(Int64 value)
+ {
+     hard_limit.store(value, std::memory_order_relaxed);
+diff --git a/src/Common/MemoryTracker.h b/src/Common/MemoryTracker.h
+index a0138b25b5f7..780a869acad4 100644
+--- a/src/Common/MemoryTracker.h
++++ b/src/Common/MemoryTracker.h
+@@ -28,6 +28,9 @@ extern thread_local bool memory_tracker_always_throw_logical_error_on_allocation
+ #define ALLOW_ALLOCATIONS_IN_SCOPE static_assert(true)
+ #endif
+ 
++struct OvercommitRatio;
++struct OvercommitTracker;
++
+ /** Tracks memory consumption.
+   * It throws an exception if amount of consumed memory become greater than certain limit.
+   * The same memory tracker could be simultaneously used in different threads.
+@@ -40,6 +43,7 @@ class MemoryTracker
+ private:
+     std::atomic<Int64> amount {0};
+     std::atomic<Int64> peak {0};
++    std::atomic<Int64> soft_limit {0};
+     std::atomic<Int64> hard_limit {0};
+     std::atomic<Int64> profiler_limit {0};
+ 
+@@ -61,6 +65,8 @@ class MemoryTracker
+     /// This description will be used as prefix into log messages (if isn't nullptr)
+     std::atomic<const char *> description_ptr = nullptr;
+ 
++    OvercommitTracker * overcommit_tracker = nullptr;
++
+     bool updatePeak(Int64 will_be, bool log_memory_usage);
+     void logMemoryUsage(Int64 current) const;
+ 
+@@ -83,7 +89,7 @@ class MemoryTracker
+ 
+     void allocNoThrow(Int64 size);
+ 
+-    void allocImpl(Int64 size, bool throw_if_memory_exceeded);
++    void allocImpl(Int64 size, bool throw_if_memory_exceeded, MemoryTracker * query_tracker = nullptr);
+ 
+     void realloc(Int64 old_size, Int64 new_size)
+     {
+@@ -108,8 +114,14 @@ class MemoryTracker
+         return peak.load(std::memory_order_relaxed);
+     }
+ 
++    void setSoftLimit(Int64 value);
+     void setHardLimit(Int64 value);
+ 
++    Int64 getSoftLimit() const
++    {
++        return soft_limit.load(std::memory_order_relaxed);
++    }
++
+     /** Set limit if it was not set.
+       * Otherwise, set limit to new value, if new value is greater than previous limit.
+       */
+@@ -159,6 +171,14 @@ class MemoryTracker
+         description_ptr.store(description, std::memory_order_relaxed);
+     }
+ 
++    OvercommitRatio getOvercommitRatio();
++    OvercommitRatio getOvercommitRatio(Int64 limit);
++
++    void setOvercommitTracker(OvercommitTracker * tracker) noexcept
++    {
++        overcommit_tracker = tracker;
++    }
++
+     /// Reset the accumulated data
+     void resetCounters();
+ 
+diff --git a/src/Common/OvercommitTracker.cpp b/src/Common/OvercommitTracker.cpp
+new file mode 100644
+index 000000000000..4be7096aa607
+--- /dev/null
++++ b/src/Common/OvercommitTracker.cpp
+@@ -0,0 +1,119 @@
++#include "OvercommitTracker.h"
++
++#include <chrono>
++#include <mutex>
++#include <Interpreters/ProcessList.h>
++
++using namespace std::chrono_literals;
++
++OvercommitTracker::OvercommitTracker()
++    : max_wait_time(0us)
++    , picked_tracker(nullptr)
++    , cancelation_state(QueryCancelationState::NONE)
++{}
++
++void OvercommitTracker::setMaxWaitTime(UInt64 wait_time)
++{
++    std::lock_guard guard(overcommit_m);
++    max_wait_time = wait_time * 1us;
++}
++
++bool OvercommitTracker::needToStopQuery(MemoryTracker * tracker)
++{
++    std::unique_lock<std::mutex> lk(overcommit_m);
++
++    pickQueryToExclude();
++    assert(cancelation_state == QueryCancelationState::RUNNING);
++
++    // If no query was chosen we need to stop current query.
++    // This may happen if no soft limit is set.
++    if (picked_tracker == nullptr)
++    {
++        cancelation_state = QueryCancelationState::NONE;
++        return true;
++    }
++    if (picked_tracker == tracker)
++        return true;
++    return !cv.wait_for(lk, max_wait_time, [this]()
++    {
++        return cancelation_state == QueryCancelationState::NONE;
++    });
++}
++
++void OvercommitTracker::unsubscribe(MemoryTracker * tracker)
++{
++    std::unique_lock<std::mutex> lk(overcommit_m);
++    if (picked_tracker == tracker)
++    {
++        LOG_DEBUG(getLogger(), "Picked query stopped");
++
++        picked_tracker = nullptr;
++        cancelation_state = QueryCancelationState::NONE;
++        cv.notify_all();
++    }
++}
++
++UserOvercommitTracker::UserOvercommitTracker(DB::ProcessListForUser * user_process_list_)
++    : user_process_list(user_process_list_)
++{}
++
++void UserOvercommitTracker::pickQueryToExcludeImpl()
++{
++    MemoryTracker * query_tracker = nullptr;
++    OvercommitRatio current_ratio{0, 0};
++    // At this moment query list must be read only.
++    // BlockQueryIfMemoryLimit is used in ProcessList to guarantee this.
++    auto & queries = user_process_list->queries;
++    LOG_DEBUG(logger, "Trying to choose query to stop from {} queries", queries.size());
++    for (auto const & query : queries)
++    {
++        if (query.second->isKilled())
++            continue;
++
++        auto * memory_tracker = query.second->getMemoryTracker();
++        if (!memory_tracker)
++            continue;
++
++        auto ratio = memory_tracker->getOvercommitRatio();
++        LOG_DEBUG(logger, "Query has ratio {}/{}", ratio.committed, ratio.soft_limit);
++        if (ratio.soft_limit != 0 && current_ratio < ratio)
++        {
++            query_tracker = memory_tracker;
++            current_ratio   = ratio;
++        }
++    }
++    LOG_DEBUG(logger, "Selected to stop query with overcommit ratio {}/{}",
++        current_ratio.committed, current_ratio.soft_limit);
++    picked_tracker = query_tracker;
++}
++
++void GlobalOvercommitTracker::pickQueryToExcludeImpl()
++{
++    MemoryTracker * query_tracker = nullptr;
++    OvercommitRatio current_ratio{0, 0};
++    process_list->processEachQueryStatus([&](DB::QueryStatus const & query)
++    {
++        if (query.isKilled())
++            return;
++
++        Int64 user_soft_limit = 0;
++        if (auto const * user_process_list = query.getUserProcessList())
++            user_soft_limit = user_process_list->user_memory_tracker.getSoftLimit();
++        if (user_soft_limit == 0)
++            return;
++
++        auto * memory_tracker = query.getMemoryTracker();
++        if (!memory_tracker)
++            return;
++        auto ratio = memory_tracker->getOvercommitRatio(user_soft_limit);
++        LOG_DEBUG(logger, "Query has ratio {}/{}", ratio.committed, ratio.soft_limit);
++        if (current_ratio < ratio)
++        {
++            query_tracker = memory_tracker;
++            current_ratio   = ratio;
++        }
++    });
++    LOG_DEBUG(logger, "Selected to stop query with overcommit ratio {}/{}",
++        current_ratio.committed, current_ratio.soft_limit);
++    picked_tracker = query_tracker;
++}
+diff --git a/src/Common/OvercommitTracker.h b/src/Common/OvercommitTracker.h
+new file mode 100644
+index 000000000000..2286ad4bde20
+--- /dev/null
++++ b/src/Common/OvercommitTracker.h
+@@ -0,0 +1,155 @@
++#pragma once
++
++#include <base/logger_useful.h>
++#include <base/types.h>
++#include <boost/core/noncopyable.hpp>
++#include <Poco/Logger.h>
++#include <cassert>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <unordered_map>
++
++// This struct is used for the comparison of query memory usage.
++struct OvercommitRatio
++{
++    OvercommitRatio(Int64 committed_, Int64 soft_limit_)
++        : committed(committed_)
++        , soft_limit(soft_limit_)
++    {}
++
++    friend bool operator<(OvercommitRatio const & lhs, OvercommitRatio const & rhs) noexcept
++    {
++        // (a / b < c / d) <=> (a * d < c * b)
++        return (lhs.committed * rhs.soft_limit) < (rhs.committed * lhs.soft_limit)
++            || (lhs.soft_limit == 0 && rhs.soft_limit > 0)
++            || (lhs.committed == 0 && rhs.committed == 0 && lhs.soft_limit > rhs.soft_limit);
++    }
++
++    // actual query memory usage
++    Int64 committed;
++    // guaranteed amount of memory query can use
++    Int64 soft_limit;
++};
++
++class MemoryTracker;
++
++// Usually it's hard to set some reasonable hard memory limit
++// (especially, the default value). This class introduces new
++// mechanisim for the limiting of memory usage.
++// Soft limit represents guaranteed amount of memory query/user
++// may use. It's allowed to exceed this limit. But if hard limit
++// is reached, query with the biggest overcommit ratio
++// is killed to free memory.
++struct OvercommitTracker : boost::noncopyable
++{
++    OvercommitTracker();
++
++    void setMaxWaitTime(UInt64 wait_time);
++
++    bool needToStopQuery(MemoryTracker * tracker);
++
++    void unsubscribe(MemoryTracker * tracker);
++
++    virtual ~OvercommitTracker() = default;
++
++protected:
++    virtual void pickQueryToExcludeImpl() = 0;
++
++    mutable std::mutex overcommit_m;
++    mutable std::condition_variable cv;
++
++    std::chrono::microseconds max_wait_time;
++
++    enum class QueryCancelationState
++    {
++        NONE,
++        RUNNING,
++    };
++
++    // Specifies memory tracker of the chosen to stop query.
++    // If soft limit is not set, all the queries which reach hard limit must stop.
++    // This case is represented as picked tracker pointer is set to nullptr and
++    // overcommit tracker is in RUNNING state.
++    MemoryTracker * picked_tracker;
++    QueryCancelationState cancelation_state;
++
++    virtual Poco::Logger * getLogger() = 0;
++
++private:
++
++    void pickQueryToExclude()
++    {
++        if (cancelation_state != QueryCancelationState::RUNNING)
++        {
++            pickQueryToExcludeImpl();
++            cancelation_state = QueryCancelationState::RUNNING;
++        }
++    }
++
++    friend struct BlockQueryIfMemoryLimit;
++};
++
++namespace DB
++{
++    class ProcessList;
++    struct ProcessListForUser;
++}
++
++struct UserOvercommitTracker : OvercommitTracker
++{
++    explicit UserOvercommitTracker(DB::ProcessListForUser * user_process_list_);
++
++    ~UserOvercommitTracker() override = default;
++
++protected:
++    void pickQueryToExcludeImpl() override final;
++
++    Poco::Logger * getLogger() override final { return logger; }
++private:
++    DB::ProcessListForUser * user_process_list;
++    Poco::Logger * logger = &Poco::Logger::get("UserOvercommitTracker");
++};
++
++struct GlobalOvercommitTracker : OvercommitTracker
++{
++    explicit GlobalOvercommitTracker(DB::ProcessList * process_list_)
++        : process_list(process_list_)
++    {}
++
++    ~GlobalOvercommitTracker() override = default;
++
++protected:
++    void pickQueryToExcludeImpl() override final;
++
++    Poco::Logger * getLogger() override final { return logger; }
++private:
++    DB::ProcessList * process_list;
++    Poco::Logger * logger = &Poco::Logger::get("GlobalOvercommitTracker");
++};
++
++// UserOvercommitTracker requires to check the whole list of user's queries
++// to pick one to stop. BlockQueryIfMemoryLimit struct allows to wait until
++// query selection is finished. It's used in ProcessList to make user query
++// list immutable when UserOvercommitTracker reads it.
++struct BlockQueryIfMemoryLimit
++{
++    BlockQueryIfMemoryLimit(OvercommitTracker const & overcommit_tracker)
++        : mutex(overcommit_tracker.overcommit_m)
++        , lk(mutex)
++    {
++        if (overcommit_tracker.cancelation_state == OvercommitTracker::QueryCancelationState::RUNNING)
++        {
++            overcommit_tracker.cv.wait_for(lk, overcommit_tracker.max_wait_time, [&overcommit_tracker]()
++            {
++                return overcommit_tracker.cancelation_state == OvercommitTracker::QueryCancelationState::NONE;
++            });
++        }
++    }
++
++    ~BlockQueryIfMemoryLimit() = default;
++
++private:
++    std::mutex & mutex;
++    std::unique_lock<std::mutex> lk;
++};
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index cd29ef959adc..7dc2aada25bd 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -358,11 +358,15 @@ class IColumn;
+     M(OverflowMode, distinct_overflow_mode, OverflowMode::THROW, "What to do when the limit is exceeded.", 0) \
+     \
+     M(UInt64, max_memory_usage, 0, "Maximum memory usage for processing of single query. Zero means unlimited.", 0) \
++    M(UInt64, max_guaranteed_memory_usage, 0, "Maximum guaranteed memory usage for processing of single query. It represents soft limit. Zero means unlimited.", 0) \
+     M(UInt64, max_memory_usage_for_user, 0, "Maximum memory usage for processing all concurrently running queries for the user. Zero means unlimited.", 0) \
++    M(UInt64, max_guaranteed_memory_usage_for_user, 0, "Maximum guaranteed memory usage for processing all concurrently running queries for the user. It represents soft limit. Zero means unlimited.", 0) \
+     M(UInt64, max_untracked_memory, (4 * 1024 * 1024), "Small allocations and deallocations are grouped in thread local variable and tracked or profiled only when amount (in absolute value) becomes larger than specified value. If the value is higher than 'memory_profiler_step' it will be effectively lowered to 'memory_profiler_step'.", 0) \
+     M(UInt64, memory_profiler_step, (4 * 1024 * 1024), "Whenever query memory usage becomes larger than every next step in number of bytes the memory profiler will collect the allocating stack trace. Zero means disabled memory profiler. Values lower than a few megabytes will slow down query processing.", 0) \
+     M(Float, memory_profiler_sample_probability, 0., "Collect random allocations and deallocations and write them into system.trace_log with 'MemorySample' trace_type. The probability is for every alloc/free regardless to the size of the allocation. Note that sampling happens only when the amount of untracked memory exceeds 'max_untracked_memory'. You may want to set 'max_untracked_memory' to 0 for extra fine grained sampling.", 0) \
+     \
++    M(UInt64, memory_usage_overcommit_max_wait_microseconds, 0, "Maximum time thread will wait for memory to be freed in the case of memory overcommit. If timeout is reached and memory is not freed, exception is thrown", 0) \
++    \
+     M(UInt64, max_network_bandwidth, 0, "The maximum speed of data exchange over the network in bytes per second for a query. Zero means unlimited.", 0) \
+     M(UInt64, max_network_bytes, 0, "The maximum number of bytes (compressed) to receive or transmit over the network for execution of the query.", 0) \
+     M(UInt64, max_network_bandwidth_for_user, 0, "The maximum speed of data exchange over the network in bytes per second for all concurrently running user queries. Zero means unlimited.", 0)\
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 822f1dcb534e..e8115c384bbe 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -208,6 +208,7 @@ struct ContextSharedPart
+     mutable MarkCachePtr index_mark_cache;                  /// Cache of marks in compressed files of MergeTree indices.
+     mutable MMappedFileCachePtr mmap_cache; /// Cache of mmapped files to avoid frequent open/map/unmap/close and to reuse from several threads.
+     ProcessList process_list;                               /// Executing queries at the moment.
++    GlobalOvercommitTracker global_overcommit_tracker;
+     MergeList merge_list;                                   /// The list of executable merge (for (Replicated)?MergeTree)
+     ReplicatedFetchList replicated_fetch_list;
+     ConfigurationPtr users_config;                          /// Config with the users, profiles and quotas sections.
+@@ -275,7 +276,9 @@ struct ContextSharedPart
+     Context::ConfigReloadCallback config_reload_callback;
+ 
+     ContextSharedPart()
+-        : access_control(std::make_unique<AccessControl>()), macros(std::make_unique<Macros>())
++        : access_control(std::make_unique<AccessControl>())
++        , global_overcommit_tracker(&process_list)
++        , macros(std::make_unique<Macros>())
+     {
+         /// TODO: make it singleton (?)
+         static std::atomic<size_t> num_calls{0};
+@@ -474,6 +477,7 @@ std::unique_lock<std::recursive_mutex> Context::getLock() const
+ 
+ ProcessList & Context::getProcessList() { return shared->process_list; }
+ const ProcessList & Context::getProcessList() const { return shared->process_list; }
++OvercommitTracker * Context::getGlobalOvercommitTracker() const { return &shared->global_overcommit_tracker; }
+ MergeList & Context::getMergeList() { return shared->merge_list; }
+ const MergeList & Context::getMergeList() const { return shared->merge_list; }
+ ReplicatedFetchList & Context::getReplicatedFetchList() { return shared->replicated_fetch_list; }
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index 6b0a4671efb1..2a2783603a27 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -29,6 +29,7 @@
+ namespace Poco::Net { class IPAddress; }
+ namespace zkutil { class ZooKeeper; }
+ 
++struct OvercommitTracker;
+ 
+ namespace DB
+ {
+@@ -657,6 +658,8 @@ class Context: public std::enable_shared_from_this<Context>
+     ProcessList & getProcessList();
+     const ProcessList & getProcessList() const;
+ 
++    OvercommitTracker * getGlobalOvercommitTracker() const;
++
+     MergeList & getMergeList();
+     const MergeList & getMergeList() const;
+ 
+diff --git a/src/Interpreters/ProcessList.cpp b/src/Interpreters/ProcessList.cpp
+index 3c91f00ebf4c..d17d8e4972a5 100644
+--- a/src/Interpreters/ProcessList.cpp
++++ b/src/Interpreters/ProcessList.cpp
+@@ -195,33 +195,21 @@ ProcessList::EntryPtr ProcessList::insert(const String & query_, const IAST * as
+                     ErrorCodes::QUERY_WITH_SAME_ID_IS_ALREADY_RUNNING);
+         }
+ 
+-        auto process_it = processes.emplace(processes.end(),
+-            query_context, query_, client_info, priorities.insert(settings.priority), query_kind);
+-
+-        increaseQueryKindAmount(query_kind);
+-
+-        res = std::make_shared<Entry>(*this, process_it);
+-
+         ProcessListForUser & user_process_list = user_to_queries[client_info.current_user];
+-        user_process_list.queries.emplace(client_info.current_query_id, &res->get());
+-
+-        process_it->setUserProcessList(&user_process_list);
+-
+-        /// Track memory usage for all simultaneously running queries from single user.
+-        user_process_list.user_memory_tracker.setOrRaiseHardLimit(settings.max_memory_usage_for_user);
+-        user_process_list.user_memory_tracker.setDescription("(for user)");
+ 
+         /// Actualize thread group info
+-        if (auto thread_group = CurrentThread::getGroup())
++        auto thread_group = CurrentThread::getGroup();
++        if (thread_group)
+         {
+             std::lock_guard lock_thread_group(thread_group->mutex);
+             thread_group->performance_counters.setParent(&user_process_list.user_performance_counters);
+             thread_group->memory_tracker.setParent(&user_process_list.user_memory_tracker);
+-            thread_group->query = process_it->query;
+-            thread_group->normalized_query_hash = normalizedQueryHash<false>(process_it->query);
++            thread_group->query = query_;
++            thread_group->normalized_query_hash = normalizedQueryHash<false>(query_);
+ 
+             /// Set query-level memory trackers
+             thread_group->memory_tracker.setOrRaiseHardLimit(settings.max_memory_usage);
++            thread_group->memory_tracker.setSoftLimit(settings.max_guaranteed_memory_usage);
+ 
+             if (query_context->hasTraceCollector())
+             {
+@@ -236,10 +224,28 @@ ProcessList::EntryPtr ProcessList::insert(const String & query_, const IAST * as
+ 
+             /// NOTE: Do not set the limit for thread-level memory tracker since it could show unreal values
+             ///  since allocation and deallocation could happen in different threads
++        }
++
++        auto process_it = processes.emplace(processes.end(),
++            query_context, query_, client_info, priorities.insert(settings.priority), std::move(thread_group), query_kind);
++
++        increaseQueryKindAmount(query_kind);
++
++        res = std::make_shared<Entry>(*this, process_it);
+ 
+-            process_it->thread_group = std::move(thread_group);
++        process_it->setUserProcessList(&user_process_list);
++
++        {
++            BlockQueryIfMemoryLimit block_query{user_process_list.user_overcommit_tracker};
++            user_process_list.queries.emplace(client_info.current_query_id, &res->get());
+         }
+ 
++        /// Track memory usage for all simultaneously running queries from single user.
++        user_process_list.user_memory_tracker.setOrRaiseHardLimit(settings.max_memory_usage_for_user);
++        user_process_list.user_memory_tracker.setSoftLimit(settings.max_guaranteed_memory_usage_for_user);
++        user_process_list.user_memory_tracker.setDescription("(for user)");
++        user_process_list.user_overcommit_tracker.setMaxWaitTime(settings.memory_usage_overcommit_max_wait_microseconds);
++
+         if (!user_process_list.user_throttler)
+         {
+             if (settings.max_network_bandwidth_for_user)
+@@ -268,9 +274,6 @@ ProcessListEntry::~ProcessListEntry()
+ 
+     const QueryStatus * process_list_element_ptr = &*it;
+ 
+-    /// This removes the memory_tracker of one request.
+-    parent.processes.erase(it);
+-
+     auto user_process_list_it = parent.user_to_queries.find(user);
+     if (user_process_list_it == parent.user_to_queries.end())
+     {
+@@ -286,11 +289,15 @@ ProcessListEntry::~ProcessListEntry()
+     {
+         if (running_query->second == process_list_element_ptr)
+         {
++            BlockQueryIfMemoryLimit block_query{user_process_list.user_overcommit_tracker};
+             user_process_list.queries.erase(running_query->first);
+             found = true;
+         }
+     }
+ 
++    /// This removes the memory_tracker of one request.
++    parent.processes.erase(it);
++
+     if (!found)
+     {
+         LOG_ERROR(&Poco::Logger::get("ProcessList"), "Logical error: cannot find query by query_id and pointer to ProcessListElement in ProcessListForUser");
+@@ -312,10 +319,16 @@ ProcessListEntry::~ProcessListEntry()
+ 
+ 
+ QueryStatus::QueryStatus(
+-    ContextPtr context_, const String & query_, const ClientInfo & client_info_, QueryPriorities::Handle && priority_handle_, IAST::QueryKind query_kind_)
++    ContextPtr context_,
++    const String & query_,
++    const ClientInfo & client_info_,
++    QueryPriorities::Handle && priority_handle_,
++    ThreadGroupStatusPtr && thread_group_,
++    IAST::QueryKind query_kind_)
+     : WithContext(context_)
+     , query(query_)
+     , client_info(client_info_)
++    , thread_group(std::move(thread_group_))
+     , priority_handle(std::move(priority_handle_))
+     , query_kind(query_kind_)
+     , num_queries_increment(CurrentMetrics::Query)
+@@ -328,6 +341,14 @@ QueryStatus::QueryStatus(
+ QueryStatus::~QueryStatus()
+ {
+     assert(executors.empty());
++
++    if (auto * memory_tracker = getMemoryTracker())
++    {
++        if (user_process_list)
++            user_process_list->user_overcommit_tracker.unsubscribe(memory_tracker);
++        if (auto shared_context = getContext())
++            shared_context->getGlobalOvercommitTracker()->unsubscribe(memory_tracker);
++    }
+ }
+ 
+ CancellationCode QueryStatus::cancelQuery(bool)
+@@ -481,7 +502,11 @@ ProcessList::Info ProcessList::getInfo(bool get_thread_list, bool get_profile_ev
+ }
+ 
+ 
+-ProcessListForUser::ProcessListForUser() = default;
++ProcessListForUser::ProcessListForUser()
++    : user_overcommit_tracker(this)
++{
++    user_memory_tracker.setOvercommitTracker(&user_overcommit_tracker);
++}
+ 
+ 
+ ProcessListForUserInfo ProcessListForUser::getInfo(bool get_profile_events) const
+diff --git a/src/Interpreters/ProcessList.h b/src/Interpreters/ProcessList.h
+index 2ba0b0814ee9..5fb4bca7e13f 100644
+--- a/src/Interpreters/ProcessList.h
++++ b/src/Interpreters/ProcessList.h
+@@ -16,6 +16,7 @@
+ #include <Common/ProfileEvents.h>
+ #include <Common/Stopwatch.h>
+ #include <Common/Throttler.h>
++#include <Common/OvercommitTracker.h>
+ 
+ #include <condition_variable>
+ #include <list>
+@@ -76,6 +77,7 @@ class QueryStatus : public WithContext
+     friend class ThreadStatus;
+     friend class CurrentThread;
+     friend class ProcessListEntry;
++    friend struct ::GlobalOvercommitTracker;
+ 
+     String query;
+     ClientInfo client_info;
+@@ -132,6 +134,7 @@ class QueryStatus : public WithContext
+         const String & query_,
+         const ClientInfo & client_info_,
+         QueryPriorities::Handle && priority_handle_,
++        ThreadGroupStatusPtr && thread_group_,
+         IAST::QueryKind query_kind_
+         );
+ 
+@@ -154,6 +157,13 @@ class QueryStatus : public WithContext
+ 
+     ThrottlerPtr getUserNetworkThrottler();
+ 
++    MemoryTracker * getMemoryTracker() const
++    {
++        if (!thread_group)
++            return nullptr;
++        return &thread_group->memory_tracker;
++    }
++
+     bool updateProgressIn(const Progress & value)
+     {
+         CurrentThread::updateProgressIn(value);
+@@ -216,6 +226,8 @@ struct ProcessListForUser
+     /// Limit and counter for memory of all simultaneously running queries of single user.
+     MemoryTracker user_memory_tracker{VariableContext::User};
+ 
++    UserOvercommitTracker user_overcommit_tracker;
++
+     /// Count network usage for all simultaneously running queries of single user.
+     ThrottlerPtr user_throttler;
+ 
+@@ -337,6 +349,14 @@ class ProcessList
+         max_size = max_size_;
+     }
+ 
++    template <typename F>
++    void processEachQueryStatus(F && func) const
++    {
++        std::lock_guard lk(mutex);
++        for (auto && query : processes)
++            func(query);
++    }
++
+     void setMaxInsertQueriesAmount(size_t max_insert_queries_amount_)
+     {
+         std::lock_guard lock(mutex);

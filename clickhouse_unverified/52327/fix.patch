@@ -1,0 +1,184 @@
+diff --git a/src/Interpreters/Context.cpp b/src/Interpreters/Context.cpp
+index 9e4d1e8d1e20..cc1277e08b90 100644
+--- a/src/Interpreters/Context.cpp
++++ b/src/Interpreters/Context.cpp
+@@ -1461,15 +1461,24 @@ void Context::addQueryAccessInfo(
+ void Context::addQueryAccessInfo(const Names & partition_names)
+ {
+     if (isGlobalContext())
+-    {
+         throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have query access info");
+-    }
+ 
+     std::lock_guard<std::mutex> lock(query_access_info.mutex);
+     for (const auto & partition_name : partition_names)
+-    {
+         query_access_info.partitions.emplace(partition_name);
+-    }
++}
++
++void Context::addQueryAccessInfo(const QualifiedProjectionName & qualified_projection_name)
++{
++    if (!qualified_projection_name)
++        return;
++
++    if (isGlobalContext())
++        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have query access info");
++
++    std::lock_guard<std::mutex> lock(query_access_info.mutex);
++    query_access_info.projections.emplace(fmt::format(
++        "{}.{}", qualified_projection_name.storage_id.getFullTableName(), backQuoteIfNeed(qualified_projection_name.projection_name)));
+ }
+ 
+ void Context::addQueryFactoriesInfo(QueryLogFactories factory_type, const String & created_object) const
+diff --git a/src/Interpreters/Context.h b/src/Interpreters/Context.h
+index 3a8d41bf1300..fa210f044512 100644
+--- a/src/Interpreters/Context.h
++++ b/src/Interpreters/Context.h
+@@ -658,6 +658,14 @@ class Context: public std::enable_shared_from_this<Context>
+         const String & view_name = {});
+     void addQueryAccessInfo(const Names & partition_names);
+ 
++    struct QualifiedProjectionName
++    {
++        StorageID storage_id = StorageID::createEmpty();
++        String projection_name;
++        explicit operator bool() const { return !projection_name.empty(); }
++    };
++    void addQueryAccessInfo(const QualifiedProjectionName & qualified_projection_name);
++
+ 
+     /// Supported factories for records in query_log
+     enum class QueryLogFactories
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizeUseAggregateProjection.cpp b/src/Processors/QueryPlan/Optimizations/optimizeUseAggregateProjection.cpp
+index f183bdca7a9f..53f47bcdf951 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizeUseAggregateProjection.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizeUseAggregateProjection.cpp
+@@ -625,8 +625,16 @@ bool optimizeUseAggregateProjections(QueryPlan::Node & node, QueryPlan::Nodes &
+         //           candidates.minmax_projection->block.dumpStructure());
+ 
+         Pipe pipe(std::make_shared<SourceFromSingleChunk>(std::move(candidates.minmax_projection->block)));
+-        projection_reading = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
+-
++        projection_reading = std::make_unique<ReadFromPreparedSource>(
++            std::move(pipe),
++            context,
++            query_info.is_internal
++                ? Context::QualifiedProjectionName{}
++                : Context::QualifiedProjectionName
++                  {
++                      .storage_id = reading->getMergeTreeData().getStorageID(),
++                      .projection_name = candidates.minmax_projection->candidate.projection->name,
++                  });
+         has_ordinary_parts = !candidates.minmax_projection->normal_parts.empty();
+         if (has_ordinary_parts)
+             reading->resetParts(std::move(candidates.minmax_projection->normal_parts));
+@@ -658,7 +666,16 @@ bool optimizeUseAggregateProjections(QueryPlan::Node & node, QueryPlan::Nodes &
+         {
+             auto header = proj_snapshot->getSampleBlockForColumns(best_candidate->dag->getRequiredColumnsNames());
+             Pipe pipe(std::make_shared<NullSource>(std::move(header)));
+-            projection_reading = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
++            projection_reading = std::make_unique<ReadFromPreparedSource>(
++                std::move(pipe),
++                context,
++                query_info.is_internal
++                    ? Context::QualifiedProjectionName{}
++                    : Context::QualifiedProjectionName
++                      {
++                          .storage_id = reading->getMergeTreeData().getStorageID(),
++                          .projection_name = best_candidate->projection->name,
++                      });
+         }
+ 
+         has_ordinary_parts = best_candidate->merge_tree_ordinary_select_result_ptr != nullptr;
+diff --git a/src/Processors/QueryPlan/Optimizations/optimizeUseNormalProjection.cpp b/src/Processors/QueryPlan/Optimizations/optimizeUseNormalProjection.cpp
+index dd7a5d449bcc..f6ace6f8025e 100644
+--- a/src/Processors/QueryPlan/Optimizations/optimizeUseNormalProjection.cpp
++++ b/src/Processors/QueryPlan/Optimizations/optimizeUseNormalProjection.cpp
+@@ -183,7 +183,16 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
+     if (!projection_reading)
+     {
+         Pipe pipe(std::make_shared<NullSource>(proj_snapshot->getSampleBlockForColumns(required_columns)));
+-        projection_reading = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
++        projection_reading = std::make_unique<ReadFromPreparedSource>(
++            std::move(pipe),
++            context,
++            query_info.is_internal
++                ? Context::QualifiedProjectionName{}
++                : Context::QualifiedProjectionName
++                  {
++                      .storage_id = reading->getMergeTreeData().getStorageID(),
++                      .projection_name = best_candidate->projection->name,
++                  });
+     }
+ 
+     bool has_ordinary_parts = best_candidate->merge_tree_ordinary_select_result_ptr != nullptr;
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index 13de5d1d1402..2d2412f7e36f 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -1761,6 +1761,10 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
+                 fmt::format("{}.{}", data.getStorageID().getFullNameNotQuoted(), part.data_part->info.partition_id));
+         }
+         context->getQueryContext()->addQueryAccessInfo(partition_names);
++
++        if (storage_snapshot->projection)
++            context->getQueryContext()->addQueryAccessInfo(
++                Context::QualifiedProjectionName{.storage_id = data.getStorageID(), .projection_name = storage_snapshot->projection->name});
+     }
+ 
+     ProfileEvents::increment(ProfileEvents::SelectedParts, result.selected_parts);
+diff --git a/src/Processors/QueryPlan/ReadFromPreparedSource.cpp b/src/Processors/QueryPlan/ReadFromPreparedSource.cpp
+index 7446203ec358..a24c4dbe4d08 100644
+--- a/src/Processors/QueryPlan/ReadFromPreparedSource.cpp
++++ b/src/Processors/QueryPlan/ReadFromPreparedSource.cpp
+@@ -4,14 +4,19 @@
+ namespace DB
+ {
+ 
+-ReadFromPreparedSource::ReadFromPreparedSource(Pipe pipe_)
++ReadFromPreparedSource::ReadFromPreparedSource(Pipe pipe_, ContextPtr context_, Context::QualifiedProjectionName qualified_projection_name_)
+     : ISourceStep(DataStream{.header = pipe_.getHeader()})
+     , pipe(std::move(pipe_))
++    , context(std::move(context_))
++    , qualified_projection_name(std::move(qualified_projection_name_))
+ {
+ }
+ 
+ void ReadFromPreparedSource::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+ {
++    if (context && context->hasQueryContext())
++        context->getQueryContext()->addQueryAccessInfo(qualified_projection_name);
++
+     for (const auto & processor : pipe.getProcessors())
+         processors.emplace_back(processor);
+ 
+diff --git a/src/Processors/QueryPlan/ReadFromPreparedSource.h b/src/Processors/QueryPlan/ReadFromPreparedSource.h
+index 05e3ebd51027..2606f5010099 100644
+--- a/src/Processors/QueryPlan/ReadFromPreparedSource.h
++++ b/src/Processors/QueryPlan/ReadFromPreparedSource.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <Interpreters/Context.h>
+ #include <Processors/QueryPlan/ISourceStep.h>
+ #include <QueryPipeline/Pipe.h>
+ 
+@@ -9,7 +11,8 @@ namespace DB
+ class ReadFromPreparedSource : public ISourceStep
+ {
+ public:
+-    explicit ReadFromPreparedSource(Pipe pipe_);
++    explicit ReadFromPreparedSource(
++        Pipe pipe_, ContextPtr context_ = nullptr, Context::QualifiedProjectionName qualified_projection_name_ = {});
+ 
+     String getName() const override { return "ReadFromPreparedSource"; }
+ 
+@@ -18,6 +21,7 @@ class ReadFromPreparedSource : public ISourceStep
+ protected:
+     Pipe pipe;
+     ContextPtr context;
++    Context::QualifiedProjectionName qualified_projection_name;
+ };
+ 
+ class ReadFromStorageStep : public ReadFromPreparedSource

@@ -1,0 +1,140 @@
+diff --git a/src/Processors/QueryPlan/Optimizations/useVectorSearch.cpp b/src/Processors/QueryPlan/Optimizations/useVectorSearch.cpp
+index ebd383426e54..3c365bcc19ee 100644
+--- a/src/Processors/QueryPlan/Optimizations/useVectorSearch.cpp
++++ b/src/Processors/QueryPlan/Optimizations/useVectorSearch.cpp
+@@ -108,12 +108,26 @@ size_t tryUseVectorSearch(QueryPlan::Node * parent_node, QueryPlan::Nodes & /*no
+     else
+         return updated_layers;
+ 
+-    /// Extract reference_vec. It is expected to be a COLUMN-type node and of type Const(Array(Float*)).
++    /// Extract stuff from the ORDER BY clause. It is expected to look like this: ORDER BY cosineDistance(vec1, [1.0, 2.0 ...])
++    /// - The search column is 'vec1'.
++    /// - The reference vector is [1.0, 2.0, ...].
+     const ActionsDAG::NodeRawConstPtrs & sort_column_node_children = sort_column_node->children;
+     std::vector<Float64> reference_vector;
++    String search_column;
++
+     for (const auto * child : sort_column_node_children)
+     {
+-        if (child->type == ActionsDAG::ActionType::COLUMN)
++        if (child->type == ActionsDAG::ActionType::ALIAS) /// new analyzer
++        {
++            const auto * search_column_node = child->children.at(0);
++            if (search_column_node->type == ActionsDAG::ActionType::INPUT)
++                search_column = search_column_node->result_name;
++        }
++        else if (child->type == ActionsDAG::ActionType::INPUT) /// old analyzer
++        {
++            search_column = child->result_name;
++        }
++        else if (child->type == ActionsDAG::ActionType::COLUMN)
+         {
+             /// Is it an Array(Float32) or Array(Float64) column?
+             const DataTypePtr & data_type = child->result_type;
+@@ -148,10 +162,10 @@ size_t tryUseVectorSearch(QueryPlan::Node * parent_node, QueryPlan::Nodes & /*no
+         }
+     }
+ 
+-    if (reference_vector.empty())
++    if (search_column.empty() || reference_vector.empty())
+         return updated_layers;
+ 
+-    auto vector_search_parameters = std::make_optional<VectorSearchParameters>(distance_function, n, reference_vector);
++    auto vector_search_parameters = std::make_optional<VectorSearchParameters>(search_column, distance_function, n, reference_vector);
+     read_from_mergetree_step->setVectorSearchParameters(std::move(vector_search_parameters));
+ 
+     return updated_layers;
+diff --git a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
+index 1b4d57880c5c..21e25f6c4b9a 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
+@@ -143,6 +143,7 @@ void USearchIndexWithSerialization::deserialize(ReadBuffer & istr)
+         /// See the comment in MergeTreeIndexGranuleVectorSimilarity::deserializeBinary why we throw here
+         throw Exception(ErrorCodes::INCORRECT_DATA, "Could not load vector similarity index. Please drop the index and create it again. Error: {}", String(result.error.release()));
+ 
++    /// Indicate the number of concurrent threads that will potentially search this specific usearch index
+     try_reserve(limits());
+ }
+ 
+@@ -396,9 +397,11 @@ void MergeTreeIndexAggregatorVectorSimilarity::update(const Block & block, size_
+ 
+ MergeTreeIndexConditionVectorSimilarity::MergeTreeIndexConditionVectorSimilarity(
+     const std::optional<VectorSearchParameters> & parameters_,
++    const String & index_column_,
+     unum::usearch::metric_kind_t metric_kind_,
+     ContextPtr context)
+     : parameters(parameters_)
++    , index_column(index_column_)
+     , metric_kind(metric_kind_)
+     , expansion_search(context->getSettingsRef()[Setting::hnsw_candidate_list_size_for_search])
+ {
+@@ -413,13 +416,21 @@ bool MergeTreeIndexConditionVectorSimilarity::mayBeTrueOnGranule(MergeTreeIndexG
+ 
+ bool MergeTreeIndexConditionVectorSimilarity::alwaysUnknownOrTrue() const
+ {
+-    /// The vector similarity index was build for a specific distance function ("metric_kind").
+-    /// We can use it for vector search only if the distance function used in the SELECT query is the same.
+-    bool distance_function_in_query_and_distance_function_in_index_match = parameters &&
+-        ((parameters->distance_function == "L2Distance" && metric_kind == unum::usearch::metric_kind_t::l2sq_k)
+-        || (parameters->distance_function == "cosineDistance" && metric_kind == unum::usearch::metric_kind_t::cos_k));
++    if (!parameters)
++        return true;
++
++    /// The vector similarity index was build on a specific column.
++    /// It can only be used if the ORDER BY clause in the SELECT query is against the same column.
++    if (parameters->column != index_column)
++        return true;
++
++    /// The vector similarity index was build for a specific distance function.
++    /// It can only be used if the ORDER BY clause in the SELECT query uses the same distance function.
++    if ((parameters->distance_function == "L2Distance" && metric_kind != unum::usearch::metric_kind_t::l2sq_k)
++        || (parameters->distance_function == "cosineDistance" && metric_kind != unum::usearch::metric_kind_t::cos_k))
++            return true;
+ 
+-    return !distance_function_in_query_and_distance_function_in_index_match;
++    return false;
+ }
+ 
+ std::vector<UInt64> MergeTreeIndexConditionVectorSimilarity::calculateApproximateNearestNeighbors(MergeTreeIndexGranulePtr granule_) const
+@@ -496,7 +507,8 @@ MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(const ActionsDAG * /*filter_actions_dag*/, ContextPtr context, const std::optional<VectorSearchParameters> & parameters) const
+ {
+-    return std::make_shared<MergeTreeIndexConditionVectorSimilarity>(parameters, metric_kind, context);
++    const String & index_column = index.column_names[0];
++    return std::make_shared<MergeTreeIndexConditionVectorSimilarity>(parameters, index_column, metric_kind, context);
+ }
+ 
+ MergeTreeIndexPtr vectorSimilarityIndexCreator(const IndexDescription & index)
+diff --git a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
+index e350360b3a4e..8341fd55bba7 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
++++ b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
+@@ -142,6 +142,7 @@ class MergeTreeIndexConditionVectorSimilarity final : public IMergeTreeIndexCond
+ public:
+     explicit MergeTreeIndexConditionVectorSimilarity(
+         const std::optional<VectorSearchParameters> & parameters_,
++        const String & index_column_,
+         unum::usearch::metric_kind_t metric_kind_,
+         ContextPtr context);
+ 
+@@ -153,6 +154,7 @@ class MergeTreeIndexConditionVectorSimilarity final : public IMergeTreeIndexCond
+ 
+ private:
+     std::optional<VectorSearchParameters> parameters;
++    const String index_column;
+     const unum::usearch::metric_kind_t metric_kind;
+     const size_t expansion_search;
+ };
+diff --git a/src/Storages/MergeTree/MergeTreeIndices.h b/src/Storages/MergeTree/MergeTreeIndices.h
+index 6d2e1fbddd7a..f54089752789 100644
+--- a/src/Storages/MergeTree/MergeTreeIndices.h
++++ b/src/Storages/MergeTree/MergeTreeIndices.h
+@@ -43,6 +43,7 @@ struct MergeTreeIndexFormat
+ /// A vehicle which transports elements of the SELECT query to the vector similarity index.
+ struct VectorSearchParameters
+ {
++    String column;
+     String distance_function;
+     size_t limit;
+     std::vector<Float64> reference_vector;

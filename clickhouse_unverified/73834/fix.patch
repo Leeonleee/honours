@@ -1,0 +1,624 @@
+diff --git a/src/IO/Progress.cpp b/src/IO/Progress.cpp
+index c5bcd0c490aa..8b22abe73fb7 100644
+--- a/src/IO/Progress.cpp
++++ b/src/IO/Progress.cpp
+@@ -74,24 +74,30 @@ void ProgressValues::writeJSON(WriteBuffer & out) const
+     /// Numbers are written in double quotes (as strings) to avoid loss of precision
+     ///  of 64-bit integers after interpretation by JavaScript.
+ 
++    bool has_value = false;
++
++    auto write = [&](const char * name, UInt64 value)
++    {
++        if (!value)
++            return;
++        if (has_value)
++            writeChar(',', out);
++        writeCString(name, out);
++        writeCString(":\"", out);
++        writeIntText(value, out);
++        writeChar('"', out);
++        has_value = true;
++    };
++
+     writeCString("{", out);
+-    writeCString("\"read_rows\":\"", out);
+-    writeText(read_rows, out);
+-    writeCString("\",\"read_bytes\":\"", out);
+-    writeText(read_bytes, out);
+-    writeCString("\",\"written_rows\":\"", out);
+-    writeText(written_rows, out);
+-    writeCString("\",\"written_bytes\":\"", out);
+-    writeText(written_bytes, out);
+-    writeCString("\",\"total_rows_to_read\":\"", out);
+-    writeText(total_rows_to_read, out);
+-    writeCString("\",\"result_rows\":\"", out);
+-    writeText(result_rows, out);
+-    writeCString("\",\"result_bytes\":\"", out);
+-    writeText(result_bytes, out);
+-    writeCString("\",\"elapsed_ns\":\"", out);
+-    writeText(elapsed_ns, out);
+-    writeCString("\"", out);
++    write("\"read_rows\"", read_rows);
++    write("\"read_bytes\"", read_bytes);
++    write("\"written_rows\"", written_rows);
++    write("\"written_bytes\"", written_bytes);
++    write("\"total_rows_to_read\"", total_rows_to_read);
++    write("\"result_rows\"", result_rows);
++    write("\"result_bytes\"", result_bytes);
++    write("\"elapsed_ns\"", elapsed_ns);
+     writeCString("}", out);
+ }
+ 
+diff --git a/src/Processors/Formats/IOutputFormat.cpp b/src/Processors/Formats/IOutputFormat.cpp
+index 9b99ecb2d7c7..389f3592e76d 100644
+--- a/src/Processors/Formats/IOutputFormat.cpp
++++ b/src/Processors/Formats/IOutputFormat.cpp
+@@ -65,6 +65,14 @@ static Chunk prepareTotals(Chunk chunk)
+ 
+ void IOutputFormat::work()
+ {
++    std::lock_guard lock(writing_mutex);
++
++    if (has_progress_update_to_write)
++    {
++        writeProgress(statistics.progress);
++        has_progress_update_to_write = false;
++    }
++
+     writePrefixIfNeeded();
+ 
+     if (finished && !finalized)
+@@ -73,9 +81,9 @@ void IOutputFormat::work()
+             setRowsBeforeLimit(rows_before_limit_counter->get());
+         if (rows_before_aggregation_counter && rows_before_aggregation_counter->hasAppliedStep())
+             setRowsBeforeAggregation(rows_before_aggregation_counter->get());
+-        finalize();
++        finalizeUnlocked();
+         if (auto_flush)
+-            flush();
++            flushImpl();
+         return;
+     }
+ 
+@@ -101,30 +109,43 @@ void IOutputFormat::work()
+     }
+ 
+     if (auto_flush)
+-        flush();
++        flushImpl();
+ 
+     has_input = false;
+ }
+ 
+-void IOutputFormat::flush()
++void IOutputFormat::flushImpl()
+ {
+     out.next();
+ }
+ 
++void IOutputFormat::flush()
++{
++    std::lock_guard lock(writing_mutex);
++    flushImpl();
++}
++
+ void IOutputFormat::write(const Block & block)
+ {
++    std::lock_guard lock(writing_mutex);
++
++    if (has_progress_update_to_write)
++    {
++        writeProgress(statistics.progress);
++        has_progress_update_to_write = false;
++    }
++
+     writePrefixIfNeeded();
+     consume(Chunk(block.getColumns(), block.rows()));
+ 
+     if (auto_flush)
+-        flush();
++        flushImpl();
+ }
+ 
+-void IOutputFormat::finalize()
++void IOutputFormat::finalizeUnlocked()
+ {
+     if (finalized)
+         return;
+-
+     writePrefixIfNeeded();
+     writeSuffixIfNeeded();
+     finalizeImpl();
+@@ -132,4 +153,26 @@ void IOutputFormat::finalize()
+     finalized = true;
+ }
+ 
++void IOutputFormat::finalize()
++{
++    std::lock_guard lock(writing_mutex);
++    finalizeUnlocked();
++}
++
++void IOutputFormat::onProgress(const Progress & progress)
++{
++    statistics.progress.incrementPiecewiseAtomically(progress);
++    if (writesProgressConcurrently())
++    {
++        std::unique_lock lock(writing_mutex, std::try_to_lock);
++        if (lock)
++        {
++            writeProgress(statistics.progress);
++            has_progress_update_to_write = false;
++        }
++        else
++            has_progress_update_to_write = true;
++    }
++}
++
+ }
+diff --git a/src/Processors/Formats/IOutputFormat.h b/src/Processors/Formats/IOutputFormat.h
+index e9af4ca7cf5c..300267caf47c 100644
+--- a/src/Processors/Formats/IOutputFormat.h
++++ b/src/Processors/Formats/IOutputFormat.h
+@@ -30,9 +30,7 @@ class IOutputFormat : public IProcessor
+     Status prepare() override;
+     void work() override;
+ 
+-    /// Flush output buffers if any.
+-    virtual void flush();
+-
++    void flush();
+     void setAutoFlush() { auto_flush = true; }
+ 
+     /// Value for rows_before_limit_at_least field.
+@@ -48,8 +46,8 @@ class IOutputFormat : public IProcessor
+     void setRowsBeforeAggregationCounter(RowsBeforeStepCounterPtr counter) override { rows_before_aggregation_counter.swap(counter); }
+ 
+     /// Notify about progress. Method could be called from different threads.
+-    /// Passed value are delta, that must be summarized.
+-    virtual void onProgress(const Progress & /*progress*/) { }
++    /// Passed values are deltas, that must be summarized.
++    virtual void onProgress(const Progress & progress);
+ 
+     /// Content-Type to set when sending HTTP response.
+     virtual std::string getContentType() const { return "text/plain; charset=UTF-8"; }
+@@ -114,7 +112,6 @@ class IOutputFormat : public IProcessor
+ protected:
+     friend class ParallelFormattingOutputFormat;
+ 
+-
+     void writeSuffixIfNeeded()
+     {
+         if (need_write_suffix)
+@@ -124,6 +121,10 @@ class IOutputFormat : public IProcessor
+         }
+     }
+ 
++    void finalizeUnlocked();
++
++    virtual void flushImpl();
++
+     virtual void consume(Chunk) = 0;
+     virtual void consumeTotals(Chunk) {}
+     virtual void consumeExtremes(Chunk) {}
+@@ -133,6 +134,16 @@ class IOutputFormat : public IProcessor
+     virtual void writeSuffix() {}
+     virtual void resetFormatterImpl() {}
+ 
++    /// If the method writeProgress is non-empty.
++    virtual bool writesProgressConcurrently() const
++    {
++        return false;
++    }
++
++    /// This method could be called from another thread,
++    /// but will be serialized with other writing methods using the writing_mutex.
++    virtual void writeProgress(const Progress &) {}
++
+     /// Methods-helpers for parallel formatting.
+ 
+     /// Set the number of rows that was already read in
+@@ -194,7 +205,9 @@ class IOutputFormat : public IProcessor
+ 
+     RowsBeforeStepCounterPtr rows_before_limit_counter;
+     RowsBeforeStepCounterPtr rows_before_aggregation_counter;
++
+     Statistics statistics;
++    std::atomic_bool has_progress_update_to_write = false;
+ 
+ private:
+     size_t rows_read_before = 0;
+@@ -203,5 +216,9 @@ class IOutputFormat : public IProcessor
+     /// Counters for consumed chunks. Are used for QueryLog.
+     size_t result_rows = 0;
+     size_t result_bytes = 0;
++
++    /// To serialize the calls to writeProgress (which could be called from another thread) and other writing methods.
++    std::mutex writing_mutex;
+ };
++
+ }
+diff --git a/src/Processors/Formats/Impl/AvroRowOutputFormat.cpp b/src/Processors/Formats/Impl/AvroRowOutputFormat.cpp
+index e505d545f17d..4601cde69c8f 100644
+--- a/src/Processors/Formats/Impl/AvroRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/AvroRowOutputFormat.cpp
+@@ -86,7 +86,7 @@ class OutputStreamWriteBufferAdapter : public avro::OutputStream
+     void backup(size_t len) override { out.position() -= len; }
+ 
+     uint64_t byteCount() const override { return out.count(); }
+-    void flush() override { }
++    void flush() override {}
+ 
+ private:
+     WriteBuffer & out;
+diff --git a/src/Processors/Formats/Impl/JSONColumnsWithMetadataBlockOutputFormat.h b/src/Processors/Formats/Impl/JSONColumnsWithMetadataBlockOutputFormat.h
+index e52084404837..37c0f3b9e531 100644
+--- a/src/Processors/Formats/Impl/JSONColumnsWithMetadataBlockOutputFormat.h
++++ b/src/Processors/Formats/Impl/JSONColumnsWithMetadataBlockOutputFormat.h
+@@ -49,7 +49,6 @@ class JSONColumnsWithMetadataBlockOutputFormat : public JSONColumnsBlockOutputFo
+         statistics.rows_before_aggregation = rows_before_aggregation_;
+         statistics.applied_aggregation = true;
+     }
+-    void onProgress(const Progress & progress_) override { statistics.progress.incrementPiecewiseAtomically(progress_); }
+ 
+ protected:
+     void consumeTotals(Chunk chunk) override;
+diff --git a/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.cpp b/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.cpp
+index c7942e93e675..838ac81bc4af 100644
+--- a/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.cpp
+@@ -3,14 +3,12 @@
+ #include <Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.h>
+ #include <Formats/FormatFactory.h>
+ 
++
+ namespace DB
+ {
+ 
+-
+ void JSONEachRowWithProgressRowOutputFormat::writeRowStartDelimiter()
+ {
+-    if (has_progress)
+-        writeProgress();
+     writeCString("{\"row\":{", *ostr);
+ }
+ 
+@@ -20,43 +18,12 @@ void JSONEachRowWithProgressRowOutputFormat::writeRowEndDelimiter()
+     field_number = 0;
+ }
+ 
+-void JSONEachRowWithProgressRowOutputFormat::onProgress(const Progress & value)
+-{
+-    progress.incrementPiecewiseAtomically(value);
+-    String progress_line;
+-    {
+-        WriteBufferFromString buf(progress_line);
+-        writeCString("{\"progress\":", buf);
+-        progress.writeJSON(buf);
+-        writeCString("}
+", buf);
+-    }
+-
+-    std::lock_guard lock(progress_lines_mutex);
+-    progress_lines.emplace_back(std::move(progress_line));
+-    has_progress = true;
+-}
+-
+-void JSONEachRowWithProgressRowOutputFormat::flush()
+-{
+-    if (has_progress)
+-        writeProgress();
+-    JSONEachRowRowOutputFormat::flush();
+-}
+-
+-void JSONEachRowWithProgressRowOutputFormat::writeSuffix()
+-{
+-    if (has_progress)
+-        writeProgress();
+-    JSONEachRowRowOutputFormat::writeSuffix();
+-}
+-
+-void JSONEachRowWithProgressRowOutputFormat::writeProgress()
++void JSONEachRowWithProgressRowOutputFormat::writeProgress(const Progress & value)
+ {
+-    std::lock_guard lock(progress_lines_mutex);
+-    for (const auto & progress_line : progress_lines)
+-        writeString(progress_line,  *ostr);
+-    progress_lines.clear();
+-    has_progress = false;
++    writeCString("{\"progress\":", *ostr);
++    value.writeJSON(*ostr);
++    writeCString("}
+", *ostr);
++    ostr->next();
+ }
+ 
+ void registerOutputFormatJSONEachRowWithProgress(FormatFactory & factory)
+diff --git a/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.h b/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.h
+index 6bdf27a472e2..f34e82eb90cb 100644
+--- a/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.h
++++ b/src/Processors/Formats/Impl/JSONEachRowWithProgressRowOutputFormat.h
+@@ -1,4 +1,5 @@
+ #pragma once
++
+ #include <Processors/Formats/Impl/JSONEachRowRowOutputFormat.h>
+ #include <mutex>
+ 
+@@ -10,22 +11,12 @@ class JSONEachRowWithProgressRowOutputFormat final : public JSONEachRowRowOutput
+ public:
+     using JSONEachRowRowOutputFormat::JSONEachRowRowOutputFormat;
+ 
+-    void onProgress(const Progress & value) override;
+-    void flush() override;
++    bool writesProgressConcurrently() const override { return true; }
++    void writeProgress(const Progress & value) override;
+ 
+ private:
+     void writeRowStartDelimiter() override;
+     void writeRowEndDelimiter() override;
+-    void writeSuffix() override;
+-
+-    void writeProgress();
+-
+-    Progress progress;
+-    std::vector<String> progress_lines;
+-    std::mutex progress_lines_mutex;
+-    /// To not lock mutex and check progress_lines every row,
+-    /// we will use atomic flag that progress_lines is not empty.
+-    std::atomic_bool has_progress = false;
+ };
+ 
+ }
+diff --git a/src/Processors/Formats/Impl/JSONRowOutputFormat.cpp b/src/Processors/Formats/Impl/JSONRowOutputFormat.cpp
+index fec24b10c11e..c2473804d0d8 100644
+--- a/src/Processors/Formats/Impl/JSONRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/JSONRowOutputFormat.cpp
+@@ -142,13 +142,6 @@ void JSONRowOutputFormat::resetFormatterImpl()
+     statistics = Statistics();
+ }
+ 
+-
+-void JSONRowOutputFormat::onProgress(const Progress & value)
+-{
+-    statistics.progress.incrementPiecewiseAtomically(value);
+-}
+-
+-
+ void registerOutputFormatJSON(FormatFactory & factory)
+ {
+     factory.registerOutputFormat("JSON", [](
+diff --git a/src/Processors/Formats/Impl/JSONRowOutputFormat.h b/src/Processors/Formats/Impl/JSONRowOutputFormat.h
+index c36adb5ee3ef..b42416d0c66e 100644
+--- a/src/Processors/Formats/Impl/JSONRowOutputFormat.h
++++ b/src/Processors/Formats/Impl/JSONRowOutputFormat.h
+@@ -26,8 +26,6 @@ class JSONRowOutputFormat : public RowOutputFormatWithExceptionHandlerAdaptor<Ro
+ 
+     String getName() const override { return "JSONRowOutputFormat"; }
+ 
+-    void onProgress(const Progress & value) override;
+-
+     String getContentType() const override { return "application/json; charset=UTF-8"; }
+ 
+     void setRowsBeforeLimit(size_t rows_before_limit_) override
+diff --git a/src/Processors/Formats/Impl/MySQLOutputFormat.cpp b/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
+index 08a6d19a7825..8433de02d3d2 100644
+--- a/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/MySQLOutputFormat.cpp
+@@ -83,7 +83,7 @@ void MySQLOutputFormat::consume(Chunk chunk)
+         }
+     }
+ 
+-    flush();
++    flushImpl();
+ }
+ 
+ void MySQLOutputFormat::finalizeImpl()
+@@ -131,7 +131,7 @@ void MySQLOutputFormat::finalizeImpl()
+     }
+ }
+ 
+-void MySQLOutputFormat::flush()
++void MySQLOutputFormat::flushImpl()
+ {
+     packet_endpoint->out->next();
+ }
+diff --git a/src/Processors/Formats/Impl/MySQLOutputFormat.h b/src/Processors/Formats/Impl/MySQLOutputFormat.h
+index dfaa52878c33..62a94f3154d7 100644
+--- a/src/Processors/Formats/Impl/MySQLOutputFormat.h
++++ b/src/Processors/Formats/Impl/MySQLOutputFormat.h
+@@ -25,7 +25,7 @@ class MySQLOutputFormat final : public IOutputFormat, WithContext
+ 
+     void setContext(ContextPtr context_);
+ 
+-    void flush() override;
++    void flushImpl() override;
+ 
+ private:
+     void consume(Chunk) override;
+diff --git a/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.cpp b/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.cpp
+index 86ebc522fa6e..ebeec2f34eae 100644
+--- a/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.cpp
+@@ -3,6 +3,7 @@
+ #include <Common/setThreadName.h>
+ #include <Common/scope_guard_safe.h>
+ 
++
+ namespace DB
+ {
+     void ParallelFormattingOutputFormat::finalizeImpl()
+@@ -161,7 +162,7 @@ namespace DB
+                 out.write(unit.segment.data(), unit.actual_memory_size);
+ 
+                 if (need_flush.exchange(false) || auto_flush)
+-                    IOutputFormat::flush();
++                    out.next();
+ 
+                 ++collector_unit_number;
+                 rows_collected += unit.rows_num;
+@@ -263,7 +264,7 @@ namespace DB
+                 }
+             }
+ 
+-            /// Flush all the data to handmade buffer.
++            /// Flush all the data to the handmade buffer.
+             formatter->flush();
+             formatter->finalizeBuffers();
+             out_buffer.finalize();
+diff --git a/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.h b/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.h
+index 2b97d3467b93..ef6ad5da47b4 100644
+--- a/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.h
++++ b/src/Processors/Formats/Impl/ParallelFormattingOutputFormat.h
+@@ -17,6 +17,7 @@
+ #include <deque>
+ #include <atomic>
+ 
++
+ namespace CurrentMetrics
+ {
+     extern const Metric ParallelFormattingOutputFormatThreads;
+@@ -114,7 +115,7 @@ class ParallelFormattingOutputFormat : public IOutputFormat
+ 
+     String getName() const override { return "ParallelFormattingOutputFormat"; }
+ 
+-    void flush() override
++    void flushImpl() override
+     {
+         need_flush = true;
+     }
+@@ -130,12 +131,6 @@ class ParallelFormattingOutputFormat : public IOutputFormat
+         finishAndWait();
+     }
+ 
+-    void onProgress(const Progress & value) override
+-    {
+-        std::lock_guard lock(statistics_mutex);
+-        statistics.progress.incrementPiecewiseAtomically(value);
+-    }
+-
+     void writeSuffix() override
+     {
+         addChunk(Chunk{}, ProcessingUnitType::PLAIN_FINISH, /*can_throw_exception*/ true);
+diff --git a/src/Processors/Formats/Impl/PostgreSQLOutputFormat.cpp b/src/Processors/Formats/Impl/PostgreSQLOutputFormat.cpp
+index 4ac874b883d1..70dbf77320f5 100644
+--- a/src/Processors/Formats/Impl/PostgreSQLOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/PostgreSQLOutputFormat.cpp
+@@ -56,7 +56,7 @@ void PostgreSQLOutputFormat::consume(Chunk chunk)
+     }
+ }
+ 
+-void PostgreSQLOutputFormat::flush()
++void PostgreSQLOutputFormat::flushImpl()
+ {
+     message_transport.flush();
+ }
+diff --git a/src/Processors/Formats/Impl/PostgreSQLOutputFormat.h b/src/Processors/Formats/Impl/PostgreSQLOutputFormat.h
+index f5fd55530b99..a0c9998e14a0 100644
+--- a/src/Processors/Formats/Impl/PostgreSQLOutputFormat.h
++++ b/src/Processors/Formats/Impl/PostgreSQLOutputFormat.h
+@@ -17,7 +17,7 @@ class PostgreSQLOutputFormat final : public IOutputFormat
+ 
+     String getName() const override {return "PostgreSQLOutputFormat";}
+ 
+-    void flush() override;
++    void flushImpl() override;
+ 
+ private:
+     void writePrefix() override;
+diff --git a/src/Processors/Formats/Impl/TemplateBlockOutputFormat.h b/src/Processors/Formats/Impl/TemplateBlockOutputFormat.h
+index 5e88d79b4a8e..1f2353102bd1 100644
+--- a/src/Processors/Formats/Impl/TemplateBlockOutputFormat.h
++++ b/src/Processors/Formats/Impl/TemplateBlockOutputFormat.h
+@@ -26,7 +26,6 @@ class TemplateBlockOutputFormat : public IOutputFormat
+         statistics.rows_before_aggregation = rows_before_aggregation_;
+         statistics.applied_aggregation = true;
+     }
+-    void onProgress(const Progress & progress_) override { statistics.progress.incrementPiecewiseAtomically(progress_); }
+ 
+     enum class ResultsetPart : size_t
+     {
+diff --git a/src/Processors/Formats/Impl/XMLRowOutputFormat.cpp b/src/Processors/Formats/Impl/XMLRowOutputFormat.cpp
+index b19fcfd4a4a5..ce5080b10893 100644
+--- a/src/Processors/Formats/Impl/XMLRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/XMLRowOutputFormat.cpp
+@@ -178,11 +178,6 @@ void XMLRowOutputFormat::writeExtremesElement(const char * title, const Columns
+ }
+ 
+ 
+-void XMLRowOutputFormat::onProgress(const Progress & value)
+-{
+-    statistics.progress.incrementPiecewiseAtomically(value);
+-}
+-
+ void XMLRowOutputFormat::finalizeImpl()
+ {
+     writeCString("\t<rows>", *ostr);
+diff --git a/src/Processors/Formats/Impl/XMLRowOutputFormat.h b/src/Processors/Formats/Impl/XMLRowOutputFormat.h
+index 792acd118c81..059773f60fa9 100644
+--- a/src/Processors/Formats/Impl/XMLRowOutputFormat.h
++++ b/src/Processors/Formats/Impl/XMLRowOutputFormat.h
+@@ -55,8 +55,6 @@ class XMLRowOutputFormat final : public RowOutputFormatWithExceptionHandlerAdapt
+     }
+     void onRowsReadBeforeUpdate() override { row_count = getRowsReadBefore(); }
+ 
+-    void onProgress(const Progress & value) override;
+-
+     String getContentType() const override { return "application/xml; charset=UTF-8"; }
+ 
+     void writeExtremesElement(const char * title, const Columns & columns, size_t row_num);
+diff --git a/src/Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h b/src/Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h
+index 6c931d7793e4..b4f2bc8eb325 100644
+--- a/src/Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h
++++ b/src/Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h
+@@ -29,11 +29,11 @@ class OutputFormatWithUTF8ValidationAdaptorBase : public Base
+             validating_ostr = std::make_unique<WriteBufferValidUTF8>(*Base::getWriteBufferPtr());
+     }
+ 
+-    void flush() override
++    void flushImpl() override
+     {
+         if (validating_ostr)
+             validating_ostr->next();
+-        Base::flush();
++        Base::flushImpl();
+     }
+ 
+     void finalizeBuffers() override
+@@ -68,4 +68,3 @@ using OutputFormatWithUTF8ValidationAdaptor = OutputFormatWithUTF8ValidationAdap
+ using RowOutputFormatWithUTF8ValidationAdaptor = OutputFormatWithUTF8ValidationAdaptorBase<IRowOutputFormat>;
+ 
+ }
+-
+diff --git a/src/Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h b/src/Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h
+index 048bf18d4f97..e64738b60a03 100644
+--- a/src/Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h
++++ b/src/Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h
+@@ -60,12 +60,12 @@ class RowOutputFormatWithExceptionHandlerAdaptor : public Base
+     void write(const Columns & columns, size_t row_num) override { Base::write(columns, row_num); }
+     void writeRowBetweenDelimiter() override { Base::writeRowBetweenDelimiter(); }
+ 
+-    void flush() override
++    void flushImpl() override
+     {
+         if (peekable_out)
+             peekable_out->next();
+ 
+-        Base::flush();
++        Base::flushImpl();
+     }
+ 
+     void finalizeBuffers() override
+diff --git a/src/TableFunctions/TableFunctionMerge.cpp b/src/TableFunctions/TableFunctionMerge.cpp
+index 13b5c167e0e4..cca0c2990f63 100644
+--- a/src/TableFunctions/TableFunctionMerge.cpp
++++ b/src/TableFunctions/TableFunctionMerge.cpp
+@@ -31,7 +31,7 @@ namespace
+     throw Exception(
+         ErrorCodes::BAD_ARGUMENTS,
+         "Error while executing table function merge. Either there is no database, which matches regular expression `{}`, or there are "
+-        "no tables in database matches `{}`, which fit tables expression: {}",
++        "no tables in the database matches `{}`, which fit tables expression: {}",
+         source_database_regexp,
+         source_database_regexp,
+         source_table_regexp);

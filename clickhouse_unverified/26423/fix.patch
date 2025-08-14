@@ -1,0 +1,147 @@
+diff --git a/src/DataTypes/DataTypeInterval.h b/src/DataTypes/DataTypeInterval.h
+index d66b329185d9..a44fd686b614 100644
+--- a/src/DataTypes/DataTypeInterval.h
++++ b/src/DataTypes/DataTypeInterval.h
+@@ -36,6 +36,7 @@ class DataTypeInterval final : public DataTypeNumberBase<Int64>
+     bool isParametric() const override { return true; }
+     bool cannotBeStoredInTables() const override { return true; }
+     bool isCategorial() const override { return false; }
++    bool canBeInsideNullable() const override { return true; }
+ };
+ 
+ }
+diff --git a/src/Functions/IFunction.cpp b/src/Functions/IFunction.cpp
+index 998d48941ba8..e3802b98abf6 100644
+--- a/src/Functions/IFunction.cpp
++++ b/src/Functions/IFunction.cpp
+@@ -181,7 +181,10 @@ ColumnPtr IExecutableFunction::defaultImplementationForNulls(
+     {
+         // Default implementation for nulls returns null result for null arguments,
+         // so the result type must be nullable.
+-        assert(result_type->isNullable());
++        if (!result_type->isNullable())
++            throw Exception(ErrorCodes::LOGICAL_ERROR,
++                            "Function {} with Null argument and default implementation for Nulls "
++                            "is expected to return Nullable result, got {}", result_type->getName());
+ 
+         return result_type->createColumnConstWithDefaultValue(input_rows_count);
+     }
+diff --git a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+index adddb0c33d97..f46cbdd24652 100644
+--- a/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
++++ b/src/Interpreters/ExecuteScalarSubqueriesVisitor.cpp
+@@ -1,8 +1,10 @@
+ #include <Interpreters/ExecuteScalarSubqueriesVisitor.h>
+ 
+ #include <Columns/ColumnTuple.h>
++#include <Columns/ColumnNullable.h>
+ #include <DataStreams/materializeBlock.h>
+ #include <DataTypes/DataTypeTuple.h>
++#include <DataTypes/DataTypeNullable.h>
+ #include <IO/WriteHelpers.h>
+ #include <Interpreters/Context.h>
+ #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+@@ -15,6 +17,7 @@
+ #include <Parsers/ASTSubquery.h>
+ #include <Parsers/ASTTablesInSelectQuery.h>
+ #include <Parsers/ASTWithElement.h>
++#include <Parsers/queryToString.h>
+ #include <Processors/Executors/PullingAsyncPipelineExecutor.h>
+ 
+ 
+@@ -119,8 +122,24 @@ void ExecuteScalarSubqueriesMatcher::visit(const ASTSubquery & subquery, ASTPtr
+ 
+             if (block.rows() == 0)
+             {
+-                /// Interpret subquery with empty result as Null literal
+-                auto ast_new = std::make_unique<ASTLiteral>(Null());
++                auto types = interpreter.getSampleBlock().getDataTypes();
++                if (types.size() != 1)
++                    types = {std::make_shared<DataTypeTuple>(types)};
++
++                auto & type = types[0];
++                if (!type->isNullable())
++                {
++                    if (!type->canBeInsideNullable())
++                        throw Exception(ErrorCodes::INCORRECT_RESULT_OF_SCALAR_SUBQUERY,
++                                        "Scalar subquery returned empty result of type {} which cannot be Nullable",
++                                        type->getName());
++
++                    type = makeNullable(type);
++                }
++
++                ASTPtr ast_new = std::make_shared<ASTLiteral>(Null());
++                ast_new = addTypeConversionToAST(std::move(ast_new), type->getName());
++
+                 ast_new->setAlias(ast->tryGetAlias());
+                 ast = std::move(ast_new);
+                 return;
+@@ -140,10 +159,20 @@ void ExecuteScalarSubqueriesMatcher::visit(const ASTSubquery & subquery, ASTPtr
+         size_t columns = block.columns();
+ 
+         if (columns == 1)
++        {
++            auto & column = block.getByPosition(0);
++            /// Here we wrap type to nullable if we can.
++            /// It is needed cause if subquery return no rows, it's result will be Null.
++            /// In case of many columns, do not check it cause tuple can't be nullable.
++            if (!column.type->isNullable() && column.type->canBeInsideNullable())
++            {
++                column.type = makeNullable(column.type);
++                column.column = makeNullable(column.column);
++            }
+             scalar = block;
++        }
+         else
+         {
+-
+             ColumnWithTypeAndName ctn;
+             ctn.type = std::make_shared<DataTypeTuple>(block.getDataTypes());
+             ctn.column = ColumnTuple::create(block.getColumns());
+diff --git a/src/Interpreters/OptimizeIfWithConstantConditionVisitor.cpp b/src/Interpreters/OptimizeIfWithConstantConditionVisitor.cpp
+index cdcf6f7dddd9..a8e2d371e051 100644
+--- a/src/Interpreters/OptimizeIfWithConstantConditionVisitor.cpp
++++ b/src/Interpreters/OptimizeIfWithConstantConditionVisitor.cpp
+@@ -39,9 +39,12 @@ static bool tryExtractConstValueFromCondition(const ASTPtr & condition, bool & v
+                 const ASTPtr & type_ast = expr_list->children.at(1);
+                 if (const auto * type_literal = type_ast->as<ASTLiteral>())
+                 {
+-                    if (type_literal->value.getType() == Field::Types::String &&
+-                        type_literal->value.get<std::string>() == "UInt8")
+-                        return tryExtractConstValueFromCondition(expr_list->children.at(0), value);
++                    if (type_literal->value.getType() == Field::Types::String)
++                    {
++                        const auto & type_str = type_literal->value.get<std::string>();
++                        if (type_str == "UInt8" || type_str == "Nullable(UInt8)")
++                            return tryExtractConstValueFromCondition(expr_list->children.at(0), value);
++                    }
+                 }
+             }
+         }
+diff --git a/src/Storages/MergeTree/KeyCondition.cpp b/src/Storages/MergeTree/KeyCondition.cpp
+index e58d4ecfc073..235cadfba117 100644
+--- a/src/Storages/MergeTree/KeyCondition.cpp
++++ b/src/Storages/MergeTree/KeyCondition.cpp
+@@ -531,6 +531,11 @@ bool KeyCondition::getConstant(const ASTPtr & expr, Block & block_with_constants
+         /// Simple literal
+         out_value = lit->value;
+         out_type = block_with_constants.getByName(column_name).type;
++
++        /// If constant is not Null, we can assume it's type is not Nullable as well.
++        if (!out_value.isNull())
++            out_type = removeNullable(out_type);
++
+         return true;
+     }
+     else if (block_with_constants.has(column_name) && isColumnConst(*block_with_constants.getByName(column_name).column))
+@@ -539,6 +544,10 @@ bool KeyCondition::getConstant(const ASTPtr & expr, Block & block_with_constants
+         const auto & expr_info = block_with_constants.getByName(column_name);
+         out_value = (*expr_info.column)[0];
+         out_type = expr_info.type;
++
++        if (!out_value.isNull())
++            out_type = removeNullable(out_type);
++
+         return true;
+     }
+     else

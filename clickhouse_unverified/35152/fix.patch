@@ -1,0 +1,929 @@
+diff --git a/docs/en/interfaces/formats.md b/docs/en/interfaces/formats.md
+index 22c647bee138..8a0562383b67 100644
+--- a/docs/en/interfaces/formats.md
++++ b/docs/en/interfaces/formats.md
+@@ -51,6 +51,7 @@ The supported formats are:
+ | [PrettySpace](#prettyspace)                                                             | ✗     | ✔      |
+ | [Protobuf](#protobuf)                                                                   | ✔     | ✔      |
+ | [ProtobufSingle](#protobufsingle)                                                       | ✔     | ✔      |
++| [ProtobufList](#protobuflist)                                                           | ✔     | ✔      |
+ | [Avro](#data-format-avro)                                                               | ✔     | ✔      |
+ | [AvroConfluent](#data-format-avro-confluent)                                            | ✔     | ✗      |
+ | [Parquet](#data-format-parquet)                                                         | ✔     | ✔      |
+@@ -1230,7 +1231,38 @@ See also [how to read/write length-delimited protobuf messages in popular langua
+ 
+ ## ProtobufSingle {#protobufsingle}
+ 
+-Same as [Protobuf](#protobuf) but for storing/parsing single Protobuf message without length delimiters.
++Same as [Protobuf](#protobuf) but for storing/parsing a single Protobuf message without length delimiter.
++As a result, only a single table row can be written/read.
++
++## ProtobufList {#protobuflist}
++
++Similar to Protobuf but rows are represented as a sequence of sub-messages contained in a message with fixed name "Envelope".
++
++Usage example:
++
++``` sql
++SELECT * FROM test.table FORMAT ProtobufList SETTINGS format_schema = 'schemafile:MessageType'
++```
++
++``` bash
++cat protobuflist_messages.bin | clickhouse-client --query "INSERT INTO test.table FORMAT ProtobufList SETTINGS format_schema='schemafile:MessageType'"
++```
++
++where the file `schemafile.proto` looks like this:
++
++``` capnp
++syntax = "proto3";
++
++message Envelope {
++  message MessageType {
++    string name = 1;
++    string surname = 2;
++    uint32 birthDate = 3;
++    repeated string phoneNumbers = 4;
++  };
++  MessageType row = 1;
++};
++```
+ 
+ ## Avro {#data-format-avro}
+ 
+diff --git a/src/Formats/ProtobufSchemas.cpp b/src/Formats/ProtobufSchemas.cpp
+index 9f25f830e373..249737d18388 100644
+--- a/src/Formats/ProtobufSchemas.cpp
++++ b/src/Formats/ProtobufSchemas.cpp
+@@ -24,7 +24,9 @@ ProtobufSchemas & ProtobufSchemas::instance()
+ class ProtobufSchemas::ImporterWithSourceTree : public google::protobuf::compiler::MultiFileErrorCollector
+ {
+ public:
+-    explicit ImporterWithSourceTree(const String & schema_directory) : importer(&disk_source_tree, this)
++    explicit ImporterWithSourceTree(const String & schema_directory, WithEnvelope with_envelope_)
++        : importer(&disk_source_tree, this)
++        , with_envelope(with_envelope_)
+     {
+         disk_source_tree.MapPath("", schema_directory);
+     }
+@@ -39,16 +41,33 @@ class ProtobufSchemas::ImporterWithSourceTree : public google::protobuf::compile
+             return descriptor;
+ 
+         const auto * file_descriptor = importer.Import(schema_path);
+-        // If there are parsing errors AddError() throws an exception and in this case the following line
++        // If there are parsing errors, AddError() throws an exception and in this case the following line
+         // isn't executed.
+         assert(file_descriptor);
+ 
+-        descriptor = file_descriptor->FindMessageTypeByName(message_name);
+-        if (!descriptor)
+-            throw Exception(
+-                "Not found a message named '" + message_name + "' in the schema file '" + schema_path + "'", ErrorCodes::BAD_ARGUMENTS);
+-
+-        return descriptor;
++        if (with_envelope == WithEnvelope::No)
++        {
++            const auto * message_descriptor = file_descriptor->FindMessageTypeByName(message_name);
++            if (!message_descriptor)
++                throw Exception(
++                    "Could not find a message named '" + message_name + "' in the schema file '" + schema_path + "'", ErrorCodes::BAD_ARGUMENTS);
++
++            return message_descriptor;
++        }
++        else
++        {
++            const auto * envelope_descriptor = file_descriptor->FindMessageTypeByName("Envelope");
++            if (!envelope_descriptor)
++                throw Exception(
++                    "Could not find a message named 'Envelope' in the schema file '" + schema_path + "'", ErrorCodes::BAD_ARGUMENTS);
++
++            const auto * message_descriptor = envelope_descriptor->FindNestedTypeByName(message_name); // silly protobuf API disallows a restricting the field type to messages
++            if (!message_descriptor)
++                throw Exception(
++                    "Could not find a message named '" + message_name + "' in the schema file '" + schema_path + "'", ErrorCodes::BAD_ARGUMENTS);
++
++            return message_descriptor;
++        }
+     }
+ 
+ private:
+@@ -63,18 +82,16 @@ class ProtobufSchemas::ImporterWithSourceTree : public google::protobuf::compile
+ 
+     google::protobuf::compiler::DiskSourceTree disk_source_tree;
+     google::protobuf::compiler::Importer importer;
++    const WithEnvelope with_envelope;
+ };
+ 
+ 
+-ProtobufSchemas::ProtobufSchemas() = default;
+-ProtobufSchemas::~ProtobufSchemas() = default;
+-
+-const google::protobuf::Descriptor * ProtobufSchemas::getMessageTypeForFormatSchema(const FormatSchemaInfo & info)
++const google::protobuf::Descriptor * ProtobufSchemas::getMessageTypeForFormatSchema(const FormatSchemaInfo & info, WithEnvelope with_envelope)
+ {
+     std::lock_guard lock(mutex);
+     auto it = importers.find(info.schemaDirectory());
+     if (it == importers.end())
+-        it = importers.emplace(info.schemaDirectory(), std::make_unique<ImporterWithSourceTree>(info.schemaDirectory())).first;
++        it = importers.emplace(info.schemaDirectory(), std::make_unique<ImporterWithSourceTree>(info.schemaDirectory(), with_envelope)).first;
+     auto * importer = it->second.get();
+     return importer->import(info.schemaPath(), info.messageName());
+ }
+diff --git a/src/Formats/ProtobufSchemas.h b/src/Formats/ProtobufSchemas.h
+index 0a2eeea98934..40e386b46422 100644
+--- a/src/Formats/ProtobufSchemas.h
++++ b/src/Formats/ProtobufSchemas.h
+@@ -28,14 +28,36 @@ class FormatSchemaInfo;
+ class ProtobufSchemas : private boost::noncopyable
+ {
+ public:
+-    static ProtobufSchemas & instance();
++    enum class WithEnvelope
++    {
++        // Return descriptor for a top-level message with a user-provided name.
++        // Example: In protobuf schema
++        //   message MessageType {
++        //     string colA = 1;
++        //     int32 colB = 2;
++        //   }
++        // message_name = "MessageType" returns a descriptor. Used by IO
++        // formats Protobuf and ProtobufSingle.
++        No,
++        // Return descriptor for a message with a user-provided name one level
++        // below a top-level message with the hardcoded name "Envelope".
++        // Example: In protobuf schema
++        //   message Envelope {
++        //     message MessageType {
++        //       string colA = 1;
++        //       int32 colB = 2;
++        //     }
++        //   }
++        // message_name = "MessageType" returns a descriptor. Used by IO format
++        // ProtobufList.
++        Yes
++    };
+ 
+-    ProtobufSchemas();
+-    ~ProtobufSchemas();
++    static ProtobufSchemas & instance();
+ 
+     /// Parses the format schema, then parses the corresponding proto file, and returns the descriptor of the message type.
+     /// The function never returns nullptr, it throws an exception if it cannot load or parse the file.
+-    const google::protobuf::Descriptor * getMessageTypeForFormatSchema(const FormatSchemaInfo & info);
++    const google::protobuf::Descriptor * getMessageTypeForFormatSchema(const FormatSchemaInfo & info, WithEnvelope with_envelope);
+ 
+ private:
+     class ImporterWithSourceTree;
+diff --git a/src/Formats/ProtobufSerializer.cpp b/src/Formats/ProtobufSerializer.cpp
+index 389d25a1f467..b44342d0ca5b 100644
+--- a/src/Formats/ProtobufSerializer.cpp
++++ b/src/Formats/ProtobufSerializer.cpp
+@@ -2171,6 +2171,11 @@ namespace
+                 field_index_by_field_tag.emplace(field_infos[i].field_tag, i);
+         }
+ 
++        void setHasEnvelopeAsParent()
++        {
++            has_envelope_as_parent = true;
++        }
++
+         void setColumns(const ColumnPtr * columns_, size_t num_columns_) override
+         {
+             if (!num_columns_)
+@@ -2217,7 +2222,7 @@ namespace
+ 
+         void writeRow(size_t row_num) override
+         {
+-            if (parent_field_descriptor)
++            if (parent_field_descriptor || has_envelope_as_parent)
+                 writer->startNestedMessage();
+             else
+                 writer->startMessage();
+@@ -2236,13 +2241,17 @@ namespace
+                 bool is_group = (parent_field_descriptor->type() == FieldTypeId::TYPE_GROUP);
+                 writer->endNestedMessage(parent_field_descriptor->number(), is_group, should_skip_if_empty);
+             }
++            else if (has_envelope_as_parent)
++            {
++                writer->endNestedMessage(1, false, should_skip_if_empty);
++            }
+             else
+                 writer->endMessage(with_length_delimiter);
+         }
+ 
+         void readRow(size_t row_num) override
+         {
+-            if (parent_field_descriptor)
++            if (parent_field_descriptor || has_envelope_as_parent)
+                 reader->startNestedMessage();
+             else
+                 reader->startMessage(with_length_delimiter);
+@@ -2285,7 +2294,7 @@ namespace
+                 }
+             }
+ 
+-            if (parent_field_descriptor)
++            if (parent_field_descriptor || has_envelope_as_parent)
+                 reader->endNestedMessage();
+             else
+                 reader->endMessage(false);
+@@ -2375,6 +2384,7 @@ namespace
+         };
+ 
+         const FieldDescriptor * const parent_field_descriptor;
++        bool has_envelope_as_parent = false;
+         const bool with_length_delimiter;
+         const std::unique_ptr<RowInputMissingColumnsFiller> missing_columns_filler;
+         const bool should_skip_if_empty;
+@@ -2388,6 +2398,86 @@ namespace
+         size_t last_field_index = static_cast<size_t>(-1);
+     };
+ 
++    /// Serializes a top-level envelope message in the protobuf schema.
++    /// "Envelope" means that the contained subtree of serializers is enclosed in a message just once,
++    /// i.e. only when the first and the last row read/write trigger a read/write of the msg header.
++    class ProtobufSerializerEnvelope : public ProtobufSerializer
++    {
++    public:
++        ProtobufSerializerEnvelope(
++            std::unique_ptr<ProtobufSerializerMessage>&& serializer_,
++            const ProtobufReaderOrWriter & reader_or_writer_)
++            : serializer(std::move(serializer_))
++            , reader(reader_or_writer_.reader)
++            , writer(reader_or_writer_.writer)
++        {
++            // The inner serializer has a backreference of type protobuf::FieldDescriptor * to it's parent
++            // serializer. If it is unset, it considers itself the top-level message, otherwise a nested
++            // message and accordingly it makes start/endMessage() vs. startEndNestedMessage() calls into
++            // Protobuf(Writer|Reader). There is no field descriptor because Envelopes merely forward calls
++            // but don't contain data to be serialized. We must still force the inner serializer to act
++            // as nested message.
++            serializer->setHasEnvelopeAsParent();
++        }
++
++        void setColumns(const ColumnPtr * columns_, size_t num_columns_) override
++        {
++            serializer->setColumns(columns_, num_columns_);
++        }
++
++        void setColumns(const MutableColumnPtr * columns_, size_t num_columns_) override
++        {
++            serializer->setColumns(columns_, num_columns_);
++        }
++
++        void writeRow(size_t row_num) override
++        {
++            if (first_call_of_write_row)
++            {
++                writer->startMessage();
++                first_call_of_write_row = false;
++            }
++
++            serializer->writeRow(row_num);
++        }
++
++        void finalizeWrite() override
++        {
++            writer->endMessage(/*with_length_delimiter = */ true);
++        }
++
++        void readRow(size_t row_num) override
++        {
++            if (first_call_of_read_row)
++            {
++                reader->startMessage(/*with_length_delimiter = */ true);
++                first_call_of_read_row = false;
++            }
++
++            int field_tag;
++            [[maybe_unused]] bool ret = reader->readFieldNumber(field_tag);
++            assert(ret);
++
++            serializer->readRow(row_num);
++        }
++
++        void insertDefaults(size_t row_num) override
++        {
++            serializer->insertDefaults(row_num);
++        }
++
++        void describeTree(WriteBuffer & out, size_t indent) const override
++        {
++            writeIndent(out, indent) << "ProtobufSerializerEnvelope ->
+";
++            serializer->describeTree(out, indent + 1);
++        }
++
++        std::unique_ptr<ProtobufSerializerMessage> serializer;
++        ProtobufReader * const reader;
++        ProtobufWriter * const writer;
++        bool first_call_of_write_row = true;
++        bool first_call_of_read_row = true;
++    };
+ 
+     /// Serializes a tuple with explicit names as a nested message.
+     class ProtobufSerializerTupleAsNestedMessage : public ProtobufSerializer
+@@ -2610,7 +2700,8 @@ namespace
+             const DataTypes & data_types,
+             std::vector<size_t> & missing_column_indices,
+             const MessageDescriptor & message_descriptor,
+-            bool with_length_delimiter)
++            bool with_length_delimiter,
++            bool with_envelope)
+         {
+             root_serializer_ptr = std::make_shared<ProtobufSerializer *>();
+             get_root_desc_function = [root_serializer_ptr = root_serializer_ptr](size_t indent) -> String
+@@ -2648,13 +2739,23 @@ namespace
+             boost::range::set_difference(collections::range(column_names.size()), used_column_indices_sorted,
+                                          std::back_inserter(missing_column_indices));
+ 
+-            *root_serializer_ptr = message_serializer.get();
+-
++            if (!with_envelope)
++            {
++                *root_serializer_ptr = message_serializer.get();
+ #if 0
+-            LOG_INFO(&Poco::Logger::get("ProtobufSerializer"), "Serialization tree:
+{}", get_root_desc_function(0));
++                LOG_INFO(&Poco::Logger::get("ProtobufSerializer"), "Serialization tree:
+{}", get_root_desc_function(0));
+ #endif
+-
+-            return message_serializer;
++                return message_serializer;
++            }
++            else
++            {
++                auto envelope_serializer = std::make_unique<ProtobufSerializerEnvelope>(std::move(message_serializer), reader_or_writer);
++                *root_serializer_ptr = envelope_serializer.get();
++#if 0
++                LOG_INFO(&Poco::Logger::get("ProtobufSerializer"), "Serialization tree:
+{}", get_root_desc_function(0));
++#endif
++                return envelope_serializer;
++            }
+         }
+ 
+     private:
+@@ -3337,9 +3438,10 @@ std::unique_ptr<ProtobufSerializer> ProtobufSerializer::create(
+     std::vector<size_t> & missing_column_indices,
+     const google::protobuf::Descriptor & message_descriptor,
+     bool with_length_delimiter,
++    bool with_envelope,
+     ProtobufReader & reader)
+ {
+-    return ProtobufSerializerBuilder(reader).buildMessageSerializer(column_names, data_types, missing_column_indices, message_descriptor, with_length_delimiter);
++    return ProtobufSerializerBuilder(reader).buildMessageSerializer(column_names, data_types, missing_column_indices, message_descriptor, with_length_delimiter, with_envelope);
+ }
+ 
+ std::unique_ptr<ProtobufSerializer> ProtobufSerializer::create(
+@@ -3347,10 +3449,11 @@ std::unique_ptr<ProtobufSerializer> ProtobufSerializer::create(
+     const DataTypes & data_types,
+     const google::protobuf::Descriptor & message_descriptor,
+     bool with_length_delimiter,
++    bool with_envelope,
+     ProtobufWriter & writer)
+ {
+     std::vector<size_t> missing_column_indices;
+-    return ProtobufSerializerBuilder(writer).buildMessageSerializer(column_names, data_types, missing_column_indices, message_descriptor, with_length_delimiter);
++    return ProtobufSerializerBuilder(writer).buildMessageSerializer(column_names, data_types, missing_column_indices, message_descriptor, with_length_delimiter, with_envelope);
+ }
+ 
+ NamesAndTypesList protobufSchemaToCHSchema(const google::protobuf::Descriptor * message_descriptor)
+diff --git a/src/Formats/ProtobufSerializer.h b/src/Formats/ProtobufSerializer.h
+index d9bed913517e..6ebb50cc636c 100644
+--- a/src/Formats/ProtobufSerializer.h
++++ b/src/Formats/ProtobufSerializer.h
+@@ -26,6 +26,7 @@ class ProtobufSerializer
+ 
+     virtual void setColumns(const ColumnPtr * columns, size_t num_columns) = 0;
+     virtual void writeRow(size_t row_num) = 0;
++    virtual void finalizeWrite() {}
+ 
+     virtual void setColumns(const MutableColumnPtr * columns, size_t num_columns) = 0;
+     virtual void readRow(size_t row_num) = 0;
+@@ -39,6 +40,7 @@ class ProtobufSerializer
+         std::vector<size_t> & missing_column_indices,
+         const google::protobuf::Descriptor & message_descriptor,
+         bool with_length_delimiter,
++        bool with_envelope,
+         ProtobufReader & reader);
+ 
+     static std::unique_ptr<ProtobufSerializer> create(
+@@ -46,6 +48,7 @@ class ProtobufSerializer
+         const DataTypes & data_types,
+         const google::protobuf::Descriptor & message_descriptor,
+         bool with_length_delimiter,
++        bool with_envelope,
+         ProtobufWriter & writer);
+ };
+ 
+diff --git a/src/Formats/registerFormats.cpp b/src/Formats/registerFormats.cpp
+index b7b3b51cd7bb..f6faa605ba81 100644
+--- a/src/Formats/registerFormats.cpp
++++ b/src/Formats/registerFormats.cpp
+@@ -36,6 +36,8 @@ void registerInputFormatJSONCompactEachRow(FormatFactory & factory);
+ void registerOutputFormatJSONCompactEachRow(FormatFactory & factory);
+ void registerInputFormatProtobuf(FormatFactory & factory);
+ void registerOutputFormatProtobuf(FormatFactory & factory);
++void registerInputFormatProtobufList(FormatFactory & factory);
++void registerOutputFormatProtobufList(FormatFactory & factory);
+ void registerInputFormatTemplate(FormatFactory & factory);
+ void registerOutputFormatTemplate(FormatFactory & factory);
+ void registerInputFormatMsgPack(FormatFactory & factory);
+@@ -96,6 +98,7 @@ void registerNativeSchemaReader(FormatFactory & factory);
+ void registerRowBinaryWithNamesAndTypesSchemaReader(FormatFactory & factory);
+ void registerAvroSchemaReader(FormatFactory & factory);
+ void registerProtobufSchemaReader(FormatFactory & factory);
++void registerProtobufListSchemaReader(FormatFactory & factory);
+ void registerLineAsStringSchemaReader(FormatFactory & factory);
+ void registerJSONAsStringSchemaReader(FormatFactory & factory);
+ void registerRawBLOBSchemaReader(FormatFactory & factory);
+@@ -138,6 +141,8 @@ void registerFormats()
+     registerInputFormatJSONCompactEachRow(factory);
+     registerOutputFormatJSONCompactEachRow(factory);
+     registerInputFormatProtobuf(factory);
++    registerOutputFormatProtobufList(factory);
++    registerInputFormatProtobufList(factory);
+     registerOutputFormatProtobuf(factory);
+     registerInputFormatTemplate(factory);
+     registerOutputFormatTemplate(factory);
+@@ -195,6 +200,7 @@ void registerFormats()
+     registerRowBinaryWithNamesAndTypesSchemaReader(factory);
+     registerAvroSchemaReader(factory);
+     registerProtobufSchemaReader(factory);
++    registerProtobufListSchemaReader(factory);
+     registerLineAsStringSchemaReader(factory);
+     registerJSONAsStringSchemaReader(factory);
+     registerRawBLOBSchemaReader(factory);
+diff --git a/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp b/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp
+new file mode 100644
+index 000000000000..42b329fd8798
+--- /dev/null
++++ b/src/Processors/Formats/Impl/ProtobufListInputFormat.cpp
+@@ -0,0 +1,97 @@
++#include "ProtobufListInputFormat.h"
++
++#if USE_PROTOBUF
++#   include <Core/Block.h>
++#   include <Formats/FormatFactory.h>
++#   include <Formats/ProtobufReader.h>
++#   include <Formats/ProtobufSchemas.h>
++#   include <Formats/ProtobufSerializer.h>
++
++namespace DB
++{
++
++ProtobufListInputFormat::ProtobufListInputFormat(ReadBuffer & in_, const Block & header_, const Params & params_, const FormatSchemaInfo & schema_info_)
++    : IRowInputFormat(header_, in_, params_)
++    , reader(std::make_unique<ProtobufReader>(in_))
++    , serializer(ProtobufSerializer::create(
++        header_.getNames(),
++        header_.getDataTypes(),
++        missing_column_indices,
++        *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_, ProtobufSchemas::WithEnvelope::Yes),
++        /* with_length_delimiter = */ true,
++        /* with_envelope = */ true,
++         *reader))
++{
++}
++
++bool ProtobufListInputFormat::readRow(MutableColumns & columns, RowReadExtension & row_read_extension)
++{
++    if (reader->eof())
++    {
++        reader->endMessage(/*ignore_errors =*/ false);
++        return false;
++    }
++
++    size_t row_num = columns.empty() ? 0 : columns[0]->size();
++    if (!row_num)
++        serializer->setColumns(columns.data(), columns.size());
++
++    serializer->readRow(row_num);
++
++    row_read_extension.read_columns.clear();
++    row_read_extension.read_columns.resize(columns.size(), true);
++    for (size_t column_idx : missing_column_indices)
++        row_read_extension.read_columns[column_idx] = false;
++    return true;
++}
++
++ProtobufListSchemaReader::ProtobufListSchemaReader(const FormatSettings & format_settings)
++    : schema_info(
++          format_settings.schema.format_schema,
++          "Protobuf",
++          true,
++          format_settings.schema.is_server,
++          format_settings.schema.format_schema_path)
++{
++}
++
++NamesAndTypesList ProtobufListSchemaReader::readSchema()
++{
++    const auto * message_descriptor = ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info, ProtobufSchemas::WithEnvelope::Yes);
++    return protobufSchemaToCHSchema(message_descriptor);
++}
++
++void registerInputFormatProtobufList(FormatFactory & factory)
++{
++    factory.registerInputFormat(
++            "ProtobufList",
++            [](ReadBuffer &buf,
++                const Block & sample,
++                RowInputFormatParams params,
++                const FormatSettings & settings)
++            {
++                return std::make_shared<ProtobufListInputFormat>(buf, sample, std::move(params), FormatSchemaInfo(settings, "Protobuf", true));
++            });
++    factory.markFormatAsColumnOriented("ProtobufList");
++}
++
++void registerProtobufListSchemaReader(FormatFactory & factory)
++{
++    factory.registerExternalSchemaReader("ProtobufList", [](const FormatSettings & settings)
++    {
++        return std::make_shared<ProtobufListSchemaReader>(settings);
++    });
++}
++
++}
++
++#else
++
++namespace DB
++{
++class FormatFactory;
++void registerInputFormatProtobufList(FormatFactory &) {}
++void registerProtobufListSchemaReader(FormatFactory &) {}
++}
++
++#endif
+diff --git a/src/Processors/Formats/Impl/ProtobufListInputFormat.h b/src/Processors/Formats/Impl/ProtobufListInputFormat.h
+new file mode 100644
+index 000000000000..cecda3acda0d
+--- /dev/null
++++ b/src/Processors/Formats/Impl/ProtobufListInputFormat.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include "config_formats.h"
++
++#if USE_PROTOBUF
++#    include <Formats/FormatSchemaInfo.h>
++#    include <Processors/Formats/IRowInputFormat.h>
++#    include <Processors/Formats/ISchemaReader.h>
++
++namespace DB
++{
++class Block;
++class ProtobufReader;
++class ProtobufSerializer;
++class ReadBuffer;
++
++/** Stream designed to deserialize data from the google protobuf format.
++  * One nested Protobuf message is parsed as one row of data.
++  *
++  * Parsing of the protobuf format requires the 'format_schema' setting to be set, e.g.
++  * INSERT INTO table FORMAT Protobuf SETTINGS format_schema = 'schema:Message'
++  * where schema is the name of "schema.proto" file specifying protobuf schema.
++  */
++class ProtobufListInputFormat final : public IRowInputFormat
++{
++public:
++    ProtobufListInputFormat(ReadBuffer & in_, const Block & header_, const Params & params_, const FormatSchemaInfo & schema_info_);
++
++    String getName() const override { return "ProtobufListInputFormat"; }
++
++private:
++    bool readRow(MutableColumns & columns, RowReadExtension & row_read_extension) override;
++
++    std::unique_ptr<ProtobufReader> reader;
++    std::vector<size_t> missing_column_indices;
++    std::unique_ptr<ProtobufSerializer> serializer;
++};
++
++class ProtobufListSchemaReader : public IExternalSchemaReader
++{
++public:
++    explicit ProtobufListSchemaReader(const FormatSettings & format_settings);
++
++    NamesAndTypesList readSchema() override;
++
++private:
++    const FormatSchemaInfo schema_info;
++};
++
++}
++
++#endif
+diff --git a/src/Processors/Formats/Impl/ProtobufListOutputFormat.cpp b/src/Processors/Formats/Impl/ProtobufListOutputFormat.cpp
+new file mode 100644
+index 000000000000..e78c9e3b13b8
+--- /dev/null
++++ b/src/Processors/Formats/Impl/ProtobufListOutputFormat.cpp
+@@ -0,0 +1,68 @@
++#include "ProtobufListOutputFormat.h"
++
++#if USE_PROTOBUF
++#   include <Formats/FormatFactory.h>
++#   include <Formats/FormatSchemaInfo.h>
++#   include <Formats/ProtobufWriter.h>
++#   include <Formats/ProtobufSerializer.h>
++#   include <Formats/ProtobufSchemas.h>
++
++namespace DB
++{
++
++ProtobufListOutputFormat::ProtobufListOutputFormat(
++    WriteBuffer & out_,
++    const Block & header_,
++    const RowOutputFormatParams & params_,
++    const FormatSchemaInfo & schema_info_)
++    : IRowOutputFormat(header_, out_, params_)
++    , writer(std::make_unique<ProtobufWriter>(out))
++    , serializer(ProtobufSerializer::create(
++          header_.getNames(),
++          header_.getDataTypes(),
++          *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_, ProtobufSchemas::WithEnvelope::Yes),
++          /* with_length_delimiter = */ true,
++          /* with_envelope = */ true,
++          *writer))
++{
++}
++
++void ProtobufListOutputFormat::write(const Columns & columns, size_t row_num)
++{
++    if (row_num == 0)
++        serializer->setColumns(columns.data(), columns.size());
++
++    serializer->writeRow(row_num);
++}
++
++void ProtobufListOutputFormat::finalizeImpl()
++{
++    serializer->finalizeWrite();
++}
++
++void registerOutputFormatProtobufList(FormatFactory & factory)
++{
++    factory.registerOutputFormat(
++        "ProtobufList",
++        [](WriteBuffer & buf,
++           const Block & header,
++           const RowOutputFormatParams & params,
++           const FormatSettings & settings)
++        {
++            return std::make_shared<ProtobufListOutputFormat>(
++                buf, header, params,
++                FormatSchemaInfo(settings, "Protobuf", true));
++        });
++}
++
++}
++
++#else
++
++namespace DB
++{
++class FormatFactory;
++void registerOutputFormatProtobufList(FormatFactory &) {}
++}
++
++#endif
+diff --git a/src/Processors/Formats/Impl/ProtobufListOutputFormat.h b/src/Processors/Formats/Impl/ProtobufListOutputFormat.h
+new file mode 100644
+index 000000000000..47fe618d2e1f
+--- /dev/null
++++ b/src/Processors/Formats/Impl/ProtobufListOutputFormat.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include "config_formats.h"
++
++#if USE_PROTOBUF
++#    include <Processors/Formats/IRowOutputFormat.h>
++
++namespace DB
++{
++class FormatSchemaInfo;
++class ProtobufWriter;
++class ProtobufSerializer;
++
++/** Stream designed to serialize data in the google protobuf format.
++  * Each row is written as a separated nested message, and all rows are enclosed by a single
++  * top-level, envelope message
++  *
++  * Serializing in the protobuf format requires the 'format_schema' setting to be set, e.g.
++  * SELECT * from table FORMAT Protobuf SETTINGS format_schema = 'schema:Message'
++  * where schema is the name of "schema.proto" file specifying protobuf schema.
++  */
++// class ProtobufListOutputFormat final : public IOutputFormat
++class ProtobufListOutputFormat final : public IRowOutputFormat
++{
++public:
++    ProtobufListOutputFormat(
++        WriteBuffer & out_,
++        const Block & header_,
++        const RowOutputFormatParams & params_,
++        const FormatSchemaInfo & schema_info_);
++
++    String getName() const override { return "ProtobufListOutputFormat"; }
++
++    String getContentType() const override { return "application/octet-stream"; }
++
++private:
++    void write(const Columns & columns, size_t row_num) override;
++    void writeField(const IColumn &, const ISerialization &, size_t) override {}
++
++    void finalizeImpl() override;
++
++    std::unique_ptr<ProtobufWriter> writer;
++    std::unique_ptr<ProtobufSerializer> serializer;
++};
++
++}
++
++#endif
+diff --git a/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp b/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
+index 395d8294aa57..38c18aa967c0 100644
+--- a/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
++++ b/src/Processors/Formats/Impl/ProtobufRowInputFormat.cpp
+@@ -3,16 +3,13 @@
+ #if USE_PROTOBUF
+ #   include <Core/Block.h>
+ #   include <Formats/FormatFactory.h>
+-#   include <Formats/FormatSchemaInfo.h>
+ #   include <Formats/ProtobufReader.h>
+ #   include <Formats/ProtobufSchemas.h>
+ #   include <Formats/ProtobufSerializer.h>
+-#   include <Interpreters/Context.h>
+-#   include <base/range.h>
+-
+ 
+ namespace DB
+ {
++
+ ProtobufRowInputFormat::ProtobufRowInputFormat(ReadBuffer & in_, const Block & header_, const Params & params_, const FormatSchemaInfo & schema_info_, bool with_length_delimiter_)
+     : IRowInputFormat(header_, in_, params_)
+     , reader(std::make_unique<ProtobufReader>(in_))
+@@ -20,14 +17,13 @@ ProtobufRowInputFormat::ProtobufRowInputFormat(ReadBuffer & in_, const Block & h
+           header_.getNames(),
+           header_.getDataTypes(),
+           missing_column_indices,
+-          *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_),
++          *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_, ProtobufSchemas::WithEnvelope::No),
+           with_length_delimiter_,
++          /* with_envelope = */ false,
+          *reader))
+ {
+ }
+ 
+-ProtobufRowInputFormat::~ProtobufRowInputFormat() = default;
+-
+ bool ProtobufRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & row_read_extension)
+ {
+     if (reader->eof())
+@@ -85,7 +81,7 @@ ProtobufSchemaReader::ProtobufSchemaReader(const FormatSettings & format_setting
+ 
+ NamesAndTypesList ProtobufSchemaReader::readSchema()
+ {
+-    const auto * message_descriptor = ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info);
++    const auto * message_descriptor = ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info, ProtobufSchemas::WithEnvelope::No);
+     return protobufSchemaToCHSchema(message_descriptor);
+ }
+ 
+@@ -111,7 +107,6 @@ namespace DB
+ {
+ class FormatFactory;
+ void registerInputFormatProtobuf(FormatFactory &) {}
+-
+ void registerProtobufSchemaReader(FormatFactory &) {}
+ }
+ 
+diff --git a/src/Processors/Formats/Impl/ProtobufRowInputFormat.h b/src/Processors/Formats/Impl/ProtobufRowInputFormat.h
+index 9566cb451066..1c276356664a 100644
+--- a/src/Processors/Formats/Impl/ProtobufRowInputFormat.h
++++ b/src/Processors/Formats/Impl/ProtobufRowInputFormat.h
+@@ -3,17 +3,16 @@
+ #include "config_formats.h"
+ 
+ #if USE_PROTOBUF
+-#    include <Formats/FormatSchemaInfo.h>
+-#    include <Processors/Formats/IRowInputFormat.h>
+-#    include <Processors/Formats/ISchemaReader.h>
++#   include <Processors/Formats/IRowInputFormat.h>
++#   include <Processors/Formats/ISchemaReader.h>
++#   include <Formats/FormatSchemaInfo.h>
+ 
+ namespace DB
+ {
+ class Block;
+-class FormatSchemaInfo;
+ class ProtobufReader;
+ class ProtobufSerializer;
+-
++class ReadBuffer;
+ 
+ /** Stream designed to deserialize data from the google protobuf format.
+   * One Protobuf message is parsed as one row of data.
+@@ -30,12 +29,11 @@ class ProtobufRowInputFormat final : public IRowInputFormat
+ {
+ public:
+     ProtobufRowInputFormat(ReadBuffer & in_, const Block & header_, const Params & params_, const FormatSchemaInfo & schema_info_, bool with_length_delimiter_);
+-    ~ProtobufRowInputFormat() override;
+ 
+     String getName() const override { return "ProtobufRowInputFormat"; }
+ 
+ private:
+-    bool readRow(MutableColumns & columns, RowReadExtension &) override;
++    bool readRow(MutableColumns & columns, RowReadExtension & row_read_extension) override;
+     bool allowSyncAfterError() const override;
+     void syncAfterError() override;
+ 
+@@ -52,7 +50,7 @@ class ProtobufSchemaReader : public IExternalSchemaReader
+     NamesAndTypesList readSchema() override;
+ 
+ private:
+-    FormatSchemaInfo schema_info;
++    const FormatSchemaInfo schema_info;
+ };
+ 
+ }
+diff --git a/src/Processors/Formats/Impl/ProtobufRowOutputFormat.cpp b/src/Processors/Formats/Impl/ProtobufRowOutputFormat.cpp
+index 29cd9be79bce..fa730f8ec2aa 100644
+--- a/src/Processors/Formats/Impl/ProtobufRowOutputFormat.cpp
++++ b/src/Processors/Formats/Impl/ProtobufRowOutputFormat.cpp
+@@ -4,12 +4,12 @@
+ #   include <Formats/FormatFactory.h>
+ #   include <Core/Block.h>
+ #   include <Formats/FormatSchemaInfo.h>
++#   include <Formats/FormatSettings.h>
+ #   include <Formats/ProtobufSchemas.h>
+ #   include <Formats/ProtobufSerializer.h>
+ #   include <Formats/ProtobufWriter.h>
+ #   include <google/protobuf/descriptor.h>
+ 
+-
+ namespace DB
+ {
+ namespace ErrorCodes
+@@ -17,7 +17,6 @@ namespace ErrorCodes
+     extern const int NO_ROW_DELIMITER;
+ }
+ 
+-
+ ProtobufRowOutputFormat::ProtobufRowOutputFormat(
+     WriteBuffer & out_,
+     const Block & header_,
+@@ -30,8 +29,9 @@ ProtobufRowOutputFormat::ProtobufRowOutputFormat(
+     , serializer(ProtobufSerializer::create(
+           header_.getNames(),
+           header_.getDataTypes(),
+-          *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_),
++          *ProtobufSchemas::instance().getMessageTypeForFormatSchema(schema_info_, ProtobufSchemas::WithEnvelope::No),
+           with_length_delimiter_,
++          /* with_envelope = */ false,
+           *writer))
+     , allow_multiple_rows(with_length_delimiter_ || settings_.protobuf.allow_multiple_rows_without_delimiter)
+ {
+@@ -44,13 +44,12 @@ void ProtobufRowOutputFormat::write(const Columns & columns, size_t row_num)
+             "The ProtobufSingle format can't be used to write multiple rows because this format doesn't have any row delimiter.",
+             ErrorCodes::NO_ROW_DELIMITER);
+ 
+-    if (!row_num)
++    if (row_num == 0)
+         serializer->setColumns(columns.data(), columns.size());
+ 
+     serializer->writeRow(row_num);
+ }
+ 
+-
+ void registerOutputFormatProtobuf(FormatFactory & factory)
+ {
+     for (bool with_length_delimiter : {false, true})
+diff --git a/src/Processors/Formats/Impl/ProtobufRowOutputFormat.h b/src/Processors/Formats/Impl/ProtobufRowOutputFormat.h
+index 43d79b4d0915..9f7f0b969238 100644
+--- a/src/Processors/Formats/Impl/ProtobufRowOutputFormat.h
++++ b/src/Processors/Formats/Impl/ProtobufRowOutputFormat.h
+@@ -3,17 +3,15 @@
+ #include "config_formats.h"
+ 
+ #if USE_PROTOBUF
+-#    include <Core/Block.h>
+-#    include <Formats/FormatSchemaInfo.h>
+-#    include <Formats/FormatSettings.h>
+ #    include <Processors/Formats/IRowOutputFormat.h>
+ 
+-
+ namespace DB
+ {
+-class ProtobufWriter;
+-class ProtobufSerializer;
++class DB;
+ class FormatSchemaInfo;
++class ProtobufSerializer;
++class ProtobufWriter;
++class WriteBuffer;
+ struct FormatSettings;
+ 
+ /** Stream designed to serialize data in the google protobuf format.

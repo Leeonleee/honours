@@ -1,0 +1,185 @@
+diff --git a/src/Interpreters/ColumnAliasesVisitor.cpp b/src/Interpreters/ColumnAliasesVisitor.cpp
+index 9b7e0a91c181..43a6c4d4cf10 100644
+--- a/src/Interpreters/ColumnAliasesVisitor.cpp
++++ b/src/Interpreters/ColumnAliasesVisitor.cpp
+@@ -3,7 +3,6 @@
+ #include <Interpreters/RequiredSourceColumnsVisitor.h>
+ #include <Interpreters/addTypeConversionToAST.h>
+ #include <Parsers/ASTTablesInSelectQuery.h>
+-#include <Parsers/ASTSelectWithUnionQuery.h>
+ #include <Parsers/ASTSelectQuery.h>
+ #include <Parsers/ASTSubquery.h>
+ #include <Parsers/ASTAlterQuery.h>
+@@ -14,8 +13,11 @@
+ namespace DB
+ {
+ 
+-bool ColumnAliasesMatcher::needChildVisit(const ASTPtr & node, const ASTPtr &)
++bool ColumnAliasesMatcher::needChildVisit(const ASTPtr & node, const ASTPtr &, const Data & data)
+ {
++    if (data.excluded_nodes.contains(node.get()))
++        return false;
++
+     if (const auto * f = node->as<ASTFunction>())
+     {
+         /// "lambda" visits children itself.
+diff --git a/src/Interpreters/ColumnAliasesVisitor.h b/src/Interpreters/ColumnAliasesVisitor.h
+index 9be83d83d498..b593842e133d 100644
+--- a/src/Interpreters/ColumnAliasesVisitor.h
++++ b/src/Interpreters/ColumnAliasesVisitor.h
+@@ -46,7 +46,7 @@ using DataTypePtr = std::shared_ptr<const IDataType>;
+ class ColumnAliasesMatcher
+ {
+ public:
+-    using Visitor = InDepthNodeVisitor<ColumnAliasesMatcher, false>;
++    using Visitor = InDepthNodeVisitor<ColumnAliasesMatcher, false, true>;
+ 
+     struct Data
+     {
+@@ -57,14 +57,16 @@ class ColumnAliasesMatcher
+         NameSet array_join_source_columns;
+         ContextPtr context;
+ 
++        const std::unordered_set<IAST *> & excluded_nodes;
++
+         /// private_aliases are from lambda, so these are local names.
+         NameSet private_aliases;
+ 
+         /// Check if query is changed by this visitor.
+         bool changed = false;
+ 
+-        Data(const ColumnsDescription & columns_, const NameToNameMap & array_join_result_columns_, ContextPtr context_)
+-            : columns(columns_), context(context_)
++        Data(const ColumnsDescription & columns_, const NameToNameMap & array_join_result_columns_, ContextPtr context_, const std::unordered_set<IAST *> & excluded_nodes_)
++            : columns(columns_), context(context_), excluded_nodes(excluded_nodes_)
+         {
+             for (const auto & [result, source] : array_join_result_columns_)
+             {
+@@ -75,7 +77,7 @@ class ColumnAliasesMatcher
+     };
+ 
+     static void visit(ASTPtr & ast, Data & data);
+-    static bool needChildVisit(const ASTPtr & node, const ASTPtr & child);
++    static bool needChildVisit(const ASTPtr & node, const ASTPtr & child, const Data & data);
+ 
+ private:
+     static void visit(ASTIdentifier & node, ASTPtr & ast, Data & data);
+diff --git a/src/Interpreters/InDepthNodeVisitor.h b/src/Interpreters/InDepthNodeVisitor.h
+index 90235de34b02..b7353f2c2431 100644
+--- a/src/Interpreters/InDepthNodeVisitor.h
++++ b/src/Interpreters/InDepthNodeVisitor.h
+@@ -10,7 +10,7 @@ namespace DB
+ 
+ /// Visits AST tree in depth, call functions for nodes according to Matcher type data.
+ /// You need to define Data, visit() and needChildVisit() in Matcher class.
+-template <typename Matcher, bool _top_to_bottom, typename T = ASTPtr>
++template <typename Matcher, bool _top_to_bottom, bool need_child_accept_data = false, typename T = ASTPtr>
+ class InDepthNodeVisitor
+ {
+ public:
+@@ -51,13 +51,21 @@ class InDepthNodeVisitor
+     void visitChildren(T & ast)
+     {
+         for (auto & child : ast->children)
+-            if (Matcher::needChildVisit(ast, child))
++        {
++            bool need_visit_child = false;
++            if constexpr (need_child_accept_data)
++                need_visit_child = Matcher::needChildVisit(ast, child, data);
++            else
++                need_visit_child = Matcher::needChildVisit(ast, child);
++
++            if (need_visit_child)
+                 visit(child);
++        }
+     }
+ };
+ 
+-template <typename Matcher, bool top_to_bottom>
+-using ConstInDepthNodeVisitor = InDepthNodeVisitor<Matcher, top_to_bottom, const ASTPtr>;
++template <typename Matcher, bool top_to_bottom, bool need_child_accept_data = false>
++using ConstInDepthNodeVisitor = InDepthNodeVisitor<Matcher, top_to_bottom, need_child_accept_data, const ASTPtr>;
+ 
+ struct NeedChild
+ {
+diff --git a/src/Interpreters/TreeRewriter.cpp b/src/Interpreters/TreeRewriter.cpp
+index 51df6cd022b5..11402e052dca 100644
+--- a/src/Interpreters/TreeRewriter.cpp
++++ b/src/Interpreters/TreeRewriter.cpp
+@@ -951,16 +951,9 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
+     setJoinStrictness(
+         *select_query, settings.join_default_strictness, settings.any_join_distinct_right_table_keys, result.analyzed_join->table_join);
+ 
+-    if (const auto * join_ast = select_query->join(); join_ast && tables_with_columns.size() >= 2)
+-    {
+-        auto & table_join_ast = join_ast->table_join->as<ASTTableJoin &>();
+-        if (table_join_ast.using_expression_list && result.metadata_snapshot)
+-            replaceAliasColumnsInQuery(table_join_ast.using_expression_list, result.metadata_snapshot->getColumns(), result.array_join_result_to_source, getContext());
+-        if (table_join_ast.on_expression && result.metadata_snapshot)
+-            replaceAliasColumnsInQuery(table_join_ast.on_expression, result.metadata_snapshot->getColumns(), result.array_join_result_to_source, getContext());
+-
+-        collectJoinedColumns(*result.analyzed_join, table_join_ast, tables_with_columns, result.aliases);
+-    }
++    auto * table_join_ast = select_query->join() ? select_query->join()->table_join->as<ASTTableJoin>() : nullptr;
++    if (table_join_ast && tables_with_columns.size() >= 2)
++        collectJoinedColumns(*result.analyzed_join, *table_join_ast, tables_with_columns, result.aliases);
+ 
+     result.aggregates = getAggregates(query, *select_query);
+     result.window_function_asts = getWindowFunctions(query, *select_query);
+@@ -971,8 +964,19 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
+     bool is_initiator = getContext()->getClientInfo().distributed_depth == 0;
+     if (settings.optimize_respect_aliases && result.metadata_snapshot && is_initiator)
+     {
++        std::unordered_set<IAST *> excluded_nodes;
++        {
++            /// Do not replace ALIASed columns in JOIN ON/USING sections
++            if (table_join_ast && table_join_ast->on_expression)
++                excluded_nodes.insert(table_join_ast->on_expression.get());
++            if (table_join_ast && table_join_ast->using_expression_list)
++                excluded_nodes.insert(table_join_ast->using_expression_list.get());
++        }
++
++        bool is_changed = replaceAliasColumnsInQuery(query, result.metadata_snapshot->getColumns(),
++                                                     result.array_join_result_to_source, getContext(), excluded_nodes);
+         /// If query is changed, we need to redo some work to correct name resolution.
+-        if (replaceAliasColumnsInQuery(query, result.metadata_snapshot->getColumns(), result.array_join_result_to_source, getContext()))
++        if (is_changed)
+         {
+             result.aggregates = getAggregates(query, *select_query);
+             result.window_function_asts = getWindowFunctions(query, *select_query);
+diff --git a/src/Interpreters/replaceAliasColumnsInQuery.cpp b/src/Interpreters/replaceAliasColumnsInQuery.cpp
+index 604ba3590ae7..fc6a97e2039a 100644
+--- a/src/Interpreters/replaceAliasColumnsInQuery.cpp
++++ b/src/Interpreters/replaceAliasColumnsInQuery.cpp
+@@ -7,9 +7,13 @@ namespace DB
+ {
+ 
+ bool replaceAliasColumnsInQuery(
+-    ASTPtr & ast, const ColumnsDescription & columns, const NameToNameMap & array_join_result_to_source, ContextPtr context)
++        ASTPtr & ast,
++        const ColumnsDescription & columns,
++        const NameToNameMap & array_join_result_to_source,
++        ContextPtr context,
++        const std::unordered_set<IAST *> & excluded_nodes)
+ {
+-    ColumnAliasesVisitor::Data aliases_column_data(columns, array_join_result_to_source, context);
++    ColumnAliasesVisitor::Data aliases_column_data(columns, array_join_result_to_source, context, excluded_nodes);
+     ColumnAliasesVisitor aliases_column_visitor(aliases_column_data);
+     aliases_column_visitor.visit(ast);
+     return aliases_column_data.changed;
+diff --git a/src/Interpreters/replaceAliasColumnsInQuery.h b/src/Interpreters/replaceAliasColumnsInQuery.h
+index 5d9207ad11b2..7f5fee3b14b0 100644
+--- a/src/Interpreters/replaceAliasColumnsInQuery.h
++++ b/src/Interpreters/replaceAliasColumnsInQuery.h
+@@ -12,6 +12,10 @@ class ColumnsDescription;
+ 
+ /// Replace storage alias columns in select query if possible. Return true if the query is changed.
+ bool replaceAliasColumnsInQuery(
+-    ASTPtr & ast, const ColumnsDescription & columns, const NameToNameMap & array_join_result_to_source, ContextPtr context);
++        ASTPtr & ast,
++        const ColumnsDescription & columns,
++        const NameToNameMap & array_join_result_to_source,
++        ContextPtr context,
++        const std::unordered_set<IAST *> & excluded_nodes = {});
+ 
+ }

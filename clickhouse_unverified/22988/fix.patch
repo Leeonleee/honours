@@ -1,0 +1,413 @@
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index d31073ae9329..0eebee4e3ae2 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -70,6 +70,7 @@ class IColumn;
+     M(UInt64, connections_with_failover_max_tries, DBMS_CONNECTION_POOL_WITH_FAILOVER_DEFAULT_MAX_TRIES, "The maximum number of attempts to connect to replicas.", 0) \
+     M(UInt64, s3_min_upload_part_size, 512*1024*1024, "The minimum size of part to upload during multipart upload to S3.", 0) \
+     M(UInt64, s3_max_single_part_upload_size, 64*1024*1024, "The maximum size of object to upload using singlepart upload to S3.", 0) \
++    M(UInt64, s3_max_single_read_retries, 4, "The maximum number of retries during single S3 read.", 0) \
+     M(UInt64, s3_max_redirects, 10, "Max number of S3 redirects hops allowed.", 0) \
+     M(UInt64, s3_max_connections, 1024, "The maximum number of connections per server.", 0) \
+     M(Bool, extremes, false, "Calculate minimums and maximums of the result columns. They can be output in JSON-formats.", IMPORTANT) \
+diff --git a/src/Disks/S3/DiskS3.cpp b/src/Disks/S3/DiskS3.cpp
+index 1de4ab843ac5..90c69b7f3b36 100644
+--- a/src/Disks/S3/DiskS3.cpp
++++ b/src/Disks/S3/DiskS3.cpp
+@@ -249,8 +249,12 @@ class ReadIndirectBufferFromS3 final : public ReadBufferFromFileBase
+ {
+ public:
+     ReadIndirectBufferFromS3(
+-        std::shared_ptr<Aws::S3::S3Client> client_ptr_, const String & bucket_, DiskS3::Metadata metadata_, size_t buf_size_)
+-        : client_ptr(std::move(client_ptr_)), bucket(bucket_), metadata(std::move(metadata_)), buf_size(buf_size_)
++        std::shared_ptr<Aws::S3::S3Client> client_ptr_, const String & bucket_, DiskS3::Metadata metadata_, UInt64 s3_max_single_read_retries_, size_t buf_size_)
++        : client_ptr(std::move(client_ptr_))
++        , bucket(bucket_)
++        , metadata(std::move(metadata_))
++        , s3_max_single_read_retries(s3_max_single_read_retries_)
++        , buf_size(buf_size_)
+     {
+     }
+ 
+@@ -306,7 +310,7 @@ class ReadIndirectBufferFromS3 final : public ReadBufferFromFileBase
+             const auto & [path, size] = metadata.s3_objects[i];
+             if (size > offset)
+             {
+-                auto buf = std::make_unique<ReadBufferFromS3>(client_ptr, bucket, metadata.s3_root_path + path, buf_size);
++                auto buf = std::make_unique<ReadBufferFromS3>(client_ptr, bucket, metadata.s3_root_path + path, s3_max_single_read_retries, buf_size);
+                 buf->seek(offset, SEEK_SET);
+                 return buf;
+             }
+@@ -335,7 +339,7 @@ class ReadIndirectBufferFromS3 final : public ReadBufferFromFileBase
+ 
+         ++current_buf_idx;
+         const auto & path = metadata.s3_objects[current_buf_idx].first;
+-        current_buf = std::make_unique<ReadBufferFromS3>(client_ptr, bucket, metadata.s3_root_path + path, buf_size);
++        current_buf = std::make_unique<ReadBufferFromS3>(client_ptr, bucket, metadata.s3_root_path + path, s3_max_single_read_retries, buf_size);
+         current_buf->next();
+         working_buffer = current_buf->buffer();
+         absolute_position += working_buffer.size();
+@@ -346,6 +350,7 @@ class ReadIndirectBufferFromS3 final : public ReadBufferFromFileBase
+     std::shared_ptr<Aws::S3::S3Client> client_ptr;
+     const String & bucket;
+     DiskS3::Metadata metadata;
++    UInt64 s3_max_single_read_retries;
+     size_t buf_size;
+ 
+     size_t absolute_position = 0;
+@@ -559,6 +564,7 @@ DiskS3::DiskS3(
+     String bucket_,
+     String s3_root_path_,
+     String metadata_path_,
++    UInt64 s3_max_single_read_retries_,
+     size_t min_upload_part_size_,
+     size_t max_single_part_upload_size_,
+     size_t min_bytes_for_seek_,
+@@ -572,6 +578,7 @@ DiskS3::DiskS3(
+     , bucket(std::move(bucket_))
+     , s3_root_path(std::move(s3_root_path_))
+     , metadata_path(std::move(metadata_path_))
++    , s3_max_single_read_retries(s3_max_single_read_retries_)
+     , min_upload_part_size(min_upload_part_size_)
+     , max_single_part_upload_size(max_single_part_upload_size_)
+     , min_bytes_for_seek(min_bytes_for_seek_)
+@@ -678,7 +685,7 @@ std::unique_ptr<ReadBufferFromFileBase> DiskS3::readFile(const String & path, si
+     LOG_DEBUG(&Poco::Logger::get("DiskS3"), "Read from file by path: {}. Existing S3 objects: {}",
+         backQuote(metadata_path + path), metadata.s3_objects.size());
+ 
+-    auto reader = std::make_unique<ReadIndirectBufferFromS3>(client, bucket, metadata, buf_size);
++    auto reader = std::make_unique<ReadIndirectBufferFromS3>(client, bucket, metadata, s3_max_single_read_retries, buf_size);
+     return std::make_unique<SeekAvoidingReadBuffer>(std::move(reader), min_bytes_for_seek);
+ }
+ 
+@@ -982,7 +989,7 @@ int DiskS3::readSchemaVersion(const String & source_bucket, const String & sourc
+     if (!checkObjectExists(source_bucket, source_path + SCHEMA_VERSION_OBJECT))
+         return version;
+ 
+-    ReadBufferFromS3 buffer (client, source_bucket, source_path + SCHEMA_VERSION_OBJECT);
++    ReadBufferFromS3 buffer(client, source_bucket, source_path + SCHEMA_VERSION_OBJECT, s3_max_single_read_retries);
+     readIntText(version, buffer);
+ 
+     return version;
+diff --git a/src/Disks/S3/DiskS3.h b/src/Disks/S3/DiskS3.h
+index 87aab71fc44b..72548addfdf5 100644
+--- a/src/Disks/S3/DiskS3.h
++++ b/src/Disks/S3/DiskS3.h
+@@ -40,6 +40,7 @@ class DiskS3 : public IDisk
+         String bucket_,
+         String s3_root_path_,
+         String metadata_path_,
++        UInt64 s3_max_single_read_retries_,
+         size_t min_upload_part_size_,
+         size_t max_single_part_upload_size_,
+         size_t min_bytes_for_seek_,
+@@ -180,6 +181,7 @@ class DiskS3 : public IDisk
+     const String bucket;
+     const String s3_root_path;
+     String metadata_path;
++    UInt64 s3_max_single_read_retries;
+     size_t min_upload_part_size;
+     size_t max_single_part_upload_size;
+     size_t min_bytes_for_seek;
+diff --git a/src/Disks/S3/registerDiskS3.cpp b/src/Disks/S3/registerDiskS3.cpp
+index a15b6bcf8228..2a9dbda930db 100644
+--- a/src/Disks/S3/registerDiskS3.cpp
++++ b/src/Disks/S3/registerDiskS3.cpp
+@@ -152,6 +152,7 @@ void registerDiskS3(DiskFactory & factory)
+             uri.bucket,
+             uri.key,
+             metadata_path,
++            context->getSettingsRef().s3_max_single_read_retries,
+             context->getSettingsRef().s3_min_upload_part_size,
+             context->getSettingsRef().s3_max_single_part_upload_size,
+             config.getUInt64(config_prefix + ".min_bytes_for_seek", 1024 * 1024),
+diff --git a/src/IO/ReadBufferFromS3.cpp b/src/IO/ReadBufferFromS3.cpp
+index fd07a7f309ad..1e27b0284b76 100644
+--- a/src/IO/ReadBufferFromS3.cpp
++++ b/src/IO/ReadBufferFromS3.cpp
+@@ -12,10 +12,12 @@
+ 
+ #    include <utility>
+ 
++
+ namespace ProfileEvents
+ {
+     extern const Event S3ReadMicroseconds;
+     extern const Event S3ReadBytes;
++    extern const Event S3ReadRequestsErrors;
+ }
+ 
+ namespace DB
+@@ -29,26 +31,58 @@ namespace ErrorCodes
+ 
+ 
+ ReadBufferFromS3::ReadBufferFromS3(
+-    std::shared_ptr<Aws::S3::S3Client> client_ptr_, const String & bucket_, const String & key_, size_t buffer_size_)
+-    : SeekableReadBuffer(nullptr, 0), client_ptr(std::move(client_ptr_)), bucket(bucket_), key(key_), buffer_size(buffer_size_)
++    std::shared_ptr<Aws::S3::S3Client> client_ptr_, const String & bucket_, const String & key_, UInt64 s3_max_single_read_retries_, size_t buffer_size_)
++    : SeekableReadBuffer(nullptr, 0)
++    , client_ptr(std::move(client_ptr_))
++    , bucket(bucket_)
++    , key(key_)
++    , s3_max_single_read_retries(s3_max_single_read_retries_)
++    , buffer_size(buffer_size_)
+ {
+ }
+ 
+-
+ bool ReadBufferFromS3::nextImpl()
+ {
+-    if (!initialized)
+-    {
++    /// Restoring valid value of `count()` during `nextImpl()`. See `ReadBuffer::next()`.
++    pos = working_buffer.begin();
++
++    if (!impl)
+         impl = initialize();
+-        initialized = true;
+-    }
+ 
+     Stopwatch watch;
+-    auto res = impl->next();
++    bool next_result = false;
++
++    for (Int64 attempt = static_cast<Int64>(s3_max_single_read_retries); attempt >= 0; --attempt)
++    {
++        if (!impl)
++            impl = initialize();
++
++        try
++        {
++            next_result = impl->next();
++            /// FIXME. 1. Poco `istream` cannot read less than buffer_size or this state is being discarded during
++            ///           istream <-> iostream conversion. `gcount` always contains 0,
++            ///           that's why we always have error "Cannot read from istream at offset 0".
++
++            break;
++        }
++        catch (const Exception & e)
++        {
++            ProfileEvents::increment(ProfileEvents::S3ReadRequestsErrors, 1);
++
++            LOG_INFO(log, "Caught exception while reading S3 object. Bucket: {}, Key: {}, Offset: {}, Remaining attempts: {}, Message: {}",
++                    bucket, key, getPosition(), attempt, e.message());
++
++            impl.reset();
++
++            if (!attempt)
++                throw;
++        }
++    }
++
+     watch.stop();
+     ProfileEvents::increment(ProfileEvents::S3ReadMicroseconds, watch.elapsedMicroseconds());
+-
+-    if (!res)
++    if (!next_result)
+         return false;
+     internal_buffer = impl->buffer();
+ 
+@@ -60,7 +94,7 @@ bool ReadBufferFromS3::nextImpl()
+ 
+ off_t ReadBufferFromS3::seek(off_t offset_, int whence)
+ {
+-    if (initialized)
++    if (impl)
+         throw Exception("Seek is allowed only before first read attempt from the buffer.", ErrorCodes::CANNOT_SEEK_THROUGH_FILE);
+ 
+     if (whence != SEEK_SET)
+@@ -74,7 +108,6 @@ off_t ReadBufferFromS3::seek(off_t offset_, int whence)
+     return offset;
+ }
+ 
+-
+ off_t ReadBufferFromS3::getPosition()
+ {
+     return offset + count();
+@@ -82,13 +115,13 @@ off_t ReadBufferFromS3::getPosition()
+ 
+ std::unique_ptr<ReadBuffer> ReadBufferFromS3::initialize()
+ {
+-    LOG_TRACE(log, "Read S3 object. Bucket: {}, Key: {}, Offset: {}", bucket, key, std::to_string(offset));
++    LOG_TRACE(log, "Read S3 object. Bucket: {}, Key: {}, Offset: {}", bucket, key, getPosition());
+ 
+     Aws::S3::Model::GetObjectRequest req;
+     req.SetBucket(bucket);
+     req.SetKey(key);
+-    if (offset != 0)
+-        req.SetRange("bytes=" + std::to_string(offset) + "-");
++    if (getPosition())
++        req.SetRange("bytes=" + std::to_string(getPosition()) + "-");
+ 
+     Aws::S3::Model::GetObjectOutcome outcome = client_ptr->GetObject(req);
+ 
+diff --git a/src/IO/ReadBufferFromS3.h b/src/IO/ReadBufferFromS3.h
+index 829b73d0af6e..1f4124d909fb 100644
+--- a/src/IO/ReadBufferFromS3.h
++++ b/src/IO/ReadBufferFromS3.h
+@@ -27,8 +27,8 @@ class ReadBufferFromS3 : public SeekableReadBuffer
+     std::shared_ptr<Aws::S3::S3Client> client_ptr;
+     String bucket;
+     String key;
++    UInt64 s3_max_single_read_retries;
+     size_t buffer_size;
+-    bool initialized = false;
+     off_t offset = 0;
+     Aws::S3::Model::GetObjectResult read_result;
+     std::unique_ptr<ReadBuffer> impl;
+@@ -40,6 +40,7 @@ class ReadBufferFromS3 : public SeekableReadBuffer
+         std::shared_ptr<Aws::S3::S3Client> client_ptr_,
+         const String & bucket_,
+         const String & key_,
++        UInt64 s3_max_single_read_retries_,
+         size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE);
+ 
+     bool nextImpl() override;
+diff --git a/src/Storages/StorageS3.cpp b/src/Storages/StorageS3.cpp
+index a5cbd004d559..0bda8fac3ed6 100644
+--- a/src/Storages/StorageS3.cpp
++++ b/src/Storages/StorageS3.cpp
+@@ -166,6 +166,7 @@ StorageS3Source::StorageS3Source(
+     ContextPtr context_,
+     const ColumnsDescription & columns_,
+     UInt64 max_block_size_,
++    UInt64 s3_max_single_read_retries_,
+     const String compression_hint_,
+     const std::shared_ptr<Aws::S3::S3Client> & client_,
+     const String & bucket_,
+@@ -177,6 +178,7 @@ StorageS3Source::StorageS3Source(
+     , format(format_)
+     , columns_desc(columns_)
+     , max_block_size(max_block_size_)
++    , s3_max_single_read_retries(s3_max_single_read_retries_)
+     , compression_hint(compression_hint_)
+     , client(client_)
+     , sample_block(sample_block_)
+@@ -197,7 +199,7 @@ bool StorageS3Source::initialize()
+     file_path = bucket + "/" + current_key;
+ 
+     read_buf = wrapReadBufferWithCompressionMethod(
+-        std::make_unique<ReadBufferFromS3>(client, bucket, current_key), chooseCompressionMethod(current_key, compression_hint));
++        std::make_unique<ReadBufferFromS3>(client, bucket, current_key, s3_max_single_read_retries), chooseCompressionMethod(current_key, compression_hint));
+     auto input_format = FormatFactory::instance().getInput(format, *read_buf, sample_block, getContext(), max_block_size);
+     reader = std::make_shared<InputStreamFromInputFormat>(input_format);
+ 
+@@ -312,6 +314,7 @@ StorageS3::StorageS3(
+     const String & secret_access_key_,
+     const StorageID & table_id_,
+     const String & format_name_,
++    UInt64 s3_max_single_read_retries_,
+     UInt64 min_upload_part_size_,
+     UInt64 max_single_part_upload_size_,
+     UInt64 max_connections_,
+@@ -323,6 +326,7 @@ StorageS3::StorageS3(
+     : IStorage(table_id_)
+     , client_auth{uri_, access_key_id_, secret_access_key_, max_connections_, {}, {}} /// Client and settings will be updated later
+     , format_name(format_name_)
++    , s3_max_single_read_retries(s3_max_single_read_retries_)
+     , min_upload_part_size(min_upload_part_size_)
+     , max_single_part_upload_size(max_single_part_upload_size_)
+     , compression_method(compression_method_)
+@@ -389,6 +393,7 @@ Pipe StorageS3::read(
+             local_context,
+             metadata_snapshot->getColumns(),
+             max_block_size,
++            s3_max_single_read_retries,
+             compression_method,
+             client_auth.client,
+             client_auth.uri.bucket,
+@@ -473,6 +478,7 @@ void registerStorageS3Impl(const String & name, StorageFactory & factory)
+             secret_access_key = engine_args[2]->as<ASTLiteral &>().value.safeGet<String>();
+         }
+ 
++        UInt64 s3_max_single_read_retries = args.getLocalContext()->getSettingsRef().s3_max_single_read_retries;
+         UInt64 min_upload_part_size = args.getLocalContext()->getSettingsRef().s3_min_upload_part_size;
+         UInt64 max_single_part_upload_size = args.getLocalContext()->getSettingsRef().s3_max_single_part_upload_size;
+         UInt64 max_connections = args.getLocalContext()->getSettingsRef().s3_max_connections;
+@@ -496,6 +502,7 @@ void registerStorageS3Impl(const String & name, StorageFactory & factory)
+             secret_access_key,
+             args.table_id,
+             format_name,
++            s3_max_single_read_retries,
+             min_upload_part_size,
+             max_single_part_upload_size,
+             max_connections,
+diff --git a/src/Storages/StorageS3.h b/src/Storages/StorageS3.h
+index 1e1d76fa6e3f..b068f82cfb1a 100644
+--- a/src/Storages/StorageS3.h
++++ b/src/Storages/StorageS3.h
+@@ -55,6 +55,7 @@ class StorageS3Source : public SourceWithProgress, WithContext
+         ContextPtr context_,
+         const ColumnsDescription & columns_,
+         UInt64 max_block_size_,
++        UInt64 s3_max_single_read_retries_,
+         const String compression_hint_,
+         const std::shared_ptr<Aws::S3::S3Client> & client_,
+         const String & bucket,
+@@ -71,6 +72,7 @@ class StorageS3Source : public SourceWithProgress, WithContext
+     String format;
+     ColumnsDescription columns_desc;
+     UInt64 max_block_size;
++    UInt64 s3_max_single_read_retries;
+     String compression_hint;
+     std::shared_ptr<Aws::S3::S3Client> client;
+     Block sample_block;
+@@ -100,6 +102,7 @@ class StorageS3 : public ext::shared_ptr_helper<StorageS3>, public IStorage, Wit
+         const String & secret_access_key,
+         const StorageID & table_id_,
+         const String & format_name_,
++        UInt64 s3_max_single_read_retries_,
+         UInt64 min_upload_part_size_,
+         UInt64 max_single_part_upload_size_,
+         UInt64 max_connections_,
+@@ -145,6 +148,7 @@ class StorageS3 : public ext::shared_ptr_helper<StorageS3>, public IStorage, Wit
+     ClientAuthentificaiton client_auth;
+ 
+     String format_name;
++    UInt64 s3_max_single_read_retries;
+     size_t min_upload_part_size;
+     size_t max_single_part_upload_size;
+     String compression_method;
+diff --git a/src/TableFunctions/TableFunctionS3.cpp b/src/TableFunctions/TableFunctionS3.cpp
+index 2da597f49ff9..973899d21019 100644
+--- a/src/TableFunctions/TableFunctionS3.cpp
++++ b/src/TableFunctions/TableFunctionS3.cpp
+@@ -83,6 +83,7 @@ StoragePtr TableFunctionS3::executeImpl(const ASTPtr & /*ast_function*/, Context
+ {
+     Poco::URI uri (filename);
+     S3::URI s3_uri (uri);
++    UInt64 s3_max_single_read_retries = context->getSettingsRef().s3_max_single_read_retries;
+     UInt64 min_upload_part_size = context->getSettingsRef().s3_min_upload_part_size;
+     UInt64 max_single_part_upload_size = context->getSettingsRef().s3_max_single_part_upload_size;
+     UInt64 max_connections = context->getSettingsRef().s3_max_connections;
+@@ -93,6 +94,7 @@ StoragePtr TableFunctionS3::executeImpl(const ASTPtr & /*ast_function*/, Context
+             secret_access_key,
+             StorageID(getDatabaseName(), table_name),
+             format,
++            s3_max_single_read_retries,
+             min_upload_part_size,
+             max_single_part_upload_size,
+             max_connections,
+diff --git a/src/TableFunctions/TableFunctionS3Cluster.cpp b/src/TableFunctions/TableFunctionS3Cluster.cpp
+index 26ef07ef97fe..16f48c706089 100644
+--- a/src/TableFunctions/TableFunctionS3Cluster.cpp
++++ b/src/TableFunctions/TableFunctionS3Cluster.cpp
+@@ -109,12 +109,17 @@ StoragePtr TableFunctionS3Cluster::executeImpl(
+         Poco::URI uri (filename);
+         S3::URI s3_uri (uri);
+         /// Actually this parameters are not used
++        UInt64 s3_max_single_read_retries = context->getSettingsRef().s3_max_single_read_retries;
+         UInt64 min_upload_part_size = context->getSettingsRef().s3_min_upload_part_size;
+         UInt64 max_single_part_upload_size = context->getSettingsRef().s3_max_single_part_upload_size;
+         UInt64 max_connections = context->getSettingsRef().s3_max_connections;
+         storage = StorageS3::create(
+             s3_uri, access_key_id, secret_access_key, StorageID(getDatabaseName(), table_name),
+-            format, min_upload_part_size, max_single_part_upload_size, max_connections,
++            format,
++            s3_max_single_read_retries,
++            min_upload_part_size,
++            max_single_part_upload_size,
++            max_connections,
+             getActualTableStructure(context), ConstraintsDescription{},
+             context, compression_method, /*distributed_processing=*/true);
+     }

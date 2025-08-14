@@ -1,0 +1,179 @@
+diff --git a/dbms/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp b/dbms/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+index 74193fa71568..5a9affaacd4d 100644
+--- a/dbms/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
++++ b/dbms/src/Storages/MergeTree/MergeTreeDataMergerMutator.cpp
+@@ -157,7 +157,14 @@ UInt64 MergeTreeDataMergerMutator::getMaxSourcePartsSizeForMerge(size_t pool_siz
+ 
+ UInt64 MergeTreeDataMergerMutator::getMaxSourcePartSizeForMutation()
+ {
+-    return static_cast<UInt64>(DiskSpaceMonitor::getUnreservedFreeSpace(data.full_path) / DISK_USAGE_COEFFICIENT_TO_RESERVE);
++    size_t total_threads_in_pool = pool.getNumberOfThreads();
++    size_t busy_threads_in_pool = CurrentMetrics::values[CurrentMetrics::BackgroundPoolTask].load(std::memory_order_relaxed);
++
++    /// Allow mutations only if there are enough threads, leave free threads for merges else
++    if (total_threads_in_pool - busy_threads_in_pool >= data.settings.number_of_free_entries_in_pool_to_execute_mutation)
++        return static_cast<UInt64>(DiskSpaceMonitor::getUnreservedFreeSpace(data.full_path) / DISK_USAGE_COEFFICIENT_TO_RESERVE);
++
++    return 0;
+ }
+ 
+ 
+diff --git a/dbms/src/Storages/MergeTree/MergeTreeSettings.h b/dbms/src/Storages/MergeTree/MergeTreeSettings.h
+index e670000ecc5b..afd0772a9374 100644
+--- a/dbms/src/Storages/MergeTree/MergeTreeSettings.h
++++ b/dbms/src/Storages/MergeTree/MergeTreeSettings.h
+@@ -30,8 +30,10 @@ struct MergeTreeSettings : public SettingsCollection<MergeTreeSettings>
+     /** Merge settings. */ \
+     M(SettingUInt64, max_bytes_to_merge_at_max_space_in_pool, 150ULL * 1024 * 1024 * 1024, "Maximum in total size of parts to merge, when there are maximum free threads in background pool (or entries in replication queue).") \
+     M(SettingUInt64, max_bytes_to_merge_at_min_space_in_pool, 1024 * 1024, "Maximum in total size of parts to merge, when there are minimum free threads in background pool (or entries in replication queue).") \
+-    M(SettingUInt64, max_replicated_merges_in_queue, 16, "How many tasks of merging parts are allowed simultaneously in ReplicatedMergeTree queue.") \
++    M(SettingUInt64, max_replicated_merges_in_queue, 16, "How many tasks of merging and mutating parts are allowed simultaneously in ReplicatedMergeTree queue.") \
++    M(SettingUInt64, max_replicated_mutations_in_queue, 8, "How many tasks of mutating parts are allowed simultaneously in ReplicatedMergeTree queue.") \
+     M(SettingUInt64, number_of_free_entries_in_pool_to_lower_max_size_of_merge, 8, "When there is less than specified number of free entries in pool (or replicated queue), start to lower maximum size of merge to process (or to put in queue). This is to allow small merges to process - not filling the pool with long running merges.") \
++    M(SettingUInt64, number_of_free_entries_in_pool_to_execute_mutation, 10, "When there is less than specified number of free entries in pool, do not execute part mutations. This is to leave free threads for regular merges and avoid \"Too many parts\"") \
+     M(SettingSeconds, old_parts_lifetime, 8 * 60, "How many seconds to keep obsolete parts.") \
+     M(SettingSeconds, temporary_directories_lifetime, 86400, "How many seconds to keep tmp_-directories.") \
+     \
+diff --git a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+index 665e8c9bd5c5..fd65f14fedbf 100644
+--- a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
++++ b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.cpp
+@@ -956,15 +956,19 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
+             return false;
+         }
+ 
+-        /** Execute merge only if there are enough free threads in background pool to do merges of that size.
+-          * But if all threads are free (maximal size of merge is allowed) then execute any merge,
+-          *  (because it may be ordered by OPTIMIZE or early with differrent settings).
++        UInt64 max_source_parts_size = entry.type == LogEntry::MERGE_PARTS ? merger_mutator.getMaxSourcePartsSizeForMerge()
++                                                                           : merger_mutator.getMaxSourcePartSizeForMutation();
++        /** If there are enough free threads in background pool to do large merges (maximal size of merge is allowed),
++          * then ignore value returned by getMaxSourcePartsSizeForMerge() and execute merge of any size,
++          * because it may be ordered by OPTIMIZE or early with different settings.
++          * Setting max_bytes_to_merge_at_max_space_in_pool still working for regular merges,
++          * because the leader replica does not assign merges of greater size (except OPTIMIZE PARTITION and OPTIMIZE FINAL).
+           */
+-        UInt64 max_source_parts_size = merger_mutator.getMaxSourcePartsSizeForMerge();
+-        if (max_source_parts_size != data.settings.max_bytes_to_merge_at_max_space_in_pool
+-            && sum_parts_size_in_bytes > max_source_parts_size)
++        bool ignore_max_size = (entry.type == LogEntry::MERGE_PARTS) && (max_source_parts_size == data.settings.max_bytes_to_merge_at_max_space_in_pool);
++
++        if (!ignore_max_size && sum_parts_size_in_bytes > max_source_parts_size)
+         {
+-            String reason = "Not executing log entry for part " + entry.new_part_name
++            String reason = "Not executing log entry " + entry.typeToString() + " for part " + entry.new_part_name
+                 + " because source parts size (" + formatReadableSizeWithBinarySuffix(sum_parts_size_in_bytes)
+                 + ") is greater than the current maximum (" + formatReadableSizeWithBinarySuffix(max_source_parts_size) + ").";
+             LOG_DEBUG(log, reason);
+@@ -1154,17 +1158,21 @@ bool ReplicatedMergeTreeQueue::processEntry(
+ }
+ 
+ 
+-size_t ReplicatedMergeTreeQueue::countMergesAndPartMutations() const
++std::pair<size_t, size_t> ReplicatedMergeTreeQueue::countMergesAndPartMutations() const
+ {
+     std::lock_guard lock(state_mutex);
+ 
+-    size_t count = 0;
++    size_t count_merges = 0;
++    size_t count_mutations = 0;
+     for (const auto & entry : queue)
+-        if (entry->type == ReplicatedMergeTreeLogEntry::MERGE_PARTS
+-            || entry->type == ReplicatedMergeTreeLogEntry::MUTATE_PART)
+-            ++count;
++    {
++        if (entry->type == ReplicatedMergeTreeLogEntry::MERGE_PARTS)
++            ++count_merges;
++        else if (entry->type == ReplicatedMergeTreeLogEntry::MUTATE_PART)
++            ++count_mutations;
++    }
+ 
+-    return count;
++    return std::make_pair(count_merges, count_mutations);
+ }
+ 
+ 
+diff --git a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+index 47d82f4a9a2a..5a84cfbb5a6b 100644
+--- a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
++++ b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeQueue.h
+@@ -296,7 +296,7 @@ class ReplicatedMergeTreeQueue
+     bool processEntry(std::function<zkutil::ZooKeeperPtr()> get_zookeeper, LogEntryPtr & entry, const std::function<bool(LogEntryPtr &)> func);
+ 
+     /// Count the number of merges and mutations of single parts in the queue.
+-    size_t countMergesAndPartMutations() const;
++    std::pair<size_t, size_t> countMergesAndPartMutations() const;
+ 
+     /// Count the total number of active mutations.
+     size_t countMutations() const;
+diff --git a/dbms/src/Storages/StorageMergeTree.cpp b/dbms/src/Storages/StorageMergeTree.cpp
+index d062bb197ca7..779efe95a8c2 100644
+--- a/dbms/src/Storages/StorageMergeTree.cpp
++++ b/dbms/src/Storages/StorageMergeTree.cpp
+@@ -624,8 +624,6 @@ bool StorageMergeTree::tryMutatePart()
+     /// You must call destructor with unlocked `currently_merging_mutex`.
+     std::optional<CurrentlyMergingPartsTagger> tagger;
+     {
+-        auto disk_space = DiskSpaceMonitor::getUnreservedFreeSpace(full_path);
+-
+         std::lock_guard lock(currently_merging_mutex);
+ 
+         if (current_mutations_by_version.empty())
+@@ -641,8 +639,7 @@ bool StorageMergeTree::tryMutatePart()
+             if (mutations_begin_it == mutations_end_it)
+                 continue;
+ 
+-            auto estimated_needed_space = MergeTreeDataMergerMutator::estimateNeededDiskSpace({part});
+-            if (estimated_needed_space > disk_space)
++            if (merger_mutator.getMaxSourcePartSizeForMutation() < part->bytes_on_disk)
+                 continue;
+ 
+             for (auto it = mutations_begin_it; it != mutations_end_it; ++it)
+@@ -655,7 +652,7 @@ bool StorageMergeTree::tryMutatePart()
+             future_part.part_info = new_part_info;
+             future_part.name = part->getNewName(new_part_info);
+ 
+-            tagger.emplace(future_part, estimated_needed_space, *this);
++            tagger.emplace(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace({part}), *this);
+             break;
+         }
+     }
+diff --git a/dbms/src/Storages/StorageReplicatedMergeTree.cpp b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+index 8b32cc327049..7a946400658a 100644
+--- a/dbms/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -2193,17 +2193,18 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
+         /// If many merges is already queued, then will queue only small enough merges.
+         /// Otherwise merge queue could be filled with only large merges,
+         /// and in the same time, many small parts could be created and won't be merged.
+-        size_t merges_and_mutations_queued = queue.countMergesAndPartMutations();
+-        if (merges_and_mutations_queued >= settings.max_replicated_merges_in_queue)
++        auto merges_and_mutations_queued = queue.countMergesAndPartMutations();
++        size_t merges_and_mutations_sum = merges_and_mutations_queued.first + merges_and_mutations_queued.second;
++        if (merges_and_mutations_sum >= settings.max_replicated_merges_in_queue)
+         {
+-            LOG_TRACE(log, "Number of queued merges and part mutations (" << merges_and_mutations_queued
+-                << ") is greater than max_replicated_merges_in_queue ("
++            LOG_TRACE(log, "Number of queued merges (" << merges_and_mutations_queued.first << ") and part mutations ("
++                << merges_and_mutations_queued.second << ") is greater than max_replicated_merges_in_queue ("
+                 << settings.max_replicated_merges_in_queue << "), so won't select new parts to merge or mutate.");
+         }
+         else
+         {
+             UInt64 max_source_parts_size_for_merge = merger_mutator.getMaxSourcePartsSizeForMerge(
+-                settings.max_replicated_merges_in_queue, merges_and_mutations_queued);
++                settings.max_replicated_merges_in_queue, merges_and_mutations_sum);
+             UInt64 max_source_part_size_for_mutation = merger_mutator.getMaxSourcePartSizeForMutation();
+ 
+             FutureMergedMutatedPart future_merged_part;
+@@ -2213,7 +2214,9 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
+                 success = createLogEntryToMergeParts(zookeeper, future_merged_part.parts,
+                     future_merged_part.name, deduplicate, force_ttl);
+             }
+-            else if (max_source_part_size_for_mutation > 0 && queue.countMutations() > 0)
++            /// If there are many mutations in queue it may happen, that we cannot enqueue enough merges to merge all new parts
++            else if (max_source_part_size_for_mutation > 0 && queue.countMutations() > 0
++                     && merges_and_mutations_queued.second < settings.max_replicated_mutations_in_queue)
+             {
+                 /// Choose a part to mutate.
+                 DataPartsVector data_parts = getDataPartsVector();

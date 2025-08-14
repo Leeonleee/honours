@@ -1,0 +1,657 @@
+diff --git a/docs/en/sql-reference/functions/string-search-functions.md b/docs/en/sql-reference/functions/string-search-functions.md
+index 7b14b0e96dee..b6b70c7795bc 100644
+--- a/docs/en/sql-reference/functions/string-search-functions.md
++++ b/docs/en/sql-reference/functions/string-search-functions.md
+@@ -391,10 +391,18 @@ For patterns to search for substrings in a string, it is better to use LIKE or 
+ 
+ ## multiMatchAny(haystack, \[pattern<sub>1</sub>, pattern<sub>2</sub>, …, pattern<sub>n</sub>\])
+ 
+-The same as `match`, but returns 0 if none of the regular expressions are matched and 1 if any of the patterns matches. It uses [hyperscan](https://github.com/intel/hyperscan) library. For patterns to search substrings in a string, it is better to use `multiSearchAny` since it works much faster.
++The same as `match`, but returns 0 if none of the regular expressions are matched and 1 if any of the patterns matches. For patterns to search substrings in a string, it is better to use `multiSearchAny` since it works much faster.
+ 
+ :::note
+-The length of any of the `haystack` string must be less than 2<sup>32</sup> bytes otherwise the exception is thrown. This restriction takes place because of hyperscan API.
++Functions `multiMatchAny`, `multiMatchAnyIndex`, `multiMatchAllIndices` and their fuzzy equivalents (`multiFuzzyMatchAny`,
++`multiFuzzyMatchAnyIndex`, `multiFuzzyMatchAllIndices`) use the (Vectorscan)[https://github.com/VectorCamp/vectorscan] library. As such,
++they are only enabled if ClickHouse is compiled with support for vectorscan.
++
++Due to restrictions of vectorscan, the length of the `haystack` string must be less than 2<sup>32</sup> bytes.
++
++Hyperscan is generally vulnerable to regular expression denial of service (ReDoS) attacks (e.g. see
++(here)[https://www.usenix.org/conference/usenixsecurity22/presentation/turonova], (here)[https://doi.org/10.1007/s10664-021-10033-1] and
++(here)[ https://doi.org/10.1145/3236024.3236027]. Users are adviced to check the provided patterns carefully.
+ :::
+ 
+ ## multiMatchAnyIndex(haystack, \[pattern<sub>1</sub>, pattern<sub>2</sub>, …, pattern<sub>n</sub>\])
+diff --git a/src/Core/Settings.h b/src/Core/Settings.h
+index 983ec4d64165..e378de778751 100644
+--- a/src/Core/Settings.h
++++ b/src/Core/Settings.h
+@@ -446,6 +446,7 @@ class IColumn;
+     M(Bool, allow_hyperscan, true, "Allow functions that use Hyperscan library. Disable to avoid potentially long compilation times and excessive resource usage.", 0) \
+     M(UInt64, max_hyperscan_regexp_length, 0, "Max length of regexp than can be used in hyperscan multi-match functions. Zero means unlimited.", 0) \
+     M(UInt64, max_hyperscan_regexp_total_length, 0, "Max total length of all regexps than can be used in hyperscan multi-match functions (per every function). Zero means unlimited.", 0) \
++    M(Bool, reject_expensive_hyperscan_regexps, true, "Reject patterns which will likely be expensive to evaluate with hyperscan (due to NFA state explosion)", 0) \
+     M(Bool, allow_simdjson, true, "Allow using simdjson library in 'JSON*' functions if AVX2 instructions are available. If disabled rapidjson will be used.", 0) \
+     M(Bool, allow_introspection_functions, false, "Allow functions for introspection of ELF and DWARF for query profiling. These functions are slow and may impose security considerations.", 0) \
+     \
+diff --git a/src/Dictionaries/RegExpTreeDictionary.cpp b/src/Dictionaries/RegExpTreeDictionary.cpp
+index fdda2cd407d8..c636f200324a 100644
+--- a/src/Dictionaries/RegExpTreeDictionary.cpp
++++ b/src/Dictionaries/RegExpTreeDictionary.cpp
+@@ -17,6 +17,7 @@
+ #include <DataTypes/DataTypesNumber.h>
+ 
+ #include <Functions/Regexps.h>
++#include <Functions/checkHyperscanRegexp.h>
+ #include <QueryPipeline/QueryPipeline.h>
+ 
+ #include <Dictionaries/ClickHouseDictionarySource.h>
+@@ -152,53 +153,6 @@ void RegExpTreeDictionary::calculateBytesAllocated()
+     bytes_allocated += 2 * sizeof(UInt64) * topology_order.size();
+ }
+ 
+-namespace
+-{
+-    /// hyper scan is not good at processing regex containing {0, 200}
+-    /// This will make re compilation slow and failed. So we select this heavy regular expressions and
+-    /// process it with re2.
+-    struct RegexChecker
+-    {
+-        re2_st::RE2 searcher;
+-        RegexChecker() : searcher(R"(\{([\d]+),([\d]+)\})") {}
+-
+-        static bool isFigureLargerThanFifty(const String & str)
+-        try
+-        {
+-            auto number = std::stoi(str);
+-            return number > 50;
+-        }
+-        catch (std::exception &)
+-        {
+-            return false;
+-        }
+-
+-        [[maybe_unused]]
+-        bool isSimpleRegex(const String & regex) const
+-        {
+-
+-            re2_st::StringPiece haystack(regex.data(), regex.size());
+-            re2_st::StringPiece matches[10];
+-            size_t start_pos = 0;
+-            while (start_pos < regex.size())
+-            {
+-                if (searcher.Match(haystack, start_pos, regex.size(), re2_st::RE2::Anchor::UNANCHORED, matches, 10))
+-                {
+-                    const auto & match = matches[0];
+-                    start_pos += match.length();
+-                    const auto & match1 = matches[1];
+-                    const auto & match2 = matches[2];
+-                    if (isFigureLargerThanFifty(match1.ToString()) || isFigureLargerThanFifty(match2.ToString()))
+-                        return false;
+-                }
+-                else
+-                    break;
+-            }
+-            return true;
+-        }
+-    };
+-}
+-
+ void RegExpTreeDictionary::initRegexNodes(Block & block)
+ {
+     auto id_column = block.getByName(kId).column;
+@@ -207,7 +161,9 @@ void RegExpTreeDictionary::initRegexNodes(Block & block)
+     auto keys_column = block.getByName(kKeys).column;
+     auto values_column = block.getByName(kValues).column;
+ 
+-    RegexChecker checker;
++#ifdef USE_VECTORSCAN
++    SlowWithHyperscanChecker checker;
++#endif
+ 
+     size_t size = block.rows();
+     for (size_t i = 0; i < size; i++)
+@@ -253,7 +209,7 @@ void RegExpTreeDictionary::initRegexNodes(Block & block)
+         }
+         regex_nodes.emplace(id, node);
+ #if USE_VECTORSCAN
+-        if (use_vectorscan && checker.isSimpleRegex(regex))
++        if (use_vectorscan && !checker.isSlow(regex))
+         {
+             simple_regexps.push_back(regex);
+             regexp_ids.push_back(id);
+diff --git a/src/Functions/FunctionsMultiStringFuzzySearch.h b/src/Functions/FunctionsMultiStringFuzzySearch.h
+index 5d86dd4dadad..00d989f388ed 100644
+--- a/src/Functions/FunctionsMultiStringFuzzySearch.h
++++ b/src/Functions/FunctionsMultiStringFuzzySearch.h
+@@ -39,13 +39,14 @@ class FunctionsMultiStringFuzzySearch : public IFunction
+     static FunctionPtr create(ContextPtr context)
+     {
+         const auto & settings = context->getSettingsRef();
+-        return std::make_shared<FunctionsMultiStringFuzzySearch>(settings.allow_hyperscan, settings.max_hyperscan_regexp_length, settings.max_hyperscan_regexp_total_length);
++        return std::make_shared<FunctionsMultiStringFuzzySearch>(settings.allow_hyperscan, settings.max_hyperscan_regexp_length, settings.max_hyperscan_regexp_total_length, settings.reject_expensive_hyperscan_regexps);
+     }
+ 
+-    FunctionsMultiStringFuzzySearch(bool allow_hyperscan_, size_t max_hyperscan_regexp_length_, size_t max_hyperscan_regexp_total_length_)
++    FunctionsMultiStringFuzzySearch(bool allow_hyperscan_, size_t max_hyperscan_regexp_length_, size_t max_hyperscan_regexp_total_length_, bool reject_expensive_hyperscan_regexps_)
+         : allow_hyperscan(allow_hyperscan_)
+         , max_hyperscan_regexp_length(max_hyperscan_regexp_length_)
+         , max_hyperscan_regexp_total_length(max_hyperscan_regexp_total_length_)
++        , reject_expensive_hyperscan_regexps(reject_expensive_hyperscan_regexps_)
+     {}
+ 
+     String getName() const override { return name; }
+@@ -112,14 +113,14 @@ class FunctionsMultiStringFuzzySearch : public IFunction
+                 col_needles_const->getValue<Array>(),
+                 vec_res, offsets_res,
+                 edit_distance,
+-                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+         else
+             Impl::vectorVector(
+                 col_haystack_vector->getChars(), col_haystack_vector->getOffsets(),
+                 col_needles_vector->getData(), col_needles_vector->getOffsets(),
+                 vec_res, offsets_res,
+                 edit_distance,
+-                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+ 
+         // the combination of const haystack + const needle is not implemented because
+         // useDefaultImplementationForConstants() == true makes upper layers convert both to
+@@ -135,6 +136,7 @@ class FunctionsMultiStringFuzzySearch : public IFunction
+     const bool allow_hyperscan;
+     const size_t max_hyperscan_regexp_length;
+     const size_t max_hyperscan_regexp_total_length;
++    const bool reject_expensive_hyperscan_regexps;
+ };
+ 
+ }
+diff --git a/src/Functions/FunctionsMultiStringSearch.h b/src/Functions/FunctionsMultiStringSearch.h
+index 2465567b8836..c0ed90aa042c 100644
+--- a/src/Functions/FunctionsMultiStringSearch.h
++++ b/src/Functions/FunctionsMultiStringSearch.h
+@@ -53,13 +53,14 @@ class FunctionsMultiStringSearch : public IFunction
+     static FunctionPtr create(ContextPtr context)
+     {
+         const auto & settings = context->getSettingsRef();
+-        return std::make_shared<FunctionsMultiStringSearch>(settings.allow_hyperscan, settings.max_hyperscan_regexp_length, settings.max_hyperscan_regexp_total_length);
++        return std::make_shared<FunctionsMultiStringSearch>(settings.allow_hyperscan, settings.max_hyperscan_regexp_length, settings.max_hyperscan_regexp_total_length, settings.reject_expensive_hyperscan_regexps);
+     }
+ 
+-    FunctionsMultiStringSearch(bool allow_hyperscan_, size_t max_hyperscan_regexp_length_, size_t max_hyperscan_regexp_total_length_)
++    FunctionsMultiStringSearch(bool allow_hyperscan_, size_t max_hyperscan_regexp_length_, size_t max_hyperscan_regexp_total_length_, bool reject_expensive_hyperscan_regexps_)
+         : allow_hyperscan(allow_hyperscan_)
+         , max_hyperscan_regexp_length(max_hyperscan_regexp_length_)
+         , max_hyperscan_regexp_total_length(max_hyperscan_regexp_total_length_)
++        , reject_expensive_hyperscan_regexps(reject_expensive_hyperscan_regexps_)
+     {}
+ 
+     String getName() const override { return name; }
+@@ -108,13 +109,13 @@ class FunctionsMultiStringSearch : public IFunction
+                 col_haystack_vector->getChars(), col_haystack_vector->getOffsets(),
+                 col_needles_const->getValue<Array>(),
+                 vec_res, offsets_res,
+-                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+         else
+             Impl::vectorVector(
+                 col_haystack_vector->getChars(), col_haystack_vector->getOffsets(),
+                 col_needles_vector->getData(), col_needles_vector->getOffsets(),
+                 vec_res, offsets_res,
+-                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++                allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+ 
+         // the combination of const haystack + const needle is not implemented because
+         // useDefaultImplementationForConstants() == true makes upper layers convert both to
+@@ -130,6 +131,7 @@ class FunctionsMultiStringSearch : public IFunction
+     const bool allow_hyperscan;
+     const size_t max_hyperscan_regexp_length;
+     const size_t max_hyperscan_regexp_total_length;
++    const bool reject_expensive_hyperscan_regexps;
+ };
+ 
+ }
+diff --git a/src/Functions/MatchImpl.h b/src/Functions/MatchImpl.h
+index 00c08ea8531a..db8dd55474e4 100644
+--- a/src/Functions/MatchImpl.h
++++ b/src/Functions/MatchImpl.h
+@@ -6,7 +6,7 @@
+ #include <Columns/ColumnString.h>
+ #include <Columns/ColumnsNumber.h>
+ #include <Core/ColumnNumbers.h>
+-#include "Regexps.h"
++#include <Functions/Regexps.h>
+ 
+ #include "config.h"
+ #include <re2_st/re2.h>
+diff --git a/src/Functions/MultiMatchAllIndicesImpl.h b/src/Functions/MultiMatchAllIndicesImpl.h
+index dec8349e6934..d655311f5320 100644
+--- a/src/Functions/MultiMatchAllIndicesImpl.h
++++ b/src/Functions/MultiMatchAllIndicesImpl.h
+@@ -6,7 +6,7 @@
+ #include <DataTypes/DataTypesNumber.h>
+ #include <DataTypes/DataTypeArray.h>
+ #include <Functions/checkHyperscanRegexp.h>
+-#include "Regexps.h"
++#include <Functions/Regexps.h>
+ 
+ #include "config.h"
+ 
+@@ -51,9 +51,10 @@ struct MultiMatchAllIndicesImpl
+         PaddedPODArray<UInt64> & offsets,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+-        vectorConstant(haystack_data, haystack_offsets, needles_arr, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++        vectorConstant(haystack_data, haystack_offsets, needles_arr, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+     }
+ 
+     static void vectorConstant(
+@@ -65,7 +66,8 @@ struct MultiMatchAllIndicesImpl
+         std::optional<UInt32> edit_distance,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+         if (!allow_hyperscan)
+             throw Exception(ErrorCodes::FUNCTION_NOT_ALLOWED, "Hyperscan functions are disabled, because setting 'allow_hyperscan' is set to 0");
+@@ -77,6 +79,14 @@ struct MultiMatchAllIndicesImpl
+ 
+         checkHyperscanRegexp(needles, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
+ 
++        if (reject_expensive_hyperscan_regexps)
++        {
++            SlowWithHyperscanChecker checker;
++            for (auto needle : needles)
++                if (checker.isSlow(needle))
++                    throw Exception(ErrorCodes::HYPERSCAN_CANNOT_SCAN_TEXT, "Regular expression evaluation in vectorscan will be too slow. To ignore this error, disable setting 'reject_expensive_hyperscan_regexps'.");
++        }
++
+         offsets.resize(haystack_offsets.size());
+ 
+         if (needles_arr.empty())
+@@ -135,6 +145,7 @@ struct MultiMatchAllIndicesImpl
+         (void)edit_distance;
+         (void)max_hyperscan_regexp_length;
+         (void)max_hyperscan_regexp_total_length;
++        (void)reject_expensive_hyperscan_regexps;
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "multi-search all indices is not implemented when vectorscan is off");
+ #endif // USE_VECTORSCAN
+     }
+@@ -148,9 +159,10 @@ struct MultiMatchAllIndicesImpl
+         PaddedPODArray<UInt64> & offsets,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+-        vectorVector(haystack_data, haystack_offsets, needles_data, needles_offsets, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++        vectorVector(haystack_data, haystack_offsets, needles_data, needles_offsets, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+     }
+ 
+     static void vectorVector(
+@@ -163,7 +175,8 @@ struct MultiMatchAllIndicesImpl
+         std::optional<UInt32> edit_distance,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+         if (!allow_hyperscan)
+             throw Exception(ErrorCodes::FUNCTION_NOT_ALLOWED, "Hyperscan functions are disabled, because setting 'allow_hyperscan' is set to 0");
+@@ -195,6 +208,14 @@ struct MultiMatchAllIndicesImpl
+ 
+             checkHyperscanRegexp(needles, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
+ 
++            if (reject_expensive_hyperscan_regexps)
++            {
++                SlowWithHyperscanChecker checker;
++                for (auto needle : needles)
++                    if (checker.isSlow(needle))
++                        throw Exception(ErrorCodes::HYPERSCAN_CANNOT_SCAN_TEXT, "Regular expression evaluation in vectorscan will be too slow. To ignore this error, disable setting 'reject_expensive_hyperscan_regexps'.");
++            }
++
+             MultiRegexps::DeferredConstructedRegexpsPtr deferred_constructed_regexps = MultiRegexps::getOrSet</*SaveIndices*/ true, WithEditDistance>(needles, edit_distance);
+             MultiRegexps::Regexps * regexps = deferred_constructed_regexps->get();
+             hs_scratch_t * scratch = nullptr;
+@@ -249,6 +270,7 @@ struct MultiMatchAllIndicesImpl
+         (void)edit_distance;
+         (void)max_hyperscan_regexp_length;
+         (void)max_hyperscan_regexp_total_length;
++        (void)reject_expensive_hyperscan_regexps;
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "multi-search all indices is not implemented when vectorscan is off");
+ #endif // USE_VECTORSCAN
+     }
+diff --git a/src/Functions/MultiMatchAnyImpl.h b/src/Functions/MultiMatchAnyImpl.h
+index 0e42d4f6b583..672aaa951690 100644
+--- a/src/Functions/MultiMatchAnyImpl.h
++++ b/src/Functions/MultiMatchAnyImpl.h
+@@ -5,7 +5,7 @@
+ #include <Columns/ColumnString.h>
+ #include <DataTypes/DataTypesNumber.h>
+ #include <Functions/checkHyperscanRegexp.h>
+-#include "Regexps.h"
++#include <Functions/Regexps.h>
+ 
+ #include "config.h"
+ 
+@@ -65,9 +65,10 @@ struct MultiMatchAnyImpl
+         PaddedPODArray<UInt64> & offsets,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+-        vectorConstant(haystack_data, haystack_offsets, needles_arr, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++        vectorConstant(haystack_data, haystack_offsets, needles_arr, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+     }
+ 
+     static void vectorConstant(
+@@ -79,7 +80,8 @@ struct MultiMatchAnyImpl
+         [[maybe_unused]] std::optional<UInt32> edit_distance,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+         if (!allow_hyperscan)
+             throw Exception(ErrorCodes::FUNCTION_NOT_ALLOWED, "Hyperscan functions are disabled, because setting 'allow_hyperscan' is set to 0");
+@@ -91,6 +93,14 @@ struct MultiMatchAnyImpl
+ 
+         checkHyperscanRegexp(needles, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
+ 
++        if (reject_expensive_hyperscan_regexps)
++        {
++            SlowWithHyperscanChecker checker;
++            for (auto needle : needles)
++                if (checker.isSlow(needle))
++                    throw Exception(ErrorCodes::HYPERSCAN_CANNOT_SCAN_TEXT, "Regular expression evaluation in vectorscan will be too slow. To ignore this error, disable setting 'reject_expensive_hyperscan_regexps'.");
++        }
++
+         res.resize(haystack_offsets.size());
+ 
+         if (needles_arr.empty())
+@@ -175,9 +185,10 @@ struct MultiMatchAnyImpl
+         PaddedPODArray<UInt64> & offsets,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+-        vectorVector(haystack_data, haystack_offsets, needles_data, needles_offsets, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
++        vectorVector(haystack_data, haystack_offsets, needles_data, needles_offsets, res, offsets, std::nullopt, allow_hyperscan, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length, reject_expensive_hyperscan_regexps);
+     }
+ 
+     static void vectorVector(
+@@ -190,7 +201,8 @@ struct MultiMatchAnyImpl
+         std::optional<UInt32> edit_distance,
+         bool allow_hyperscan,
+         size_t max_hyperscan_regexp_length,
+-        size_t max_hyperscan_regexp_total_length)
++        size_t max_hyperscan_regexp_total_length,
++        bool reject_expensive_hyperscan_regexps)
+     {
+         if (!allow_hyperscan)
+             throw Exception(ErrorCodes::FUNCTION_NOT_ALLOWED, "Hyperscan functions are disabled, because setting 'allow_hyperscan' is set to 0");
+@@ -209,9 +221,7 @@ struct MultiMatchAnyImpl
+             needles.reserve(needles_offsets[i] - prev_needles_offset);
+ 
+             for (size_t j = prev_needles_offset; j < needles_offsets[i]; ++j)
+-            {
+                 needles.emplace_back(needles_data_string->getDataAt(j).toView());
+-            }
+ 
+             if (needles.empty())
+             {
+@@ -223,6 +233,14 @@ struct MultiMatchAnyImpl
+ 
+             checkHyperscanRegexp(needles, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
+ 
++            if (reject_expensive_hyperscan_regexps)
++            {
++                SlowWithHyperscanChecker checker;
++                for (auto needle : needles)
++                    if (checker.isSlow(needle))
++                        throw Exception(ErrorCodes::HYPERSCAN_CANNOT_SCAN_TEXT, "Regular expression evaluation in vectorscan will be too slow. To ignore this error, disable setting 'reject_expensive_hyperscan_regexps'.");
++            }
++
+             MultiRegexps::DeferredConstructedRegexpsPtr deferred_constructed_regexps = MultiRegexps::getOrSet</*SaveIndices*/ FindAnyIndex, WithEditDistance>(needles, edit_distance);
+             MultiRegexps::Regexps * regexps = deferred_constructed_regexps->get();
+             hs_scratch_t * scratch = nullptr;
+@@ -309,6 +327,16 @@ struct MultiMatchAnyImpl
+ 
+             checkHyperscanRegexp(needles, max_hyperscan_regexp_length, max_hyperscan_regexp_total_length);
+ 
++            if (reject_expensive_hyperscan_regexps)
++            {
++                for (auto needle : needles)
++                {
++                    SlowWithHyperscanChecker checker;
++                    if (checker.isSlow(needle))
++                        throw Exception(ErrorCodes::HYPERSCAN_CANNOT_SCAN_TEXT, "Regular expression evaluation in vectorscan will be too slow. To ignore this error, disable setting 'reject_expensive_hyperscan_regexps'.");
++                }
++            }
++
+             for (size_t j = 0; j < needles.size(); ++j)
+             {
+                 String needle(needles[j]);
+diff --git a/src/Functions/MultiSearchFirstIndexImpl.h b/src/Functions/MultiSearchFirstIndexImpl.h
+index f108f2ca41e2..73f3c92adfb1 100644
+--- a/src/Functions/MultiSearchFirstIndexImpl.h
++++ b/src/Functions/MultiSearchFirstIndexImpl.h
+@@ -32,7 +32,8 @@ struct MultiSearchFirstIndexImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         // For performance of Volnitsky search, it is crucial to save only one byte for pattern number.
+         if (needles_arr.size() > std::numeric_limits<UInt8>::max())
+@@ -78,7 +79,8 @@ struct MultiSearchFirstIndexImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         const size_t haystack_size = haystack_offsets.size();
+         res.resize(haystack_size);
+diff --git a/src/Functions/MultiSearchFirstPositionImpl.h b/src/Functions/MultiSearchFirstPositionImpl.h
+index 69cab478d134..99dd3f9d3940 100644
+--- a/src/Functions/MultiSearchFirstPositionImpl.h
++++ b/src/Functions/MultiSearchFirstPositionImpl.h
+@@ -32,7 +32,8 @@ struct MultiSearchFirstPositionImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         // For performance of Volnitsky search, it is crucial to save only one byte for pattern number.
+         if (needles_arr.size() > std::numeric_limits<UInt8>::max())
+@@ -87,7 +88,8 @@ struct MultiSearchFirstPositionImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         const size_t haystack_size = haystack_offsets.size();
+         res.resize(haystack_size);
+diff --git a/src/Functions/MultiSearchImpl.h b/src/Functions/MultiSearchImpl.h
+index d42c2ca43e4b..fb7d56f302ab 100644
+--- a/src/Functions/MultiSearchImpl.h
++++ b/src/Functions/MultiSearchImpl.h
+@@ -32,7 +32,8 @@ struct MultiSearchImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         // For performance of Volnitsky search, it is crucial to save only one byte for pattern number.
+         if (needles_arr.size() > std::numeric_limits<UInt8>::max())
+@@ -77,7 +78,8 @@ struct MultiSearchImpl
+         PaddedPODArray<UInt64> & /*offsets*/,
+         bool /*allow_hyperscan*/,
+         size_t /*max_hyperscan_regexp_length*/,
+-        size_t /*max_hyperscan_regexp_total_length*/)
++        size_t /*max_hyperscan_regexp_total_length*/,
++        bool /*reject_expensive_hyperscan_regexps*/)
+     {
+         const size_t haystack_size = haystack_offsets.size();
+         res.resize(haystack_size);
+diff --git a/src/Functions/checkHyperscanRegexp.cpp b/src/Functions/checkHyperscanRegexp.cpp
+index 4a1bc4f9031e..e6fbc3baa1a7 100644
+--- a/src/Functions/checkHyperscanRegexp.cpp
++++ b/src/Functions/checkHyperscanRegexp.cpp
+@@ -1,6 +1,7 @@
+ #include <Functions/checkHyperscanRegexp.h>
+ 
+ #include <Common/Exception.h>
++#include <charconv>
+ 
+ namespace DB
+ {
+@@ -27,4 +28,78 @@ void checkHyperscanRegexp(const std::vector<std::string_view> & regexps, size_t
+     }
+ }
+ 
++namespace
++{
++
++bool isLargerThanFifty(std::string_view str)
++{
++    int number;
++    auto [_, ec] = std::from_chars(str.begin(), str.end(), number);
++    if (ec != std::errc())
++        return false;
++    return number > 50;
++}
++
++}
++
++/// Check for sub-patterns of the form x{n} or x{n,} can be expensive. Ignore spaces before/after n and m.
++bool SlowWithHyperscanChecker::isSlowOneRepeat(std::string_view regexp)
++{
++    re2_st::StringPiece haystack(regexp.data(), regexp.size());
++    re2_st::StringPiece matches[2];
++    size_t start_pos = 0;
++    while (start_pos < regexp.size())
++    {
++        if (searcher_one_repeat.Match(haystack, start_pos, regexp.size(), re2_st::RE2::Anchor::UNANCHORED, matches, 2))
++        {
++            const auto & match = matches[0];
++            start_pos += (matches[0].data() - haystack.data()) + match.length(); // fwd by prefix + match length
++            const auto & submatch = matches[1];
++            if (isLargerThanFifty({submatch.data(), submatch.size()}))
++                return true;
++        }
++        else
++            break;
++    }
++    return false;
++}
++
++/// Check if sub-patterns of the form x{n,m} can be expensive. Ignore spaces before/after n and m.
++bool SlowWithHyperscanChecker::isSlowTwoRepeats(std::string_view regexp)
++{
++    re2_st::StringPiece haystack(regexp.data(), regexp.size());
++    re2_st::StringPiece matches[3];
++    size_t start_pos = 0;
++    while (start_pos < regexp.size())
++    {
++        if (searcher_two_repeats.Match(haystack, start_pos, regexp.size(), re2_st::RE2::Anchor::UNANCHORED, matches, 3))
++        {
++            const auto & match = matches[0];
++            start_pos += (matches[0].data() - haystack.data()) + match.length(); // fwd by prefix + match length
++            const auto & submatch1 = matches[1];
++            const auto & submatch2 = matches[2];
++            if (isLargerThanFifty({submatch1.data(), submatch1.size()})
++             || isLargerThanFifty({submatch2.data(), submatch2.size()}))
++                return true;
++        }
++        else
++            break;
++    }
++    return false;
++}
++
++SlowWithHyperscanChecker::SlowWithHyperscanChecker()
++    : searcher_one_repeat(R"(\{\s*([\d]+)\s*,?\s*})")
++    , searcher_two_repeats(R"(\{\s*([\d]+)\s*,\s*([\d]+)\s*\})")
++{}
++
++bool SlowWithHyperscanChecker::isSlow(std::string_view regexp)
++{
++    if (isSlowOneRepeat(regexp))
++        return true;
++    else if (isSlowTwoRepeats(regexp))
++        return true;
++    return false;
++}
++
+ }
+diff --git a/src/Functions/checkHyperscanRegexp.h b/src/Functions/checkHyperscanRegexp.h
+index e5f1165a949d..8bb76e6ebc44 100644
+--- a/src/Functions/checkHyperscanRegexp.h
++++ b/src/Functions/checkHyperscanRegexp.h
+@@ -3,9 +3,27 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include <re2_st/re2.h>
++
+ namespace DB
+ {
+ 
+ void checkHyperscanRegexp(const std::vector<std::string_view> & regexps, size_t max_hyperscan_regexp_length, size_t max_hyperscan_regexp_total_length);
+ 
++/// Regexp evaluation with hyperscan can be slow for certain patterns due to NFA state explosion. Try to identify such patterns on a
++/// best-effort basis.
++
++class SlowWithHyperscanChecker
++{
++public:
++    SlowWithHyperscanChecker();
++    bool isSlow(std::string_view regexp);
++
++private:
++    bool isSlowOneRepeat(std::string_view regexp);
++    bool isSlowTwoRepeats(std::string_view regexp);
++    re2_st::RE2 searcher_one_repeat;
++    re2_st::RE2 searcher_two_repeats;
++};
++
+ }
+diff --git a/src/Functions/extract.cpp b/src/Functions/extract.cpp
+index 5d539e03daea..74c5a2fdd366 100644
+--- a/src/Functions/extract.cpp
++++ b/src/Functions/extract.cpp
+@@ -1,6 +1,6 @@
+-#include "FunctionsStringSearchToString.h"
+-#include "FunctionFactory.h"
+-#include "Regexps.h"
++#include <Functions/FunctionsStringSearchToString.h>
++#include <Functions/FunctionFactory.h>
++#include <Functions/Regexps.h>
+ #include <Common/OptimizedRegularExpression.h>
+ 
+ 

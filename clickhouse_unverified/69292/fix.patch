@@ -1,0 +1,278 @@
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.cpp b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+index 3f88106e8fa9..8d71abc0f02e 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.cpp
++++ b/src/Analyzer/Resolve/QueryAnalyzer.cpp
+@@ -218,6 +218,28 @@ void QueryAnalyzer::resolve(QueryTreeNodePtr & node, const QueryTreeNodePtr & ta
+     }
+ }
+ 
++void QueryAnalyzer::resolveConstantExpression(QueryTreeNodePtr & node, const QueryTreeNodePtr & table_expression, ContextPtr context)
++{
++    IdentifierResolveScope scope(node, nullptr /*parent_scope*/);
++
++    if (!scope.context)
++        scope.context = context;
++
++    auto node_type = node->getNodeType();
++
++    if (table_expression && node_type != QueryTreeNodeType::QUERY && node_type != QueryTreeNodeType::UNION)
++    {
++        scope.expression_join_tree_node = table_expression;
++        validateTableExpressionModifiers(scope.expression_join_tree_node, scope);
++        initializeTableExpressionData(scope.expression_join_tree_node, scope);
++    }
++
++    if (node_type == QueryTreeNodeType::LIST)
++        resolveExpressionNodeList(node, scope, false /*allow_lambda_expression*/, false /*allow_table_expression*/);
++    else
++        resolveExpressionNode(node, scope, false /*allow_lambda_expression*/, false /*allow_table_expression*/);
++}
++
+ std::optional<JoinTableSide> QueryAnalyzer::getColumnSideFromJoinTree(const QueryTreeNodePtr & resolved_identifier, const JoinNode & join_node)
+ {
+     if (resolved_identifier->getNodeType() == QueryTreeNodeType::CONSTANT)
+diff --git a/src/Analyzer/Resolve/QueryAnalyzer.h b/src/Analyzer/Resolve/QueryAnalyzer.h
+index 7f9088b35e5f..0d4309843e6f 100644
+--- a/src/Analyzer/Resolve/QueryAnalyzer.h
++++ b/src/Analyzer/Resolve/QueryAnalyzer.h
+@@ -119,6 +119,8 @@ class QueryAnalyzer
+ 
+     void resolve(QueryTreeNodePtr & node, const QueryTreeNodePtr & table_expression, ContextPtr context);
+ 
++    void resolveConstantExpression(QueryTreeNodePtr & node, const QueryTreeNodePtr & table_expression, ContextPtr context);
++
+ private:
+     /// Utility functions
+ 
+diff --git a/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp b/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
+index 1bb60a4cf960..602c79ee3325 100644
+--- a/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
++++ b/src/Interpreters/IInterpreterUnionOrSelectQuery.cpp
+@@ -12,12 +12,14 @@
+ #include <Interpreters/ExpressionAnalyzer.h>
+ #include <Interpreters/TreeRewriter.h>
+ #include <Processors/QueryPlan/FilterStep.h>
++#include <Common/Logger.h>
+ 
+ 
+ namespace DB
+ {
+ namespace Setting
+ {
++    extern const SettingsBool allow_experimental_analyzer;
+     extern const SettingsString additional_result_filter;
+     extern const SettingsUInt64 max_bytes_to_read;
+     extern const SettingsUInt64 max_bytes_to_read_leaf;
+@@ -47,7 +49,13 @@ IInterpreterUnionOrSelectQuery::IInterpreterUnionOrSelectQuery(
+     /// it's possible that new analyzer will be enabled in ::getQueryProcessingStage method
+     /// of the underlying storage when all other parts of infrastructure are not ready for it
+     /// (built with old analyzer).
+-    context->setSetting("allow_experimental_analyzer", false);
++    if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
++    {
++        LOG_TRACE(getLogger("IInterpreterUnionOrSelectQuery"),
++            "The new analyzer is enabled, but the old interpreter is used. It can be a bug, please report it. Will disable 'allow_experimental_analyzer' setting (for query: {})",
++            query_ptr->formatForLogging());
++        context->setSetting("allow_experimental_analyzer", false);
++    }
+ 
+     if (options.shard_num)
+         context->addSpecialScalar(
+diff --git a/src/Interpreters/evaluateConstantExpression.cpp b/src/Interpreters/evaluateConstantExpression.cpp
+index 4301ded40e17..4e2d68ad6faa 100644
+--- a/src/Interpreters/evaluateConstantExpression.cpp
++++ b/src/Interpreters/evaluateConstantExpression.cpp
+@@ -4,6 +4,9 @@
+ #include <Columns/ColumnSet.h>
+ #include <Columns/ColumnTuple.h>
+ #include <Common/typeid_cast.h>
++#include <Analyzer/Resolve/QueryAnalyzer.h>
++#include <Analyzer/QueryTreeBuilder.h>
++#include <Analyzer/TableNode.h>
+ #include <Core/Block.h>
+ #include <Core/Settings.h>
+ #include <DataTypes/DataTypesNumber.h>
+@@ -15,18 +18,30 @@
+ #include <Interpreters/Context.h>
+ #include <Interpreters/castColumn.h>
+ #include <Interpreters/convertFieldToType.h>
++#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
+ #include <Interpreters/ExpressionAnalyzer.h>
+ #include <Interpreters/FunctionNameNormalizer.h>
+ #include <Interpreters/ReplaceQueryParameterVisitor.h>
++#include <Interpreters/SelectQueryOptions.h>
+ #include <Interpreters/TreeRewriter.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTIdentifier.h>
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/ASTSubquery.h>
++#include <Parsers/ASTSelectQuery.h>
++#include <Planner/CollectSets.h>
++#include <Planner/CollectTableExpressionData.h>
++#include <Planner/PlannerActionsVisitor.h>
++#include <Planner/PlannerContext.h>
++#include <Planner/Utils.h>
+ #include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
++#include <Processors/Executors/PullingPipelineExecutor.h>
+ #include <Storages/MergeTree/KeyCondition.h>
++#include <Storages/ColumnsDescription.h>
++#include <Storages/StorageDummy.h>
+ #include <TableFunctions/TableFunctionFactory.h>
+ 
++#include <optional>
+ #include <unordered_map>
+ 
+ 
+@@ -35,6 +50,7 @@ namespace DB
+ namespace Setting
+ {
+     extern const SettingsBool normalize_function_names;
++    extern const SettingsBool allow_experimental_analyzer;
+ }
+ 
+ namespace ErrorCodes
+@@ -76,34 +92,74 @@ std::optional<EvaluateConstantExpressionResult> evaluateConstantExpressionImpl(c
+     ReplaceQueryParameterVisitor param_visitor(context->getQueryParameters());
+     param_visitor.visit(ast);
+ 
+-    /// Notice: function name normalization is disabled when it's a secondary query, because queries are either
+-    /// already normalized on initiator node, or not normalized and should remain unnormalized for
+-    /// compatibility.
+-    if (context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
+-        && context->getSettingsRef()[Setting::normalize_function_names])
+-        FunctionNameNormalizer::visit(ast.get());
++    String result_name;
+ 
+-    auto syntax_result = TreeRewriter(context, no_throw).analyze(ast, source_columns);
+-    if (!syntax_result)
+-        return {};
++    ColumnPtr result_column;
++    DataTypePtr result_type;
++    if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
++    {
++        result_name = ast->getColumnName();
+ 
+-    /// AST potentially could be transformed to literal during TreeRewriter analyze.
+-    /// For example if we have SQL user defined function that return literal AS subquery.
+-    if (ASTLiteral * literal = ast->as<ASTLiteral>())
+-        return getFieldAndDataTypeFromLiteral(literal);
++        auto execution_context = Context::createCopy(context);
++        auto expression = buildQueryTree(ast, execution_context);
+ 
+-    auto actions = ExpressionAnalyzer(ast, syntax_result, context).getConstActionsDAG();
++        ColumnsDescription fake_column_descriptions(source_columns);
++        auto storage = std::make_shared<StorageDummy>(StorageID{"dummy", "dummy"}, fake_column_descriptions);
++        QueryTreeNodePtr fake_table_expression = std::make_shared<TableNode>(storage, execution_context);
+ 
+-    ColumnPtr result_column;
+-    DataTypePtr result_type;
+-    String result_name = ast->getColumnName();
+-    for (const auto & action_node : actions.getOutputs())
++        QueryAnalyzer analyzer(false);
++        analyzer.resolveConstantExpression(expression, fake_table_expression, execution_context);
++
++        GlobalPlannerContextPtr global_planner_context = std::make_shared<GlobalPlannerContext>(nullptr, nullptr, FiltersForTableExpressionMap{});
++        auto planner_context = std::make_shared<PlannerContext>(execution_context, global_planner_context, SelectQueryOptions{});
++
++        collectSourceColumns(expression, planner_context, false /*keep_alias_columns*/);
++        collectSets(expression, *planner_context);
++
++        auto actions = buildActionsDAGFromExpressionNode(expression, {}, planner_context);
++
++        if (actions.getOutputs().size() != 1)
++        {
++            throw Exception(ErrorCodes::LOGICAL_ERROR, "ActionsDAG contains more than 1 output for expression: {}", ast->formatForLogging());
++        }
++
++        const auto & output = actions.getOutputs()[0];
++        if (output->column)
++        {
++            result_column = output->column;
++            result_type = output->result_type;
++        }
++    }
++    else
+     {
+-        if ((action_node->result_name == result_name) && action_node->column)
++        /// Notice: function name normalization is disabled when it's a secondary query, because queries are either
++        /// already normalized on initiator node, or not normalized and should remain unnormalized for
++        /// compatibility.
++        if (context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY
++            && context->getSettingsRef()[Setting::normalize_function_names])
++            FunctionNameNormalizer::visit(ast.get());
++
++        result_name = ast->getColumnName();
++
++        auto syntax_result = TreeRewriter(context, no_throw).analyze(ast, source_columns);
++        if (!syntax_result)
++            return {};
++
++        /// AST potentially could be transformed to literal during TreeRewriter analyze.
++        /// For example if we have SQL user defined function that return literal AS subquery.
++        if (ASTLiteral * literal = ast->as<ASTLiteral>())
++            return getFieldAndDataTypeFromLiteral(literal);
++
++        auto actions = ExpressionAnalyzer(ast, syntax_result, context).getConstActionsDAG();
++
++        for (const auto & action_node : actions.getOutputs())
+         {
+-            result_column = action_node->column;
+-            result_type = action_node->result_type;
+-            break;
++            if ((action_node->result_name == result_name) && action_node->column)
++            {
++                result_column = action_node->column;
++                result_type = action_node->result_type;
++                break;
++            }
+         }
+     }
+ 
+diff --git a/src/Storages/StorageDistributed.cpp b/src/Storages/StorageDistributed.cpp
+index 24d885d9fff0..5da4c83f77b4 100644
+--- a/src/Storages/StorageDistributed.cpp
++++ b/src/Storages/StorageDistributed.cpp
+@@ -489,7 +489,7 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
+     }
+ 
+     std::optional<QueryProcessingStage::Enum> optimized_stage;
+-    if (query_info.query_tree)
++    if (settings[Setting::allow_experimental_analyzer])
+         optimized_stage = getOptimizedQueryProcessingStageAnalyzer(query_info, settings);
+     else
+         optimized_stage = getOptimizedQueryProcessingStage(query_info, settings);
+diff --git a/src/TableFunctions/TableFunctionExecutable.cpp b/src/TableFunctions/TableFunctionExecutable.cpp
+index cccd3587bc74..12371f6ff822 100644
+--- a/src/TableFunctions/TableFunctionExecutable.cpp
++++ b/src/TableFunctions/TableFunctionExecutable.cpp
+@@ -71,12 +71,12 @@ std::vector<size_t> TableFunctionExecutable::skipAnalysisForArguments(const Quer
+     const auto & table_function_node_arguments = table_function_node.getArguments().getNodes();
+     size_t table_function_node_arguments_size = table_function_node_arguments.size();
+ 
+-    if (table_function_node_arguments_size <= 2)
++    if (table_function_node_arguments_size <= 3)
+         return {};
+ 
+     std::vector<size_t> result_indexes;
+-    result_indexes.reserve(table_function_node_arguments_size - 2);
+-    for (size_t i = 2; i < table_function_node_arguments_size; ++i)
++    result_indexes.reserve(table_function_node_arguments_size - 3);
++    for (size_t i = 3; i < table_function_node_arguments_size; ++i)
+         result_indexes.push_back(i);
+ 
+     return result_indexes;
+@@ -103,10 +103,11 @@ void TableFunctionExecutable::parseArguments(const ASTPtr & ast_function, Contex
+         if (!args[i]->as<ASTIdentifier>() &&
+             !args[i]->as<ASTLiteral>() &&
+             !args[i]->as<ASTQueryParameter>() &&
+-            !args[i]->as<ASTSubquery>())
++            !args[i]->as<ASTSubquery>() &&
++            !args[i]->as<ASTFunction>())
+             throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+-                "Illegal type of argument '{}' for table function '{}': must be an identifier or string literal",
+-                argument_name, getName());
++                "Illegal type of argument '{}' for table function '{}': must be an identifier or string literal, but got: {}",
++                argument_name, getName(), args[i]->formatForErrorMessage());
+     };
+ 
+     check_argument(0, "script_name");

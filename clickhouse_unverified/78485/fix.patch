@@ -1,0 +1,1288 @@
+diff --git a/src/Interpreters/evaluateConstantExpression.cpp b/src/Interpreters/evaluateConstantExpression.cpp
+index bc1a5d054a18..5e56a4be2727 100644
+--- a/src/Interpreters/evaluateConstantExpression.cpp
++++ b/src/Interpreters/evaluateConstantExpression.cpp
+@@ -747,10 +747,13 @@ std::optional<ConstantVariants> evaluateExpressionOverConstantCondition(
+     const ContextPtr & context,
+     size_t max_elements)
+ {
+-    auto inverted_dag = KeyCondition::cloneASTWithInversionPushDown({predicate}, context);
+-    auto matches = matchTrees(expr, inverted_dag, false);
++    if (!predicate)
++        return {};
++
++    ActionsDAGWithInversionPushDown filter_dag(predicate, context);
++    auto matches = matchTrees(expr, *filter_dag.dag, false);
+ 
+-    auto predicates = analyze(inverted_dag.getOutputs().at(0), matches, context, max_elements);
++    auto predicates = analyze(filter_dag.predicate, matches, context, max_elements);
+ 
+     if (!predicates)
+         return {};
+diff --git a/src/Processors/QueryPlan/ReadFromMergeTree.cpp b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+index c4db5c838c31..eae38c263034 100644
+--- a/src/Processors/QueryPlan/ReadFromMergeTree.cpp
++++ b/src/Processors/QueryPlan/ReadFromMergeTree.cpp
+@@ -1650,8 +1650,10 @@ static void buildIndexes(
+ 
+     const auto & settings = context->getSettingsRef();
+ 
++    ActionsDAGWithInversionPushDown filter_dag((filter_actions_dag ? filter_actions_dag->getOutputs().front() : nullptr), context);
++
+     indexes.emplace(
+-        ReadFromMergeTree::Indexes{KeyCondition{filter_actions_dag, context, primary_key_column_names, primary_key.expression}});
++        ReadFromMergeTree::Indexes{KeyCondition{filter_dag, context, primary_key_column_names, primary_key.expression}});
+ 
+     if (metadata_snapshot->hasPartitionKey())
+     {
+@@ -1659,12 +1661,12 @@ static void buildIndexes(
+         auto minmax_columns_names = MergeTreeData::getMinMaxColumnsNames(partition_key);
+         auto minmax_expression_actions = MergeTreeData::getMinMaxExpr(partition_key, ExpressionActionsSettings(context));
+ 
+-        indexes->minmax_idx_condition.emplace(filter_actions_dag, context, minmax_columns_names, minmax_expression_actions);
+-        indexes->partition_pruner.emplace(metadata_snapshot, filter_actions_dag, context, false /* strict */);
++        indexes->minmax_idx_condition.emplace(filter_dag, context, minmax_columns_names, minmax_expression_actions);
++        indexes->partition_pruner.emplace(metadata_snapshot, filter_dag, context, false /* strict */);
+     }
+ 
+-    indexes->part_values = MergeTreeDataSelectExecutor::filterPartsByVirtualColumns(metadata_snapshot, data, parts, filter_actions_dag, context);
+-    MergeTreeDataSelectExecutor::buildKeyConditionFromPartOffset(indexes->part_offset_condition, filter_actions_dag, context);
++    indexes->part_values = MergeTreeDataSelectExecutor::filterPartsByVirtualColumns(metadata_snapshot, data, parts, filter_dag.predicate, context);
++    MergeTreeDataSelectExecutor::buildKeyConditionFromPartOffset(indexes->part_offset_condition, filter_dag.predicate, context);
+ 
+     indexes->use_skip_indexes = settings[Setting::use_skip_indexes];
+     if (query_info.isFinal() && !settings[Setting::use_skip_indexes_if_final])
+@@ -1748,17 +1750,20 @@ static void buildIndexes(
+         {
+ #if USE_USEARCH
+             if (const auto * vector_similarity_index = typeid_cast<const MergeTreeIndexVectorSimilarity *>(index_helper.get()))
+-                condition = vector_similarity_index->createIndexCondition(filter_actions_dag, context, vector_search_parameters);
++                condition = vector_similarity_index->createIndexCondition(filter_dag.predicate, context, vector_search_parameters);
+ #endif
+             if (const auto * legacy_vector_similarity_index = typeid_cast<const MergeTreeIndexLegacyVectorSimilarity *>(index_helper.get()))
+-                condition = legacy_vector_similarity_index->createIndexCondition(filter_actions_dag, context);
++                condition = legacy_vector_similarity_index->createIndexCondition(filter_dag.predicate, context);
+ 
+             if (!condition)
+                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown vector search index {}", index_helper->index.name);
+         }
+         else
+         {
+-            condition = index_helper->createIndexCondition(filter_actions_dag, context);
++            if (!filter_dag.predicate)
++                continue;
++
++            condition = index_helper->createIndexCondition(filter_dag.predicate, context);
+         }
+ 
+         if (!condition->alwaysUnknownOrTrue())
+diff --git a/src/Processors/QueryPlan/ReadFromSystemNumbersStep.cpp b/src/Processors/QueryPlan/ReadFromSystemNumbersStep.cpp
+index 586183698f75..ed41b8eb10ca 100644
+--- a/src/Processors/QueryPlan/ReadFromSystemNumbersStep.cpp
++++ b/src/Processors/QueryPlan/ReadFromSystemNumbersStep.cpp
+@@ -481,7 +481,8 @@ Pipe ReadFromSystemNumbersStep::makePipe()
+     chassert(numbers_storage.step != UInt64{0});
+ 
+     /// Build rpn of query filters
+-    KeyCondition condition(filter_actions_dag ? &*filter_actions_dag : nullptr, context, column_names, key_expression);
++    ActionsDAGWithInversionPushDown inverted_dag(filter_actions_dag ? filter_actions_dag->getOutputs().front() : nullptr, context);
++    KeyCondition condition(inverted_dag, context, column_names, key_expression);
+ 
+     if (condition.extractPlainRanges(ranges))
+     {
+diff --git a/src/Processors/SourceWithKeyCondition.cpp b/src/Processors/SourceWithKeyCondition.cpp
+index 90867e4e0a6a..12f8b39e1ae8 100644
+--- a/src/Processors/SourceWithKeyCondition.cpp
++++ b/src/Processors/SourceWithKeyCondition.cpp
+@@ -8,8 +8,9 @@ namespace DB
+ 
+ void SourceWithKeyCondition::setKeyConditionImpl(const std::optional<ActionsDAG> & filter_actions_dag, ContextPtr context, const Block & keys)
+ {
++    ActionsDAGWithInversionPushDown inverted_dag(filter_actions_dag ? filter_actions_dag->getOutputs().front() : nullptr, context);
+     key_condition = std::make_shared<const KeyCondition>(
+-        filter_actions_dag ? &*filter_actions_dag : nullptr,
++        inverted_dag,
+         context,
+         keys.getNames(),
+         std::make_shared<ExpressionActions>(ActionsDAG(keys.getColumnsWithTypeAndName())));
+diff --git a/src/Storages/Hive/StorageHive.cpp b/src/Storages/Hive/StorageHive.cpp
+index 3f7b655f7a00..c0cc6847e7de 100644
+--- a/src/Storages/Hive/StorageHive.cpp
++++ b/src/Storages/Hive/StorageHive.cpp
+@@ -641,7 +641,8 @@ HiveFiles StorageHive::collectHiveFilesFromPartition(
+         for (size_t i = 0; i < partition_names.size(); ++i)
+             ranges.emplace_back(fields[i]);
+ 
+-        const KeyCondition partition_key_condition(filter_actions_dag, getContext(), partition_names, partition_minmax_idx_expr);
++        ActionsDAGWithInversionPushDown inverted_dag(filter_actions_dag->getOutputs().front(), context_);
++        const KeyCondition partition_key_condition(inverted_dag, getContext(), partition_names, partition_minmax_idx_expr);
+         if (!partition_key_condition.checkInHyperrectangle(ranges, partition_types).can_be_true)
+             return {};
+     }
+@@ -709,7 +710,8 @@ HiveFilePtr StorageHive::getHiveFileIfNeeded(
+ 
+     if (prune_level >= PruneLevel::File)
+     {
+-        const KeyCondition hivefile_key_condition(filter_actions_dag, getContext(), hivefile_name_types.getNames(), hivefile_minmax_idx_expr);
++        ActionsDAGWithInversionPushDown inverted_dag(filter_actions_dag->getOutputs().front(), context_);
++        const KeyCondition hivefile_key_condition(inverted_dag, getContext(), hivefile_name_types.getNames(), hivefile_minmax_idx_expr);
+         if (hive_file->useFileMinMaxIndex())
+         {
+             /// Load file level minmax index and apply
+diff --git a/src/Storages/MergeTree/KeyCondition.cpp b/src/Storages/MergeTree/KeyCondition.cpp
+index 9eea8dbda3e0..9599f5f9f9bd 100644
+--- a/src/Storages/MergeTree/KeyCondition.cpp
++++ b/src/Storages/MergeTree/KeyCondition.cpp
+@@ -572,19 +572,30 @@ ASTPtr cloneASTWithInversionPushDown(const ASTPtr node, const bool need_inversio
+     return need_inversion ? makeASTFunction("not", cloned_node) : cloned_node;
+ }
+ 
+-static const ActionsDAG::Node & cloneASTWithInversionPushDown(
++static bool isTrivialCast(const ActionsDAG::Node & node)
++{
++    if (node.function_base->getName() != "CAST" || node.children.size() != 2 || node.children[1]->type != ActionsDAG::ActionType::COLUMN)
++        return false;
++
++    const auto * column_const = typeid_cast<const ColumnConst *>(node.children[1]->column.get());
++    if (!column_const)
++        return false;
++
++    Field field = column_const->getField();
++    if (field.getType() != Field::Types::String)
++        return false;
++
++    auto type_name = field.safeGet<String>();
++    return node.children[0]->result_type->getName() == type_name;
++}
++
++static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
+     const ActionsDAG::Node & node,
+     ActionsDAG & inverted_dag,
+-    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> to_inverted,
++    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> & inputs_mapping,
+     const ContextPtr & context,
+     const bool need_inversion)
+ {
+-    {
+-        auto it = to_inverted.find(&node);
+-        if (it != to_inverted.end())
+-            return *it->second;
+-    }
+-
+     const ActionsDAG::Node * res = nullptr;
+     bool handled_inversion = false;
+ 
+@@ -592,8 +603,12 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+     {
+         case (ActionsDAG::ActionType::INPUT):
+         {
+-            /// Note: inputs order is not important here. Will match columns by names.
+-            res = &inverted_dag.addInput({node.column, node.result_type, node.result_name});
++            auto & input = inputs_mapping[&node];
++            if (input == nullptr)
++                /// Note: inputs order is not important here. Will match columns by names.
++                input = &inverted_dag.addInput({node.column, node.result_type, node.result_name});
++
++            res = input;
+             break;
+         }
+         case (ActionsDAG::ActionType::COLUMN):
+@@ -617,13 +632,13 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+         case (ActionsDAG::ActionType::ALIAS):
+         {
+             /// Ignore aliases
+-            res = &cloneASTWithInversionPushDown(*node.children.front(), inverted_dag, to_inverted, context, need_inversion);
++            res = &cloneDAGWithInversionPushDown(*node.children.front(), inverted_dag, inputs_mapping, context, need_inversion);
+             handled_inversion = true;
+             break;
+         }
+         case (ActionsDAG::ActionType::ARRAY_JOIN):
+         {
+-            const auto & arg = cloneASTWithInversionPushDown(*node.children.front(), inverted_dag, to_inverted, context, false);
++            const auto & arg = cloneDAGWithInversionPushDown(*node.children.front(), inverted_dag, inputs_mapping, context, false);
+             res = &inverted_dag.addArrayJoin(arg, {});
+             break;
+         }
+@@ -632,7 +647,7 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+             auto name = node.function_base->getName();
+             if (name == "not")
+             {
+-                res = &cloneASTWithInversionPushDown(*node.children.front(), inverted_dag, to_inverted, context, !need_inversion);
++                res = &cloneDAGWithInversionPushDown(*node.children.front(), inverted_dag, inputs_mapping, context, !need_inversion);
+                 handled_inversion = true;
+             }
+             else if (name == "indexHint")
+@@ -646,19 +661,29 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+                         children = index_hint_dag.getOutputs();
+ 
+                         for (auto & arg : children)
+-                            arg = &cloneASTWithInversionPushDown(*arg, inverted_dag, to_inverted, context, need_inversion);
++                            arg = &cloneDAGWithInversionPushDown(*arg, inverted_dag, inputs_mapping, context, need_inversion);
+                     }
+                 }
+ 
+                 res = &inverted_dag.addFunction(node.function_base, children, "");
+                 handled_inversion = true;
+             }
++            else if (name == "materialize")
++            {
++                /// Remove "materialize" from index analysis.
++                res = &cloneDAGWithInversionPushDown(*node.children.front(), inverted_dag, inputs_mapping, context, need_inversion);
++            }
++            else if (isTrivialCast(node))
++            {
++                /// Remove trivial cast and keep its first argument.
++                res = &cloneDAGWithInversionPushDown(*node.children.front(), inverted_dag, inputs_mapping, context, need_inversion);
++            }
+             else if (need_inversion && (name == "and" || name == "or"))
+             {
+                 ActionsDAG::NodeRawConstPtrs children(node.children);
+ 
+                 for (auto & arg : children)
+-                    arg = &cloneASTWithInversionPushDown(*arg, inverted_dag, to_inverted, context, need_inversion);
++                    arg = &cloneDAGWithInversionPushDown(*arg, inverted_dag, inputs_mapping, context, need_inversion);
+ 
+                 FunctionOverloadResolverPtr function_builder;
+ 
+@@ -679,7 +704,7 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+                 ActionsDAG::NodeRawConstPtrs children(node.children);
+ 
+                 for (auto & arg : children)
+-                    arg = &cloneASTWithInversionPushDown(*arg, inverted_dag, to_inverted, context, false);
++                    arg = &cloneDAGWithInversionPushDown(*arg, inverted_dag, inputs_mapping, context, false);
+ 
+                 auto it = inverse_relations.find(name);
+                 if (it != inverse_relations.end())
+@@ -723,10 +748,22 @@ static const ActionsDAG::Node & cloneASTWithInversionPushDown(
+     if (!handled_inversion && need_inversion)
+         res = &inverted_dag.addFunction(FunctionFactory::instance().get("not", context), {res}, "");
+ 
+-    to_inverted[&node] = res;
+     return *res;
+ }
+ 
++static ActionsDAG cloneDAGWithInversionPushDown(const ActionsDAG::Node * predicate, const ContextPtr & context)
++{
++    ActionsDAG res;
++
++    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> inputs_mapping;
++
++    predicate = &DB::cloneDAGWithInversionPushDown(*predicate, res, inputs_mapping, context, false);
++
++    res.getOutputs() = {predicate};
++
++    return res;
++}
++
+ const std::unordered_map<String, KeyCondition::SpaceFillingCurveType> KeyCondition::space_filling_curve_name_to_type {
+         {"mortonEncode", SpaceFillingCurveType::Morton},
+         {"hilbertEncode", SpaceFillingCurveType::Hilbert}
+@@ -758,26 +795,6 @@ static bool mayExistOnBloomFilter(const KeyCondition::BloomFilterData & conditio
+     return true;
+ }
+ 
+-ActionsDAG KeyCondition::cloneASTWithInversionPushDown(ActionsDAG::NodeRawConstPtrs nodes, const ContextPtr & context)
+-{
+-    ActionsDAG res;
+-
+-    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> to_inverted;
+-
+-    for (auto & node : nodes)
+-        node = &DB::cloneASTWithInversionPushDown(*node, res, to_inverted, context, false);
+-
+-    if (nodes.size() > 1)
+-    {
+-        auto function_builder = FunctionFactory::instance().get("and", context);
+-        nodes = {&res.addFunction(function_builder, std::move(nodes), "")};
+-    }
+-
+-    res.getOutputs().swap(nodes);
+-
+-    return res;
+-}
+-
+ /** Calculate expressions, that depend only on constants.
+   * For index to work when something like "WHERE Date = toDate(now())" is written.
+   */
+@@ -846,8 +863,26 @@ void KeyCondition::getAllSpaceFillingCurves()
+     }
+ }
+ 
++ActionsDAGWithInversionPushDown::ActionsDAGWithInversionPushDown(const ActionsDAG::Node * predicate_, const ContextPtr & context)
++{
++    if (!predicate_)
++        return;
++
++    /** When non-strictly monotonic functions are employed in functional index (e.g. ORDER BY toStartOfHour(dateTime)),
++    * the use of NOT operator in predicate will result in the indexing algorithm leave out some data.
++    * This is caused by rewriting in KeyCondition::tryParseAtomFromAST of relational operators to less strict
++    * when parsing the AST into internal RPN representation.
++    * To overcome the problem, before parsing the AST we transform it to its semantically equivalent form where all NOT's
++    * are pushed down and applied (when possible) to leaf nodes.
++    */
++    dag = cloneDAGWithInversionPushDown(predicate_, context);
++
++    predicate = dag->getOutputs()[0];
++}
++
++
+ KeyCondition::KeyCondition(
+-    const ActionsDAG * filter_dag,
++    const ActionsDAGWithInversionPushDown & filter_dag,
+     ContextPtr context,
+     const Names & key_column_names_,
+     const ExpressionActionsPtr & key_expr_,
+@@ -872,7 +907,7 @@ KeyCondition::KeyCondition(
+     if (context->getSettingsRef()[Setting::analyze_index_with_space_filling_curves])
+         getAllSpaceFillingCurves();
+ 
+-    if (!filter_dag)
++    if (!filter_dag.predicate)
+     {
+         has_filter = false;
+         relaxed = true;
+@@ -882,19 +917,7 @@ KeyCondition::KeyCondition(
+ 
+     has_filter = true;
+ 
+-    /** When non-strictly monotonic functions are employed in functional index (e.g. ORDER BY toStartOfHour(dateTime)),
+-      * the use of NOT operator in predicate will result in the indexing algorithm leave out some data.
+-      * This is caused by rewriting in KeyCondition::tryParseAtomFromAST of relational operators to less strict
+-      * when parsing the AST into internal RPN representation.
+-      * To overcome the problem, before parsing the AST we transform it to its semantically equivalent form where all NOT's
+-      * are pushed down and applied (when possible) to leaf nodes.
+-      */
+-    auto inverted_dag = cloneASTWithInversionPushDown({filter_dag->getOutputs().at(0)}, context);
+-    assert(inverted_dag.getOutputs().size() == 1);
+-
+-    const auto * inverted_dag_filter_node = inverted_dag.getOutputs()[0];
+-
+-    RPNBuilder<RPNElement> builder(inverted_dag_filter_node, context, [&](const RPNBuilderTreeNode & node, RPNElement & out)
++    RPNBuilder<RPNElement> builder(filter_dag.predicate, context, [&](const RPNBuilderTreeNode & node, RPNElement & out)
+     {
+         return extractAtomFromTree(node, out);
+     });
+diff --git a/src/Storages/MergeTree/KeyCondition.h b/src/Storages/MergeTree/KeyCondition.h
+index ec7126d2d8e2..c20881a0b723 100644
+--- a/src/Storages/MergeTree/KeyCondition.h
++++ b/src/Storages/MergeTree/KeyCondition.h
+@@ -28,6 +28,18 @@ struct ActionDAGNodes;
+ class MergeTreeSetIndex;
+ 
+ 
++/// Canonize the predicate
++/// * push down NOT to leaf nodes
++/// * remove aliases and re-generate function names
++/// * remove unneeded functions (e.g. materialize)
++struct ActionsDAGWithInversionPushDown
++{
++    std::optional<ActionsDAG> dag;
++    const ActionsDAG::Node * predicate = nullptr;
++
++    explicit ActionsDAGWithInversionPushDown(const ActionsDAG::Node * predicate_, const ContextPtr & context);
++};
++
+ /** Condition on the index.
+   *
+   * Consists of the conditions for the key belonging to all possible ranges or sets,
+@@ -41,7 +53,7 @@ class KeyCondition
+ public:
+     /// Construct key condition from ActionsDAG nodes
+     KeyCondition(
+-        const ActionsDAG * filter_dag,
++        const ActionsDAGWithInversionPushDown & filter_dag,
+         ContextPtr context,
+         const Names & key_column_names,
+         const ExpressionActionsPtr & key_expr,
+@@ -149,8 +161,6 @@ class KeyCondition
+         DataTypePtr current_type,
+         bool single_point = false);
+ 
+-    static ActionsDAG cloneASTWithInversionPushDown(ActionsDAG::NodeRawConstPtrs nodes, const ContextPtr & context);
+-
+     bool matchesExactContinuousRange() const;
+ 
+     /// Extract plain ranges of the condition.
+diff --git a/src/Storages/MergeTree/MergeTreeData.cpp b/src/Storages/MergeTree/MergeTreeData.cpp
+index 9fec37e6c8ff..9ecdb402292f 100644
+--- a/src/Storages/MergeTree/MergeTreeData.cpp
++++ b/src/Storages/MergeTree/MergeTreeData.cpp
+@@ -641,13 +641,14 @@ ConditionSelectivityEstimator MergeTreeData::getConditionSelectivityEstimatorByP
+ 
+     const auto & parts = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data).parts;
+ 
+-    if (parts.empty())
++    if (parts.empty() || !filter_dag)
+         return {};
+ 
+     ASTPtr expression_ast;
+ 
+     ConditionSelectivityEstimator estimator;
+-    PartitionPruner partition_pruner(storage_snapshot->metadata, filter_dag, local_context);
++    ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), local_context);
++    PartitionPruner partition_pruner(storage_snapshot->metadata, inverted_dag, local_context);
+ 
+     if (partition_pruner.isUseless())
+     {
+@@ -1379,7 +1380,9 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
+         if (!virtual_columns_block.has(input->result_name))
+             valid = false;
+ 
+-    PartitionPruner partition_pruner(metadata_snapshot, &*filter_dag, local_context, true /* strict */);
++    ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), local_context);
++
++    PartitionPruner partition_pruner(metadata_snapshot, inverted_dag, local_context, true /* strict */);
+     if (partition_pruner.isUseless() && !valid)
+         return {};
+ 
+@@ -7613,10 +7616,11 @@ Block MergeTreeData::getMinMaxCountProjectionBlock(
+             auto minmax_columns_names = getMinMaxColumnsNames(partition_key);
+             minmax_columns_types = getMinMaxColumnsTypes(partition_key);
+ 
++            ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), query_context);
+             minmax_idx_condition.emplace(
+-                filter_dag, query_context, minmax_columns_names,
++                inverted_dag, query_context, minmax_columns_names,
+                 getMinMaxExpr(partition_key, ExpressionActionsSettings(query_context)));
+-            partition_pruner.emplace(metadata_snapshot, filter_dag, query_context, false /* strict */);
++            partition_pruner.emplace(metadata_snapshot, inverted_dag, query_context, false /* strict */);
+         }
+ 
+         const auto * predicate = filter_dag->getOutputs().at(0);
+diff --git a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+index c886f7c99aaa..352fdf75c920 100644
+--- a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
++++ b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.cpp
+@@ -473,9 +473,9 @@ MergeTreeDataSelectSamplingData MergeTreeDataSelectExecutor::getSampling(
+ }
+ 
+ void MergeTreeDataSelectExecutor::buildKeyConditionFromPartOffset(
+-    std::optional<KeyCondition> & part_offset_condition, const ActionsDAG * filter_dag, ContextPtr context)
++    std::optional<KeyCondition> & part_offset_condition, const ActionsDAG::Node * predicate, ContextPtr context)
+ {
+-    if (!filter_dag)
++    if (!predicate)
+         return;
+ 
+     auto part_offset_type = std::make_shared<DataTypeUInt64>();
+@@ -484,7 +484,7 @@ void MergeTreeDataSelectExecutor::buildKeyConditionFromPartOffset(
+         = {ColumnWithTypeAndName(part_offset_type->createColumn(), part_offset_type, "_part_offset"),
+            ColumnWithTypeAndName(part_type->createColumn(), part_type, "_part")};
+ 
+-    auto dag = VirtualColumnUtils::splitFilterDagForAllowedInputs(filter_dag->getOutputs().at(0), &sample);
++    auto dag = VirtualColumnUtils::splitFilterDagForAllowedInputs(predicate, &sample);
+     if (!dag)
+         return;
+ 
+@@ -494,7 +494,7 @@ void MergeTreeDataSelectExecutor::buildKeyConditionFromPartOffset(
+         return;
+ 
+     part_offset_condition.emplace(KeyCondition{
+-        &*dag,
++        ActionsDAGWithInversionPushDown(dag->getOutputs().front(), context),
+         context,
+         sample.getNames(),
+         std::make_shared<ExpressionActions>(ActionsDAG(sample.getColumnsWithTypeAndName()), ExpressionActionsSettings{}),
+@@ -505,14 +505,14 @@ std::optional<std::unordered_set<String>> MergeTreeDataSelectExecutor::filterPar
+     const StorageMetadataPtr & metadata_snapshot,
+     const MergeTreeData & data,
+     const MergeTreeData::DataPartsVector & parts,
+-    const ActionsDAG * filter_dag,
++    const ActionsDAG::Node * predicate,
+     ContextPtr context)
+ {
+-    if (!filter_dag)
++    if (!predicate)
+         return {};
+ 
+     auto sample = data.getHeaderWithVirtualsForFilter(metadata_snapshot);
+-    auto dag = VirtualColumnUtils::splitFilterDagForAllowedInputs(filter_dag->getOutputs().at(0), &sample);
++    auto dag = VirtualColumnUtils::splitFilterDagForAllowedInputs(predicate, &sample);
+     if (!dag)
+         return {};
+ 
+diff --git a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
+index 67e02eee6546..9a753202c5fc 100644
+--- a/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
++++ b/src/Storages/MergeTree/MergeTreeDataSelectExecutor.h
+@@ -6,6 +6,7 @@
+ #include <Storages/MergeTree/RangesInDataPart.h>
+ #include <Storages/MergeTree/PartitionPruner.h>
+ #include <Processors/QueryPlan/ReadFromMergeTree.h>
++#include <Interpreters/ActionsDAG.h>
+ 
+ 
+ namespace DB
+@@ -159,7 +160,7 @@ class MergeTreeDataSelectExecutor
+ 
+     /// If possible, construct optional key condition from predicates containing _part_offset column.
+     static void buildKeyConditionFromPartOffset(
+-        std::optional<KeyCondition> & part_offset_condition, const ActionsDAG * filter_dag, ContextPtr context);
++        std::optional<KeyCondition> & part_offset_condition, const ActionsDAG::Node * predicate, ContextPtr context);
+ 
+     /// If possible, filter using expression on virtual columns.
+     /// Example: SELECT count() FROM table WHERE _part = 'part_name'
+@@ -168,7 +169,7 @@ class MergeTreeDataSelectExecutor
+         const StorageMetadataPtr & metadata_snapshot,
+         const MergeTreeData & data,
+         const MergeTreeData::DataPartsVector & parts,
+-        const ActionsDAG * filter_dag,
++        const ActionsDAG::Node * predicate,
+         ContextPtr context);
+ 
+     /// Filter parts using minmax index and partition key.
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
+index 38f6d2336e71..239fba5ebb0c 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
+@@ -17,7 +17,6 @@
+ #include <Parsers/ASTIdentifier.h>
+ #include <Parsers/ASTSubquery.h>
+ #include <Storages/MergeTree/MergeTreeData.h>
+-#include <Storages/MergeTree/MergeTreeIndexUtils.h>
+ #include <Storages/MergeTree/RPNBuilder.h>
+ 
+ 
+@@ -188,21 +187,17 @@ bool maybeTrueOnBloomFilter(const IColumn * hash_column, const BloomFilterPtr &
+ }
+ 
+ MergeTreeIndexConditionBloomFilter::MergeTreeIndexConditionBloomFilter(
+-    const ActionsDAG * filter_actions_dag, ContextPtr context_, const Block & header_, size_t hash_functions_)
++    const ActionsDAG::Node * predicate, ContextPtr context_, const Block & header_, size_t hash_functions_)
+     : WithContext(context_), header(header_), hash_functions(hash_functions_)
+ {
+-    if (!filter_actions_dag)
++    if (!predicate)
+     {
+         rpn.push_back(RPNElement::FUNCTION_UNKNOWN);
+         return;
+     }
+ 
+-    /// Clone ActionsDAG with re-generated column name for constants.
+-    /// DAG from the query (with enabled analyzer) uses suffixes for constants, like 1_UInt8.
+-    /// DAG from the skip indexes does not use it. This breaks matching by column name sometimes.
+-    auto cloned_filter_actions_dag = cloneFilterDAGForIndexesAnalysis(*filter_actions_dag);
+     RPNBuilder<RPNElement> builder(
+-        cloned_filter_actions_dag.getOutputs().at(0),
++        predicate,
+         context_,
+         [&](const RPNBuilderTreeNode & node, RPNElement & out) { return extractAtomFromTree(node, out); });
+     rpn = std::move(builder).extractRPN();
+@@ -898,9 +893,9 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexBloomFilter::createIndexAggregator(con
+     return std::make_shared<MergeTreeIndexAggregatorBloomFilter>(bits_per_row, hash_functions, index.column_names);
+ }
+ 
+-MergeTreeIndexConditionPtr MergeTreeIndexBloomFilter::createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context) const
++MergeTreeIndexConditionPtr MergeTreeIndexBloomFilter::createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const
+ {
+-    return std::make_shared<MergeTreeIndexConditionBloomFilter>(filter_actions_dag, context, index.sample_block, hash_functions);
++    return std::make_shared<MergeTreeIndexConditionBloomFilter>(predicate, context, index.sample_block, hash_functions);
+ }
+ 
+ static void assertIndexColumnsType(const Block & header)
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.h b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.h
+index 884cb099a768..2e943ae27034 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.h
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.h
+@@ -74,7 +74,7 @@ class MergeTreeIndexConditionBloomFilter final : public IMergeTreeIndexCondition
+         std::vector<std::pair<size_t, ColumnPtr>> predicate;
+     };
+ 
+-    MergeTreeIndexConditionBloomFilter(const ActionsDAG * filter_actions_dag, ContextPtr context_, const Block & header_, size_t hash_functions_);
++    MergeTreeIndexConditionBloomFilter(const ActionsDAG::Node * predicate, ContextPtr context_, const Block & header_, size_t hash_functions_);
+ 
+     bool alwaysUnknownOrTrue() const override;
+ 
+@@ -147,7 +147,7 @@ class MergeTreeIndexBloomFilter final : public IMergeTreeIndex
+ 
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+ 
+-    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+ private:
+     size_t bits_per_row;
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
+index 4e531583d2d0..416287a8fed3 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.cpp
+@@ -15,7 +15,6 @@
+ #include <Interpreters/misc.h>
+ #include <Parsers/ASTSelectQuery.h>
+ #include <Storages/MergeTree/MergeTreeData.h>
+-#include <Storages/MergeTree/MergeTreeIndexUtils.h>
+ #include <Storages/MergeTree/RPNBuilder.h>
+ 
+ #include <Poco/Logger.h>
+@@ -146,7 +145,7 @@ void MergeTreeIndexAggregatorBloomFilterText::update(const Block & block, size_t
+ }
+ 
+ MergeTreeConditionBloomFilterText::MergeTreeConditionBloomFilterText(
+-    const ActionsDAG * filter_actions_dag,
++    const ActionsDAG::Node * predicate,
+     ContextPtr context,
+     const Block & index_sample_block,
+     const BloomFilterParameters & params_,
+@@ -156,18 +155,14 @@ MergeTreeConditionBloomFilterText::MergeTreeConditionBloomFilterText(
+     , params(params_)
+     , token_extractor(token_extactor_)
+ {
+-    if (!filter_actions_dag)
++    if (!predicate)
+     {
+         rpn.push_back(RPNElement::FUNCTION_UNKNOWN);
+         return;
+     }
+ 
+-    /// Clone ActionsDAG with re-generated column name for constants.
+-    /// DAG from the query (with enabled analyzer) uses suffixes for constants, like 1_UInt8.
+-    /// DAG from the skip indexes does not use it. This breaks matching by column name sometimes.
+-    auto cloned_filter_actions_dag = cloneFilterDAGForIndexesAnalysis(*filter_actions_dag);
+     RPNBuilder<RPNElement> builder(
+-        cloned_filter_actions_dag.getOutputs().at(0),
++        predicate,
+         context,
+         [&](const RPNBuilderTreeNode & node, RPNElement & out) { return extractAtomFromTree(node, out); });
+     rpn = std::move(builder).extractRPN();
+@@ -756,9 +751,9 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexBloomFilterText::createIndexAggregator
+ }
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexBloomFilterText::createIndexCondition(
+-        const ActionsDAG * filter_dag, ContextPtr context) const
++        const ActionsDAG::Node * predicate, ContextPtr context) const
+ {
+-    return std::make_shared<MergeTreeConditionBloomFilterText>(filter_dag, context, index.sample_block, params, token_extractor.get());
++    return std::make_shared<MergeTreeConditionBloomFilterText>(predicate, context, index.sample_block, params, token_extractor.get());
+ }
+ 
+ MergeTreeIndexPtr bloomFilterIndexTextCreator(
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.h b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.h
+index c0b419fdb2f9..cc3e6ee0f15a 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.h
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilterText.h
+@@ -64,7 +64,7 @@ class MergeTreeConditionBloomFilterText final : public IMergeTreeIndexCondition
+ {
+ public:
+     MergeTreeConditionBloomFilterText(
+-            const ActionsDAG * filter_actions_dag,
++            const ActionsDAG::Node * predicate,
+             ContextPtr context,
+             const Block & index_sample_block,
+             const BloomFilterParameters & params_,
+@@ -166,7 +166,7 @@ class MergeTreeIndexBloomFilterText final : public IMergeTreeIndex
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+ 
+     MergeTreeIndexConditionPtr createIndexCondition(
+-            const ActionsDAG * filter_dag, ContextPtr context) const override;
++            const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     BloomFilterParameters params;
+     /// Function for selecting next token.
+diff --git a/src/Storages/MergeTree/MergeTreeIndexGin.cpp b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+index bb97ac7d6f31..64b73be33675 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexGin.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexGin.cpp
+@@ -15,7 +15,6 @@
+ #include <Interpreters/Set.h>
+ #include <Interpreters/misc.h>
+ #include <Storages/MergeTree/MergeTreeData.h>
+-#include <Storages/MergeTree/MergeTreeIndexUtils.h>
+ #include <Storages/MergeTree/RPNBuilder.h>
+ #include <Common/OptimizedRegularExpression.h>
+ #include <algorithm>
+@@ -190,7 +189,7 @@ void MergeTreeIndexAggregatorGin::update(const Block & block, size_t * pos, size
+ }
+ 
+ MergeTreeIndexConditionGin::MergeTreeIndexConditionGin(
+-    const ActionsDAG * filter_actions_dag,
++    const ActionsDAG::Node * predicate,
+     ContextPtr context_,
+     const Block & index_sample_block,
+     const GinFilterParameters & params_,
+@@ -199,19 +198,15 @@ MergeTreeIndexConditionGin::MergeTreeIndexConditionGin(
+     , params(params_)
+     , token_extractor(token_extactor_)
+ {
+-    if (!filter_actions_dag)
++    if (!predicate)
+     {
+         rpn.push_back(RPNElement::FUNCTION_UNKNOWN);
+         return;
+     }
+ 
+-    /// Clone ActionsDAG with re-generated column name for constants.
+-    /// DAG from the query (with enabled analyzer) uses suffixes for constants, like 1_UInt8.
+-    /// DAG from the skip indexes does not use it. This breaks matching by column name sometimes.
+-    auto cloned_filter_actions_dag = cloneFilterDAGForIndexesAnalysis(*filter_actions_dag);
+     rpn = std::move(
+             RPNBuilder<RPNElement>(
+-                    cloned_filter_actions_dag.getOutputs().at(0), context_,
++                    predicate, context_,
+                     [&](const RPNBuilderTreeNode & node, RPNElement & out)
+                     {
+                         return this->traverseAtomAST(node, out);
+@@ -777,9 +772,9 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexGin::createIndexAggregatorForPart(cons
+ }
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexGin::createIndexCondition(
+-        const ActionsDAG * filter_actions_dag, ContextPtr context) const
++    const ActionsDAG::Node * predicate, ContextPtr context) const
+ {
+-    return std::make_shared<MergeTreeIndexConditionGin>(filter_actions_dag, context, index.sample_block, params, token_extractor.get());
++    return std::make_shared<MergeTreeIndexConditionGin>(predicate, context, index.sample_block, params, token_extractor.get());
+ };
+ 
+ MergeTreeIndexPtr ginIndexCreator(
+diff --git a/src/Storages/MergeTree/MergeTreeIndexGin.h b/src/Storages/MergeTree/MergeTreeIndexGin.h
+index dc7cb28386aa..063a4c5c3603 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexGin.h
++++ b/src/Storages/MergeTree/MergeTreeIndexGin.h
+@@ -65,7 +65,7 @@ class MergeTreeIndexConditionGin final : public IMergeTreeIndexCondition, WithCo
+ {
+ public:
+     MergeTreeIndexConditionGin(
+-            const ActionsDAG * filter_actions_dag,
++            const ActionsDAG::Node * predicate,
+             ContextPtr context,
+             const Block & index_sample_block,
+             const GinFilterParameters & params_,
+@@ -172,7 +172,7 @@ class MergeTreeIndexGin final : public IMergeTreeIndex
+     MergeTreeIndexGranulePtr createIndexGranule() const override;
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+     MergeTreeIndexAggregatorPtr createIndexAggregatorForPart(const GinIndexStorePtr & store, const MergeTreeWriterSettings & /*settings*/) const override;
+-    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     GinFilterParameters params;
+     /// Function for selecting next token.
+diff --git a/src/Storages/MergeTree/MergeTreeIndexHypothesis.cpp b/src/Storages/MergeTree/MergeTreeIndexHypothesis.cpp
+index 4bce5f34a1bb..307226d661b2 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexHypothesis.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexHypothesis.cpp
+@@ -78,7 +78,7 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexHypothesis::createIndexAggregator(cons
+ }
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexHypothesis::createIndexCondition(
+-    const ActionsDAG *, ContextPtr) const
++    const ActionsDAG::Node *, ContextPtr) const
+ {
+     throw Exception(ErrorCodes::LOGICAL_ERROR, "Not supported");
+ }
+diff --git a/src/Storages/MergeTree/MergeTreeIndexHypothesis.h b/src/Storages/MergeTree/MergeTreeIndexHypothesis.h
+index dfdc1f29dc17..9832b0d9a2ff 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexHypothesis.h
++++ b/src/Storages/MergeTree/MergeTreeIndexHypothesis.h
+@@ -71,7 +71,7 @@ class MergeTreeIndexHypothesis : public IMergeTreeIndex
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+ 
+     MergeTreeIndexConditionPtr createIndexCondition(
+-        const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++        const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     MergeTreeIndexMergedConditionPtr createIndexMergedCondition(
+         const SelectQueryInfo & query_info, StorageMetadataPtr storage_metadata) const override;
+diff --git a/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.cpp b/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.cpp
+index 954ce3360d27..3cf015adbe1f 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.cpp
+@@ -23,7 +23,7 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexLegacyVectorSimilarity::createIndexAgg
+     throw Exception(ErrorCodes::ILLEGAL_INDEX, "Indexes of type 'annoy' or 'usearch' are no longer supported. Please drop and recreate the index as type 'vector_similarity'");
+ }
+ 
+-MergeTreeIndexConditionPtr MergeTreeIndexLegacyVectorSimilarity::createIndexCondition(const ActionsDAG *, ContextPtr) const
++MergeTreeIndexConditionPtr MergeTreeIndexLegacyVectorSimilarity::createIndexCondition(const ActionsDAG::Node *, ContextPtr) const
+ {
+     throw Exception(ErrorCodes::ILLEGAL_INDEX, "Indexes of type 'annoy' or 'usearch' are no longer supported. Please drop and recreate the index as type 'vector_similarity'");
+ }
+diff --git a/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.h b/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.h
+index 12e997463a07..9772ff1802a8 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.h
++++ b/src/Storages/MergeTree/MergeTreeIndexLegacyVectorSimilarity.h
+@@ -17,7 +17,7 @@ class MergeTreeIndexLegacyVectorSimilarity : public IMergeTreeIndex
+ 
+     MergeTreeIndexGranulePtr createIndexGranule() const override;
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings &) const override;
+-    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     bool isVectorSimilarityIndex() const override { return true; }
+ };
+diff --git a/src/Storages/MergeTree/MergeTreeIndexMinMax.cpp b/src/Storages/MergeTree/MergeTreeIndexMinMax.cpp
+index 4d7870c4dba5..f9fdc2c97cd0 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexMinMax.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexMinMax.cpp
+@@ -161,17 +161,17 @@ void MergeTreeIndexAggregatorMinMax::update(const Block & block, size_t * pos, s
+ namespace
+ {
+ 
+-KeyCondition buildCondition(const IndexDescription & index, const ActionsDAG * filter_actions_dag, ContextPtr context)
++KeyCondition buildCondition(const IndexDescription & index, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context)
+ {
+-    return KeyCondition{filter_actions_dag, context, index.column_names, index.expression};
++    return KeyCondition{filter_dag, context, index.column_names, index.expression};
+ }
+ 
+ }
+ 
+ MergeTreeIndexConditionMinMax::MergeTreeIndexConditionMinMax(
+-    const IndexDescription & index, const ActionsDAG * filter_actions_dag, ContextPtr context)
++    const IndexDescription & index, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context)
+     : index_data_types(index.data_types)
+-    , condition(buildCondition(index, filter_actions_dag, context))
++    , condition(buildCondition(index, filter_dag, context))
+ {
+ }
+ 
+@@ -199,9 +199,10 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexMinMax::createIndexAggregator(const Me
+ }
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexMinMax::createIndexCondition(
+-    const ActionsDAG * filter_actions_dag, ContextPtr context) const
++    const ActionsDAG::Node * predicate, ContextPtr context) const
+ {
+-    return std::make_shared<MergeTreeIndexConditionMinMax>(index, filter_actions_dag, context);
++    ActionsDAGWithInversionPushDown filter_dag(predicate, context);
++    return std::make_shared<MergeTreeIndexConditionMinMax>(index, filter_dag, context);
+ }
+ 
+ MergeTreeIndexFormat MergeTreeIndexMinMax::getDeserializedFormat(const IDataPartStorage & data_part_storage, const std::string & relative_path_prefix) const
+diff --git a/src/Storages/MergeTree/MergeTreeIndexMinMax.h b/src/Storages/MergeTree/MergeTreeIndexMinMax.h
+index 229d16ff008f..049219fb1c0e 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexMinMax.h
++++ b/src/Storages/MergeTree/MergeTreeIndexMinMax.h
+@@ -52,7 +52,7 @@ class MergeTreeIndexConditionMinMax final : public IMergeTreeIndexCondition
+ public:
+     MergeTreeIndexConditionMinMax(
+         const IndexDescription & index,
+-        const ActionsDAG * filter_actions_dag,
++        const ActionsDAGWithInversionPushDown & filter_dag,
+         ContextPtr context);
+ 
+     bool alwaysUnknownOrTrue() const override;
+@@ -79,7 +79,7 @@ class MergeTreeIndexMinMax : public IMergeTreeIndex
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+ 
+     MergeTreeIndexConditionPtr createIndexCondition(
+-        const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++        const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     const char* getSerializedFileExtension() const override { return ".idx2"; }
+     MergeTreeIndexFormat getDeserializedFormat(const IDataPartStorage & data_part_storage, const std::string & path_prefix) const override; /// NOLINT
+diff --git a/src/Storages/MergeTree/MergeTreeIndexSet.cpp b/src/Storages/MergeTree/MergeTreeIndexSet.cpp
+index 0419d423f238..16102136eea9 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexSet.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexSet.cpp
+@@ -18,9 +18,6 @@
+ #include <Functions/indexHint.h>
+ #include <Planner/PlannerActionsVisitor.h>
+ 
+-#include <Storages/MergeTree/MergeTreeIndexUtils.h>
+-
+-
+ namespace DB
+ {
+ 
+@@ -342,14 +339,14 @@ MergeTreeIndexGranulePtr MergeTreeIndexAggregatorSet::getGranuleAndReset()
+     return granule;
+ }
+ 
+-KeyCondition buildCondition(const IndexDescription & index, const ActionsDAG * filter_actions_dag, ContextPtr context)
++KeyCondition buildCondition(const IndexDescription & index, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context)
+ {
+-    return KeyCondition{filter_actions_dag, context, index.column_names, index.expression};
++    return KeyCondition{filter_dag, context, index.column_names, index.expression};
+ }
+ 
+ MergeTreeIndexConditionSet::MergeTreeIndexConditionSet(
+     size_t max_rows_,
+-    const ActionsDAG * filter_dag,
++    const ActionsDAGWithInversionPushDown & filter_dag,
+     ContextPtr context,
+     const IndexDescription & index_description)
+     : index_name(index_description.name)
+@@ -361,21 +358,18 @@ MergeTreeIndexConditionSet::MergeTreeIndexConditionSet(
+         if (!key_columns.contains(name))
+             key_columns.insert(name);
+ 
+-    if (!filter_dag)
++    if (!filter_dag.predicate)
+         return;
+ 
+-    /// Clone ActionsDAG with re-generated column name for constants.
+-    /// DAG from the query (with enabled analyzer) uses suffixes for constants, like 1_UInt8.
+-    /// DAG from the skip indexes does not use it. This breaks matching by column name sometimes.
+-    auto filter_actions_dag = cloneFilterDAGForIndexesAnalysis(*filter_dag);
+     std::vector<FutureSetPtr> sets_to_prepare;
+-    if (checkDAGUseless(*filter_actions_dag.getOutputs().at(0), context, sets_to_prepare))
++    if (checkDAGUseless(*filter_dag.predicate, context, sets_to_prepare))
+         return;
+     /// Try to run subqueries, don't use index if failed (e.g. if use_index_for_in_with_subqueries is disabled).
+     for (auto & set : sets_to_prepare)
+         if (!set->buildOrderedSetInplace(context))
+             return;
+ 
++    auto filter_actions_dag = filter_dag.dag->clone();
+     const auto * filter_actions_dag_node = filter_actions_dag.getOutputs().at(0);
+ 
+     std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> node_to_result_node;
+@@ -755,9 +749,10 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexSet::createIndexAggregator(const Merge
+ }
+ 
+ MergeTreeIndexConditionPtr MergeTreeIndexSet::createIndexCondition(
+-    const ActionsDAG * filter_actions_dag, ContextPtr context) const
++    const ActionsDAG::Node * predicate, ContextPtr context) const
+ {
+-    return std::make_shared<MergeTreeIndexConditionSet>(max_rows, filter_actions_dag, context, index);
++    ActionsDAGWithInversionPushDown filter_dag(predicate, context);
++    return std::make_shared<MergeTreeIndexConditionSet>(max_rows, filter_dag, context, index);
+ }
+ 
+ MergeTreeIndexPtr setIndexCreator(const IndexDescription & index)
+diff --git a/src/Storages/MergeTree/MergeTreeIndexSet.h b/src/Storages/MergeTree/MergeTreeIndexSet.h
+index bfb95b39ad8c..9902c2ee6dc6 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexSet.h
++++ b/src/Storages/MergeTree/MergeTreeIndexSet.h
+@@ -100,7 +100,7 @@ class MergeTreeIndexConditionSet final : public IMergeTreeIndexCondition
+ public:
+     MergeTreeIndexConditionSet(
+         size_t max_rows_,
+-        const ActionsDAG * filter_dag,
++        const ActionsDAGWithInversionPushDown & filter_dag,
+         ContextPtr context,
+         const IndexDescription & index_description);
+ 
+@@ -168,7 +168,7 @@ class MergeTreeIndexSet final : public IMergeTreeIndex
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+ 
+     MergeTreeIndexConditionPtr createIndexCondition(
+-            const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
++        const ActionsDAG::Node * predicate, ContextPtr context) const override;
+ 
+     size_t max_rows = 0;
+ };
+diff --git a/src/Storages/MergeTree/MergeTreeIndexUtils.cpp b/src/Storages/MergeTree/MergeTreeIndexUtils.cpp
+deleted file mode 100644
+index bee0c4c9a3f0..000000000000
+--- a/src/Storages/MergeTree/MergeTreeIndexUtils.cpp
++++ /dev/null
+@@ -1,150 +0,0 @@
+-#include <Storages/MergeTree/MergeTreeIndexUtils.h>
+-
+-#include <Parsers/ASTExpressionList.h>
+-#include <Parsers/ASTFunction.h>
+-#include <Parsers/ASTSelectQuery.h>
+-#include <Parsers/ASTLiteral.h>
+-#include <Columns/ColumnConst.h>
+-#include <Functions/IFunction.h>
+-
+-namespace DB
+-{
+-
+-ASTPtr buildFilterNode(const ASTPtr & select_query, ASTs additional_filters)
+-{
+-    auto & select_query_typed = select_query->as<ASTSelectQuery &>();
+-
+-    ASTs filters;
+-    if (select_query_typed.where())
+-        filters.push_back(select_query_typed.where());
+-
+-    if (select_query_typed.prewhere())
+-        filters.push_back(select_query_typed.prewhere());
+-
+-    filters.insert(filters.end(), additional_filters.begin(), additional_filters.end());
+-
+-    if (filters.empty())
+-        return nullptr;
+-
+-    ASTPtr filter_node;
+-
+-    if (filters.size() == 1)
+-    {
+-        filter_node = filters.front();
+-    }
+-    else
+-    {
+-        auto function = std::make_shared<ASTFunction>();
+-
+-        function->name = "and";
+-        function->arguments = std::make_shared<ASTExpressionList>();
+-        function->children.push_back(function->arguments);
+-        function->arguments->children = std::move(filters);
+-
+-        filter_node = std::move(function);
+-    }
+-
+-    return filter_node;
+-}
+-
+-namespace
+-{
+-
+-bool isTrivialCast(const ActionsDAG::Node & node)
+-{
+-    if (node.function_base->getName() != "CAST" || node.children.size() != 2 || node.children[1]->type != ActionsDAG::ActionType::COLUMN)
+-        return false;
+-
+-    const auto * column_const = typeid_cast<const ColumnConst *>(node.children[1]->column.get());
+-    if (!column_const)
+-        return false;
+-
+-    Field field = column_const->getField();
+-    if (field.getType() != Field::Types::String)
+-        return false;
+-
+-    auto type_name = field.safeGet<String>();
+-    return node.children[0]->result_type->getName() == type_name;
+-}
+-
+-const ActionsDAG::Node & cloneFilterDAGNodeForIndexesAnalysis(
+-    const ActionsDAG::Node & node,
+-    ActionsDAG & new_dag,
+-    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> & cloned_nodes)
+-{
+-    auto it = cloned_nodes.find(&node);
+-    if (it != cloned_nodes.end())
+-        return *it->second;
+-
+-    const ActionsDAG::Node * res;
+-    switch (node.type)
+-    {
+-        case (ActionsDAG::ActionType::INPUT):
+-        {
+-            res = &new_dag.addInput({node.column, node.result_type, node.result_name});
+-            break;
+-        }
+-        case (ActionsDAG::ActionType::COLUMN):
+-        {
+-            String name;
+-            if (const auto * column_const = typeid_cast<const ColumnConst *>(node.column.get());
+-                column_const && column_const->getDataType() != TypeIndex::Function)
+-            {
+-                /// Re-generate column name for constant.
+-                name = ASTLiteral(column_const->getField()).getColumnName();
+-            }
+-            else
+-                name = node.result_name;
+-
+-            res = &new_dag.addColumn({node.column, node.result_type, name});
+-            break;
+-        }
+-        case (ActionsDAG::ActionType::ALIAS):
+-        {
+-            auto arg = cloneFilterDAGNodeForIndexesAnalysis(*node.children.front(), new_dag, cloned_nodes);
+-            res = &new_dag.addAlias(arg, node.result_name);
+-            break;
+-        }
+-        case (ActionsDAG::ActionType::ARRAY_JOIN):
+-        {
+-            auto arg = cloneFilterDAGNodeForIndexesAnalysis(*node.children.front(), new_dag, cloned_nodes);
+-            res = &new_dag.addArrayJoin(arg, {});
+-            break;
+-        }
+-        case (ActionsDAG::ActionType::FUNCTION):
+-        {
+-            if (isTrivialCast(node))
+-            {
+-                /// Remove trivial cast and keep its first argument.
+-                res = &cloneFilterDAGNodeForIndexesAnalysis(*node.children[0], new_dag, cloned_nodes);
+-            }
+-            else
+-            {
+-                ActionsDAG::NodeRawConstPtrs children(node.children);
+-                for (auto & arg : children)
+-                    arg = &cloneFilterDAGNodeForIndexesAnalysis(*arg, new_dag, cloned_nodes);
+-                res = &new_dag.addFunction(node.function_base, children, "");
+-            }
+-            break;
+-        }
+-    }
+-
+-    cloned_nodes[&node] = res;
+-    return *res;
+-}
+-
+-}
+-
+-ActionsDAG cloneFilterDAGForIndexesAnalysis(const ActionsDAG & dag)
+-{
+-    ActionsDAG new_dag;
+-    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> cloned_nodes;
+-    ActionsDAG::NodeRawConstPtrs outputs = dag.getOutputs();
+-    for (auto & node : outputs)
+-        node = &cloneFilterDAGNodeForIndexesAnalysis(*node, new_dag, cloned_nodes);
+-
+-    new_dag.getOutputs().swap(outputs);
+-    return new_dag;
+-}
+-
+-}
+diff --git a/src/Storages/MergeTree/MergeTreeIndexUtils.h b/src/Storages/MergeTree/MergeTreeIndexUtils.h
+deleted file mode 100644
+index e8ff7240e1c5..000000000000
+--- a/src/Storages/MergeTree/MergeTreeIndexUtils.h
++++ /dev/null
+@@ -1,20 +0,0 @@
+-#pragma once
+-
+-#include <Parsers/IAST_fwd.h>
+-#include <Interpreters/ActionsDAG.h>
+-
+-namespace DB
+-{
+-
+-/** Build AST filter node for index analysis from WHERE and PREWHERE sections of select query and additional filters.
+-  * If select query does not have WHERE and PREWHERE and additional filters are empty null is returned.
+-  */
+-ASTPtr buildFilterNode(const ASTPtr & select_query, ASTs additional_filters = {});
+-
+-/// Clone ActionsDAG with re-generated column name for constants.
+-/// DAG from the query (with enabled analyzer) uses suffixes for constants, like 1_UInt8.
+-/// DAG from the skip indexes does not use it. This breaks matching by column name sometimes.
+-/// Also remove useless CASTs to the same type (CAST(column, 'Type') where column already has type Type).
+-ActionsDAG cloneFilterDAGForIndexesAnalysis(const ActionsDAG & dag);
+-
+-}
+diff --git a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
+index 35daf696e56a..ca87cb149541 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.cpp
+@@ -513,12 +513,12 @@ MergeTreeIndexAggregatorPtr MergeTreeIndexVectorSimilarity::createIndexAggregato
+     return std::make_shared<MergeTreeIndexAggregatorVectorSimilarity>(index.name, index.sample_block, dimensions, metric_kind, scalar_kind, usearch_hnsw_params);
+ }
+ 
+-MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(const ActionsDAG * /*filter_actions_dag*/, ContextPtr /*context*/) const
++MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(const ActionsDAG::Node * /*predicate*/, ContextPtr /*context*/) const
+ {
+     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Function not supported for vector similarity index");
+ }
+ 
+-MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(const ActionsDAG * /*filter_actions_dag*/, ContextPtr context, const std::optional<VectorSearchParameters> & parameters) const
++MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(const ActionsDAG::Node * /*predicate*/, ContextPtr context, const std::optional<VectorSearchParameters> & parameters) const
+ {
+     const String & index_column = index.column_names[0];
+     return std::make_shared<MergeTreeIndexConditionVectorSimilarity>(parameters, index_column, metric_kind, context);
+diff --git a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
+index 9e2b854f15f8..15c7f2c08964 100644
+--- a/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
++++ b/src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.h
+@@ -176,8 +176,8 @@ class MergeTreeIndexVectorSimilarity : public IMergeTreeIndex
+ 
+     MergeTreeIndexGranulePtr createIndexGranule() const override;
+     MergeTreeIndexAggregatorPtr createIndexAggregator(const MergeTreeWriterSettings & settings) const override;
+-    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context) const override;
+-    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG * filter_actions_dag, ContextPtr context, const std::optional<VectorSearchParameters> & parameters) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const override;
++    MergeTreeIndexConditionPtr createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context, const std::optional<VectorSearchParameters> & parameters) const override;
+     bool isVectorSimilarityIndex() const override { return true; }
+ 
+ private:
+diff --git a/src/Storages/MergeTree/MergeTreeIndices.h b/src/Storages/MergeTree/MergeTreeIndices.h
+index d1a4d051ebec..22dba58311cf 100644
+--- a/src/Storages/MergeTree/MergeTreeIndices.h
++++ b/src/Storages/MergeTree/MergeTreeIndices.h
+@@ -2,6 +2,7 @@
+ #include "config.h"
+ 
+ #include <Storages/IndicesDescription.h>
++#include <Interpreters/ActionsDAG.h>
+ 
+ #include <memory>
+ #include <string>
+@@ -214,11 +215,11 @@ struct IMergeTreeIndex
+     }
+ 
+     virtual MergeTreeIndexConditionPtr createIndexCondition(
+-        const ActionsDAG * filter_actions_dag, ContextPtr context) const = 0;
++        const ActionsDAG::Node * predicate, ContextPtr context) const = 0;
+ 
+     /// The vector similarity index overrides this method
+     virtual MergeTreeIndexConditionPtr createIndexCondition(
+-        const ActionsDAG * /*filter_actions_dag*/, ContextPtr /*context*/,
++        const ActionsDAG::Node * /*predicate*/, ContextPtr /*context*/,
+         const std::optional<VectorSearchParameters> & /*parameters*/) const
+     {
+         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+diff --git a/src/Storages/MergeTree/MergeTreeSequentialSource.cpp b/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
+index cdd7952b648a..25be7867959b 100644
+--- a/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
++++ b/src/Storages/MergeTree/MergeTreeSequentialSource.cpp
+@@ -360,7 +360,8 @@ class ReadFromPart final : public ISourceStep
+         {
+             const auto & primary_key = storage_snapshot->metadata->getPrimaryKey();
+             const Names & primary_key_column_names = primary_key.column_names;
+-            KeyCondition key_condition(&*filter, context, primary_key_column_names, primary_key.expression);
++            ActionsDAGWithInversionPushDown filter_dag(filter->getOutputs().front(), context);
++            KeyCondition key_condition(filter_dag, context, primary_key_column_names, primary_key.expression);
+             LOG_DEBUG(log, "Key condition: {}", key_condition.toString());
+ 
+             if (!key_condition.alwaysFalse())
+diff --git a/src/Storages/MergeTree/PartitionPruner.cpp b/src/Storages/MergeTree/PartitionPruner.cpp
+index 0a51336845da..3f0e0b9332e2 100644
+--- a/src/Storages/MergeTree/PartitionPruner.cpp
++++ b/src/Storages/MergeTree/PartitionPruner.cpp
+@@ -4,9 +4,9 @@
+ namespace DB
+ {
+ 
+-PartitionPruner::PartitionPruner(const StorageMetadataPtr & metadata, const ActionsDAG * filter_actions_dag, ContextPtr context, bool strict)
++PartitionPruner::PartitionPruner(const StorageMetadataPtr & metadata, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context, bool strict)
+     : partition_key(MergeTreePartition::adjustPartitionKey(metadata, context))
+-    , partition_condition(filter_actions_dag, context, partition_key.column_names, partition_key.expression, true /* single_point */)
++    , partition_condition(filter_dag, context, partition_key.column_names, partition_key.expression, true /* single_point */)
+     , useless((strict && partition_condition.isRelaxed()) || partition_condition.alwaysUnknownOrTrue())
+ {
+ }
+diff --git a/src/Storages/MergeTree/PartitionPruner.h b/src/Storages/MergeTree/PartitionPruner.h
+index d89dfb7b2456..714b07bf61a3 100644
+--- a/src/Storages/MergeTree/PartitionPruner.h
++++ b/src/Storages/MergeTree/PartitionPruner.h
+@@ -13,7 +13,7 @@ namespace DB
+ class PartitionPruner
+ {
+ public:
+-    PartitionPruner(const StorageMetadataPtr & metadata, const ActionsDAG * filter_actions_dag, ContextPtr context, bool strict = false);
++    PartitionPruner(const StorageMetadataPtr & metadata, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context, bool strict = false);
+ 
+     bool canBePruned(const IMergeTreeDataPart & part) const;
+ 
+diff --git a/src/Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.cpp b/src/Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.cpp
+index 9a487b6cd617..c2b4754e116b 100644
+--- a/src/Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.cpp
++++ b/src/Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.cpp
+@@ -73,8 +73,9 @@ PartitionPruner::PartitionPruner(
+             partition_columns_description,
+             context);
+ 
++        DB::ActionsDAGWithInversionPushDown inverted_dag(filter_dag.getOutputs().front(), context);
+         key_condition.emplace(
+-            &filter_dag, context, partition_key.column_names, partition_key.expression, true /* single_point */);
++            inverted_dag, context, partition_key.column_names, partition_key.expression, true /* single_point */);
+     }
+ }
+ 
+diff --git a/src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.cpp b/src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.cpp
+index 246af3f2d457..59d2234ea1a7 100644
+--- a/src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.cpp
++++ b/src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.cpp
+@@ -145,7 +145,10 @@ ManifestFilesPruner::ManifestFilesPruner(
+     {
+         partition_key = &manifest_file.getPartitionKeyDescription();
+         if (transformed_dag != nullptr)
+-            partition_key_condition.emplace(transformed_dag.get(), context, partition_key->column_names, partition_key->expression, true /* single_point */);
++        {
++            ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context);
++            partition_key_condition.emplace(inverted_dag, context, partition_key->column_names, partition_key->expression, true /* single_point */);
++        }
+     }
+ 
+     if (manifest_file.hasBoundsInfoInManifests() && transformed_dag != nullptr)
+@@ -163,7 +166,8 @@ ManifestFilesPruner::ManifestFilesPruner(
+                 ExpressionActionsPtr expression = std::make_shared<ExpressionActions>(
+                     ActionsDAG({name_and_type}), ExpressionActionsSettings(context));
+ 
+-                min_max_key_conditions.emplace(used_column_id, KeyCondition(transformed_dag.get(), context, {name_and_type.name}, expression));
++                ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context);
++                min_max_key_conditions.emplace(used_column_id, KeyCondition(inverted_dag, context, {name_and_type.name}, expression));
+             }
+         }
+     }

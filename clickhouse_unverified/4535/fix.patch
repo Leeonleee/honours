@@ -1,0 +1,1569 @@
+diff --git a/dbms/programs/server/TCPHandler.cpp b/dbms/programs/server/TCPHandler.cpp
+index 32b877fb2b8a..013f047ae67c 100644
+--- a/dbms/programs/server/TCPHandler.cpp
++++ b/dbms/programs/server/TCPHandler.cpp
+@@ -724,7 +724,7 @@ bool TCPHandler::receiveData()
+                 query_context.addExternalTable(external_table_name, storage);
+             }
+             /// The data will be written directly to the table.
+-            state.io.out = storage->write(ASTPtr(), query_context.getSettingsRef());
++            state.io.out = storage->write(ASTPtr(), query_context);
+         }
+         if (block)
+             state.io.out->write(block);
+diff --git a/dbms/src/Common/RWLock.cpp b/dbms/src/Common/RWLock.cpp
+index 98e2a9f2995d..7eea6c7d76d4 100644
+--- a/dbms/src/Common/RWLock.cpp
++++ b/dbms/src/Common/RWLock.cpp
+@@ -33,27 +33,28 @@ namespace ErrorCodes
+ }
+ 
+ 
+-class RWLockImpl::LockHandlerImpl
++class RWLockImpl::LockHolderImpl
+ {
+     RWLock parent;
+     GroupsContainer::iterator it_group;
+     ClientsContainer::iterator it_client;
+-    ThreadToHandler::iterator it_handler;
++    ThreadToHolder::iterator it_thread;
++    QueryIdToHolder::iterator it_query;
+     CurrentMetrics::Increment active_client_increment;
+ 
+-    LockHandlerImpl(RWLock && parent, GroupsContainer::iterator it_group, ClientsContainer::iterator it_client);
++    LockHolderImpl(RWLock && parent, GroupsContainer::iterator it_group, ClientsContainer::iterator it_client);
+ 
+ public:
+ 
+-    LockHandlerImpl(const LockHandlerImpl & other) = delete;
++    LockHolderImpl(const LockHolderImpl & other) = delete;
+ 
+-    ~LockHandlerImpl();
++    ~LockHolderImpl();
+ 
+     friend class RWLockImpl;
+ };
+ 
+ 
+-RWLockImpl::LockHandler RWLockImpl::getLock(RWLockImpl::Type type)
++RWLockImpl::LockHolder RWLockImpl::getLock(RWLockImpl::Type type, const String & query_id)
+ {
+     Stopwatch watch(CLOCK_MONOTONIC_COARSE);
+     CurrentMetrics::Increment waiting_client_increment((type == Read) ? CurrentMetrics::RWLockWaitingReaders
+@@ -66,28 +67,33 @@ RWLockImpl::LockHandler RWLockImpl::getLock(RWLockImpl::Type type)
+                                                 : ProfileEvents::RWLockWritersWaitMilliseconds, watch.elapsedMilliseconds());
+     };
+ 
+-    auto this_thread_id = std::this_thread::get_id();
+     GroupsContainer::iterator it_group;
+     ClientsContainer::iterator it_client;
+ 
+     std::unique_lock lock(mutex);
+ 
+-    /// Check if the same thread is acquiring previously acquired lock
+-    auto it_handler = thread_to_handler.find(this_thread_id);
+-    if (it_handler != thread_to_handler.end())
+-    {
+-        auto handler_ptr = it_handler->second.lock();
++    /// Check if the same query is acquiring previously acquired lock
++    LockHolder existing_holder_ptr;
++
++    auto this_thread_id = std::this_thread::get_id();
++    auto it_thread = thread_to_holder.find(this_thread_id);
+ 
+-        /// Lock may be released in another thread, but not yet deleted inside |~LogHandlerImpl()|
++    auto it_query = query_id_to_holder.end();
++    if (query_id != RWLockImpl::NO_QUERY)
++        it_query = query_id_to_holder.find(query_id);
+ 
+-        if (handler_ptr)
+-        {
+-            /// XXX: it means we can't upgrade lock from read to write - with proper waiting!
+-            if (type != Read || handler_ptr->it_group->type != Read)
+-                throw Exception("Attempt to acquire exclusive lock recursively", ErrorCodes::LOGICAL_ERROR);
++    if (it_thread != thread_to_holder.end())
++        existing_holder_ptr = it_thread->second.lock();
++    else if (it_query != query_id_to_holder.end())
++        existing_holder_ptr = it_query->second.lock();
+ 
+-            return handler_ptr;
+-        }
++    if (existing_holder_ptr)
++    {
++        /// XXX: it means we can't upgrade lock from read to write - with proper waiting!
++        if (type != Read || existing_holder_ptr->it_group->type != Read)
++            throw Exception("Attempt to acquire exclusive lock recursively", ErrorCodes::LOGICAL_ERROR);
++
++        return existing_holder_ptr;
+     }
+ 
+     if (type == Type::Write || queue.empty() || queue.back().type == Type::Write)
+@@ -115,11 +121,15 @@ RWLockImpl::LockHandler RWLockImpl::getLock(RWLockImpl::Type type)
+         throw;
+     }
+ 
+-    LockHandler res(new LockHandlerImpl(shared_from_this(), it_group, it_client));
++    LockHolder res(new LockHolderImpl(shared_from_this(), it_group, it_client));
+ 
+-    /// Insert myself (weak_ptr to the handler) to threads set to implement recursive lock
+-    it_handler = thread_to_handler.emplace(this_thread_id, res).first;
+-    res->it_handler = it_handler;
++    /// Insert myself (weak_ptr to the holder) to threads set to implement recursive lock
++    it_thread = thread_to_holder.emplace(this_thread_id, res).first;
++    res->it_thread = it_thread;
++
++    if (query_id != RWLockImpl::NO_QUERY)
++        it_query = query_id_to_holder.emplace(query_id, res).first;
++    res->it_query = it_query;
+ 
+     /// We are first, we should not wait anything
+     /// If we are not the first client in the group, a notification could be already sent
+@@ -137,12 +147,15 @@ RWLockImpl::LockHandler RWLockImpl::getLock(RWLockImpl::Type type)
+ }
+ 
+ 
+-RWLockImpl::LockHandlerImpl::~LockHandlerImpl()
++RWLockImpl::LockHolderImpl::~LockHolderImpl()
+ {
+     std::unique_lock lock(parent->mutex);
+ 
+-    /// Remove weak_ptr to the handler, since there are no owners of the current lock
+-    parent->thread_to_handler.erase(it_handler);
++    /// Remove weak_ptrs to the holder, since there are no owners of the current lock
++    parent->thread_to_holder.erase(it_thread);
++
++    if (it_query != parent->query_id_to_holder.end())
++        parent->query_id_to_holder.erase(it_query);
+ 
+     /// Removes myself from client list of our group
+     it_group->clients.erase(it_client);
+@@ -161,7 +174,7 @@ RWLockImpl::LockHandlerImpl::~LockHandlerImpl()
+ }
+ 
+ 
+-RWLockImpl::LockHandlerImpl::LockHandlerImpl(RWLock && parent, RWLockImpl::GroupsContainer::iterator it_group,
++RWLockImpl::LockHolderImpl::LockHolderImpl(RWLock && parent, RWLockImpl::GroupsContainer::iterator it_group,
+                                              RWLockImpl::ClientsContainer::iterator it_client)
+     : parent{std::move(parent)}, it_group{it_group}, it_client{it_client},
+       active_client_increment{(*it_client == RWLockImpl::Read) ? CurrentMetrics::RWLockActiveReaders
+diff --git a/dbms/src/Common/RWLock.h b/dbms/src/Common/RWLock.h
+index fd95ed48e27c..858411dbb086 100644
+--- a/dbms/src/Common/RWLock.h
++++ b/dbms/src/Common/RWLock.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <Core/Types.h>
+ #include <boost/core/noncopyable.hpp>
+ #include <list>
+ #include <vector>
+@@ -17,7 +18,13 @@ using RWLock = std::shared_ptr<RWLockImpl>;
+ 
+ 
+ /// Implements shared lock with FIFO service
+-/// Can be acquired recursively (several calls from the same thread) in Read mode
++/// Can be acquired recursively (several calls for the same query or the same OS thread) in Read mode
++///
++/// NOTE: it is important to allow acquiring the same lock in Read mode without waiting if it is already
++/// acquired by another thread of the same query. Otherwise the following deadlock is possible:
++/// - SELECT thread 1 locks in the Read mode
++/// - ALTER tries to lock in the Write mode (waits for SELECT thread 1)
++/// - SELECT thread 2 tries to lock in the Read mode (waits for ALTER)
+ class RWLockImpl : public std::enable_shared_from_this<RWLockImpl>
+ {
+ public:
+@@ -29,14 +36,17 @@ class RWLockImpl : public std::enable_shared_from_this<RWLockImpl>
+ 
+     static RWLock create() { return RWLock(new RWLockImpl); }
+ 
+-    /// Just use LockHandler::reset() to release the lock
+-    class LockHandlerImpl;
+-    friend class LockHandlerImpl;
+-    using LockHandler = std::shared_ptr<LockHandlerImpl>;
+-
++    /// Just use LockHolder::reset() to release the lock
++    class LockHolderImpl;
++    friend class LockHolderImpl;
++    using LockHolder = std::shared_ptr<LockHolderImpl>;
+ 
+     /// Waits in the queue and returns appropriate lock
+-    LockHandler getLock(Type type);
++    /// Empty query_id means the lock is acquired out of the query context (e.g. in a background thread).
++    LockHolder getLock(Type type, const String & query_id);
++
++    /// Use as query_id to acquire a lock outside the query context.
++    inline static const String NO_QUERY = String();
+ 
+ private:
+     RWLockImpl() = default;
+@@ -44,7 +54,8 @@ class RWLockImpl : public std::enable_shared_from_this<RWLockImpl>
+     struct Group;
+     using GroupsContainer = std::list<Group>;
+     using ClientsContainer = std::list<Type>;
+-    using ThreadToHandler = std::map<std::thread::id, std::weak_ptr<LockHandlerImpl>>;
++    using ThreadToHolder = std::map<std::thread::id, std::weak_ptr<LockHolderImpl>>;
++    using QueryIdToHolder = std::map<String, std::weak_ptr<LockHolderImpl>>;
+ 
+     /// Group of clients that should be executed concurrently
+     /// i.e. a group could contain several readers, but only one writer
+@@ -61,7 +72,8 @@ class RWLockImpl : public std::enable_shared_from_this<RWLockImpl>
+ 
+     mutable std::mutex mutex;
+     GroupsContainer queue;
+-    ThreadToHandler thread_to_handler;
++    ThreadToHolder thread_to_holder;
++    QueryIdToHolder query_id_to_holder;
+ };
+ 
+ 
+diff --git a/dbms/src/Core/ExternalTable.cpp b/dbms/src/Core/ExternalTable.cpp
+index 5bfdbb12e954..65bff362aa7c 100644
+--- a/dbms/src/Core/ExternalTable.cpp
++++ b/dbms/src/Core/ExternalTable.cpp
+@@ -163,7 +163,7 @@ void ExternalTablesHandler::handlePart(const Poco::Net::MessageHeader & header,
+     StoragePtr storage = StorageMemory::create(data.second, ColumnsDescription{columns});
+     storage->startup();
+     context.addExternalTable(data.second, storage);
+-    BlockOutputStreamPtr output = storage->write(ASTPtr(), settings);
++    BlockOutputStreamPtr output = storage->write(ASTPtr(), context);
+ 
+     /// Write data
+     data.first->readPrefix();
+diff --git a/dbms/src/DataStreams/CreatingSetsBlockInputStream.cpp b/dbms/src/DataStreams/CreatingSetsBlockInputStream.cpp
+index f47db3e3a8b0..9255527d072a 100644
+--- a/dbms/src/DataStreams/CreatingSetsBlockInputStream.cpp
++++ b/dbms/src/DataStreams/CreatingSetsBlockInputStream.cpp
+@@ -19,10 +19,14 @@ namespace ErrorCodes
+ CreatingSetsBlockInputStream::CreatingSetsBlockInputStream(
+     const BlockInputStreamPtr & input,
+     const SubqueriesForSets & subqueries_for_sets_,
+-    const SizeLimits & network_transfer_limits)
+-    : subqueries_for_sets(subqueries_for_sets_),
+-    network_transfer_limits(network_transfer_limits)
++    const Context & context_)
++    : subqueries_for_sets(subqueries_for_sets_)
++    , context(context_)
+ {
++    const Settings & settings = context.getSettingsRef();
++    network_transfer_limits = SizeLimits(
++        settings.max_rows_to_transfer, settings.max_bytes_to_transfer, settings.transfer_overflow_mode);
++
+     for (auto & elem : subqueries_for_sets)
+     {
+         if (elem.second.source)
+@@ -92,7 +96,7 @@ void CreatingSetsBlockInputStream::createOne(SubqueryForSet & subquery)
+ 
+     BlockOutputStreamPtr table_out;
+     if (subquery.table)
+-        table_out = subquery.table->write({}, {});
++        table_out = subquery.table->write({}, context);
+ 
+     bool done_with_set = !subquery.set;
+     bool done_with_join = !subquery.join;
+diff --git a/dbms/src/DataStreams/CreatingSetsBlockInputStream.h b/dbms/src/DataStreams/CreatingSetsBlockInputStream.h
+index 241f43c9a06f..b37c45164b5a 100644
+--- a/dbms/src/DataStreams/CreatingSetsBlockInputStream.h
++++ b/dbms/src/DataStreams/CreatingSetsBlockInputStream.h
+@@ -20,7 +20,7 @@ class CreatingSetsBlockInputStream : public IBlockInputStream
+     CreatingSetsBlockInputStream(
+         const BlockInputStreamPtr & input,
+         const SubqueriesForSets & subqueries_for_sets_,
+-        const SizeLimits & network_transfer_limits);
++        const Context & context_);
+ 
+     String getName() const override { return "CreatingSets"; }
+ 
+@@ -35,6 +35,7 @@ class CreatingSetsBlockInputStream : public IBlockInputStream
+ 
+ private:
+     SubqueriesForSets subqueries_for_sets;
++    const Context & context;
+     bool created = false;
+ 
+     SizeLimits network_transfer_limits;
+diff --git a/dbms/src/DataStreams/PushingToViewsBlockOutputStream.cpp b/dbms/src/DataStreams/PushingToViewsBlockOutputStream.cpp
+index 19046b535ba5..5cb0a1e57e43 100644
+--- a/dbms/src/DataStreams/PushingToViewsBlockOutputStream.cpp
++++ b/dbms/src/DataStreams/PushingToViewsBlockOutputStream.cpp
+@@ -20,7 +20,7 @@ PushingToViewsBlockOutputStream::PushingToViewsBlockOutputStream(
+       * Although now any insertion into the table is done via PushingToViewsBlockOutputStream,
+       *  but it's clear that here is not the best place for this functionality.
+       */
+-    addTableLock(storage->lockStructure(true));
++    addTableLock(storage->lockStructure(true, context.getCurrentQueryId()));
+ 
+     /// If the "root" table deduplactes blocks, there are no need to make deduplication for children
+     /// Moreover, deduplication for AggregatingMergeTree children could produce false positives due to low size of inserting blocks
+@@ -45,7 +45,7 @@ PushingToViewsBlockOutputStream::PushingToViewsBlockOutputStream(
+             auto & materialized_view = dynamic_cast<const StorageMaterializedView &>(*dependent_table);
+ 
+             if (StoragePtr inner_table = materialized_view.tryGetTargetTable())
+-                addTableLock(inner_table->lockStructure(true));
++                addTableLock(inner_table->lockStructure(true, context.getCurrentQueryId()));
+ 
+             auto query = materialized_view.getInnerQuery();
+             BlockOutputStreamPtr out = std::make_shared<PushingToViewsBlockOutputStream>(
+@@ -57,7 +57,7 @@ PushingToViewsBlockOutputStream::PushingToViewsBlockOutputStream(
+     /* Do not push to destination table if the flag is set */
+     if (!no_destination)
+     {
+-        output = storage->write(query_ptr, context.getSettingsRef());
++        output = storage->write(query_ptr, context);
+         replicated_output = dynamic_cast<ReplicatedMergeTreeBlockOutputStream *>(output.get());
+     }
+ }
+diff --git a/dbms/src/Functions/FunctionJoinGet.cpp b/dbms/src/Functions/FunctionJoinGet.cpp
+index 1c0cbff7506e..3ee3145dcfc6 100644
+--- a/dbms/src/Functions/FunctionJoinGet.cpp
++++ b/dbms/src/Functions/FunctionJoinGet.cpp
+@@ -65,7 +65,7 @@ FunctionBasePtr FunctionBuilderJoinGet::buildImpl(const ColumnsWithTypeAndName &
+     auto join = storage_join->getJoin();
+     DataTypes data_types(arguments.size());
+ 
+-    auto table_lock = storage_join->lockStructure(false);
++    auto table_lock = storage_join->lockStructure(false, context.getCurrentQueryId());
+     for (size_t i = 0; i < arguments.size(); ++i)
+         data_types[i] = arguments[i].type;
+ 
+diff --git a/dbms/src/Interpreters/ExpressionAnalyzer.cpp b/dbms/src/Interpreters/ExpressionAnalyzer.cpp
+index 9c642175cb00..4a2e62fe1ec9 100644
+--- a/dbms/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/dbms/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -304,7 +304,7 @@ void ExpressionAnalyzer::makeSetsForIndexImpl(const ASTPtr & node)
+     {
+         const IAST & args = *func->arguments;
+ 
+-        if (storage && storage->mayBenefitFromIndexForIn(args.children.at(0)))
++        if (storage && storage->mayBenefitFromIndexForIn(args.children.at(0), context))
+         {
+             const ASTPtr & arg = args.children.at(1);
+             if (typeid_cast<ASTSubquery *>(arg.get()) || isIdentifier(arg))
+diff --git a/dbms/src/Interpreters/InterpreterCreateQuery.cpp b/dbms/src/Interpreters/InterpreterCreateQuery.cpp
+index aee75ce28557..708bd616828c 100644
+--- a/dbms/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -591,7 +591,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+     if (!as_table_name.empty())
+     {
+         as_storage = context.getTable(as_database_name, as_table_name);
+-        as_storage_lock = as_storage->lockStructure(false);
++        as_storage_lock = as_storage->lockStructure(false, context.getCurrentQueryId());
+     }
+ 
+     /// Set and retrieve list of columns.
+diff --git a/dbms/src/Interpreters/InterpreterDescribeQuery.cpp b/dbms/src/Interpreters/InterpreterDescribeQuery.cpp
+index d895c64e2311..19cb167168e9 100644
+--- a/dbms/src/Interpreters/InterpreterDescribeQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterDescribeQuery.cpp
+@@ -93,7 +93,7 @@ BlockInputStreamPtr InterpreterDescribeQuery::executeImpl()
+             table = context.getTable(database_name, table_name);
+         }
+ 
+-        auto table_lock = table->lockStructure(false);
++        auto table_lock = table->lockStructure(false, context.getCurrentQueryId());
+         columns = table->getColumns().getAll();
+         column_defaults = table->getColumns().defaults;
+         column_comments = table->getColumns().comments;
+diff --git a/dbms/src/Interpreters/InterpreterDropQuery.cpp b/dbms/src/Interpreters/InterpreterDropQuery.cpp
+index c3af6d7fa0ac..c90017721c11 100644
+--- a/dbms/src/Interpreters/InterpreterDropQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterDropQuery.cpp
+@@ -69,7 +69,7 @@ BlockIO InterpreterDropQuery::executeToTable(String & database_name_, String & t
+         {
+             database_and_table.second->shutdown();
+             /// If table was already dropped by anyone, an exception will be thrown
+-            auto table_lock = database_and_table.second->lockForAlter();
++            auto table_lock = database_and_table.second->lockForAlter(context.getCurrentQueryId());
+             /// Drop table from memory, don't touch data and metadata
+             database_and_table.first->detachTable(database_and_table.second->getTableName());
+         }
+@@ -78,7 +78,7 @@ BlockIO InterpreterDropQuery::executeToTable(String & database_name_, String & t
+             database_and_table.second->checkTableCanBeDropped();
+ 
+             /// If table was already dropped by anyone, an exception will be thrown
+-            auto table_lock = database_and_table.second->lockForAlter();
++            auto table_lock = database_and_table.second->lockForAlter(context.getCurrentQueryId());
+             /// Drop table data, don't touch metadata
+             database_and_table.second->truncate(query_ptr, context);
+         }
+@@ -89,7 +89,7 @@ BlockIO InterpreterDropQuery::executeToTable(String & database_name_, String & t
+             database_and_table.second->shutdown();
+             /// If table was already dropped by anyone, an exception will be thrown
+ 
+-            auto table_lock = database_and_table.second->lockForAlter();
++            auto table_lock = database_and_table.second->lockForAlter(context.getCurrentQueryId());
+             /// Delete table metadata and table itself from memory
+ 
+             database_and_table.first->removeTable(context, database_and_table.second->getTableName());
+@@ -126,7 +126,7 @@ BlockIO InterpreterDropQuery::executeToTemporaryTable(String & table_name, ASTDr
+             if (kind == ASTDropQuery::Kind::Truncate)
+             {
+                 /// If table was already dropped by anyone, an exception will be thrown
+-                auto table_lock = table->lockForAlter();
++                auto table_lock = table->lockForAlter(context.getCurrentQueryId());
+                 /// Drop table data, don't touch metadata
+                 table->truncate(query_ptr, context);
+             }
+@@ -135,7 +135,7 @@ BlockIO InterpreterDropQuery::executeToTemporaryTable(String & table_name, ASTDr
+                 context_handle.tryRemoveExternalTable(table_name);
+                 table->shutdown();
+                 /// If table was already dropped by anyone, an exception will be thrown
+-                auto table_lock = table->lockForAlter();
++                auto table_lock = table->lockForAlter(context.getCurrentQueryId());
+                 /// Delete table data
+                 table->drop();
+                 table->is_dropped = true;
+diff --git a/dbms/src/Interpreters/InterpreterInsertQuery.cpp b/dbms/src/Interpreters/InterpreterInsertQuery.cpp
+index 8249ff882324..00cf8e925cd0 100644
+--- a/dbms/src/Interpreters/InterpreterInsertQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterInsertQuery.cpp
+@@ -96,7 +96,7 @@ BlockIO InterpreterInsertQuery::execute()
+     checkAccess(query);
+     StoragePtr table = getTable(query);
+ 
+-    auto table_lock = table->lockStructure(true);
++    auto table_lock = table->lockStructure(true, context.getCurrentQueryId());
+ 
+     /// We create a pipeline of several streams, into which we will write data.
+     BlockOutputStreamPtr out;
+diff --git a/dbms/src/Interpreters/InterpreterOptimizeQuery.cpp b/dbms/src/Interpreters/InterpreterOptimizeQuery.cpp
+index 7d46881539cf..789787943861 100644
+--- a/dbms/src/Interpreters/InterpreterOptimizeQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterOptimizeQuery.cpp
+@@ -23,7 +23,7 @@ BlockIO InterpreterOptimizeQuery::execute()
+         return executeDDLQueryOnCluster(query_ptr, context, {ast.database});
+ 
+     StoragePtr table = context.getTable(ast.database, ast.table);
+-    auto table_lock = table->lockStructure(true);
++    auto table_lock = table->lockStructure(true, context.getCurrentQueryId());
+     table->optimize(query_ptr, ast.partition, ast.final, ast.deduplicate, context);
+     return {};
+ }
+diff --git a/dbms/src/Interpreters/InterpreterRenameQuery.cpp b/dbms/src/Interpreters/InterpreterRenameQuery.cpp
+index 58c830f3627d..e3fbe1f1de8a 100644
+--- a/dbms/src/Interpreters/InterpreterRenameQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterRenameQuery.cpp
+@@ -101,7 +101,7 @@ BlockIO InterpreterRenameQuery::execute()
+ 
+     for (const auto & names : unique_tables_from)
+         if (auto table = context.tryGetTable(names.database_name, names.table_name))
+-            locks.emplace_back(table->lockForAlter());
++            locks.emplace_back(table->lockForAlter(context.getCurrentQueryId()));
+ 
+     /** All tables are locked. If there are more than one rename in chain,
+       *  we need to hold global lock while doing all renames. Order matters to avoid deadlocks.
+diff --git a/dbms/src/Interpreters/InterpreterSelectQuery.cpp b/dbms/src/Interpreters/InterpreterSelectQuery.cpp
+index c53ea7cae9ef..87ab02af45ca 100644
+--- a/dbms/src/Interpreters/InterpreterSelectQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterSelectQuery.cpp
+@@ -194,7 +194,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
+     }
+ 
+     if (storage)
+-        table_lock = storage->lockStructure(false);
++        table_lock = storage->lockStructure(false, context.getCurrentQueryId());
+ 
+     syntax_analyzer_result = SyntaxAnalyzer(context, subquery_depth).analyze(
+         query_ptr, source_header.getNamesAndTypesList(), required_result_column_names, storage);
+@@ -1474,12 +1474,9 @@ void InterpreterSelectQuery::executeExtremes(Pipeline & pipeline)
+ 
+ void InterpreterSelectQuery::executeSubqueriesInSetsAndJoins(Pipeline & pipeline, SubqueriesForSets & subqueries_for_sets)
+ {
+-    const Settings & settings = context.getSettingsRef();
+-
+     executeUnion(pipeline);
+     pipeline.firstStream() = std::make_shared<CreatingSetsBlockInputStream>(
+-        pipeline.firstStream(), subqueries_for_sets,
+-        SizeLimits(settings.max_rows_to_transfer, settings.max_bytes_to_transfer, settings.transfer_overflow_mode));
++        pipeline.firstStream(), subqueries_for_sets, context);
+ }
+ 
+ void InterpreterSelectQuery::unifyStreams(Pipeline & pipeline)
+diff --git a/dbms/src/Interpreters/InterpreterSystemQuery.cpp b/dbms/src/Interpreters/InterpreterSystemQuery.cpp
+index 722a504f35ec..e1233a04180b 100644
+--- a/dbms/src/Interpreters/InterpreterSystemQuery.cpp
++++ b/dbms/src/Interpreters/InterpreterSystemQuery.cpp
+@@ -239,7 +239,7 @@ StoragePtr InterpreterSystemQuery::tryRestartReplica(const String & database_nam
+         table->shutdown();
+ 
+         /// If table was already dropped by anyone, an exception will be thrown
+-        auto table_lock = table->lockForAlter();
++        auto table_lock = table->lockForAlter(context.getCurrentQueryId());
+         create_ast = system_context.getCreateTableQuery(database_name, table_name);
+ 
+         database->detachTable(table_name);
+diff --git a/dbms/src/Interpreters/MutationsInterpreter.cpp b/dbms/src/Interpreters/MutationsInterpreter.cpp
+index 01db6679e6ba..fc3ebe2f76e1 100644
+--- a/dbms/src/Interpreters/MutationsInterpreter.cpp
++++ b/dbms/src/Interpreters/MutationsInterpreter.cpp
+@@ -394,11 +394,7 @@ BlockInputStreamPtr MutationsInterpreter::addStreamsForLaterStages(BlockInputStr
+ 
+         const SubqueriesForSets & subqueries_for_sets = stage.analyzer->getSubqueriesForSets();
+         if (!subqueries_for_sets.empty())
+-        {
+-            const auto & settings = context.getSettingsRef();
+-            in = std::make_shared<CreatingSetsBlockInputStream>(in, subqueries_for_sets,
+-                SizeLimits(settings.max_rows_to_transfer, settings.max_bytes_to_transfer, settings.transfer_overflow_mode));
+-        }
++            in = std::make_shared<CreatingSetsBlockInputStream>(in, subqueries_for_sets, context);
+     }
+ 
+     in = std::make_shared<MaterializingBlockInputStream>(in);
+diff --git a/dbms/src/Storages/IStorage.cpp b/dbms/src/Storages/IStorage.cpp
+index 0c2a4a4d0c97..e3d143adbb74 100644
+--- a/dbms/src/Storages/IStorage.cpp
++++ b/dbms/src/Storages/IStorage.cpp
+@@ -5,13 +5,13 @@
+ namespace DB
+ {
+ 
+-TableStructureReadLock::TableStructureReadLock(StoragePtr storage_, bool lock_structure, bool lock_data)
++TableStructureReadLock::TableStructureReadLock(StoragePtr storage_, bool lock_structure, bool lock_data, const String & query_id)
+     : storage(storage_)
+ {
+     if (lock_data)
+-        data_lock = storage->data_lock->getLock(RWLockImpl::Read);
++        data_lock = storage->data_lock->getLock(RWLockImpl::Read, query_id);
+     if (lock_structure)
+-        structure_lock = storage->structure_lock->getLock(RWLockImpl::Read);
++        structure_lock = storage->structure_lock->getLock(RWLockImpl::Read, query_id);
+ }
+ 
+ void IStorage::alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context)
+@@ -22,7 +22,7 @@ void IStorage::alter(const AlterCommands & params, const String & database_name,
+             throw Exception("Method alter supports only change comment of column for storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+ 
+-    auto lock = lockStructureForAlter();
++    auto lock = lockStructureForAlter(context.getCurrentQueryId());
+     auto new_columns = getColumns();
+     auto new_indices = getIndicesDescription();
+     params.apply(new_columns);
+diff --git a/dbms/src/Storages/IStorage.h b/dbms/src/Storages/IStorage.h
+index 7397d285b801..5841126e8448 100644
+--- a/dbms/src/Storages/IStorage.h
++++ b/dbms/src/Storages/IStorage.h
+@@ -60,19 +60,19 @@ class TableStructureReadLock
+ 
+     StoragePtr storage;
+     /// Order is important.
+-    RWLockImpl::LockHandler data_lock;
+-    RWLockImpl::LockHandler structure_lock;
++    RWLockImpl::LockHolder data_lock;
++    RWLockImpl::LockHolder structure_lock;
+ 
+ public:
+-    TableStructureReadLock(StoragePtr storage_, bool lock_structure, bool lock_data);
++    TableStructureReadLock(StoragePtr storage_, bool lock_structure, bool lock_data, const String & query_id);
+ };
+ 
+ 
+ using TableStructureReadLockPtr = std::shared_ptr<TableStructureReadLock>;
+ using TableStructureReadLocks = std::vector<TableStructureReadLockPtr>;
+ 
+-using TableStructureWriteLock = RWLockImpl::LockHandler;
+-using TableDataWriteLock = RWLockImpl::LockHandler;
++using TableStructureWriteLock = RWLockImpl::LockHolder;
++using TableDataWriteLock = RWLockImpl::LockHolder;
+ using TableFullWriteLock = std::pair<TableDataWriteLock, TableStructureWriteLock>;
+ 
+ 
+@@ -118,9 +118,9 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
+       * WARNING: You need to call methods from ITableDeclaration under such a lock. Without it, they are not thread safe.
+       * WARNING: To avoid deadlocks, this method must not be called under lock of Context.
+       */
+-    TableStructureReadLockPtr lockStructure(bool will_modify_data)
++    TableStructureReadLockPtr lockStructure(bool will_modify_data, const String & query_id)
+     {
+-        TableStructureReadLockPtr res = std::make_shared<TableStructureReadLock>(shared_from_this(), true, will_modify_data);
++        TableStructureReadLockPtr res = std::make_shared<TableStructureReadLock>(shared_from_this(), true, will_modify_data, query_id);
+         if (is_dropped)
+             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
+         return res;
+@@ -128,11 +128,11 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
+ 
+     /** Does not allow reading the table structure. It is taken for ALTER, RENAME and DROP, TRUNCATE.
+       */
+-    TableFullWriteLock lockForAlter()
++    TableFullWriteLock lockForAlter(const String & query_id)
+     {
+         /// The calculation order is important.
+-        auto res_data_lock = lockDataForAlter();
+-        auto res_structure_lock = lockStructureForAlter();
++        auto res_data_lock = lockDataForAlter(query_id);
++        auto res_structure_lock = lockStructureForAlter(query_id);
+ 
+         return {std::move(res_data_lock), std::move(res_structure_lock)};
+     }
+@@ -141,17 +141,17 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
+       * It is taken during write temporary data in ALTER MODIFY.
+       * Under this lock, you can take lockStructureForAlter() to change the structure of the table.
+       */
+-    TableDataWriteLock lockDataForAlter()
++    TableDataWriteLock lockDataForAlter(const String & query_id)
+     {
+-        auto res = data_lock->getLock(RWLockImpl::Write);
++        auto res = data_lock->getLock(RWLockImpl::Write, query_id);
+         if (is_dropped)
+             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
+         return res;
+     }
+ 
+-    TableStructureWriteLock lockStructureForAlter()
++    TableStructureWriteLock lockStructureForAlter(const String & query_id)
+     {
+-        auto res = structure_lock->getLock(RWLockImpl::Write);
++        auto res = structure_lock->getLock(RWLockImpl::Write, query_id);
+         if (is_dropped)
+             throw Exception("Table is dropped", ErrorCodes::TABLE_IS_DROPPED);
+         return res;
+@@ -199,7 +199,7 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
+       */
+     virtual BlockOutputStreamPtr write(
+         const ASTPtr & /*query*/,
+-        const Settings & /*settings*/)
++        const Context & /*context*/)
+     {
+         throw Exception("Method write is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
+     }
+@@ -293,7 +293,7 @@ class IStorage : public std::enable_shared_from_this<IStorage>, private boost::n
+     virtual bool supportsIndexForIn() const { return false; }
+ 
+     /// Provides a hint that the storage engine may evaluate the IN-condition by using an index.
+-    virtual bool mayBenefitFromIndexForIn(const ASTPtr & /* left_in_operand */) const { return false; }
++    virtual bool mayBenefitFromIndexForIn(const ASTPtr & /* left_in_operand */, const Context & /* query_context */) const { return false; }
+ 
+     /// Checks validity of the data
+     virtual bool checkData() const { throw Exception("Check query is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
+diff --git a/dbms/src/Storages/MergeTree/DataPartsExchange.cpp b/dbms/src/Storages/MergeTree/DataPartsExchange.cpp
+index a1ffd45c6295..9a8346d36a71 100644
+--- a/dbms/src/Storages/MergeTree/DataPartsExchange.cpp
++++ b/dbms/src/Storages/MergeTree/DataPartsExchange.cpp
+@@ -79,7 +79,7 @@ void Service::processQuery(const Poco::Net::HTMLForm & params, ReadBuffer & /*bo
+ 
+     try
+     {
+-        auto storage_lock = owned_storage->lockStructure(false);
++        auto storage_lock = owned_storage->lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+         MergeTreeData::DataPartPtr part = findPart(part_name);
+ 
+diff --git a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeAlterThread.cpp b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeAlterThread.cpp
+index d6295fb130a3..03b397e03905 100644
+--- a/dbms/src/Storages/MergeTree/ReplicatedMergeTreeAlterThread.cpp
++++ b/dbms/src/Storages/MergeTree/ReplicatedMergeTreeAlterThread.cpp
+@@ -108,7 +108,7 @@ void ReplicatedMergeTreeAlterThread::run()
+ 
+             LOG_INFO(log, "Version of metadata nodes in ZooKeeper changed. Waiting for structure write lock.");
+ 
+-            auto table_lock = storage.lockStructureForAlter();
++            auto table_lock = storage.lockStructureForAlter(RWLockImpl::NO_QUERY);
+ 
+             if (columns_in_zk == storage.getColumns() && metadata_diff.empty())
+             {
+@@ -134,7 +134,7 @@ void ReplicatedMergeTreeAlterThread::run()
+         /// Update parts.
+         if (changed_columns_version || force_recheck_parts)
+         {
+-            auto table_lock = storage.lockStructure(false);
++            auto table_lock = storage.lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+             if (changed_columns_version)
+                 LOG_INFO(log, "ALTER-ing parts");
+diff --git a/dbms/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp b/dbms/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
+index d32882f033e9..f0dad30025c7 100644
+--- a/dbms/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
++++ b/dbms/src/Storages/MergeTree/ReplicatedMergeTreePartCheckThread.cpp
+@@ -202,7 +202,7 @@ void ReplicatedMergeTreePartCheckThread::checkPart(const String & part_name)
+     else if (part->name == part_name)
+     {
+         auto zookeeper = storage.getZooKeeper();
+-        auto table_lock = storage.lockStructure(false);
++        auto table_lock = storage.lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+         auto local_part_header = ReplicatedMergeTreePartHeader::fromColumnsAndChecksums(
+             part->columns, part->checksums);
+diff --git a/dbms/src/Storages/MergeTree/StorageFromMergeTreeDataPart.h b/dbms/src/Storages/MergeTree/StorageFromMergeTreeDataPart.h
+index 1447ffb40d87..314474b3cae1 100644
+--- a/dbms/src/Storages/MergeTree/StorageFromMergeTreeDataPart.h
++++ b/dbms/src/Storages/MergeTree/StorageFromMergeTreeDataPart.h
+@@ -32,7 +32,7 @@ class StorageFromMergeTreeDataPart : public ext::shared_ptr_helper<StorageFromMe
+ 
+     bool supportsIndexForIn() const override { return true; }
+ 
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & /* query_context */) const override
+     {
+         return part->storage.mayBenefitFromIndexForIn(left_in_operand);
+     }
+diff --git a/dbms/src/Storages/StorageBuffer.cpp b/dbms/src/Storages/StorageBuffer.cpp
+index 9706b1d55628..b3cb485a6b4d 100644
+--- a/dbms/src/Storages/StorageBuffer.cpp
++++ b/dbms/src/Storages/StorageBuffer.cpp
+@@ -150,7 +150,7 @@ BlockInputStreams StorageBuffer::read(
+         if (destination.get() == this)
+             throw Exception("Destination table is myself. Read will cause infinite loop.", ErrorCodes::INFINITE_LOOP);
+ 
+-        auto destination_lock = destination->lockStructure(false);
++        auto destination_lock = destination->lockStructure(false, context.getCurrentQueryId());
+ 
+         const bool dst_has_same_structure = std::all_of(column_names.begin(), column_names.end(), [this, destination](const String& column_name)
+         {
+@@ -392,13 +392,13 @@ class BufferBlockOutputStream : public IBlockOutputStream
+ };
+ 
+ 
+-BlockOutputStreamPtr StorageBuffer::write(const ASTPtr & /*query*/, const Settings & /*settings*/)
++BlockOutputStreamPtr StorageBuffer::write(const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<BufferBlockOutputStream>(*this);
+ }
+ 
+ 
+-bool StorageBuffer::mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const
++bool StorageBuffer::mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const
+ {
+     if (no_destination)
+         return false;
+@@ -408,7 +408,7 @@ bool StorageBuffer::mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) con
+     if (destination.get() == this)
+         throw Exception("Destination table is myself. Read will cause infinite loop.", ErrorCodes::INFINITE_LOOP);
+ 
+-    return destination->mayBenefitFromIndexForIn(left_in_operand);
++    return destination->mayBenefitFromIndexForIn(left_in_operand, query_context);
+ }
+ 
+ 
+@@ -679,7 +679,7 @@ void StorageBuffer::flushThread()
+ 
+ void StorageBuffer::alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context)
+ {
+-    auto lock = lockStructureForAlter();
++    auto lock = lockStructureForAlter(context.getCurrentQueryId());
+ 
+     /// So that no blocks of the old structure remain.
+     optimize({} /*query*/, {} /*partition_id*/, false /*final*/, false /*deduplicate*/, context);
+diff --git a/dbms/src/Storages/StorageBuffer.h b/dbms/src/Storages/StorageBuffer.h
+index 85ea3f086b59..854d4efd05db 100644
+--- a/dbms/src/Storages/StorageBuffer.h
++++ b/dbms/src/Storages/StorageBuffer.h
+@@ -64,7 +64,7 @@ friend class BufferBlockOutputStream;
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void startup() override;
+     /// Flush all buffers into the subordinate table and stop background thread.
+@@ -78,7 +78,7 @@ friend class BufferBlockOutputStream;
+     bool supportsFinal() const override { return true; }
+     bool supportsIndexForIn() const override { return true; }
+ 
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override;
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const override;
+ 
+     /// The structure of the subordinate table is not checked and does not change.
+     void alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context) override;
+diff --git a/dbms/src/Storages/StorageDistributed.cpp b/dbms/src/Storages/StorageDistributed.cpp
+index 8ea077b671fa..644576272d02 100644
+--- a/dbms/src/Storages/StorageDistributed.cpp
++++ b/dbms/src/Storages/StorageDistributed.cpp
+@@ -307,9 +307,10 @@ BlockInputStreams StorageDistributed::read(
+ }
+ 
+ 
+-BlockOutputStreamPtr StorageDistributed::write(const ASTPtr &, const Settings & settings)
++BlockOutputStreamPtr StorageDistributed::write(const ASTPtr &, const Context & context)
+ {
+     auto cluster = getCluster();
++    const auto & settings = context.getSettingsRef();
+ 
+     /// Ban an attempt to make async insert into the table belonging to DatabaseMemory
+     if (path.empty() && !owned_cluster && !settings.insert_distributed_sync.value)
+@@ -337,7 +338,7 @@ BlockOutputStreamPtr StorageDistributed::write(const ASTPtr &, const Settings &
+ 
+ void StorageDistributed::alter(const AlterCommands & params, const String & database_name, const String & current_table_name, const Context & context)
+ {
+-    auto lock = lockStructureForAlter();
++    auto lock = lockStructureForAlter(context.getCurrentQueryId());
+ 
+     auto new_columns = getColumns();
+     auto new_indices = getIndicesDescription();
+diff --git a/dbms/src/Storages/StorageDistributed.h b/dbms/src/Storages/StorageDistributed.h
+index caa52209804f..eecab76ea8ec 100644
+--- a/dbms/src/Storages/StorageDistributed.h
++++ b/dbms/src/Storages/StorageDistributed.h
+@@ -71,7 +71,7 @@ class StorageDistributed : public ext::shared_ptr_helper<StorageDistributed>, pu
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void drop() override {}
+ 
+diff --git a/dbms/src/Storages/StorageFile.cpp b/dbms/src/Storages/StorageFile.cpp
+index 9facf743c1c0..0c221cf33931 100644
+--- a/dbms/src/Storages/StorageFile.cpp
++++ b/dbms/src/Storages/StorageFile.cpp
+@@ -252,7 +252,7 @@ class StorageFileBlockOutputStream : public IBlockOutputStream
+ 
+ BlockOutputStreamPtr StorageFile::write(
+     const ASTPtr & /*query*/,
+-    const Settings & /*settings*/)
++    const Context & /*context*/)
+ {
+     return std::make_shared<StorageFileBlockOutputStream>(*this);
+ }
+diff --git a/dbms/src/Storages/StorageFile.h b/dbms/src/Storages/StorageFile.h
+index 6716dc306a47..eb74ad615a7d 100644
+--- a/dbms/src/Storages/StorageFile.h
++++ b/dbms/src/Storages/StorageFile.h
+@@ -41,7 +41,7 @@ class StorageFile : public ext::shared_ptr_helper<StorageFile>, public IStorage
+ 
+     BlockOutputStreamPtr write(
+         const ASTPtr & query,
+-        const Settings & settings) override;
++        const Context & context) override;
+ 
+     void drop() override;
+ 
+diff --git a/dbms/src/Storages/StorageHDFS.cpp b/dbms/src/Storages/StorageHDFS.cpp
+index 84ef0a33a27d..4f6cf35c09e6 100644
+--- a/dbms/src/Storages/StorageHDFS.cpp
++++ b/dbms/src/Storages/StorageHDFS.cpp
+@@ -146,7 +146,7 @@ BlockInputStreams StorageHDFS::read(
+ 
+ void StorageHDFS::rename(const String & /*new_path_to_db*/, const String & /*new_database_name*/, const String & /*new_table_name*/) {}
+ 
+-BlockOutputStreamPtr StorageHDFS::write(const ASTPtr & /*query*/, const Settings & /*settings*/)
++BlockOutputStreamPtr StorageHDFS::write(const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<HDFSBlockOutputStream>(uri, format_name, getSampleBlock(), context);
+ }
+diff --git a/dbms/src/Storages/StorageHDFS.h b/dbms/src/Storages/StorageHDFS.h
+index 6d5141eddbce..73342cf36717 100644
+--- a/dbms/src/Storages/StorageHDFS.h
++++ b/dbms/src/Storages/StorageHDFS.h
+@@ -33,7 +33,7 @@ class StorageHDFS : public ext::shared_ptr_helper<StorageHDFS>, public IStorage
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+diff --git a/dbms/src/Storages/StorageLog.cpp b/dbms/src/Storages/StorageLog.cpp
+index 76329da78276..968358990284 100644
+--- a/dbms/src/Storages/StorageLog.cpp
++++ b/dbms/src/Storages/StorageLog.cpp
+@@ -619,7 +619,7 @@ BlockInputStreams StorageLog::read(
+ }
+ 
+ BlockOutputStreamPtr StorageLog::write(
+-    const ASTPtr & /*query*/, const Settings & /*settings*/)
++    const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     loadMarks();
+     return std::make_shared<LogBlockOutputStream>(*this);
+diff --git a/dbms/src/Storages/StorageLog.h b/dbms/src/Storages/StorageLog.h
+index 73a4d387dc55..cf0d07a3bfe7 100644
+--- a/dbms/src/Storages/StorageLog.h
++++ b/dbms/src/Storages/StorageLog.h
+@@ -34,7 +34,7 @@ friend class LogBlockOutputStream;
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+diff --git a/dbms/src/Storages/StorageMaterializedView.cpp b/dbms/src/Storages/StorageMaterializedView.cpp
+index ae33cac84272..93663badf56a 100644
+--- a/dbms/src/Storages/StorageMaterializedView.cpp
++++ b/dbms/src/Storages/StorageMaterializedView.cpp
+@@ -190,18 +190,18 @@ BlockInputStreams StorageMaterializedView::read(
+     const unsigned num_streams)
+ {
+     auto storage = getTargetTable();
+-    auto lock = storage->lockStructure(false);
++    auto lock = storage->lockStructure(false, context.getCurrentQueryId());
+     auto streams = storage->read(column_names, query_info, context, processed_stage, max_block_size, num_streams);
+     for (auto & stream : streams)
+         stream->addTableLock(lock);
+     return streams;
+ }
+ 
+-BlockOutputStreamPtr StorageMaterializedView::write(const ASTPtr & query, const Settings & settings)
++BlockOutputStreamPtr StorageMaterializedView::write(const ASTPtr & query, const Context & context)
+ {
+     auto storage = getTargetTable();
+-    auto lock = storage->lockStructure(true);
+-    auto stream = storage->write(query, settings);
++    auto lock = storage->lockStructure(true, context.getCurrentQueryId());
++    auto stream = storage->write(query, context);
+     stream->addTableLock(lock);
+     return stream;
+ }
+diff --git a/dbms/src/Storages/StorageMaterializedView.h b/dbms/src/Storages/StorageMaterializedView.h
+index d308bd3550a4..8c2657b484bb 100644
+--- a/dbms/src/Storages/StorageMaterializedView.h
++++ b/dbms/src/Storages/StorageMaterializedView.h
+@@ -26,9 +26,12 @@ class StorageMaterializedView : public ext::shared_ptr_helper<StorageMaterialize
+     bool supportsPrewhere() const override { return getTargetTable()->supportsPrewhere(); }
+     bool supportsFinal() const override { return getTargetTable()->supportsFinal(); }
+     bool supportsIndexForIn() const override { return getTargetTable()->supportsIndexForIn(); }
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override { return getTargetTable()->mayBenefitFromIndexForIn(left_in_operand); }
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const override
++    {
++        return getTargetTable()->mayBenefitFromIndexForIn(left_in_operand, query_context);
++    }
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+     void drop() override;
+ 
+     void truncate(const ASTPtr &, const Context &) override;
+diff --git a/dbms/src/Storages/StorageMemory.cpp b/dbms/src/Storages/StorageMemory.cpp
+index 3e2e779244fc..ddcf649a726a 100644
+--- a/dbms/src/Storages/StorageMemory.cpp
++++ b/dbms/src/Storages/StorageMemory.cpp
+@@ -115,7 +115,7 @@ BlockInputStreams StorageMemory::read(
+ 
+ 
+ BlockOutputStreamPtr StorageMemory::write(
+-    const ASTPtr & /*query*/, const Settings & /*settings*/)
++    const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<MemoryBlockOutputStream>(*this);
+ }
+diff --git a/dbms/src/Storages/StorageMemory.h b/dbms/src/Storages/StorageMemory.h
+index 39bcce768947..89947b50b8fc 100644
+--- a/dbms/src/Storages/StorageMemory.h
++++ b/dbms/src/Storages/StorageMemory.h
+@@ -36,7 +36,7 @@ friend class MemoryBlockOutputStream;
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void drop() override;
+ 
+diff --git a/dbms/src/Storages/StorageMerge.cpp b/dbms/src/Storages/StorageMerge.cpp
+index b6426d253610..d8e3dfce6493 100644
+--- a/dbms/src/Storages/StorageMerge.cpp
++++ b/dbms/src/Storages/StorageMerge.cpp
+@@ -122,15 +122,15 @@ bool StorageMerge::isRemote() const
+ }
+ 
+ 
+-bool StorageMerge::mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const
++bool StorageMerge::mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const
+ {
+     /// It's beneficial if it is true for at least one table.
+-    StorageListWithLocks selected_tables = getSelectedTables();
++    StorageListWithLocks selected_tables = getSelectedTables(query_context.getCurrentQueryId());
+ 
+     size_t i = 0;
+     for (const auto & table : selected_tables)
+     {
+-        if (table.first->mayBenefitFromIndexForIn(left_in_operand))
++        if (table.first->mayBenefitFromIndexForIn(left_in_operand, query_context))
+             return true;
+ 
+         ++i;
+@@ -206,7 +206,8 @@ BlockInputStreams StorageMerge::read(
+     /** First we make list of selected tables to find out its size.
+       * This is necessary to correctly pass the recommended number of threads to each table.
+       */
+-    StorageListWithLocks selected_tables = getSelectedTables(query_info.query, has_table_virtual_column, true);
++    StorageListWithLocks selected_tables = getSelectedTables(
++        query_info.query, has_table_virtual_column, true, context.getCurrentQueryId());
+ 
+     if (selected_tables.empty())
+         return createSourceStreams(
+@@ -332,7 +333,7 @@ BlockInputStreams StorageMerge::createSourceStreams(const SelectQueryInfo & quer
+     return source_streams;
+ }
+ 
+-StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables() const
++StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(const String & query_id) const
+ {
+     StorageListWithLocks selected_tables;
+     auto database = global_context.getDatabase(source_database);
+@@ -344,7 +345,7 @@ StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables() const
+         {
+             auto & table = iterator->table();
+             if (table.get() != this)
+-                selected_tables.emplace_back(table, table->lockStructure(false));
++                selected_tables.emplace_back(table, table->lockStructure(false, query_id));
+         }
+ 
+         iterator->next();
+@@ -354,7 +355,7 @@ StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables() const
+ }
+ 
+ 
+-StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(const ASTPtr & query, bool has_virtual_column, bool get_lock) const
++StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(const ASTPtr & query, bool has_virtual_column, bool get_lock, const String & query_id) const
+ {
+     StorageListWithLocks selected_tables;
+     DatabasePtr database = global_context.getDatabase(source_database);
+@@ -374,7 +375,7 @@ StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(const ASTPtr
+             if (storage.get() != this)
+             {
+                 virtual_column->insert(storage->getTableName());
+-                selected_tables.emplace_back(storage, get_lock ? storage->lockStructure(false) : TableStructureReadLockPtr{});
++                selected_tables.emplace_back(storage, get_lock ? storage->lockStructure(false, query_id) : TableStructureReadLockPtr{});
+             }
+         }
+ 
+@@ -396,7 +397,7 @@ StorageMerge::StorageListWithLocks StorageMerge::getSelectedTables(const ASTPtr
+ 
+ void StorageMerge::alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context)
+ {
+-    auto lock = lockStructureForAlter();
++    auto lock = lockStructureForAlter(context.getCurrentQueryId());
+ 
+     auto new_columns = getColumns();
+     auto new_indices = getIndicesDescription();
+diff --git a/dbms/src/Storages/StorageMerge.h b/dbms/src/Storages/StorageMerge.h
+index 1e91ed98ff39..000d8daed1a4 100644
+--- a/dbms/src/Storages/StorageMerge.h
++++ b/dbms/src/Storages/StorageMerge.h
+@@ -46,7 +46,7 @@ class StorageMerge : public ext::shared_ptr_helper<StorageMerge>, public IStorag
+     /// the structure of sub-tables is not checked
+     void alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context) override;
+ 
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override;
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context) const override;
+ 
+ private:
+     String name;
+@@ -56,9 +56,9 @@ class StorageMerge : public ext::shared_ptr_helper<StorageMerge>, public IStorag
+ 
+     using StorageListWithLocks = std::list<std::pair<StoragePtr, TableStructureReadLockPtr>>;
+ 
+-    StorageListWithLocks getSelectedTables() const;
++    StorageListWithLocks getSelectedTables(const String & query_id) const;
+ 
+-    StorageMerge::StorageListWithLocks getSelectedTables(const ASTPtr & query, bool has_virtual_column, bool get_lock) const;
++    StorageMerge::StorageListWithLocks getSelectedTables(const ASTPtr & query, bool has_virtual_column, bool get_lock, const String & query_id) const;
+ 
+     template <typename F>
+     StoragePtr getFirstTable(F && predicate) const;
+diff --git a/dbms/src/Storages/StorageMergeTree.cpp b/dbms/src/Storages/StorageMergeTree.cpp
+index 81d5186603a6..ba3fe04dd898 100644
+--- a/dbms/src/Storages/StorageMergeTree.cpp
++++ b/dbms/src/Storages/StorageMergeTree.cpp
+@@ -126,7 +126,7 @@ BlockInputStreams StorageMergeTree::read(
+     return reader.read(column_names, query_info, context, max_block_size, num_streams);
+ }
+ 
+-BlockOutputStreamPtr StorageMergeTree::write(const ASTPtr & /*query*/, const Settings & /*settings*/)
++BlockOutputStreamPtr StorageMergeTree::write(const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<MergeTreeBlockOutputStream>(*this);
+ }
+@@ -199,7 +199,7 @@ void StorageMergeTree::alter(
+ {
+     if (!params.is_mutable())
+     {
+-        auto table_soft_lock = lockStructureForAlter();
++        auto table_soft_lock = lockStructureForAlter(context.getCurrentQueryId());
+         auto new_columns = getColumns();
+         auto new_indices = getIndicesDescription();
+         params.apply(new_columns);
+@@ -211,7 +211,7 @@ void StorageMergeTree::alter(
+     /// NOTE: Here, as in ReplicatedMergeTree, you can do ALTER which does not block the writing of data for a long time.
+     auto merge_blocker = merger_mutator.actions_blocker.cancel();
+ 
+-    auto table_soft_lock = lockDataForAlter();
++    auto table_soft_lock = lockDataForAlter(context.getCurrentQueryId());
+ 
+     data.checkAlter(params, context);
+ 
+@@ -230,7 +230,7 @@ void StorageMergeTree::alter(
+             transactions.push_back(std::move(transaction));
+     }
+ 
+-    auto table_hard_lock = lockStructureForAlter();
++    auto table_hard_lock = lockStructureForAlter(context.getCurrentQueryId());
+ 
+     IDatabase::ASTModifier storage_modifier = [&] (IAST & ast)
+     {
+@@ -452,7 +452,7 @@ bool StorageMergeTree::merge(
+     bool deduplicate,
+     String * out_disable_reason)
+ {
+-    auto structure_lock = lockStructure(true);
++    auto structure_lock = lockStructure(true, RWLockImpl::NO_QUERY);
+ 
+     FutureMergedMutatedPart future_part;
+ 
+@@ -562,7 +562,7 @@ bool StorageMergeTree::merge(
+ 
+ bool StorageMergeTree::tryMutatePart()
+ {
+-    auto structure_lock = lockStructure(true);
++    auto structure_lock = lockStructure(true, RWLockImpl::NO_QUERY);
+ 
+     FutureMergedMutatedPart future_part;
+     MutationCommands commands;
+@@ -774,7 +774,7 @@ void StorageMergeTree::clearColumnInPartition(const ASTPtr & partition, const Fi
+     auto merge_blocker = merger_mutator.actions_blocker.cancel();
+ 
+     /// We don't change table structure, only data in some parts, parts are locked inside alterDataPart() function
+-    auto lock_read_structure = lockStructure(false);
++    auto lock_read_structure = lockStructure(false, context.getCurrentQueryId());
+ 
+     String partition_id = data.getPartitionIDFromQuery(partition, context);
+     auto parts = data.getDataPartsVectorInPartition(MergeTreeDataPartState::Committed, partition_id);
+@@ -879,7 +879,7 @@ void StorageMergeTree::alterPartition(const ASTPtr & query, const PartitionComma
+ 
+             case PartitionCommand::FREEZE_PARTITION:
+             {
+-                auto lock = lockStructure(false);
++                auto lock = lockStructure(false, context.getCurrentQueryId());
+                 data.freezePartition(command.partition, command.with_name, context);
+             }
+             break;
+@@ -890,7 +890,7 @@ void StorageMergeTree::alterPartition(const ASTPtr & query, const PartitionComma
+ 
+             case PartitionCommand::FREEZE_ALL_PARTITIONS:
+             {
+-                auto lock = lockStructure(false);
++                auto lock = lockStructure(false, context.getCurrentQueryId());
+                 data.freezeAll(command.with_name, context);
+             }
+             break;
+@@ -908,7 +908,7 @@ void StorageMergeTree::dropPartition(const ASTPtr & partition, bool detach, cons
+         /// This protects against "revival" of data for a removed partition after completion of merge.
+         auto merge_blocker = merger_mutator.actions_blocker.cancel();
+         /// Waits for completion of merge and does not start new ones.
+-        auto lock = lockForAlter();
++        auto lock = lockForAlter(context.getCurrentQueryId());
+ 
+         String partition_id = data.getPartitionIDFromQuery(partition, context);
+ 
+@@ -991,8 +991,8 @@ void StorageMergeTree::attachPartition(const ASTPtr & partition, bool attach_par
+ 
+ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & context)
+ {
+-    auto lock1 = lockStructure(false);
+-    auto lock2 = source_table->lockStructure(false);
++    auto lock1 = lockStructure(false, context.getCurrentQueryId());
++    auto lock2 = source_table->lockStructure(false, context.getCurrentQueryId());
+ 
+     Stopwatch watch;
+     MergeTreeData * src_data = data.checkStructureAndGetMergeTreeData(source_table);
+diff --git a/dbms/src/Storages/StorageMergeTree.h b/dbms/src/Storages/StorageMergeTree.h
+index 70968e0dcb43..d17b496bd978 100644
+--- a/dbms/src/Storages/StorageMergeTree.h
++++ b/dbms/src/Storages/StorageMergeTree.h
+@@ -38,7 +38,10 @@ class StorageMergeTree : public ext::shared_ptr_helper<StorageMergeTree>, public
+     bool supportsPrewhere() const override { return data.supportsPrewhere(); }
+     bool supportsFinal() const override { return data.supportsFinal(); }
+     bool supportsIndexForIn() const override { return true; }
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override { return data.mayBenefitFromIndexForIn(left_in_operand); }
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & /* query_context */) const override
++    {
++        return data.mayBenefitFromIndexForIn(left_in_operand);
++    }
+ 
+     const ColumnsDescription & getColumns() const override { return data.getColumns(); }
+     void setColumns(ColumnsDescription columns_) override { return data.setColumns(std::move(columns_)); }
+@@ -57,7 +60,7 @@ class StorageMergeTree : public ext::shared_ptr_helper<StorageMergeTree>, public
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     /** Perform the next step in combining the parts.
+       */
+diff --git a/dbms/src/Storages/StorageMySQL.cpp b/dbms/src/Storages/StorageMySQL.cpp
+index 76db23065fb6..127caefcd3bc 100644
+--- a/dbms/src/Storages/StorageMySQL.cpp
++++ b/dbms/src/Storages/StorageMySQL.cpp
+@@ -179,9 +179,9 @@ class StorageMySQLBlockOutputStream : public IBlockOutputStream
+ 
+ 
+ BlockOutputStreamPtr StorageMySQL::write(
+-    const ASTPtr & /*query*/, const Settings & settings)
++    const ASTPtr & /*query*/, const Context & context)
+ {
+-    return std::make_shared<StorageMySQLBlockOutputStream>(*this, remote_database_name, remote_table_name, pool.Get(), settings.mysql_max_rows_to_insert);
++    return std::make_shared<StorageMySQLBlockOutputStream>(*this, remote_database_name, remote_table_name, pool.Get(), context.getSettingsRef().mysql_max_rows_to_insert);
+ }
+ 
+ void registerStorageMySQL(StorageFactory & factory)
+diff --git a/dbms/src/Storages/StorageMySQL.h b/dbms/src/Storages/StorageMySQL.h
+index ee6f0ed3fe85..0db81f4a3463 100644
+--- a/dbms/src/Storages/StorageMySQL.h
++++ b/dbms/src/Storages/StorageMySQL.h
+@@ -40,7 +40,7 @@ class StorageMySQL : public ext::shared_ptr_helper<StorageMySQL>, public IStorag
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+ private:
+     friend class StorageMySQLBlockOutputStream;
+diff --git a/dbms/src/Storages/StorageNull.cpp b/dbms/src/Storages/StorageNull.cpp
+index 59c46fcafd21..a920fe3c3955 100644
+--- a/dbms/src/Storages/StorageNull.cpp
++++ b/dbms/src/Storages/StorageNull.cpp
+@@ -32,7 +32,7 @@ void registerStorageNull(StorageFactory & factory)
+ 
+ void StorageNull::alter(const AlterCommands & params, const String & current_database_name, const String & current_table_name, const Context & context)
+ {
+-    auto lock = lockStructureForAlter();
++    auto lock = lockStructureForAlter(context.getCurrentQueryId());
+ 
+     ColumnsDescription new_columns = getColumns();
+     IndicesDescription new_indices = getIndicesDescription();
+diff --git a/dbms/src/Storages/StorageNull.h b/dbms/src/Storages/StorageNull.h
+index 19d93d7080f1..bf0704803160 100644
+--- a/dbms/src/Storages/StorageNull.h
++++ b/dbms/src/Storages/StorageNull.h
+@@ -31,7 +31,7 @@ class StorageNull : public ext::shared_ptr_helper<StorageNull>, public IStorage
+         return { std::make_shared<NullBlockInputStream>(getSampleBlockForColumns(column_names)) };
+     }
+ 
+-    BlockOutputStreamPtr write(const ASTPtr &, const Settings &) override
++    BlockOutputStreamPtr write(const ASTPtr &, const Context &) override
+     {
+         return std::make_shared<NullBlockOutputStream>(getSampleBlock());
+     }
+diff --git a/dbms/src/Storages/StorageReplicatedMergeTree.cpp b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+index 90b9140f12bb..b9bbf762c668 100644
+--- a/dbms/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/dbms/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -1089,7 +1089,7 @@ bool StorageReplicatedMergeTree::tryExecuteMerge(const LogEntry & entry)
+     /// Can throw an exception.
+     DiskSpaceMonitor::ReservationPtr reserved_space = DiskSpaceMonitor::reserve(full_path, estimated_space_for_merge);
+ 
+-    auto table_lock = lockStructure(false);
++    auto table_lock = lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+     FutureMergedMutatedPart future_merged_part(parts);
+     if (future_merged_part.name != entry.new_part_name)
+@@ -1219,7 +1219,7 @@ bool StorageReplicatedMergeTree::tryExecutePartMutation(const StorageReplicatedM
+     /// Can throw an exception.
+     DiskSpaceMonitor::ReservationPtr reserved_space = DiskSpaceMonitor::reserve(full_path, estimated_space_for_result);
+ 
+-    auto table_lock = lockStructure(false);
++    auto table_lock = lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+     MergeTreeData::MutableDataPartPtr new_part;
+     MergeTreeData::Transaction transaction(data);
+@@ -1528,7 +1528,7 @@ void StorageReplicatedMergeTree::executeClearColumnInPartition(const LogEntry &
+     /// We don't change table structure, only data in some parts
+     /// To disable reading from these parts, we will sequentially acquire write lock for each part inside alterDataPart()
+     /// If we will lock the whole table here, a deadlock can occur. For example, if use use Buffer table (CLICKHOUSE-3238)
+-    auto lock_read_structure = lockStructure(false);
++    auto lock_read_structure = lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+     auto zookeeper = getZooKeeper();
+ 
+@@ -1624,7 +1624,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
+     PartDescriptions parts_to_add;
+     MergeTreeData::DataPartsVector parts_to_remove;
+ 
+-    auto structure_lock_dst_table = lockStructure(false);
++    auto structure_lock_dst_table = lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+     for (size_t i = 0; i < entry_replace.new_part_names.size(); ++i)
+     {
+@@ -1686,7 +1686,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
+             return 0;
+         }
+ 
+-        structure_lock_src_table = source_table->lockStructure(false);
++        structure_lock_src_table = source_table->lockStructure(false, RWLockImpl::NO_QUERY);
+ 
+         MergeTreeData::DataPartStates valid_states{MergeTreeDataPartState::PreCommitted, MergeTreeDataPartState::Committed,
+                                                    MergeTreeDataPartState::Outdated};
+@@ -2721,7 +2721,7 @@ bool StorageReplicatedMergeTree::fetchPart(const String & part_name, const Strin
+ 
+     TableStructureReadLockPtr table_lock;
+     if (!to_detached)
+-        table_lock = lockStructure(true);
++        table_lock = lockStructure(true, RWLockImpl::NO_QUERY);
+ 
+     /// Logging
+     Stopwatch stopwatch;
+@@ -2992,10 +2992,11 @@ void StorageReplicatedMergeTree::assertNotReadonly() const
+ }
+ 
+ 
+-BlockOutputStreamPtr StorageReplicatedMergeTree::write(const ASTPtr & /*query*/, const Settings & settings)
++BlockOutputStreamPtr StorageReplicatedMergeTree::write(const ASTPtr & /*query*/, const Context & context)
+ {
+     assertNotReadonly();
+ 
++    const Settings & settings = context.getSettingsRef();
+     bool deduplicate = data.settings.replicated_deduplication_window != 0 && settings.insert_deduplicate;
+ 
+     return std::make_shared<ReplicatedMergeTreeBlockOutputStream>(*this,
+@@ -3123,7 +3124,7 @@ void StorageReplicatedMergeTree::alter(const AlterCommands & params,
+ 
+     {
+         /// Just to read current structure. Alter will be done in separate thread.
+-        auto table_lock = lockStructure(false);
++        auto table_lock = lockStructure(false, query_context.getCurrentQueryId());
+ 
+         if (is_readonly)
+             throw Exception("Can't ALTER readonly table", ErrorCodes::TABLE_IS_READ_ONLY);
+@@ -3381,7 +3382,7 @@ void StorageReplicatedMergeTree::alterPartition(const ASTPtr & query, const Part
+ 
+             case PartitionCommand::FREEZE_PARTITION:
+             {
+-                auto lock = lockStructure(false);
++                auto lock = lockStructure(false, query_context.getCurrentQueryId());
+                 data.freezePartition(command.partition, command.with_name, query_context);
+             }
+             break;
+@@ -3392,7 +3393,7 @@ void StorageReplicatedMergeTree::alterPartition(const ASTPtr & query, const Part
+ 
+             case PartitionCommand::FREEZE_ALL_PARTITIONS:
+             {
+-                auto lock = lockStructure(false);
++                auto lock = lockStructure(false, query_context.getCurrentQueryId());
+                 data.freezeAll(command.with_name, query_context);
+             }
+             break;
+@@ -4447,7 +4448,7 @@ void StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()
+ {
+     /// Critical section is not required (since grabOldParts() returns unique part set on each call)
+ 
+-    auto table_lock = lockStructure(false);
++    auto table_lock = lockStructure(false, RWLockImpl::NO_QUERY);
+     auto zookeeper = getZooKeeper();
+ 
+     MergeTreeData::DataPartsVector parts = data.grabOldParts();
+@@ -4739,8 +4740,8 @@ void StorageReplicatedMergeTree::clearBlocksInPartition(
+ void StorageReplicatedMergeTree::replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace,
+                                                       const Context & context)
+ {
+-    auto lock1 = lockStructure(false);
+-    auto lock2 = source_table->lockStructure(false);
++    auto lock1 = lockStructure(false, context.getCurrentQueryId());
++    auto lock2 = source_table->lockStructure(false, context.getCurrentQueryId());
+ 
+     Stopwatch watch;
+     MergeTreeData * src_data = data.checkStructureAndGetMergeTreeData(source_table);
+diff --git a/dbms/src/Storages/StorageReplicatedMergeTree.h b/dbms/src/Storages/StorageReplicatedMergeTree.h
+index 884cc3440e11..e3a7d0230660 100644
+--- a/dbms/src/Storages/StorageReplicatedMergeTree.h
++++ b/dbms/src/Storages/StorageReplicatedMergeTree.h
+@@ -112,7 +112,7 @@ class StorageReplicatedMergeTree : public ext::shared_ptr_helper<StorageReplicat
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     bool optimize(const ASTPtr & query, const ASTPtr & partition, bool final, bool deduplicate, const Context & query_context) override;
+ 
+@@ -133,7 +133,10 @@ class StorageReplicatedMergeTree : public ext::shared_ptr_helper<StorageReplicat
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+     bool supportsIndexForIn() const override { return true; }
+-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override { return data.mayBenefitFromIndexForIn(left_in_operand); }
++    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & /* query_context */) const override
++    {
++        return data.mayBenefitFromIndexForIn(left_in_operand);
++    }
+ 
+     void checkTableCanBeDropped() const override;
+ 
+diff --git a/dbms/src/Storages/StorageSet.cpp b/dbms/src/Storages/StorageSet.cpp
+index 3a33270b1cd3..f1f4f039c8c8 100644
+--- a/dbms/src/Storages/StorageSet.cpp
++++ b/dbms/src/Storages/StorageSet.cpp
+@@ -79,7 +79,7 @@ void SetOrJoinBlockOutputStream::writeSuffix()
+ 
+ 
+ 
+-BlockOutputStreamPtr StorageSetOrJoinBase::write(const ASTPtr & /*query*/, const Settings & /*settings*/)
++BlockOutputStreamPtr StorageSetOrJoinBase::write(const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     UInt64 id = ++increment;
+     return std::make_shared<SetOrJoinBlockOutputStream>(*this, path, path + "tmp/", toString(id) + ".bin");
+diff --git a/dbms/src/Storages/StorageSet.h b/dbms/src/Storages/StorageSet.h
+index c5c7560e0f24..0585dc271c67 100644
+--- a/dbms/src/Storages/StorageSet.h
++++ b/dbms/src/Storages/StorageSet.h
+@@ -23,7 +23,7 @@ class StorageSetOrJoinBase : public IStorage
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     String getDataPath() const override { return path; }
+ 
+diff --git a/dbms/src/Storages/StorageStripeLog.cpp b/dbms/src/Storages/StorageStripeLog.cpp
+index 3519dfbc37c0..dba2e64a88f5 100644
+--- a/dbms/src/Storages/StorageStripeLog.cpp
++++ b/dbms/src/Storages/StorageStripeLog.cpp
+@@ -276,7 +276,7 @@ BlockInputStreams StorageStripeLog::read(
+ 
+ 
+ BlockOutputStreamPtr StorageStripeLog::write(
+-    const ASTPtr & /*query*/, const Settings & /*settings*/)
++    const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<StripeLogBlockOutputStream>(*this);
+ }
+diff --git a/dbms/src/Storages/StorageStripeLog.h b/dbms/src/Storages/StorageStripeLog.h
+index 0282235de515..6489c82873e7 100644
+--- a/dbms/src/Storages/StorageStripeLog.h
++++ b/dbms/src/Storages/StorageStripeLog.h
+@@ -36,7 +36,7 @@ friend class StripeLogBlockOutputStream;
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+diff --git a/dbms/src/Storages/StorageTinyLog.cpp b/dbms/src/Storages/StorageTinyLog.cpp
+index e941039e075c..4690ab925e87 100644
+--- a/dbms/src/Storages/StorageTinyLog.cpp
++++ b/dbms/src/Storages/StorageTinyLog.cpp
+@@ -398,7 +398,7 @@ BlockInputStreams StorageTinyLog::read(
+ 
+ 
+ BlockOutputStreamPtr StorageTinyLog::write(
+-    const ASTPtr & /*query*/, const Settings & /*settings*/)
++    const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<TinyLogBlockOutputStream>(*this);
+ }
+diff --git a/dbms/src/Storages/StorageTinyLog.h b/dbms/src/Storages/StorageTinyLog.h
+index b96570b44286..5b8e4bc90ac8 100644
+--- a/dbms/src/Storages/StorageTinyLog.h
++++ b/dbms/src/Storages/StorageTinyLog.h
+@@ -35,7 +35,7 @@ friend class TinyLogBlockOutputStream;
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+diff --git a/dbms/src/Storages/StorageURL.cpp b/dbms/src/Storages/StorageURL.cpp
+index e22858cedc57..3224527123bb 100644
+--- a/dbms/src/Storages/StorageURL.cpp
++++ b/dbms/src/Storages/StorageURL.cpp
+@@ -184,7 +184,7 @@ BlockInputStreams IStorageURLBase::read(const Names & column_names,
+ 
+ void IStorageURLBase::rename(const String & /*new_path_to_db*/, const String & /*new_database_name*/, const String & /*new_table_name*/) {}
+ 
+-BlockOutputStreamPtr IStorageURLBase::write(const ASTPtr & /*query*/, const Settings & /*settings*/)
++BlockOutputStreamPtr IStorageURLBase::write(const ASTPtr & /*query*/, const Context & /*context*/)
+ {
+     return std::make_shared<StorageURLBlockOutputStream>(
+         uri, format_name, getSampleBlock(), context_global, ConnectionTimeouts::getHTTPTimeouts(context_global.getSettingsRef()));
+diff --git a/dbms/src/Storages/StorageURL.h b/dbms/src/Storages/StorageURL.h
+index dff889b6037b..b84898c696db 100644
+--- a/dbms/src/Storages/StorageURL.h
++++ b/dbms/src/Storages/StorageURL.h
+@@ -28,7 +28,7 @@ class IStorageURLBase : public IStorage
+         size_t max_block_size,
+         unsigned num_streams) override;
+ 
+-    BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
++    BlockOutputStreamPtr write(const ASTPtr & query, const Context & context) override;
+ 
+     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
+ 
+diff --git a/dbms/src/Storages/System/StorageSystemColumns.cpp b/dbms/src/Storages/System/StorageSystemColumns.cpp
+index 9a3d1dd1ecb4..fe0c3d90d69a 100644
+--- a/dbms/src/Storages/System/StorageSystemColumns.cpp
++++ b/dbms/src/Storages/System/StorageSystemColumns.cpp
+@@ -61,9 +61,13 @@ class ColumnsBlockInputStream : public IBlockInputStream
+         UInt64 max_block_size,
+         ColumnPtr databases,
+         ColumnPtr tables,
+-        Storages storages)
+-        : columns_mask(columns_mask), header(header), max_block_size(max_block_size),
+-        databases(databases), tables(tables), storages(std::move(storages)), total_tables(tables->size()) {}
++        Storages storages,
++        String query_id_)
++        : columns_mask(columns_mask), header(header), max_block_size(max_block_size)
++        , databases(databases), tables(tables), storages(std::move(storages))
++        , query_id(std::move(query_id_)), total_tables(tables->size())
++    {
++    }
+ 
+     String getName() const override { return "Columns"; }
+     Block getHeader() const override { return header; }
+@@ -100,7 +104,7 @@ class ColumnsBlockInputStream : public IBlockInputStream
+ 
+                 try
+                 {
+-                    table_lock = storage->lockStructure(false);
++                    table_lock = storage->lockStructure(false, query_id);
+                 }
+                 catch (const Exception & e)
+                 {
+@@ -251,6 +255,7 @@ class ColumnsBlockInputStream : public IBlockInputStream
+     ColumnPtr databases;
+     ColumnPtr tables;
+     Storages storages;
++    String query_id;
+     size_t db_table_num = 0;
+     size_t total_tables;
+ };
+@@ -343,7 +348,8 @@ BlockInputStreams StorageSystemColumns::read(
+ 
+     return {std::make_shared<ColumnsBlockInputStream>(
+         std::move(columns_mask), std::move(res_block), max_block_size,
+-        std::move(filtered_database_column), std::move(filtered_table_column), std::move(storages))};
++        std::move(filtered_database_column), std::move(filtered_table_column), std::move(storages),
++        context.getCurrentQueryId())};
+ }
+ 
+ }
+diff --git a/dbms/src/Storages/System/StorageSystemPartsBase.cpp b/dbms/src/Storages/System/StorageSystemPartsBase.cpp
+index 435a246018d3..f8449e7a937b 100644
+--- a/dbms/src/Storages/System/StorageSystemPartsBase.cpp
++++ b/dbms/src/Storages/System/StorageSystemPartsBase.cpp
+@@ -43,7 +43,8 @@ class StoragesInfoStream
+ {
+ public:
+     StoragesInfoStream(const SelectQueryInfo & query_info, const Context & context, bool has_state_column)
+-            : has_state_column(has_state_column)
++        : query_id(context.getCurrentQueryId())
++        , has_state_column(has_state_column)
+     {
+         /// Will apply WHERE to subset of columns and then add more columns.
+         /// This is kind of complicated, but we use WHERE to do less work.
+@@ -166,7 +167,7 @@ class StoragesInfoStream
+             try
+             {
+                 /// For table not to be dropped and set of columns to remain constant.
+-                info.table_lock = info.storage->lockStructure(false);
++                info.table_lock = info.storage->lockStructure(false, query_id);
+             }
+             catch (const Exception & e)
+             {
+@@ -220,6 +221,8 @@ class StoragesInfoStream
+     }
+ 
+ private:
++    String query_id;
++
+     bool has_state_column;
+ 
+     ColumnPtr database_column;

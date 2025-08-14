@@ -1,0 +1,164 @@
+diff --git a/docs/en/sql-reference/statements/alter/comment.md b/docs/en/sql-reference/statements/alter/comment.md
+index cc49c6abf80b..f6fb179d969e 100644
+--- a/docs/en/sql-reference/statements/alter/comment.md
++++ b/docs/en/sql-reference/statements/alter/comment.md
+@@ -57,3 +57,9 @@ Output of a removed comment:
+ │         │
+ └─────────┘
+ ```
++
++**Caveats**
++
++For Replicated tables, the comment can be different on different replicas. Modifying the comment applies to a single replica.
++
++The feature is available since version 23.9. It does not work in previous ClickHouse versions.
+diff --git a/src/Interpreters/InterpreterAlterQuery.cpp b/src/Interpreters/InterpreterAlterQuery.cpp
+index 7d1f99482383..a7445f89245b 100644
+--- a/src/Interpreters/InterpreterAlterQuery.cpp
++++ b/src/Interpreters/InterpreterAlterQuery.cpp
+@@ -156,10 +156,10 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
+     if (typeid_cast<DatabaseReplicated *>(database.get()))
+     {
+         int command_types_count = !mutation_commands.empty() + !partition_commands.empty() + !alter_commands.empty();
+-        bool mixed_settings_amd_metadata_alter = alter_commands.hasSettingsAlterCommand() && !alter_commands.isSettingsAlter();
++        bool mixed_settings_amd_metadata_alter = alter_commands.hasNonReplicatedAlterCommand() && !alter_commands.areNonReplicatedAlterCommands();
+         if (1 < command_types_count || mixed_settings_amd_metadata_alter)
+             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "For Replicated databases it's not allowed "
+-                                                         "to execute ALTERs of different types in single query");
++                                                         "to execute ALTERs of different types (replicated and non replicated) in single query");
+     }
+ 
+     if (mutation_commands.hasNonEmptyMutationCommands())
+diff --git a/src/Parsers/ParserCreateQuery.cpp b/src/Parsers/ParserCreateQuery.cpp
+index bfae57cab1db..44f375adb655 100644
+--- a/src/Parsers/ParserCreateQuery.cpp
++++ b/src/Parsers/ParserCreateQuery.cpp
+@@ -526,6 +526,7 @@ bool ParserStorage::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+ 
+         break;
+     }
++
+     // If any part of storage definition is found create storage node
+     if (!storage_like)
+         return false;
+diff --git a/src/Storages/AlterCommands.cpp b/src/Storages/AlterCommands.cpp
+index 96dcd74f9473..f38fc1f37349 100644
+--- a/src/Storages/AlterCommands.cpp
++++ b/src/Storages/AlterCommands.cpp
+@@ -1350,9 +1350,14 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
+     validateColumnsDefaultsAndGetSampleBlock(default_expr_list, all_columns.getAll(), context);
+ }
+ 
+-bool AlterCommands::hasSettingsAlterCommand() const
++bool AlterCommands::hasNonReplicatedAlterCommand() const
+ {
+-    return std::any_of(begin(), end(), [](const AlterCommand & c) { return c.isSettingsAlter(); });
++    return std::any_of(begin(), end(), [](const AlterCommand & c) { return c.isSettingsAlter() || c.isCommentAlter(); });
++}
++
++bool AlterCommands::areNonReplicatedAlterCommands() const
++{
++    return std::all_of(begin(), end(), [](const AlterCommand & c) { return c.isSettingsAlter() || c.isCommentAlter(); });
+ }
+ 
+ bool AlterCommands::isSettingsAlter() const
+diff --git a/src/Storages/AlterCommands.h b/src/Storages/AlterCommands.h
+index 3e526dcc0bb3..c06872f9757d 100644
+--- a/src/Storages/AlterCommands.h
++++ b/src/Storages/AlterCommands.h
+@@ -196,8 +196,11 @@ class AlterCommands : public std::vector<AlterCommand>
+     /// Commands have to be prepared before apply.
+     void apply(StorageInMemoryMetadata & metadata, ContextPtr context) const;
+ 
+-    /// At least one command modify settings.
+-    bool hasSettingsAlterCommand() const;
++    /// At least one command modify settings or comments.
++    bool hasNonReplicatedAlterCommand() const;
++
++    /// All commands modify settings or comments.
++    bool areNonReplicatedAlterCommands() const;
+ 
+     /// All commands modify settings only.
+     bool isSettingsAlter() const;
+diff --git a/src/Storages/MergeTree/registerStorageMergeTree.cpp b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+index 75f1542e30e1..0a1827893112 100644
+--- a/src/Storages/MergeTree/registerStorageMergeTree.cpp
++++ b/src/Storages/MergeTree/registerStorageMergeTree.cpp
+@@ -80,6 +80,7 @@ ORDER BY expr
+ [SAMPLE BY expr]
+ [TTL expr [DELETE|TO DISK 'xxx'|TO VOLUME 'xxx'], ...]
+ [SETTINGS name=value, ...]
++[COMMENT 'comment']
+ 
+ See details in documentation: https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree/. Other engines of the family support different syntax, see details in the corresponding documentation topics.
+ 
+diff --git a/src/Storages/StorageMergeTree.cpp b/src/Storages/StorageMergeTree.cpp
+index 4f27cbc76ed8..719c75fd5e5b 100644
+--- a/src/Storages/StorageMergeTree.cpp
++++ b/src/Storages/StorageMergeTree.cpp
+@@ -332,6 +332,11 @@ void StorageMergeTree::alter(
+         changeSettings(new_metadata.settings_changes, table_lock_holder);
+         DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
+     }
++    else if (commands.isCommentAlter())
++    {
++        setInMemoryMetadata(new_metadata);
++        DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
++    }
+     else
+     {
+         if (!maybe_mutation_commands.empty() && maybe_mutation_commands.containBarrierCommand())
+diff --git a/src/Storages/StorageReplicatedMergeTree.cpp b/src/Storages/StorageReplicatedMergeTree.cpp
+index 5274804462c8..9c08560da17a 100644
+--- a/src/Storages/StorageReplicatedMergeTree.cpp
++++ b/src/Storages/StorageReplicatedMergeTree.cpp
+@@ -5694,6 +5694,17 @@ void StorageReplicatedMergeTree::alter(
+         return;
+     }
+ 
++    if (commands.isCommentAlter())
++    {
++        StorageInMemoryMetadata future_metadata = getInMemoryMetadata();
++        commands.apply(future_metadata, query_context);
++
++        setInMemoryMetadata(future_metadata);
++
++        DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(query_context, table_id, future_metadata);
++        return;
++    }
++
+     auto ast_to_str = [](ASTPtr query) -> String
+     {
+         if (!query)
+@@ -5763,12 +5774,27 @@ void StorageReplicatedMergeTree::alter(
+         String new_columns_str = future_metadata.columns.toString();
+         ops.emplace_back(zkutil::makeSetRequest(fs::path(zookeeper_path) / "columns", new_columns_str, -1));
+ 
+-        if (ast_to_str(current_metadata->settings_changes) != ast_to_str(future_metadata.settings_changes))
++        bool settings_are_changed = (ast_to_str(current_metadata->settings_changes) != ast_to_str(future_metadata.settings_changes));
++        bool comment_is_changed = (current_metadata->comment != future_metadata.comment);
++
++        if (settings_are_changed || comment_is_changed)
+         {
+-            /// Just change settings
+             StorageInMemoryMetadata metadata_copy = *current_metadata;
+-            metadata_copy.settings_changes = future_metadata.settings_changes;
+-            changeSettings(metadata_copy.settings_changes, table_lock_holder);
++
++            if (settings_are_changed)
++            {
++                /// Just change settings
++                metadata_copy.settings_changes = future_metadata.settings_changes;
++                changeSettings(metadata_copy.settings_changes, table_lock_holder);
++            }
++
++            /// The comment is not replicated as of today, but we can implement it later.
++            if (comment_is_changed)
++            {
++                metadata_copy.setComment(future_metadata.comment);
++                setInMemoryMetadata(metadata_copy);
++            }
++
+             DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(query_context, table_id, metadata_copy);
+         }
+ 

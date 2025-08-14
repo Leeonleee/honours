@@ -1,0 +1,667 @@
+diff --git a/docs/en/sql-reference/window-functions/index.md b/docs/en/sql-reference/window-functions/index.md
+index d7f4a696476d..0a563cd6d66a 100644
+--- a/docs/en/sql-reference/window-functions/index.md
++++ b/docs/en/sql-reference/window-functions/index.md
+@@ -10,7 +10,7 @@ ClickHouse supports the standard grammar for defining windows and window functio
+ | Feature | Support or workaround |
+ | --------| ----------|
+ | ad hoc window specification (`count(*) over (partition by id order by time desc)`) | supported |
+-| expressions involving window functions, e.g. `(count(*) over ()) / 2)` | not supported, wrap in a subquery ([feature request](https://github.com/ClickHouse/ClickHouse/issues/19857)) |
++| expressions involving window functions, e.g. `(count(*) over ()) / 2)` | supported |
+ | `WINDOW` clause (`select ... from table window w as (partition by id)`) | supported |
+ | `ROWS` frame | supported |
+ | `RANGE` frame | supported, the default |
+diff --git a/src/AggregateFunctions/AggregateFunctionFactory.h b/src/AggregateFunctions/AggregateFunctionFactory.h
+index e5263a54d790..a860831cb881 100644
+--- a/src/AggregateFunctions/AggregateFunctionFactory.h
++++ b/src/AggregateFunctions/AggregateFunctionFactory.h
+@@ -2,6 +2,7 @@
+ 
+ #include <AggregateFunctions/IAggregateFunction.h>
+ #include <Common/IFactoryWithAliases.h>
++#include <Parsers/ASTFunction.h>
+ 
+ 
+ #include <functional>
+@@ -105,4 +106,12 @@ class AggregateFunctionFactory final : private boost::noncopyable, public IFacto
+ 
+ };
+ 
++struct AggregateUtils
++{
++    static bool isAggregateFunction(const ASTFunction & node)
++    {
++        return AggregateFunctionFactory::instance().isAggregateFunctionName(node.name);
++    }
++};
++
+ }
+diff --git a/src/Interpreters/ActionsVisitor.cpp b/src/Interpreters/ActionsVisitor.cpp
+index f9d18cda777a..e25a6260787e 100644
+--- a/src/Interpreters/ActionsVisitor.cpp
++++ b/src/Interpreters/ActionsVisitor.cpp
+@@ -467,6 +467,15 @@ class ScopeStack::Index
+     }
+ 
+     bool contains(const std::string & name) const { return map.contains(name); }
++
++    std::vector<std::string_view> getAllNames() const
++    {
++        std::vector<std::string_view> result;
++        result.reserve(map.size());
++        for (auto const & e : map)
++            result.emplace_back(e.first);
++        return result;
++    }
+ };
+ 
+ ActionsMatcher::Data::Data(
+@@ -481,7 +490,8 @@ ActionsMatcher::Data::Data(
+     bool no_makeset_,
+     bool only_consts_,
+     bool create_source_for_in_,
+-    AggregationKeysInfo aggregation_keys_info_)
++    AggregationKeysInfo aggregation_keys_info_,
++    bool build_expression_with_window_functions_)
+     : WithContext(context_)
+     , set_size_limit(set_size_limit_)
+     , subquery_depth(subquery_depth_)
+@@ -495,6 +505,7 @@ ActionsMatcher::Data::Data(
+     , visit_depth(0)
+     , actions_stack(std::move(actions_dag), context_)
+     , aggregation_keys_info(aggregation_keys_info_)
++    , build_expression_with_window_functions(build_expression_with_window_functions_)
+     , next_unique_suffix(actions_stack.getLastActions().getIndex().size() + 1)
+ {
+ }
+@@ -504,6 +515,12 @@ bool ActionsMatcher::Data::hasColumn(const String & column_name) const
+     return actions_stack.getLastActionsIndex().contains(column_name);
+ }
+ 
++std::vector<std::string_view> ActionsMatcher::Data::getAllColumnNames() const
++{
++    const auto & index = actions_stack.getLastActionsIndex();
++    return index.getAllNames();
++}
++
+ ScopeStack::ScopeStack(ActionsDAGPtr actions_dag, ContextPtr context_) : WithContext(context_)
+ {
+     auto & level = stack.emplace_back();
+@@ -803,8 +820,9 @@ void ActionsMatcher::visit(const ASTIdentifier & identifier, const ASTPtr &, Dat
+         {
+             if (column_name_type.name == column_name)
+             {
+-                throw Exception("Column " + backQuote(column_name) + " is not under aggregate function and not in GROUP BY",
+-                                ErrorCodes::NOT_AN_AGGREGATE);
++                throw Exception(ErrorCodes::NOT_AN_AGGREGATE,
++                    "Column {} is not under aggregate function and not in GROUP BY. Have columns: {}",
++                    backQuote(column_name), toString(data.getAllColumnNames()));
+             }
+         }
+ 
+@@ -921,6 +939,7 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data &
+         return;
+     }
+ 
++    // Now we need to correctly process window functions and any expression which depend on them.
+     if (node.is_window_function)
+     {
+         // Also add columns from PARTITION BY and ORDER BY of window functions.
+@@ -928,7 +947,6 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data &
+         {
+             visit(node.window_definition, data);
+         }
+-
+         // Also manually add columns for arguments of the window function itself.
+         // ActionVisitor is written in such a way that this method must itself
+         // descend into all needed function children. Window functions can't have
+@@ -945,12 +963,45 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data &
+         // Don't need to do anything more for window functions here -- the
+         // resulting column is added in ExpressionAnalyzer, similar to the
+         // aggregate functions.
++        if (data.window_dependancy_state == WindowDependancyState::MAY_DEPEND)
++            data.window_function_in_subtree = true;
+         return;
+     }
++    else if (node.compute_after_window_functions)
++    {
++        // In this case we have window function call in subtree
++        // Add this function to actions index only if Data::build_expression_with_window_functions is set.
++        data.window_dependancy_state = WindowDependancyState::MAY_DEPEND;
++        for (const auto & arg : node.arguments->children)
++        {
++            data.window_function_in_subtree = false;
++            visit(arg, data);
++            // There is no point to check value of window_function_in_subtree here,
++            // because after window functions are computed, this variable is always false.
++        }
++        data.window_dependancy_state = WindowDependancyState::NONE;
++        if (!data.build_expression_with_window_functions)
++            return;
++    }
++    else if (data.window_dependancy_state == WindowDependancyState::MAY_DEPEND)
++    {
++        // This function may depend on evaluation of window function.
++        // We need to check it and add it to the index only if Data::build_expression_with_window_functions is set.
++        bool subtree_contains_window_call = false;
++        for (const auto & arg : node.arguments->children)
++        {
++            data.window_function_in_subtree = false;
++            visit(arg, data);
++            subtree_contains_window_call = subtree_contains_window_call || data.window_function_in_subtree;
++        }
++        data.window_function_in_subtree = subtree_contains_window_call;
++        if (subtree_contains_window_call && !data.build_expression_with_window_functions)
++            return;
++    }
+ 
+     // An aggregate function can also be calculated as a window function, but we
+     // checked for it above, so no need to do anything more.
+-    if (AggregateFunctionFactory::instance().isAggregateFunctionName(node.name))
++    if (AggregateUtils::isAggregateFunction(node))
+         return;
+ 
+     FunctionOverloadResolverPtr function_builder;
+diff --git a/src/Interpreters/ActionsVisitor.h b/src/Interpreters/ActionsVisitor.h
+index 5a74124192c2..afdf2948d473 100644
+--- a/src/Interpreters/ActionsVisitor.h
++++ b/src/Interpreters/ActionsVisitor.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <string_view>
+ #include <Core/NamesAndTypes.h>
+ #include <Interpreters/Context_fwd.h>
+ #include <Interpreters/InDepthNodeVisitor.h>
+@@ -120,6 +121,12 @@ class ActionsMatcher
+ public:
+     using Visitor = ConstInDepthNodeVisitor<ActionsMatcher, true>;
+ 
++    enum class WindowDependancyState
++    {
++        NONE,
++        MAY_DEPEND,
++    };
++
+     struct Data : public WithContext
+     {
+         SizeLimits set_size_limit;
+@@ -134,6 +141,7 @@ class ActionsMatcher
+         size_t visit_depth;
+         ScopeStack actions_stack;
+         AggregationKeysInfo aggregation_keys_info;
++        bool build_expression_with_window_functions;
+ 
+         /*
+          * Remember the last unique column suffix to avoid quadratic behavior
+@@ -142,6 +150,9 @@ class ActionsMatcher
+          */
+         int next_unique_suffix;
+ 
++        WindowDependancyState window_dependancy_state = WindowDependancyState::NONE;
++        bool window_function_in_subtree = false;
++
+         Data(
+             ContextPtr context_,
+             SizeLimits set_size_limit_,
+@@ -154,10 +165,13 @@ class ActionsMatcher
+             bool no_makeset_,
+             bool only_consts_,
+             bool create_source_for_in_,
+-            AggregationKeysInfo aggregation_keys_info_);
++            AggregationKeysInfo aggregation_keys_info_,
++            bool build_expression_with_window_functions_ = false);
+ 
+         /// Does result of the calculation already exists in the block.
+         bool hasColumn(const String & column_name) const;
++        std::vector<std::string_view> getAllColumnNames() const;
++
+         void addColumn(ColumnWithTypeAndName column)
+         {
+             actions_stack.addColumn(std::move(column));
+diff --git a/src/Interpreters/ExpressionAnalyzer.cpp b/src/Interpreters/ExpressionAnalyzer.cpp
+index 00333503db1e..cfe1167c36ce 100644
+--- a/src/Interpreters/ExpressionAnalyzer.cpp
++++ b/src/Interpreters/ExpressionAnalyzer.cpp
+@@ -137,7 +137,7 @@ bool checkPositionalArguments(ASTPtr & argument, const ASTSelectQuery * select_q
+         {
+             if (const auto * function = typeid_cast<const ASTFunction *>(node.get()))
+             {
+-                auto is_aggregate_function = AggregateFunctionFactory::instance().isAggregateFunctionName(function->name);
++                auto is_aggregate_function = AggregateUtils::isAggregateFunction(*function);
+                 if (is_aggregate_function)
+                 {
+                     throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+@@ -659,6 +659,28 @@ void ExpressionAnalyzer::getRootActionsForHaving(
+ }
+ 
+ 
++void ExpressionAnalyzer::getRootActionsForWindowFunctions(const ASTPtr & ast, bool no_makeset_for_subqueries, ActionsDAGPtr & actions)
++{
++    LogAST log;
++    ActionsVisitor::Data visitor_data(
++        getContext(),
++        settings.size_limits_for_set,
++        subquery_depth,
++        sourceColumns(),
++        std::move(actions),
++        prepared_sets,
++        subqueries_for_sets,
++        no_makeset_for_subqueries,
++        false /* no_makeset */,
++        false /*only_consts */,
++        !isRemoteStorage() /* create_source_for_in */,
++        getAggregationKeysInfo(),
++        true);
++    ActionsVisitor(visitor_data, log.stream()).visit(ast);
++    actions = visitor_data.getActions();
++}
++
++
+ void ExpressionAnalyzer::makeAggregateDescriptions(ActionsDAGPtr & actions, AggregateDescriptions & descriptions)
+ {
+     for (const ASTFunction * node : aggregates())
+@@ -895,7 +917,6 @@ void ExpressionAnalyzer::makeWindowDescriptions(ActionsDAGPtr actions)
+                 window_function.argument_types,
+                 window_function.function_parameters, properties);
+ 
+-
+         // Find the window corresponding to this function. It may be either
+         // referenced by name and previously defined in WINDOW clause, or it
+         // may be defined inline.
+@@ -1388,6 +1409,15 @@ void SelectQueryExpressionAnalyzer::appendWindowFunctionsArguments(
+     }
+ }
+ 
++void SelectQueryExpressionAnalyzer::appendExpressionsAfterWindowFunctions(ExpressionActionsChain & chain, bool /* only_types */)
++{
++    ExpressionActionsChain::Step & step = chain.lastStep(columns_after_window);
++    for (const auto & expression : syntax->expressions_with_window_function)
++    {
++        getRootActionsForWindowFunctions(expression->clone(), true, step.actions());
++    }
++}
++
+ bool SelectQueryExpressionAnalyzer::appendHaving(ExpressionActionsChain & chain, bool only_types)
+ {
+     const auto * select_query = getAggregatingQuery();
+@@ -1415,7 +1445,7 @@ void SelectQueryExpressionAnalyzer::appendSelect(ExpressionActionsChain & chain,
+     {
+         if (const auto * function = typeid_cast<const ASTFunction *>(child.get());
+             function
+-            && function->is_window_function)
++            && (function->is_window_function || function->compute_after_window_functions))
+         {
+             // Skip window function columns here -- they are calculated after
+             // other SELECT expressions by a special step.
+@@ -1891,6 +1921,12 @@ ExpressionAnalysisResult::ExpressionAnalysisResult(
+             before_window = chain.getLastActions();
+             finalize_chain(chain);
+ 
++            query_analyzer.appendExpressionsAfterWindowFunctions(chain, only_types || !first_stage);
++            for (const auto & x : chain.getLastActions()->getNamesAndTypesList())
++            {
++                query_analyzer.columns_after_window.push_back(x);
++            }
++
+             auto & step = chain.lastStep(query_analyzer.columns_after_window);
+ 
+             // The output of this expression chain is the result of
+diff --git a/src/Interpreters/ExpressionAnalyzer.h b/src/Interpreters/ExpressionAnalyzer.h
+index 80c664832e52..6c27d8c6760c 100644
+--- a/src/Interpreters/ExpressionAnalyzer.h
++++ b/src/Interpreters/ExpressionAnalyzer.h
+@@ -191,6 +191,8 @@ class ExpressionAnalyzer : protected ExpressionAnalyzerData, private boost::nonc
+ 
+     void getRootActionsForHaving(const ASTPtr & ast, bool no_makeset_for_subqueries, ActionsDAGPtr & actions, bool only_consts = false);
+ 
++    void getRootActionsForWindowFunctions(const ASTPtr & ast, bool no_makeset_for_subqueries, ActionsDAGPtr & actions);
++
+     /** Add aggregation keys to aggregation_keys, aggregate functions to aggregate_descriptions,
+       * Create a set of columns aggregated_columns resulting after the aggregation, if any,
+       *  or after all the actions that are normally performed before aggregation.
+@@ -406,6 +408,8 @@ class SelectQueryExpressionAnalyzer : public ExpressionAnalyzer
+     void appendAggregateFunctionsArguments(ExpressionActionsChain & chain, bool only_types);
+     void appendWindowFunctionsArguments(ExpressionActionsChain & chain, bool only_types);
+ 
++    void appendExpressionsAfterWindowFunctions(ExpressionActionsChain & chain, bool only_types);
++
+     /// After aggregation:
+     bool appendHaving(ExpressionActionsChain & chain, bool only_types);
+     ///  appendSelect
+diff --git a/src/Interpreters/GetAggregatesVisitor.cpp b/src/Interpreters/GetAggregatesVisitor.cpp
+new file mode 100644
+index 000000000000..a9d96a6d15a4
+--- /dev/null
++++ b/src/Interpreters/GetAggregatesVisitor.cpp
+@@ -0,0 +1,90 @@
++#include <Interpreters/GetAggregatesVisitor.h>
++
++namespace DB
++{
++
++struct WindowExpressionsCollectorChildInfo
++{
++    void update(const WindowExpressionsCollectorChildInfo & other)
++    {
++        window_function_in_subtree = window_function_in_subtree || other.window_function_in_subtree;
++    }
++
++    bool window_function_in_subtree = false;
++};
++
++// This visitor travers AST and collects the list of expressions which depend on
++// evaluation of window functions. Expression is collected only if
++// it's not a part of another expression.
++//
++// Also all collected AST nodes are marked as dependent on window function.
++// This information is used during ActionsDAG building process.
++struct WindowExpressionsCollectorMatcher
++{
++    using ChildInfo = WindowExpressionsCollectorChildInfo;
++
++    static bool needVisitChild(ASTPtr & node, const ASTPtr & child)
++    {
++        if (child->as<ASTSubquery>() || child->as<ASTSelectQuery>())
++            return false;
++        if (auto * select = node->as<ASTSelectQuery>())
++        {
++            // We don't analysis WITH statement because it might contain useless aggregates
++            if (child == select->with())
++                return false;
++        }
++        // We procces every expression manually
++        if (auto * func = node->as<ASTFunction>())
++            return false;
++        return true;
++    }
++
++    WindowExpressionsCollectorChildInfo visitNode(
++        ASTPtr & ast,
++        const ASTPtr & parent,
++        WindowExpressionsCollectorChildInfo const &)
++    {
++        return visitNode(ast, parent);
++    }
++
++    WindowExpressionsCollectorChildInfo visitNode(
++        ASTPtr & ast,
++        const ASTPtr & parent)
++    {
++        if (auto * func = ast->as<ASTFunction>())
++        {
++            if (func->is_window_function)
++                return { .window_function_in_subtree = true };
++
++            WindowExpressionsCollectorChildInfo result;
++            for (auto & arg : func->arguments->children)
++            {
++                auto subtree_result = visitNode(arg, ast);
++                result.update(subtree_result);
++            }
++
++            // We mark functions only on the top of AST
++            if ((!parent || !parent->as<ASTFunction>()) && result.window_function_in_subtree)
++            {
++                expressions_with_window_functions.push_back(func);
++                func->compute_after_window_functions = true;
++            }
++
++            return result;
++        }
++        return {};
++    }
++
++    std::vector<const ASTFunction *> expressions_with_window_functions {};
++};
++
++using WindowExpressionsCollectorVisitor = InDepthNodeVisitorWithChildInfo<WindowExpressionsCollectorMatcher>;
++
++std::vector<const ASTFunction *> getExpressionsWithWindowFunctions(ASTPtr & ast)
++{
++    WindowExpressionsCollectorVisitor visitor;
++    visitor.visit(ast);
++    return std::move(visitor.expressions_with_window_functions);
++}
++
++}
+diff --git a/src/Interpreters/GetAggregatesVisitor.h b/src/Interpreters/GetAggregatesVisitor.h
+index 3966653235aa..036d50ba4d61 100644
+--- a/src/Interpreters/GetAggregatesVisitor.h
++++ b/src/Interpreters/GetAggregatesVisitor.h
+@@ -95,9 +95,7 @@ class GetAggregatesMatcher
+     {
+         // Aggregate functions can also be calculated as window functions, but
+         // here we are interested in aggregate functions calculated in GROUP BY.
+-        return !node.is_window_function
+-            && AggregateFunctionFactory::instance().isAggregateFunctionName(
+-                node.name);
++        return !node.is_window_function && AggregateUtils::isAggregateFunction(node);
+     }
+ };
+ 
+@@ -116,4 +114,6 @@ inline void assertNoAggregates(const ASTPtr & ast, const char * description)
+     GetAggregatesVisitor(data).visit(ast);
+ }
+ 
++std::vector<const ASTFunction *> getExpressionsWithWindowFunctions(ASTPtr & ast);
++
+ }
+diff --git a/src/Interpreters/InDepthNodeVisitor.h b/src/Interpreters/InDepthNodeVisitor.h
+index b7353f2c2431..736a764e8e93 100644
+--- a/src/Interpreters/InDepthNodeVisitor.h
++++ b/src/Interpreters/InDepthNodeVisitor.h
+@@ -95,4 +95,33 @@ class OneTypeMatcher
+ template <typename Data, NeedChild::Condition need_child = NeedChild::all>
+ using ConstOneTypeMatcher = OneTypeMatcher<Data, need_child, const ASTPtr>;
+ 
++template <typename Visitor, typename T = ASTPtr>
++struct InDepthNodeVisitorWithChildInfo : Visitor
++{
++    using ChildInfo = typename Visitor::ChildInfo;
++
++    ChildInfo visit(T & ast, const T & parent = {})
++    {
++        ChildInfo all_children_info;
++        for (auto & child : ast->children)
++        {
++            if (Visitor::needVisitChild(ast, child))
++            {
++                ChildInfo child_info = visit(child, ast);
++                all_children_info.update(child_info);
++            }
++        }
++
++        try
++        {
++            return Visitor::visitNode(ast, parent, all_children_info);
++        }
++        catch (Exception & e)
++        {
++            e.addMessage("While processing {}", ast->formatForErrorMessage());
++            throw;
++        }
++    }
++};
++
+ }
+diff --git a/src/Interpreters/InterpreterInsertQuery.cpp b/src/Interpreters/InterpreterInsertQuery.cpp
+index 241ab1b0f759..4ed293e85304 100644
+--- a/src/Interpreters/InterpreterInsertQuery.cpp
++++ b/src/Interpreters/InterpreterInsertQuery.cpp
+@@ -162,7 +162,7 @@ Block InterpreterInsertQuery::getSampleBlock(
+ static bool hasAggregateFunctions(const IAST * ast)
+ {
+     if (const auto * func = typeid_cast<const ASTFunction *>(ast))
+-        if (AggregateFunctionFactory::instance().isAggregateFunctionName(func->name))
++        if (AggregateUtils::isAggregateFunction(*func))
+             return true;
+ 
+     for (const auto & child : ast->children)
+diff --git a/src/Interpreters/MonotonicityCheckVisitor.h b/src/Interpreters/MonotonicityCheckVisitor.h
+index 00347388de20..4b9f36ab72dd 100644
+--- a/src/Interpreters/MonotonicityCheckVisitor.h
++++ b/src/Interpreters/MonotonicityCheckVisitor.h
+@@ -47,8 +47,7 @@ class MonotonicityCheckMatcher
+             /// if ORDER BY contains aggregate function or window functions, it
+             /// shouldn't be optimized
+             if (ast_function.is_window_function
+-                || AggregateFunctionFactory::instance().isAggregateFunctionName(
+-                    ast_function.name))
++                || AggregateUtils::isAggregateFunction(ast_function))
+             {
+                 return false;
+             }
+diff --git a/src/Interpreters/RewriteAnyFunctionVisitor.cpp b/src/Interpreters/RewriteAnyFunctionVisitor.cpp
+index 33362648ae18..163e117f93d1 100644
+--- a/src/Interpreters/RewriteAnyFunctionVisitor.cpp
++++ b/src/Interpreters/RewriteAnyFunctionVisitor.cpp
+@@ -41,8 +41,7 @@ bool extractIdentifiers(const ASTFunction & func, std::unordered_set<ASTPtr *> &
+             // be inside `any`, but this check in GetAggregatesMatcher happens
+             // later, so we have to explicitly skip these nested functions here.
+             if (arg_func->is_window_function
+-                || AggregateFunctionFactory::instance().isAggregateFunctionName(
+-                    arg_func->name))
++                || AggregateUtils::isAggregateFunction(*arg_func))
+             {
+                 return false;
+             }
+diff --git a/src/Interpreters/TreeRewriter.cpp b/src/Interpreters/TreeRewriter.cpp
+index 70aa859e741f..3d14955c16a6 100644
+--- a/src/Interpreters/TreeRewriter.cpp
++++ b/src/Interpreters/TreeRewriter.cpp
+@@ -511,7 +511,7 @@ void removeUnneededColumnsFromSelectClause(ASTSelectQuery * select_query, const
+                 new_elements.push_back(elem);
+ 
+             /// removing aggregation can change number of rows, so `count()` result in outer sub-query would be wrong
+-            if (func && AggregateFunctionFactory::instance().isAggregateFunctionName(func->name) && !select_query->groupBy())
++            if (func && AggregateUtils::isAggregateFunction(*func) && !select_query->groupBy())
+                 new_elements.push_back(elem);
+         }
+     }
+@@ -1248,6 +1248,7 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
+ 
+     result.aggregates = getAggregates(query, *select_query);
+     result.window_function_asts = getWindowFunctions(query, *select_query);
++    result.expressions_with_window_function = getExpressionsWithWindowFunctions(query);
+     result.collectUsedColumns(query, true);
+     result.required_source_columns_before_expanding_alias_columns = result.required_source_columns.getNames();
+ 
+@@ -1271,6 +1272,7 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
+         {
+             result.aggregates = getAggregates(query, *select_query);
+             result.window_function_asts = getWindowFunctions(query, *select_query);
++            result.expressions_with_window_function = getExpressionsWithWindowFunctions(query);
+             result.collectUsedColumns(query, true);
+         }
+     }
+diff --git a/src/Interpreters/TreeRewriter.h b/src/Interpreters/TreeRewriter.h
+index 2c246455ade7..f9d8d2bfdd6a 100644
+--- a/src/Interpreters/TreeRewriter.h
++++ b/src/Interpreters/TreeRewriter.h
+@@ -44,6 +44,8 @@ struct TreeRewriterResult
+ 
+     std::vector<const ASTFunction *> window_function_asts;
+ 
++    std::vector<const ASTFunction *> expressions_with_window_function;
++
+     /// Which column is needed to be ARRAY-JOIN'ed to get the specified.
+     /// For example, for `SELECT s.v ... ARRAY JOIN a AS s` will get "s.v" -> "a.v".
+     NameToNameMap array_join_result_to_source;
+diff --git a/src/Parsers/ASTFunction.cpp b/src/Parsers/ASTFunction.cpp
+index b86929b054c0..69927c430dc7 100644
+--- a/src/Parsers/ASTFunction.cpp
++++ b/src/Parsers/ASTFunction.cpp
+@@ -89,6 +89,24 @@ void ASTFunction::appendColumnNameImpl(WriteBuffer & ostr) const
+     }
+ }
+ 
++void ASTFunction::finishFormatWithWindow(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
++{
++    if (!is_window_function)
++        return;
++
++    settings.ostr << " OVER ";
++    if (!window_name.empty())
++    {
++        settings.ostr << backQuoteIfNeed(window_name);
++    }
++    else
++    {
++        settings.ostr << "(";
++        window_definition->formatImpl(settings, state, frame);
++        settings.ostr << ")";
++    }
++}
++
+ /** Get the text that identifies this element. */
+ String ASTFunction::getID(char delim) const
+ {
+@@ -563,7 +581,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
+ 
+     if (written)
+     {
+-        return;
++        return finishFormatWithWindow(settings, state, frame);
+     }
+ 
+     settings.ostr << (settings.hilite ? hilite_function : "") << name;
+@@ -603,22 +621,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
+ 
+     settings.ostr << (settings.hilite ? hilite_none : "");
+ 
+-    if (!is_window_function)
+-    {
+-        return;
+-    }
+-
+-    settings.ostr << " OVER ";
+-    if (!window_name.empty())
+-    {
+-        settings.ostr << backQuoteIfNeed(window_name);
+-    }
+-    else
+-    {
+-        settings.ostr << "(";
+-        window_definition->formatImpl(settings, state, frame);
+-        settings.ostr << ")";
+-    }
++    return finishFormatWithWindow(settings, state, frame);
+ }
+ 
+ String getFunctionName(const IAST * ast)
+diff --git a/src/Parsers/ASTFunction.h b/src/Parsers/ASTFunction.h
+index 6efbe512cf41..6d5089f802e3 100644
+--- a/src/Parsers/ASTFunction.h
++++ b/src/Parsers/ASTFunction.h
+@@ -22,6 +22,8 @@ class ASTFunction : public ASTWithAlias
+ 
+     bool is_window_function = false;
+ 
++    bool compute_after_window_functions = false;
++
+     // We have to make these fields ASTPtr because this is what the visitors
+     // expect. Some of them take const ASTPtr & (makes no sense), and some
+     // take ASTPtr & and modify it. I don't understand how the latter is
+@@ -54,6 +56,8 @@ class ASTFunction : public ASTWithAlias
+ protected:
+     void formatImplWithoutAlias(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+     void appendColumnNameImpl(WriteBuffer & ostr) const override;
++private:
++    void finishFormatWithWindow(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const;
+ };
+ 
+ 
+diff --git a/src/Storages/TTLDescription.cpp b/src/Storages/TTLDescription.cpp
+index b745da134848..41c9c1996b13 100644
+--- a/src/Storages/TTLDescription.cpp
++++ b/src/Storages/TTLDescription.cpp
+@@ -92,7 +92,7 @@ class FindAggregateFunctionData
+     {
+         /// Do not throw if found aggregate function inside another aggregate function,
+         /// because it will be checked, while creating expressions.
+-        if (AggregateFunctionFactory::instance().isAggregateFunctionName(func.name))
++        if (AggregateUtils::isAggregateFunction(func))
+             has_aggregate_function = true;
+     }
+ };

@@ -1,0 +1,161 @@
+diff --git a/src/Interpreters/Set.cpp b/src/Interpreters/Set.cpp
+index b8b61c7c11f9..5df226cc2962 100644
+--- a/src/Interpreters/Set.cpp
++++ b/src/Interpreters/Set.cpp
+@@ -324,11 +324,11 @@ ColumnPtr Set::execute(const ColumnsWithTypeAndName & columns, bool negative) co
+ 
+         if (!transform_null_in && data_types[i]->canBeInsideNullable())
+         {
+-            result = castColumnAccurateOrNull(column_to_cast, data_types[i]);
++            result = castColumnAccurateOrNull(column_to_cast, data_types[i], cast_cache.get());
+         }
+         else
+         {
+-            result = castColumnAccurate(column_to_cast, data_types[i]);
++            result = castColumnAccurate(column_to_cast, data_types[i], cast_cache.get());
+         }
+ 
+         materialized_columns.emplace_back() = result;
+diff --git a/src/Interpreters/Set.h b/src/Interpreters/Set.h
+index 9ea46e117ef5..08c472c3c950 100644
+--- a/src/Interpreters/Set.h
++++ b/src/Interpreters/Set.h
+@@ -9,6 +9,7 @@
+ #include <Storages/MergeTree/BoolMask.h>
+ 
+ #include <Common/SharedMutex.h>
++#include <Interpreters/castColumn.h>
+ 
+ 
+ namespace DB
+@@ -33,9 +34,9 @@ class Set
+     /// This is needed for subsequent use for index.
+     Set(const SizeLimits & limits_, size_t max_elements_to_fill_, bool transform_null_in_)
+         : log(&Poco::Logger::get("Set")),
+-        limits(limits_), max_elements_to_fill(max_elements_to_fill_), transform_null_in(transform_null_in_)
+-    {
+-    }
++        limits(limits_), max_elements_to_fill(max_elements_to_fill_), transform_null_in(transform_null_in_),
++        cast_cache(std::make_unique<InternalCastFunctionCache>())
++    {}
+ 
+     /** Set can be created either from AST or from a stream of data (subquery result).
+       */
+@@ -142,6 +143,10 @@ class Set
+       */
+     mutable SharedMutex rwlock;
+ 
++    /// A cache for cast functions (if any) to avoid rebuilding cast functions
++    /// for every call to `execute`
++    mutable std::unique_ptr<InternalCastFunctionCache> cast_cache;
++
+     template <typename Method>
+     void insertFromBlockImpl(
+         Method & method,
+diff --git a/src/Interpreters/castColumn.cpp b/src/Interpreters/castColumn.cpp
+index dc9882b84b05..44e669a21abb 100644
+--- a/src/Interpreters/castColumn.cpp
++++ b/src/Interpreters/castColumn.cpp
+@@ -7,24 +7,29 @@ namespace DB
+ {
+ 
+ template <CastType cast_type = CastType::nonAccurate>
+-static ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
++static ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache = nullptr)
+ {
+     if (arg.type->equals(*type) && cast_type != CastType::accurateOrNull)
+         return arg.column;
+ 
++    const auto from_name = arg.type->getName();
++    const auto to_name = type->getName();
+     ColumnsWithTypeAndName arguments
+     {
+         arg,
+         {
+-            DataTypeString().createColumnConst(arg.column->size(), type->getName()),
++            DataTypeString().createColumnConst(arg.column->size(), to_name),
+             std::make_shared<DataTypeString>(),
+             ""
+         }
+     };
++    auto get_cast_func = [&arguments]
++    {
++        FunctionOverloadResolverPtr func_builder_cast = CastInternalOverloadResolver<cast_type>::createImpl();
++        return func_builder_cast->build(arguments);
++    };
+ 
+-    FunctionOverloadResolverPtr func_builder_cast = CastInternalOverloadResolver<cast_type>::createImpl();
+-
+-    auto func_cast = func_builder_cast->build(arguments);
++    FunctionBasePtr func_cast = cache ? cache->getOrSet(cast_type, from_name, to_name, std::move(get_cast_func)) : get_cast_func();
+ 
+     if constexpr (cast_type == CastType::accurateOrNull)
+     {
+@@ -36,19 +41,19 @@ static ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr
+     }
+ }
+ 
+-ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
++ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache)
+ {
+-    return castColumn<CastType::nonAccurate>(arg, type);
++    return castColumn<CastType::nonAccurate>(arg, type, cache);
+ }
+ 
+-ColumnPtr castColumnAccurate(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
++ColumnPtr castColumnAccurate(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache)
+ {
+-    return castColumn<CastType::accurate>(arg, type);
++    return castColumn<CastType::accurate>(arg, type, cache);
+ }
+ 
+-ColumnPtr castColumnAccurateOrNull(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
++ColumnPtr castColumnAccurateOrNull(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache)
+ {
+-    return castColumn<CastType::accurateOrNull>(arg, type);
++    return castColumn<CastType::accurateOrNull>(arg, type, cache);
+ }
+ 
+ }
+diff --git a/src/Interpreters/castColumn.h b/src/Interpreters/castColumn.h
+index fcbea0f46465..8d2c05025bb9 100644
+--- a/src/Interpreters/castColumn.h
++++ b/src/Interpreters/castColumn.h
+@@ -1,12 +1,34 @@
+ #pragma once
+ 
++#include <tuple>
+ #include <Core/ColumnWithTypeAndName.h>
++#include <Functions/FunctionsConversion.h>
+ 
+ namespace DB
+ {
+ 
+-ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type);
+-ColumnPtr castColumnAccurate(const ColumnWithTypeAndName & arg, const DataTypePtr & type);
+-ColumnPtr castColumnAccurateOrNull(const ColumnWithTypeAndName & arg, const DataTypePtr & type);
++struct InternalCastFunctionCache
++{
++private:
++    /// Maps <cast_type, from_type, to_type> -> cast functions
++    /// Doesn't own key, never refer to key after inserted
++    std::map<std::tuple<CastType, String, String>, FunctionBasePtr> impl;
++    mutable std::mutex mutex;
++public:
++    template<typename Getter>
++    FunctionBasePtr getOrSet(CastType cast_type, const String & from, const String & to, Getter && getter)
++    {
++        std::lock_guard lock{mutex};
++        auto key = std::forward_as_tuple(cast_type, from, to);
++        auto it = impl.find(key);
++        if (it == impl.end())
++            it = impl.emplace(key, getter()).first;
++        return it->second;
++    }
++};
++
++ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache = nullptr);
++ColumnPtr castColumnAccurate(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache = nullptr);
++ColumnPtr castColumnAccurateOrNull(const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache = nullptr);
+ 
+ }

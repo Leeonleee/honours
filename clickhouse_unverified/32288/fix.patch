@@ -1,0 +1,119 @@
+diff --git a/src/Databases/DDLDependencyVisitor.cpp b/src/Databases/DDLDependencyVisitor.cpp
+index 09d3752b180b..532691f79782 100644
+--- a/src/Databases/DDLDependencyVisitor.cpp
++++ b/src/Databases/DDLDependencyVisitor.cpp
+@@ -11,7 +11,7 @@
+ namespace DB
+ {
+ 
+-TableNamesSet getDependenciesSetFromCreateQuery(ContextPtr global_context, const ASTPtr & ast)
++TableNamesSet getDependenciesSetFromCreateQuery(ContextPtr global_context, const QualifiedTableName & table, const ASTPtr & ast)
+ {
+     assert(global_context == global_context->getGlobalContext());
+     TableLoadingDependenciesVisitor::Data data;
+@@ -20,6 +20,7 @@ TableNamesSet getDependenciesSetFromCreateQuery(ContextPtr global_context, const
+     data.global_context = global_context;
+     TableLoadingDependenciesVisitor visitor{data};
+     visitor.visit(ast);
++    data.dependencies.erase(table);
+     return data.dependencies;
+ }
+ 
+@@ -132,7 +133,10 @@ void DDLDependencyVisitor::extractTableNameFromArgument(const ASTFunction & func
+     }
+ 
+     if (qualified_name.database.empty())
++    {
++        /// It can be table/dictionary from default database or XML dictionary, but we cannot distinguish it here.
+         qualified_name.database = data.default_database;
++    }
+     data.dependencies.emplace(std::move(qualified_name));
+ }
+ 
+diff --git a/src/Databases/DDLDependencyVisitor.h b/src/Databases/DDLDependencyVisitor.h
+index b5ca976f6653..ae7f7aa94d9e 100644
+--- a/src/Databases/DDLDependencyVisitor.h
++++ b/src/Databases/DDLDependencyVisitor.h
+@@ -12,7 +12,7 @@ class ASTStorage;
+ 
+ using TableNamesSet = std::unordered_set<QualifiedTableName>;
+ 
+-TableNamesSet getDependenciesSetFromCreateQuery(ContextPtr global_context, const ASTPtr & ast);
++TableNamesSet getDependenciesSetFromCreateQuery(ContextPtr global_context, const QualifiedTableName & table, const ASTPtr & ast);
+ 
+ /// Visits ASTCreateQuery and extracts names of table (or dictionary) dependencies
+ /// from column default expressions (joinGet, dictGet, etc)
+diff --git a/src/Databases/DatabaseMemory.cpp b/src/Databases/DatabaseMemory.cpp
+index 50e568857438..3309d25b1c28 100644
+--- a/src/Databases/DatabaseMemory.cpp
++++ b/src/Databases/DatabaseMemory.cpp
+@@ -121,7 +121,7 @@ void DatabaseMemory::alterTable(ContextPtr local_context, const StorageID & tabl
+         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Cannot alter: There is no metadata of table {}", table_id.getNameForLogs());
+ 
+     applyMetadataChangesToCreateQuery(it->second, metadata);
+-    TableNamesSet new_dependencies = getDependenciesSetFromCreateQuery(local_context->getGlobalContext(), it->second);
++    TableNamesSet new_dependencies = getDependenciesSetFromCreateQuery(local_context->getGlobalContext(), table_id.getQualifiedName(), it->second);
+     DatabaseCatalog::instance().updateLoadingDependencies(table_id, std::move(new_dependencies));
+ }
+ 
+diff --git a/src/Databases/DatabaseOrdinary.cpp b/src/Databases/DatabaseOrdinary.cpp
+index b7a0aff24d67..b5557d9a08d9 100644
+--- a/src/Databases/DatabaseOrdinary.cpp
++++ b/src/Databases/DatabaseOrdinary.cpp
+@@ -181,8 +181,8 @@ void DatabaseOrdinary::loadTablesMetadata(ContextPtr local_context, ParsedTables
+                     return;
+                 }
+ 
+-                TableNamesSet loading_dependencies = getDependenciesSetFromCreateQuery(getContext(), ast);
+                 QualifiedTableName qualified_name{database_name, create_query->getTable()};
++                TableNamesSet loading_dependencies = getDependenciesSetFromCreateQuery(getContext(), qualified_name, ast);
+ 
+                 std::lock_guard lock{metadata.mutex};
+                 metadata.parsed_tables[qualified_name] = ParsedTableMetadata{full_path.string(), ast};
+@@ -297,7 +297,7 @@ void DatabaseOrdinary::alterTable(ContextPtr local_context, const StorageID & ta
+         out.close();
+     }
+ 
+-    TableNamesSet new_dependencies = getDependenciesSetFromCreateQuery(local_context->getGlobalContext(), ast);
++    TableNamesSet new_dependencies = getDependenciesSetFromCreateQuery(local_context->getGlobalContext(), table_id.getQualifiedName(), ast);
+     DatabaseCatalog::instance().updateLoadingDependencies(table_id, std::move(new_dependencies));
+ 
+     commitAlterTable(table_id, table_metadata_tmp_path, table_metadata_path, statement, local_context);
+diff --git a/src/Databases/TablesLoader.cpp b/src/Databases/TablesLoader.cpp
+index b8c380b7be19..4ce719279f38 100644
+--- a/src/Databases/TablesLoader.cpp
++++ b/src/Databases/TablesLoader.cpp
+@@ -133,10 +133,14 @@ void TablesLoader::removeUnresolvableDependencies(bool remove_loaded)
+         /// Table exists and it's already loaded
+         if (DatabaseCatalog::instance().isTableExist(StorageID(dependency_name.database, dependency_name.table), global_context))
+             return remove_loaded;
+-        /// It's XML dictionary. It was loaded before tables and DDL dictionaries.
++        /// It's XML dictionary.
+         if (dependency_name.database == metadata.default_database &&
+             global_context->getExternalDictionariesLoader().has(dependency_name.table))
+-            return remove_loaded;
++        {
++            LOG_WARNING(log, "Tables {} depend on XML dictionary {}, but XML dictionaries are loaded independently."
++                        "Consider converting it to DDL dictionary.", fmt::join(info.dependent_database_objects, ", "), dependency_name);
++            return true;
++        }
+ 
+         /// Some tables depends on table "dependency_name", but there is no such table in DatabaseCatalog and we don't have its metadata.
+         /// We will ignore it and try to load dependent tables without "dependency_name"
+diff --git a/src/Interpreters/InterpreterCreateQuery.cpp b/src/Interpreters/InterpreterCreateQuery.cpp
+index 0d9cad345454..8f003e75a073 100644
+--- a/src/Interpreters/InterpreterCreateQuery.cpp
++++ b/src/Interpreters/InterpreterCreateQuery.cpp
+@@ -981,9 +981,10 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
+         return {};
+ 
+     /// If table has dependencies - add them to the graph
+-    TableNamesSet loading_dependencies = getDependenciesSetFromCreateQuery(getContext()->getGlobalContext(), query_ptr);
++    QualifiedTableName qualified_name{database_name, create.getTable()};
++    TableNamesSet loading_dependencies = getDependenciesSetFromCreateQuery(getContext()->getGlobalContext(), qualified_name, query_ptr);
+     if (!loading_dependencies.empty())
+-        DatabaseCatalog::instance().addLoadingDependencies(QualifiedTableName{database_name, create.getTable()}, std::move(loading_dependencies));
++        DatabaseCatalog::instance().addLoadingDependencies(std::move(qualified_name), std::move(loading_dependencies));
+ 
+     return fillTableIfNeeded(create);
+ }

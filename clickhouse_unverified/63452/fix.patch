@@ -1,0 +1,567 @@
+diff --git a/docs/en/sql-reference/table-functions/loop.md b/docs/en/sql-reference/table-functions/loop.md
+new file mode 100644
+index 000000000000..3a9367b2d108
+--- /dev/null
++++ b/docs/en/sql-reference/table-functions/loop.md
+@@ -0,0 +1,55 @@
++# loop
++
++**Syntax**
++
++``` sql
++SELECT ... FROM loop(database, table);
++SELECT ... FROM loop(database.table);
++SELECT ... FROM loop(table);
++SELECT ... FROM loop(other_table_function(...));
++```
++
++**Parameters**
++
++- `database` — database name.
++- `table` — table name.
++- `other_table_function(...)` — other table function.
++  Example: `SELECT * FROM loop(numbers(10));`
++  `other_table_function(...)` here is `numbers(10)`.
++
++**Returned Value**
++
++Infinite loop to return query results.
++
++**Examples**
++
++Selecting data from ClickHouse:
++
++``` sql
++SELECT * FROM loop(test_database, test_table);
++SELECT * FROM loop(test_database.test_table);
++SELECT * FROM loop(test_table);
++```
++
++Or using other table function:
++
++``` sql
++SELECT * FROM loop(numbers(3)) LIMIT 7;
++   ┌─number─┐
++1. │      0 │
++2. │      1 │
++3. │      2 │
++   └────────┘
++   ┌─number─┐
++4. │      0 │
++5. │      1 │
++6. │      2 │
++   └────────┘
++   ┌─number─┐
++7. │      0 │
++   └────────┘
++``` 
++``` sql
++SELECT * FROM loop(mysql('localhost:3306', 'test', 'test', 'user', 'password'));
++...
++```
+\ No newline at end of file
+diff --git a/src/Processors/QueryPlan/ReadFromLoopStep.cpp b/src/Processors/QueryPlan/ReadFromLoopStep.cpp
+new file mode 100644
+index 000000000000..10436490a2aa
+--- /dev/null
++++ b/src/Processors/QueryPlan/ReadFromLoopStep.cpp
+@@ -0,0 +1,156 @@
++#include <Processors/QueryPlan/ReadFromLoopStep.h>
++#include <Processors/QueryPlan/QueryPlan.h>
++#include <Storages/IStorage.h>
++#include <QueryPipeline/QueryPipelineBuilder.h>
++#include <QueryPipeline/QueryPipeline.h>
++#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
++#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
++#include <QueryPipeline/QueryPlanResourceHolder.h>
++#include <Processors/ISource.h>
++#include <Processors/Sources/NullSource.h>
++#include <Processors/Executors/PullingPipelineExecutor.h>
++
++namespace DB
++{
++    namespace ErrorCodes
++    {
++        extern const int TOO_MANY_RETRIES_TO_FETCH_PARTS;
++    }
++    class PullingPipelineExecutor;
++
++    class LoopSource : public ISource
++    {
++    public:
++
++        LoopSource(
++                const Names & column_names_,
++                const SelectQueryInfo & query_info_,
++                const StorageSnapshotPtr & storage_snapshot_,
++                ContextPtr & context_,
++                QueryProcessingStage::Enum processed_stage_,
++                StoragePtr inner_storage_,
++                size_t max_block_size_,
++                size_t num_streams_)
++                : ISource(storage_snapshot_->getSampleBlockForColumns(column_names_))
++                , column_names(column_names_)
++                , query_info(query_info_)
++                , storage_snapshot(storage_snapshot_)
++                , processed_stage(processed_stage_)
++                , context(context_)
++                , inner_storage(std::move(inner_storage_))
++                , max_block_size(max_block_size_)
++                , num_streams(num_streams_)
++        {
++        }
++
++        String getName() const override { return "Loop"; }
++
++        Chunk generate() override
++        {
++            while (true)
++            {
++                if (!loop)
++                {
++                    QueryPlan plan;
++                    auto storage_snapshot_ = inner_storage->getStorageSnapshotForQuery(inner_storage->getInMemoryMetadataPtr(), nullptr, context);
++                    inner_storage->read(
++                            plan,
++                            column_names,
++                            storage_snapshot_,
++                            query_info,
++                            context,
++                            processed_stage,
++                            max_block_size,
++                            num_streams);
++                    auto builder = plan.buildQueryPipeline(
++                            QueryPlanOptimizationSettings::fromContext(context),
++                            BuildQueryPipelineSettings::fromContext(context));
++                    QueryPlanResourceHolder resources;
++                    auto pipe = QueryPipelineBuilder::getPipe(std::move(*builder), resources);
++                    query_pipeline = QueryPipeline(std::move(pipe));
++                    executor = std::make_unique<PullingPipelineExecutor>(query_pipeline);
++                    loop = true;
++                }
++                Chunk chunk;
++                if (executor->pull(chunk))
++                {
++                    if (chunk)
++                    {
++                        retries_count = 0;
++                        return chunk;
++                    }
++
++                }
++                else
++                {
++                    ++retries_count;
++                    if (retries_count > max_retries_count)
++                        throw Exception(ErrorCodes::TOO_MANY_RETRIES_TO_FETCH_PARTS, "Too many retries to pull from storage");
++                    loop = false;
++                    executor.reset();
++                    query_pipeline.reset();
++                }
++            }
++        }
++
++    private:
++
++        const Names column_names;
++        SelectQueryInfo query_info;
++        const StorageSnapshotPtr storage_snapshot;
++        QueryProcessingStage::Enum processed_stage;
++        ContextPtr context;
++        StoragePtr inner_storage;
++        size_t max_block_size;
++        size_t num_streams;
++        // add retries. If inner_storage failed to pull X times in a row we'd better to fail here not to hang
++        size_t retries_count = 0;
++        size_t max_retries_count = 3;
++        bool loop = false;
++        QueryPipeline query_pipeline;
++        std::unique_ptr<PullingPipelineExecutor> executor;
++    };
++
++    ReadFromLoopStep::ReadFromLoopStep(
++            const Names & column_names_,
++            const SelectQueryInfo & query_info_,
++            const StorageSnapshotPtr & storage_snapshot_,
++            const ContextPtr & context_,
++            QueryProcessingStage::Enum processed_stage_,
++            StoragePtr inner_storage_,
++            size_t max_block_size_,
++            size_t num_streams_)
++            : SourceStepWithFilter(
++            DataStream{.header = storage_snapshot_->getSampleBlockForColumns(column_names_)},
++            column_names_,
++            query_info_,
++            storage_snapshot_,
++            context_)
++            , column_names(column_names_)
++            , processed_stage(processed_stage_)
++            , inner_storage(std::move(inner_storage_))
++            , max_block_size(max_block_size_)
++            , num_streams(num_streams_)
++    {
++    }
++
++    Pipe ReadFromLoopStep::makePipe()
++    {
++        return Pipe(std::make_shared<LoopSource>(
++                column_names, query_info, storage_snapshot, context, processed_stage, inner_storage, max_block_size, num_streams));
++    }
++
++    void ReadFromLoopStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
++    {
++        auto pipe = makePipe();
++
++        if (pipe.empty())
++        {
++            assert(output_stream != std::nullopt);
++            pipe = Pipe(std::make_shared<NullSource>(output_stream->header));
++        }
++
++        pipeline.init(std::move(pipe));
++    }
++
++}
+diff --git a/src/Processors/QueryPlan/ReadFromLoopStep.h b/src/Processors/QueryPlan/ReadFromLoopStep.h
+new file mode 100644
+index 000000000000..4eee0ca56057
+--- /dev/null
++++ b/src/Processors/QueryPlan/ReadFromLoopStep.h
+@@ -0,0 +1,37 @@
++#pragma once
++#include <Core/QueryProcessingStage.h>
++#include <Processors/QueryPlan/SourceStepWithFilter.h>
++#include <QueryPipeline/Pipe.h>
++#include <Storages/SelectQueryInfo.h>
++
++namespace DB
++{
++
++    class ReadFromLoopStep final : public SourceStepWithFilter
++    {
++    public:
++        ReadFromLoopStep(
++                const Names & column_names_,
++                const SelectQueryInfo & query_info_,
++                const StorageSnapshotPtr & storage_snapshot_,
++                const ContextPtr & context_,
++                QueryProcessingStage::Enum processed_stage_,
++                StoragePtr inner_storage_,
++                size_t max_block_size_,
++                size_t num_streams_);
++
++        String getName() const override { return "ReadFromLoop"; }
++
++        void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
++
++    private:
++
++        Pipe makePipe();
++
++        const Names column_names;
++        QueryProcessingStage::Enum processed_stage;
++        StoragePtr inner_storage;
++        size_t max_block_size;
++        size_t num_streams;
++    };
++}
+diff --git a/src/Storages/StorageLoop.cpp b/src/Storages/StorageLoop.cpp
+new file mode 100644
+index 000000000000..2062749e60b3
+--- /dev/null
++++ b/src/Storages/StorageLoop.cpp
+@@ -0,0 +1,49 @@
++#include "StorageLoop.h"
++#include <Storages/StorageFactory.h>
++#include <Processors/QueryPlan/QueryPlan.h>
++#include <Processors/QueryPlan/ReadFromLoopStep.h>
++
++
++namespace DB
++{
++    namespace ErrorCodes
++    {
++
++    }
++    StorageLoop::StorageLoop(
++            const StorageID & table_id_,
++            StoragePtr inner_storage_)
++            : IStorage(table_id_)
++            , inner_storage(std::move(inner_storage_))
++    {
++        StorageInMemoryMetadata storage_metadata = inner_storage->getInMemoryMetadata();
++        setInMemoryMetadata(storage_metadata);
++    }
++
++
++    void StorageLoop::read(
++            QueryPlan & query_plan,
++            const Names & column_names,
++            const StorageSnapshotPtr & storage_snapshot,
++            SelectQueryInfo & query_info,
++            ContextPtr context,
++            QueryProcessingStage::Enum processed_stage,
++            size_t max_block_size,
++            size_t num_streams)
++    {
++        query_info.optimize_trivial_count = false;
++
++        query_plan.addStep(std::make_unique<ReadFromLoopStep>(
++                column_names, query_info, storage_snapshot, context, processed_stage, inner_storage, max_block_size, num_streams
++        ));
++    }
++
++    void registerStorageLoop(StorageFactory & factory)
++    {
++        factory.registerStorage("Loop", [](const StorageFactory::Arguments & args)
++        {
++            StoragePtr inner_storage;
++            return std::make_shared<StorageLoop>(args.table_id, inner_storage);
++        });
++    }
++}
+diff --git a/src/Storages/StorageLoop.h b/src/Storages/StorageLoop.h
+new file mode 100644
+index 000000000000..48760b169c20
+--- /dev/null
++++ b/src/Storages/StorageLoop.h
+@@ -0,0 +1,33 @@
++#pragma once
++#include "config.h"
++#include <Storages/IStorage.h>
++
++
++namespace DB
++{
++
++    class StorageLoop final : public IStorage
++    {
++    public:
++        StorageLoop(
++                const StorageID & table_id,
++                StoragePtr inner_storage_);
++
++        std::string getName() const override { return "Loop"; }
++
++        void read(
++                QueryPlan & query_plan,
++                const Names & column_names,
++                const StorageSnapshotPtr & storage_snapshot,
++                SelectQueryInfo & query_info,
++                ContextPtr context,
++                QueryProcessingStage::Enum processed_stage,
++                size_t max_block_size,
++                size_t num_streams) override;
++
++        bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return false; }
++
++    private:
++        StoragePtr inner_storage;
++    };
++}
+diff --git a/src/Storages/registerStorages.cpp b/src/Storages/registerStorages.cpp
+index 0fb00c08acc8..47542b7b47ea 100644
+--- a/src/Storages/registerStorages.cpp
++++ b/src/Storages/registerStorages.cpp
+@@ -25,6 +25,7 @@ void registerStorageLiveView(StorageFactory & factory);
+ void registerStorageGenerateRandom(StorageFactory & factory);
+ void registerStorageExecutable(StorageFactory & factory);
+ void registerStorageWindowView(StorageFactory & factory);
++void registerStorageLoop(StorageFactory & factory);
+ #if USE_RAPIDJSON || USE_SIMDJSON
+ void registerStorageFuzzJSON(StorageFactory & factory);
+ #endif
+@@ -120,6 +121,7 @@ void registerStorages()
+     registerStorageGenerateRandom(factory);
+     registerStorageExecutable(factory);
+     registerStorageWindowView(factory);
++    registerStorageLoop(factory);
+ #if USE_RAPIDJSON || USE_SIMDJSON
+     registerStorageFuzzJSON(factory);
+ #endif
+diff --git a/src/TableFunctions/TableFunctionLoop.cpp b/src/TableFunctions/TableFunctionLoop.cpp
+new file mode 100644
+index 000000000000..0281002e50f3
+--- /dev/null
++++ b/src/TableFunctions/TableFunctionLoop.cpp
+@@ -0,0 +1,156 @@
++#include "config.h"
++#include <TableFunctions/ITableFunction.h>
++#include <TableFunctions/TableFunctionFactory.h>
++#include <Interpreters/Context.h>
++#include <Interpreters/DatabaseCatalog.h>
++#include <Parsers/ASTFunction.h>
++#include <Parsers/ASTIdentifier.h>
++#include <Common/Exception.h>
++#include <Interpreters/evaluateConstantExpression.h>
++#include <Storages/checkAndGetLiteralArgument.h>
++#include <Storages/StorageLoop.h>
++#include "registerTableFunctions.h"
++
++namespace DB
++{
++    namespace ErrorCodes
++    {
++        extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
++        extern const int ILLEGAL_TYPE_OF_ARGUMENT;
++        extern const int UNKNOWN_TABLE;
++    }
++    namespace
++    {
++        class TableFunctionLoop : public ITableFunction
++        {
++        public:
++            static constexpr auto name = "loop";
++            std::string getName() const override { return name; }
++        private:
++            StoragePtr executeImpl(const ASTPtr & ast_function, ContextPtr context, const String & table_name, ColumnsDescription cached_columns, bool is_insert_query) const override;
++            const char * getStorageTypeName() const override { return "Loop"; }
++            ColumnsDescription getActualTableStructure(ContextPtr context, bool is_insert_query) const override;
++            void parseArguments(const ASTPtr & ast_function, ContextPtr context) override;
++
++            // save the inner table function AST
++            ASTPtr inner_table_function_ast;
++            // save database and table
++            std::string loop_database_name;
++            std::string loop_table_name;
++        };
++
++    }
++
++    void TableFunctionLoop::parseArguments(const ASTPtr & ast_function, ContextPtr context)
++    {
++        const auto & args_func = ast_function->as<ASTFunction &>();
++
++        if (!args_func.arguments)
++            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function 'loop' must have arguments.");
++
++        auto & args = args_func.arguments->children;
++        if (args.empty())
++            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "No arguments provided for table function 'loop'");
++
++        if (args.size() == 1)
++        {
++            if (const auto * id = args[0]->as<ASTIdentifier>())
++            {
++                String id_name = id->name();
++
++                size_t dot_pos = id_name.find('.');
++                if (id_name.find('.', dot_pos + 1) != String::npos)
++                    throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "There are more than one dot");
++                if (dot_pos != String::npos)
++                {
++                    loop_database_name = id_name.substr(0, dot_pos);
++                    loop_table_name = id_name.substr(dot_pos + 1);
++                }
++                else
++                {
++                    loop_table_name = id_name;
++                }
++            }
++            else if (const auto * func = args[0]->as<ASTFunction>())
++            {
++                inner_table_function_ast = args[0];
++            }
++            else
++            {
++                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Expected identifier or function for argument 1 of function 'loop', got {}", args[0]->getID());
++            }
++        }
++            // loop(database, table)
++        else if (args.size() == 2)
++        {
++            args[0] = evaluateConstantExpressionForDatabaseName(args[0], context);
++            args[1] = evaluateConstantExpressionOrIdentifierAsLiteral(args[1], context);
++
++            loop_database_name = checkAndGetLiteralArgument<String>(args[0], "database");
++            loop_table_name = checkAndGetLiteralArgument<String>(args[1], "table");
++        }
++        else
++        {
++            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function 'loop' must have 1 or 2 arguments.");
++        }
++    }
++
++    ColumnsDescription TableFunctionLoop::getActualTableStructure(ContextPtr /*context*/, bool /*is_insert_query*/) const
++    {
++        return ColumnsDescription();
++    }
++
++    StoragePtr TableFunctionLoop::executeImpl(
++            const ASTPtr & /*ast_function*/,
++            ContextPtr context,
++            const std::string & table_name,
++            ColumnsDescription cached_columns,
++            bool is_insert_query) const
++    {
++        StoragePtr storage;
++        if (!loop_table_name.empty())
++        {
++            String database_name = loop_database_name;
++            if (database_name.empty())
++                database_name = context->getCurrentDatabase();
++
++            auto database = DatabaseCatalog::instance().getDatabase(database_name);
++            storage = database->tryGetTable(loop_table_name, context);
++            if (!storage)
++                throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table '{}' not found in database '{}'", loop_table_name, database_name);
++        }
++
++        else
++        {
++            auto inner_table_function = TableFunctionFactory::instance().get(inner_table_function_ast, context);
++            storage = inner_table_function->execute(
++                    inner_table_function_ast,
++                    context,
++                    table_name,
++                    std::move(cached_columns),
++                    is_insert_query);
++        }
++        auto res = std::make_shared<StorageLoop>(
++                StorageID(getDatabaseName(), table_name),
++                storage
++        );
++        res->startup();
++        return res;
++    }
++
++    void registerTableFunctionLoop(TableFunctionFactory & factory)
++    {
++        factory.registerFunction<TableFunctionLoop>(
++                {.documentation
++                = {.description=R"(The table function can be used to continuously output query results in an infinite loop.)",
++                                .examples{{"loop", "SELECT * FROM loop((numbers(3)) LIMIT 7", "0"
++                                                                                              "1"
++                                                                                              "2"
++                                                                                              "0"
++                                                                                              "1"
++                                                                                              "2"
++                                                                                              "0"}}
++                        }});
++    }
++
++}
+diff --git a/src/TableFunctions/registerTableFunctions.cpp b/src/TableFunctions/registerTableFunctions.cpp
+index 26b9a7714164..ca4913898f96 100644
+--- a/src/TableFunctions/registerTableFunctions.cpp
++++ b/src/TableFunctions/registerTableFunctions.cpp
+@@ -11,6 +11,7 @@ void registerTableFunctions()
+     registerTableFunctionMerge(factory);
+     registerTableFunctionRemote(factory);
+     registerTableFunctionNumbers(factory);
++    registerTableFunctionLoop(factory);
+     registerTableFunctionGenerateSeries(factory);
+     registerTableFunctionNull(factory);
+     registerTableFunctionZeros(factory);
+diff --git a/src/TableFunctions/registerTableFunctions.h b/src/TableFunctions/registerTableFunctions.h
+index 4a89b3afbb3b..efde4d6dcdc0 100644
+--- a/src/TableFunctions/registerTableFunctions.h
++++ b/src/TableFunctions/registerTableFunctions.h
+@@ -8,6 +8,7 @@ class TableFunctionFactory;
+ void registerTableFunctionMerge(TableFunctionFactory & factory);
+ void registerTableFunctionRemote(TableFunctionFactory & factory);
+ void registerTableFunctionNumbers(TableFunctionFactory & factory);
++void registerTableFunctionLoop(TableFunctionFactory & factory);
+ void registerTableFunctionGenerateSeries(TableFunctionFactory & factory);
+ void registerTableFunctionNull(TableFunctionFactory & factory);
+ void registerTableFunctionZeros(TableFunctionFactory & factory);
