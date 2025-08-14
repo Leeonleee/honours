@@ -1,0 +1,659 @@
+diff --git a/src/facade/acl_commands_def.h b/src/facade/acl_commands_def.h
+index b4aaadd35b81..13bbc63665c9 100644
+--- a/src/facade/acl_commands_def.h
++++ b/src/facade/acl_commands_def.h
+@@ -21,13 +21,27 @@ using GlobType = std::pair<std::string, KeyOp>;
+ 
+ struct AclKeys {
+   std::vector<GlobType> key_globs;
++  // The user is allowed to "touch" any key. No glob matching required.
++  // Alias for ~*
+   bool all_keys = false;
+ };
+ 
++// The second bool denotes if the pattern contains an asterisk and it's
++// used to pattern match PSUBSCRIBE that requires exact literals
++using GlobTypePubSub = std::pair<std::string, bool>;
++
++struct AclPubSub {
++  std::vector<GlobTypePubSub> globs;
++  // The user can execute any variant of pub/sub/psub. No glob matching required.
++  // Alias for &* just like all_keys for AclKeys above.
++  bool all_channels = false;
++};
++
+ struct UserCredentials {
+   uint32_t acl_categories{0};
+   std::vector<uint64_t> acl_commands;
+   AclKeys keys;
++  AclPubSub pub_sub;
+   std::string ns;
+ };
+ 
+diff --git a/src/facade/command_id.h b/src/facade/command_id.h
+index edbc180aab1c..085d88385ddf 100644
+--- a/src/facade/command_id.h
++++ b/src/facade/command_id.h
+@@ -86,6 +86,16 @@ class CommandId {
+ 
+   static uint32_t OptCount(uint32_t mask);
+ 
++  // PUBLISH/SUBSCRIBE/UNSUBSCRIBE variant
++  bool IsPubSub() const {
++    return is_pub_sub_;
++  }
++
++  // PSUBSCRIBE/PUNSUBSCRIBE variant
++  bool IsPSub() const {
++    return is_p_sub_;
++  }
++
+  protected:
+   std::string name_;
+ 
+@@ -102,6 +112,9 @@ class CommandId {
+ 
+   // Whether the command can only be used by admin connections.
+   bool restricted_ = false;
++
++  bool is_pub_sub_ = false;
++  bool is_p_sub_ = false;
+ };
+ 
+ }  // namespace facade
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index 8a71797df087..3dd3b6ac910f 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -107,6 +107,8 @@ class ConnectionContext {
+   std::vector<uint64_t> acl_commands;
+   // keys
+   dfly::acl::AclKeys keys{{}, true};
++  // pub/sub
++  dfly::acl::AclPubSub pub_sub{{}, true};
+ 
+  private:
+   Connection* owner_;
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 8163800382ae..9add861b04ee 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -451,6 +451,7 @@ void Connection::DispatchOperations::operator()(const AclUpdateMessage& msg) {
+     if (msg.username == self->cntx()->authed_username) {
+       self->cntx()->acl_commands = msg.commands;
+       self->cntx()->keys = msg.keys;
++      self->cntx()->pub_sub = msg.pub_sub;
+     }
+   }
+ }
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index e01f1486f00c..3d3067f486b4 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -113,6 +113,7 @@ class Connection : public util::Connection {
+     std::string username;
+     std::vector<uint64_t> commands;
+     dfly::acl::AclKeys keys;
++    dfly::acl::AclPubSub pub_sub;
+   };
+ 
+   // Migration request message, the dispatch fiber stops to give way for thread migration.
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index ed401b78dfe1..5d54562f9480 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -130,6 +130,11 @@ CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first
+       first_key_(first_key),
+       last_key_(last_key),
+       acl_categories_(acl_categories) {
++  if (name_ == "PUBLISH" || name_ == "SUBSCRIBE" || name_ == "UNSUBSCRIBE") {
++    is_pub_sub_ = true;
++  } else if (name_ == "PSUBSCRIBE" || name_ == "PUNSUBSCRIBE") {
++    is_p_sub_ = true;
++  }
+ }
+ 
+ uint32_t CommandId::OptCount(uint32_t mask) {
+diff --git a/src/server/acl/acl_family.cc b/src/server/acl/acl_family.cc
+index 8791c875885d..d510bbded698 100644
+--- a/src/server/acl/acl_family.cc
++++ b/src/server/acl/acl_family.cc
+@@ -55,6 +55,8 @@ MaterializedContents MaterializeFileContents(std::vector<std::string>* usernames
+                                              std::string_view file_contents);
+ 
+ std::string AclKeysToString(const AclKeys& keys);
++
++std::string AclPubSubToString(const AclPubSub& pub_sub);
+ }  // namespace
+ 
+ AclFamily::AclFamily(UserRegistry* registry, util::ProactorPool* pool)
+@@ -76,6 +78,9 @@ void AclFamily::List(CmdArgList args, ConnectionContext* cntx) {
+     const std::string password = PasswordsToString(user.Passwords(), user.HasNopass(), false);
+ 
+     const std::string acl_keys = AclKeysToString(user.Keys());
++
++    const std::string acl_pub_sub = AclPubSubToString(user.PubSub());
++
+     const std::string maybe_space_com = acl_keys.empty() ? "" : " ";
+ 
+     const std::string acl_cat_and_commands =
+@@ -84,7 +89,7 @@ void AclFamily::List(CmdArgList args, ConnectionContext* cntx) {
+     using namespace std::string_view_literals;
+ 
+     absl::StrAppend(&buffer, username, " ", user.IsActive() ? "on "sv : "off "sv, password,
+-                    acl_keys, maybe_space_com, acl_cat_and_commands);
++                    acl_keys, maybe_space_com, acl_pub_sub, " ", acl_cat_and_commands);
+ 
+     cntx->SendSimpleString(buffer);
+   }
+@@ -92,14 +97,15 @@ void AclFamily::List(CmdArgList args, ConnectionContext* cntx) {
+ 
+ void AclFamily::StreamUpdatesToAllProactorConnections(const std::string& user,
+                                                       const Commands& update_commands,
+-                                                      const AclKeys& update_keys) {
++                                                      const AclKeys& update_keys,
++                                                      const AclPubSub& update_pub_sub) {
+   auto update_cb = [&]([[maybe_unused]] size_t id, util::Connection* conn) {
+     DCHECK(conn);
+     auto connection = static_cast<facade::Connection*>(conn);
+     if (connection->protocol() == facade::Protocol::REDIS && !connection->IsHttp() &&
+         connection->cntx()) {
+       connection->SendAclUpdateAsync(
+-          facade::Connection::AclUpdateMessage{user, update_commands, update_keys});
++          facade::Connection::AclUpdateMessage{user, update_commands, update_keys, update_pub_sub});
+     }
+   };
+ 
+@@ -128,11 +134,20 @@ void AclFamily::SetUser(CmdArgList args, ConnectionContext* cntx) {
+       user.Update(std::move(default_req), CategoryToIdx(), reverse_cat_table_,
+                   CategoryToCommandsIndex());
+     }
++    const bool reset_channels = req.reset_channels;
+     user.Update(std::move(req), CategoryToIdx(), reverse_cat_table_, CategoryToCommandsIndex());
++    // Send ok first because the connection might get evicted
++    cntx->SendOk();
+     if (exists) {
+-      StreamUpdatesToAllProactorConnections(std::string(username), user.AclCommands(), user.Keys());
++      if (!reset_channels) {
++        StreamUpdatesToAllProactorConnections(std::string(username), user.AclCommands(),
++                                              user.Keys(), user.PubSub());
++      }
++      // We evict connections that had their channels reseted
++      else {
++        EvictOpenConnectionsOnAllProactors({username});
++      }
+     }
+-    cntx->SendOk();
+   };
+ 
+   std::visit(Overloaded{error_case, update_case}, std::move(req));
+@@ -208,15 +223,18 @@ std::string AclFamily::RegistryToString() const {
+     const std::string password = PasswordsToString(user.Passwords(), user.HasNopass(), true);
+ 
+     const std::string acl_keys = AclKeysToString(user.Keys());
++
+     const std::string maybe_space = acl_keys.empty() ? "" : " ";
+ 
++    const std::string acl_pub_sub = AclPubSubToString(user.PubSub());
++
+     const std::string acl_cat_and_commands =
+         AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
+ 
+     using namespace std::string_view_literals;
+ 
+     absl::StrAppend(&result, command, username, " ", user.IsActive() ? "ON "sv : "OFF "sv, password,
+-                    acl_keys, maybe_space, acl_cat_and_commands, "
+");
++                    acl_keys, maybe_space, acl_pub_sub, " ", acl_cat_and_commands, "
+");
+   }
+ 
+   return result;
+@@ -391,6 +409,8 @@ void AclFamily::Log(CmdArgList args, ConnectionContext* cntx) {
+       reason = "COMMAND";
+     } else if (entry.reason == Reason::KEY) {
+       reason = "KEY";
++    } else if (entry.reason == Reason::PUB_SUB) {
++      reason = "PUB_SUB";
+     } else {
+       reason = "AUTH";
+     }
+@@ -511,7 +531,7 @@ void AclFamily::GetUser(CmdArgList args, ConnectionContext* cntx) {
+   }
+ 
+   auto* rb = static_cast<facade::RedisReplyBuilder*>(cntx->reply_builder());
+-  rb->StartArray(8);
++  rb->StartArray(10);
+ 
+   rb->SendSimpleString("flags");
+   const size_t total_elements = (pass != "nopass") ? 1 : 2;
+@@ -541,6 +561,10 @@ void AclFamily::GetUser(CmdArgList args, ConnectionContext* cntx) {
+   } else {
+     rb->SendEmptyArray();
+   }
++
++  rb->SendSimpleString("channels");
++  std::string pub_sub = AclPubSubToString(user.PubSub());
++  rb->SendSimpleString(pub_sub);
+ }
+ 
+ void AclFamily::GenPass(CmdArgList args, ConnectionContext* cntx) {
+@@ -815,6 +839,31 @@ std::optional<ParseKeyResult> MaybeParseAclKey(std::string_view command) {
+   return ParseKeyResult{std::string(key), op};
+ }
+ 
++struct ParsePubSubResult {
++  std::string glob;
++  bool has_asterisk{false};
++  bool all_channels{false};
++  bool reset_channels{false};
++};
++
++std::optional<ParsePubSubResult> MaybeParseAclPubSub(std::string_view command) {
++  if (absl::EqualsIgnoreCase(command, "ALLCHANNELS") || command == "&*") {
++    return ParsePubSubResult{"", false, true, false};
++  }
++
++  if (absl::EqualsIgnoreCase(command, "RESETCHANNELS")) {
++    return ParsePubSubResult{"", false, false, true};
++  }
++
++  if (absl::StartsWith(command, "&") && command.size() >= 2) {
++    const auto glob = command.substr(1);
++    const bool has_asterisk = glob.find('*') != std::string_view::npos;
++    return ParsePubSubResult{std::string(glob), has_asterisk};
++  }
++
++  return {};
++}
++
+ std::string PrettyPrintSha(std::string_view pass, bool all) {
+   if (all) {
+     return absl::BytesToHexString(pass);
+@@ -886,6 +935,24 @@ std::string AclKeysToString(const AclKeys& keys) {
+   return result;
+ }
+ 
++std::string AclPubSubToString(const AclPubSub& pub_sub) {
++  if (pub_sub.all_channels) {
++    return "&*";
++  }
++
++  std::string result = "resetchannels ";
++
++  for (const auto& [glob, has_asterisk] : pub_sub.globs) {
++    absl::StrAppend(&result, "&", glob, " ");
++  }
++
++  if (result.back() == ' ') {
++    result.pop_back();
++  }
++
++  return result;
++}
++
+ }  // namespace
+ 
+ std::string AclFamily::AclCatAndCommandToString(const User::CategoryChanges& cat,
+@@ -976,7 +1043,7 @@ std::pair<AclFamily::OptCommand, bool> AclFamily::MaybeParseAclCommand(
+ using facade::ErrorReply;
+ 
+ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
+-    const facade::ArgRange& args, bool hashed, bool has_all_keys) const {
++    const facade::ArgRange& args, bool hashed, bool has_all_keys, bool has_all_channels) const {
+   User::UpdateRequest req;
+ 
+   for (std::string_view arg : args) {
+@@ -993,10 +1060,11 @@ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
+       auto& [glob, op, all_keys, reset_keys] = *res;
+       if ((has_all_keys && !all_keys && !reset_keys) ||
+           (req.allow_all_keys && !all_keys && !reset_keys)) {
+-        return ErrorReply(
+-            "Error in ACL SETUSER modifier '~tmp': Adding a pattern after the * pattern (or the "
++        return ErrorReply(absl::StrCat(
++            "Error in ACL SETUSER modifier \'", facade::ToSV(arg),
++            "\': Adding a pattern after the * pattern (or the "
+             "'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start "
+-            "with an empty list of patterns");
++            "with an empty list of patterns"));
+       }
+ 
+       req.allow_all_keys = all_keys;
+@@ -1008,6 +1076,26 @@ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
+       continue;
+     }
+ 
++    if (auto res = MaybeParseAclPubSub(facade::ToSV(arg)); res) {
++      auto& [glob, has_asterisk, all_channels, reset_channels] = *res;
++      if ((has_all_channels && !all_channels && !reset_channels) ||
++          (req.all_channels && !all_channels && !reset_channels)) {
++        return ErrorReply(
++            absl::StrCat("ERR Error in ACL SETUSER modifier \'", facade::ToSV(arg),
++                         "\': Adding a pattern after the * pattern (or the 'allchannels' flag) is "
++                         "not valid and does not have any effect. Try 'resetchannels' to start "
++                         "with an empty list of channels"));
++      }
++
++      req.all_channels = all_channels;
++      req.reset_channels = reset_channels;
++      if (reset_channels) {
++        has_all_channels = false;
++      }
++      req.pub_sub.push_back({std::move(glob), has_asterisk, all_channels, reset_channels});
++      continue;
++    }
++
+     std::string command = absl::AsciiStrToUpper(arg);
+ 
+     if (auto status = MaybeParseStatus(command); status) {
+diff --git a/src/server/acl/acl_family.h b/src/server/acl/acl_family.h
+index 8ffce0567700..22d05df872aa 100644
+--- a/src/server/acl/acl_family.h
++++ b/src/server/acl/acl_family.h
+@@ -52,7 +52,8 @@ class AclFamily final {
+   using Commands = std::vector<uint64_t>;
+   void StreamUpdatesToAllProactorConnections(const std::string& user,
+                                              const Commands& update_commands,
+-                                             const AclKeys& update_keys);
++                                             const AclKeys& update_keys,
++                                             const AclPubSub& update_pub_sub);
+ 
+   // Helper function that closes all open connection from the deleted user
+   void EvictOpenConnectionsOnAllProactors(const absl::flat_hash_set<std::string_view>& user);
+@@ -83,7 +84,8 @@ class AclFamily final {
+   std::optional<std::string> MaybeParseNamespace(std::string_view command) const;
+ 
+   std::variant<User::UpdateRequest, facade::ErrorReply> ParseAclSetUser(
+-      const facade::ArgRange& args, bool hashed = false, bool has_all_keys = false) const;
++      const facade::ArgRange& args, bool hashed = false, bool has_all_keys = false,
++      bool has_all_channels = false) const;
+ 
+   void BuildIndexers(RevCommandsIndexStore families);
+ 
+diff --git a/src/server/acl/acl_log.h b/src/server/acl/acl_log.h
+index bb206ac9fbc4..158ccc461922 100644
+--- a/src/server/acl/acl_log.h
++++ b/src/server/acl/acl_log.h
+@@ -18,7 +18,7 @@ class AclLog {
+  public:
+   explicit AclLog();
+ 
+-  enum class Reason { COMMAND, AUTH, KEY };
++  enum class Reason { COMMAND, AUTH, KEY, PUB_SUB };
+ 
+   struct LogEntry {
+     std::string username;
+diff --git a/src/server/acl/user.cc b/src/server/acl/user.cc
+index 341e6b5467b0..bc0e5e34b6bc 100644
+--- a/src/server/acl/user.cc
++++ b/src/server/acl/user.cc
+@@ -76,6 +76,10 @@ void User::Update(UpdateRequest&& req, const CategoryToIdxStore& cat_to_id,
+     SetKeyGlobs(std::move(req.keys));
+   }
+ 
++  if (!req.pub_sub.empty()) {
++    SetPubSub(std::move(req.pub_sub));
++  }
++
+   if (req.is_active) {
+     SetIsActive(*req.is_active);
+   }
+@@ -214,6 +218,10 @@ const AclKeys& User::Keys() const {
+   return keys_;
+ }
+ 
++const AclPubSub& User::PubSub() const {
++  return pub_sub_;
++}
++
+ const User::CategoryChanges& User::CatChanges() const {
+   return cat_changes_;
+ }
+@@ -236,6 +244,20 @@ void User::SetKeyGlobs(std::vector<UpdateKey> keys) {
+   }
+ }
+ 
++void User::SetPubSub(std::vector<UpdatePubSub> pub_sub) {
++  for (auto& pattern : pub_sub) {
++    if (pattern.all_channels) {
++      pub_sub_.globs.clear();
++      pub_sub_.all_channels = true;
++    } else if (pattern.reset_channels) {
++      pub_sub_.globs.clear();
++      pub_sub_.all_channels = false;
++    } else {
++      pub_sub_.globs.push_back({std::move(pattern.pattern), pattern.has_asterisk});
++    }
++  }
++}
++
+ void User::SetNopass() {
+   nopass_ = true;
+   password_hashes_.clear();
+diff --git a/src/server/acl/user.h b/src/server/acl/user.h
+index 187856728e65..134c8aeb7541 100644
+--- a/src/server/acl/user.h
++++ b/src/server/acl/user.h
+@@ -40,6 +40,13 @@ class User final {
+     bool is_hashed{false};
+   };
+ 
++  struct UpdatePubSub {
++    std::string pattern;
++    bool has_asterisk{false};
++    bool all_channels{false};
++    bool reset_channels{false};
++  };
++
+   struct UpdateRequest {
+     std::vector<UpdatePass> passwords;
+ 
+@@ -59,6 +66,11 @@ class User final {
+     bool reset_all_keys{false};
+     bool allow_all_keys{false};
+ 
++    // pub/sub
++    std::vector<UpdatePubSub> pub_sub;
++    bool reset_channels{false};
++    bool all_channels{false};
++
+     // TODO allow reset all
+     // bool reset_all{false};
+ 
+@@ -107,6 +119,8 @@ class User final {
+ 
+   const AclKeys& Keys() const;
+ 
++  const AclPubSub& PubSub() const;
++
+   const std::string& Namespace() const;
+ 
+   using CategoryChanges = absl::flat_hash_map<CategoryChange, ChangeMetadata>;
+@@ -140,6 +154,10 @@ class User final {
+ 
+   // For ACL key globs
+   void SetKeyGlobs(std::vector<UpdateKey> keys);
++
++  // For ACL pub/sub
++  void SetPubSub(std::vector<UpdatePubSub> pub_sub);
++
+   void SetNamespace(const std::string& ns);
+ 
+   // Set NOPASS and remove all passwords
+@@ -170,6 +188,9 @@ class User final {
+   // Glob patterns for the keys that a user is allowed to read/write
+   AclKeys keys_;
+ 
++  // Glob patterns for pub/sub channels
++  AclPubSub pub_sub_;
++
+   // if the user is on/off
+   bool is_active_{false};
+ 
+diff --git a/src/server/acl/user_registry.cc b/src/server/acl/user_registry.cc
+index 6c5d946aff62..309d944f1f29 100644
+--- a/src/server/acl/user_registry.cc
++++ b/src/server/acl/user_registry.cc
+@@ -35,8 +35,8 @@ UserCredentials UserRegistry::GetCredentials(std::string_view username) const {
+   if (it == registry_.end()) {
+     return {};
+   }
+-  return {it->second.AclCategory(), it->second.AclCommands(), it->second.Keys(),
+-          it->second.Namespace()};
++  auto& user = it->second;
++  return {user.AclCategory(), user.AclCommands(), user.Keys(), user.PubSub(), user.Namespace()};
+ }
+ 
+ bool UserRegistry::IsUserActive(std::string_view username) const {
+@@ -80,6 +80,7 @@ User::UpdateRequest UserRegistry::DefaultUserUpdateRequest() const {
+   req.is_active = true;
+   req.updates = {std::pair<User::Sign, uint32_t>{User::Sign::PLUS, acl::ALL}};
+   req.keys = {User::UpdateKey{"~*", KeyOp::READ_WRITE, true, false}};
++  req.pub_sub = {User::UpdatePubSub{"", false, true, false}};
+   return req;
+ }
+ 
+diff --git a/src/server/acl/validator.cc b/src/server/acl/validator.cc
+index 9dcb1dba689b..5513ece55ce9 100644
+--- a/src/server/acl/validator.cc
++++ b/src/server/acl/validator.cc
+@@ -23,8 +23,17 @@ namespace dfly::acl {
+     return true;
+   }
+ 
+-  const auto [is_authed, reason] =
+-      IsUserAllowedToInvokeCommandGeneric(cntx.acl_commands, cntx.keys, tail_args, id);
++  std::pair<bool, AclLog::Reason> auth_res;
++
++  if (id.IsPubSub()) {
++    auth_res = IsPubSubCommandAuthorized(false, cntx.acl_commands, cntx.pub_sub, tail_args, id);
++  } else if (id.IsPSub()) {
++    auth_res = IsPubSubCommandAuthorized(true, cntx.acl_commands, cntx.pub_sub, tail_args, id);
++  } else {
++    auth_res = IsUserAllowedToInvokeCommandGeneric(cntx.acl_commands, cntx.keys, tail_args, id);
++  }
++
++  const auto [is_authed, reason] = auth_res;
+ 
+   if (!is_authed) {
+     auto& log = ServerState::tlocal()->acl_log;
+@@ -40,16 +49,18 @@ namespace dfly::acl {
+ #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+ #endif
+ 
+-[[nodiscard]] std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
+-    const std::vector<uint64_t>& acl_commands, const AclKeys& keys, CmdArgList tail_args,
+-    const CommandId& id) {
++static bool ValidateCommand(const std::vector<uint64_t>& acl_commands, const CommandId& id) {
+   const size_t index = id.GetFamily();
+   const uint64_t command_mask = id.GetBitIndex();
+   DCHECK_LT(index, acl_commands.size());
+ 
+-  const bool command = (acl_commands[index] & command_mask) != 0;
++  return (acl_commands[index] & command_mask) != 0;
++}
+ 
+-  if (!command) {
++[[nodiscard]] std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
++    const std::vector<uint64_t>& acl_commands, const AclKeys& keys, CmdArgList tail_args,
++    const CommandId& id) {
++  if (!ValidateCommand(acl_commands, id)) {
+     return {false, AclLog::Reason::COMMAND};
+   }
+ 
+@@ -86,6 +97,39 @@ namespace dfly::acl {
+   return {keys_allowed, AclLog::Reason::KEY};
+ }
+ 
++[[nodiscard]] std::pair<bool, AclLog::Reason> IsPubSubCommandAuthorized(
++    bool literal_match, const std::vector<uint64_t>& acl_commands, const AclPubSub& pub_sub,
++    CmdArgList tail_args, const CommandId& id) {
++  if (!ValidateCommand(acl_commands, id)) {
++    return {false, AclLog::Reason::COMMAND};
++  }
++
++  auto match = [](std::string_view pattern, std::string_view target) {
++    return stringmatchlen(pattern.data(), pattern.size(), target.data(), target.size(), 0);
++  };
++
++  auto iterate_globs = [&](std::string_view target) {
++    for (auto& [glob, has_asterisk] : pub_sub.globs) {
++      if (literal_match && (glob == target)) {
++        return true;
++      }
++      if (!literal_match && match(glob, target)) {
++        return true;
++      }
++    }
++    return false;
++  };
++
++  bool allowed = true;
++  if (!pub_sub.all_channels) {
++    for (auto channel : tail_args) {
++      allowed &= iterate_globs(facade::ToSV(channel));
++    }
++  }
++
++  return {allowed, AclLog::Reason::PUB_SUB};
++}
++
+ #pragma GCC diagnostic pop
+ 
+ }  // namespace dfly::acl
+diff --git a/src/server/acl/validator.h b/src/server/acl/validator.h
+index 4dd461b1ae35..70d849f97de8 100644
+--- a/src/server/acl/validator.h
++++ b/src/server/acl/validator.h
+@@ -13,6 +13,7 @@
+ namespace dfly::acl {
+ 
+ struct AclKeys;
++struct AclPubSub;
+ 
+ std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
+     const std::vector<uint64_t>& acl_commands, const AclKeys& keys, facade::CmdArgList tail_args,
+@@ -20,4 +21,11 @@ std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
+ 
+ bool IsUserAllowedToInvokeCommand(const ConnectionContext& cntx, const CommandId& id,
+                                   facade::CmdArgList tail_args);
++
++std::pair<bool, AclLog::Reason> IsPubSubCommandAuthorized(bool literal_match,
++                                                          const std::vector<uint64_t>& acl_commands,
++                                                          const AclPubSub& pub_sub,
++                                                          facade::CmdArgList tail_args,
++                                                          const CommandId& id);
++
+ }  // namespace dfly::acl
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index 79bb4bd9f4e6..5f8bfe4ec896 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -89,6 +89,7 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, facade::Connection* own
+   }
+ 
+   keys = std::move(cred.keys);
++  pub_sub = std::move(cred.pub_sub);
+   if (cred.acl_commands.empty()) {
+     acl_commands = std::vector<uint64_t>(acl::NumberOfFamilies(), acl::NONE_COMMANDS);
+   } else {
+@@ -102,6 +103,7 @@ ConnectionContext::ConnectionContext(const ConnectionContext* owner, Transaction
+   if (owner) {
+     acl_commands = owner->acl_commands;
+     keys = owner->keys;
++    pub_sub = owner->pub_sub;
+     skip_acl_validation = owner->skip_acl_validation;
+     ns = owner->ns;
+   } else {
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index ceee2742bebf..d88494f8daee 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1706,6 +1706,7 @@ bool ServerFamily::DoAuth(ConnectionContext* cntx, std::string_view username,
+     auto cred = registry->GetCredentials(username);
+     cntx->acl_commands = cred.acl_commands;
+     cntx->keys = std::move(cred.keys);
++    cntx->pub_sub = std::move(cred.pub_sub);
+     cntx->ns = &namespaces.GetOrInsert(cred.ns);
+     cntx->authenticated = true;
+   }

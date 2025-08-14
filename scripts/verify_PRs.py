@@ -5,9 +5,9 @@ import sys
 from datetime import datetime
 
 # Configurations
-PR_FOLDER_PATH = "../clickhouse_unverified"
+PR_FOLDER_PATH = "../dragonflydb_unverified"
 # PR_FOLDER_PATH = "../prs"
-REPO_PATH = "../repos/ClickHouse"
+DUCKDB_REPO_PATH = "../repos/dragonfly"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
 
 # def run(cmd, cwd=None, check=True):
@@ -116,28 +116,30 @@ def main():
             print(f"\n--- Testing PR {pr} ---")
 
             # Reset DuckDB repo
-            run("git reset --hard", cwd=REPO_PATH, log_file=log_file)
-            run("git clean -fd", cwd=REPO_PATH, log_file=log_file)
+            run("git reset --hard", cwd=DUCKDB_REPO_PATH, log_file=log_file)
+            run("git clean -fd", cwd=DUCKDB_REPO_PATH, log_file=log_file)
 
             # Process PR
-            process = run(f"python3 {PROCESS_SCRIPT_PATH} {pr_path} {REPO_PATH}", log_file=log_file)
+            process = run(f"python3 {PROCESS_SCRIPT_PATH} {pr_path} {DUCKDB_REPO_PATH}", log_file=log_file)
             if process is None:
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
                 continue
-            """
             # Checkout to PR commit
             with open(os.path.join(pr_path, f"{pr}.json")) as f:
                 commit_hash = json.load(f)["base_commit"]
-            if not run(f"git checkout {commit_hash}", cwd=REPO_PATH, log_file=log_file):
+            if not run(f"git checkout {commit_hash}", cwd=DUCKDB_REPO_PATH, log_file=log_file):
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
 
                 continue
 
+            # COMMENT START HERE IF YOU WANT TO ONLY PROCESS, NOT VERIFY
+            """
+
             # Compile baseline code
             print("🔧 Compiling code...")
-            if not build_duckdb(REPO_PATH, log_file=log_file):
+            if not build_duckdb(DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Compilation failed")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -156,7 +158,7 @@ def main():
 
             # Run baseline test (should pass)
             print("✅ Running baseline test... (should pass)")
-            if not run_test(test_rel_path, REPO_PATH, log_file=log_file):
+            if not run_test(test_rel_path, DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Baseline test failed")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -166,7 +168,7 @@ def main():
 
             # Apply test.patch and rerun test (should fail)
             print("📄 Applying test.patch...")
-            if not apply_patch(test_patch_path, REPO_PATH, log_file=log_file):
+            if not apply_patch(test_patch_path, DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Failed to apply test.patch")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -174,7 +176,7 @@ def main():
                 continue
             print("✅ test.patch applied (Expected behaviour)")
             print("🔧 Compiling code...")
-            if build_duckdb(REPO_PATH, log_file=log_file) is None:
+            if build_duckdb(DUCKDB_REPO_PATH, log_file=log_file) is None:
                 print("❌ Compilation failed")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -182,7 +184,7 @@ def main():
                 continue
             print("✅ Compilation succeeded (Expected behaviour)")
             print("🧪 Running modified test (should fail)...")
-            if run_test(test_rel_path, REPO_PATH, log_file=log_file):
+            if run_test(test_rel_path, DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Test did not fail after applying test.patch")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -192,7 +194,7 @@ def main():
 
             # Apply fix.patch and rerun test (should pass)
             print("📄 Applying fix.patch...")
-            if not apply_patch(os.path.join(pr_path, "fix.patch"), REPO_PATH, log_file=log_file):
+            if not apply_patch(os.path.join(pr_path, "fix.patch"), DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Failed to apply fix.patch")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -200,7 +202,7 @@ def main():
                 continue
             print("✅ fix.patch applied (Expected behaviour)")
             print("🔧 Compiling code...")
-            if build_duckdb(REPO_PATH, log_file=log_file) is None:
+            if build_duckdb(DUCKDB_REPO_PATH, log_file=log_file) is None:
                 print("❌ Compilation failed")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -208,7 +210,7 @@ def main():
                 continue
             print("✅ Compilation succeeded (Expected behaviour)")
             print("🧪 Running fixed test (should pass)...")
-            if not run_test(test_rel_path, REPO_PATH, log_file=log_file):
+            if not run_test(test_rel_path, DUCKDB_REPO_PATH, log_file=log_file):
                 print("❌ Final test failed")
                 # Print and log out valid PRs so far
                 log_invalid_pr(pr, valid_prs, log_file)
@@ -225,11 +227,13 @@ def main():
             for verified_pr in valid_prs:
                 print(verified_pr)
                 log_file.write(verified_pr + "\n")
-            log_file.flush()  # optional: flush to disk immediately
+            log_file.flush()  # optional: flush to disk immediatelyA
+
+            # COMMENT END HERE IF YOU WANT TO PROCESS ONLY
             """
             # Reset DuckDB repo
-            run("git reset --hard", cwd=REPO_PATH, log_file=log_file)
-            run("git clean -fd", cwd=REPO_PATH, log_file=log_file)
+            run("git reset --hard", cwd=DUCKDB_REPO_PATH, log_file=log_file)
+            run("git clean -fd", cwd=DUCKDB_REPO_PATH, log_file=log_file)
 
         print("\n=== Valid PRs ===")
         for pr in valid_prs:

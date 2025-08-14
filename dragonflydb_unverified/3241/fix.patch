@@ -1,0 +1,359 @@
+diff --git a/src/server/db_slice.cc b/src/server/db_slice.cc
+index cd67ffad70d9..62d463781bd8 100644
+--- a/src/server/db_slice.cc
++++ b/src/server/db_slice.cc
+@@ -220,6 +220,24 @@ unsigned PrimeEvictionPolicy::Evict(const PrimeTable::HotspotBuckets& eb, PrimeT
+   return 1;
+ }
+ 
++// Helper class to cache and restore fetched_items_ of DbSlice for flows that preempt
++// because some other transaction might conclude and clear the fetched_items_ with OnCbFinish()
++class FetchedItemsRestorer {
++ public:
++  using RestoreType = absl::flat_hash_set<CompactObjectView>;
++  explicit FetchedItemsRestorer(RestoreType* dst) : dst_to_restore_(dst) {
++    cached_ = std::move(*dst_to_restore_);
++  }
++
++  ~FetchedItemsRestorer() {
++    *dst_to_restore_ = std::move(cached_);
++  }
++
++ private:
++  RestoreType cached_;
++  RestoreType* dst_to_restore_;
++};
++
+ }  // namespace
+ 
+ #define ADD(x) (x) += o.x
+@@ -455,7 +473,6 @@ OpResult<DbSlice::PrimeItAndExp> DbSlice::FindInternal(const Context& cntx, std:
+     return OpStatus::WRONG_TYPE;
+   }
+ 
+-  FiberAtomicGuard fg;
+   if (res.it->second.HasExpire()) {  // check expiry state
+     res = ExpireIfNeeded(cntx, res.it);
+     if (!IsValid(res.it)) {
+@@ -971,8 +988,6 @@ bool DbSlice::CheckLock(IntentLock::Mode mode, DbIndex dbid, uint64_t fp) const
+ }
+ 
+ void DbSlice::PreUpdate(DbIndex db_ind, Iterator it, std::string_view key) {
+-  FiberAtomicGuard fg;
+-
+   DVLOG(2) << "Running callbacks in dbid " << db_ind;
+   CallChangeCallbacks(db_ind, ChangeReq{it.GetInnerIt()});
+ 
+@@ -1105,7 +1120,8 @@ uint64_t DbSlice::RegisterOnChange(ChangeCallback cb) {
+ }
+ 
+ void DbSlice::FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_t upper_bound) {
+-  FiberAtomicGuard fg;
++  FetchedItemsRestorer fetched_restorer(&fetched_items_);
++
+   uint64_t bucket_version = it.GetVersion();
+   // change_cb_ is ordered by version.
+   DVLOG(2) << "Running callbacks in dbid " << db_ind << " with bucket_version=" << bucket_version
+@@ -1532,6 +1548,7 @@ void DbSlice::OnCbFinish() {
+ }
+ 
+ void DbSlice::CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const {
++  FetchedItemsRestorer fetched_restorer(&fetched_items_);
+   for (const auto& ccb : change_cb_) {
+     ccb.second(id, cr);
+   }
+diff --git a/src/server/rdb_save.cc b/src/server/rdb_save.cc
+index 9166bdc97906..d39374adc8e0 100644
+--- a/src/server/rdb_save.cc
++++ b/src/server/rdb_save.cc
+@@ -292,7 +292,9 @@ SerializerBase::SerializerBase(CompressionMode compression_mode)
+     : compression_mode_(compression_mode), mem_buf_{4_KB}, tmp_buf_(nullptr) {
+ }
+ 
+-RdbSerializer::RdbSerializer(CompressionMode compression_mode) : SerializerBase(compression_mode) {
++RdbSerializer::RdbSerializer(CompressionMode compression_mode,
++                             std::function<bool(size_t)> flush_fun)
++    : SerializerBase(compression_mode), flush_fun_(std::move(flush_fun)) {
+ }
+ 
+ RdbSerializer::~RdbSerializer() {
+@@ -430,6 +432,7 @@ error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
+         RETURN_ON_ERR(SaveLzfBlob(Bytes{reinterpret_cast<uint8_t*>(data), compress_len}, node->sz));
+       } else {
+         RETURN_ON_ERR(SaveString(node->entry, node->sz));
++        FlushIfNeeded();
+       }
+     } else {
+       // listpack
+@@ -474,6 +477,7 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
+           expiry = it.ExpiryTime();
+         RETURN_ON_ERR(SaveLongLongAsString(expiry));
+       }
++      FlushIfNeeded();
+     }
+   } else {
+     CHECK_EQ(obj.Encoding(), kEncodingIntSet);
+@@ -504,6 +508,7 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
+           expiry = it.ExpiryTime();
+         RETURN_ON_ERR(SaveLongLongAsString(expiry));
+       }
++      FlushIfNeeded();
+     }
+   } else {
+     CHECK_EQ(kEncodingListPack, pv.Encoding());
+@@ -537,6 +542,7 @@ error_code RdbSerializer::SaveZSetObject(const PrimeValue& pv) {
+       ec = SaveBinaryDouble(score);
+       if (ec)
+         return false;
++      FlushIfNeeded();
+       return true;
+     });
+   } else {
+@@ -647,6 +653,7 @@ std::error_code RdbSerializer::SaveSBFObject(const PrimeValue& pv) {
+ 
+     string_view blob = sbf->data(i);
+     RETURN_ON_ERR(SaveString(blob));
++    FlushIfNeeded();
+   }
+ 
+   return {};
+@@ -1118,6 +1125,7 @@ class RdbSaver::Impl {
+   // Multi entry compression is available only on df snapshot, this will
+   // make snapshot size smaller and opreation faster.
+   CompressionMode compression_mode_;
++  SaveMode save_mode_;
+ };
+ 
+ // We pass K=sz to say how many producers are pushing data in order to maintain
+@@ -1139,6 +1147,7 @@ RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode
+   }
+ 
+   DCHECK(producers_len > 0 || channel_.IsClosing());
++  save_mode_ = sm;
+ }
+ 
+ void RdbSaver::Impl::CleanShardSnapshots() {
+@@ -1253,7 +1262,9 @@ void RdbSaver::Impl::StartSnapshotting(bool stream_journal, const Cancellation*
+   auto& s = GetSnapshot(shard);
+   s = std::make_unique<SliceSnapshot>(&shard->db_slice(), &channel_, compression_mode_);
+ 
+-  s->Start(stream_journal, cll);
++  const auto allow_flush = (save_mode_ != SaveMode::RDB) ? SliceSnapshot::SnapshotFlush::kAllow
++                                                         : SliceSnapshot::SnapshotFlush::kDisallow;
++  s->Start(stream_journal, cll, allow_flush);
+ }
+ 
+ void RdbSaver::Impl::StartIncrementalSnapshotting(Context* cntx, EngineShard* shard,
+@@ -1594,4 +1605,11 @@ size_t RdbSerializer::GetTempBufferSize() const {
+   return SerializerBase::GetTempBufferSize() + tmp_str_.size();
+ }
+ 
++bool RdbSerializer::FlushIfNeeded() {
++  if (flush_fun_) {
++    return flush_fun_(SerializedLen());
++  }
++  return false;
++}
++
+ }  // namespace dfly
+diff --git a/src/server/rdb_save.h b/src/server/rdb_save.h
+index cd6b2461a0a4..22b3a6d2db20 100644
+--- a/src/server/rdb_save.h
++++ b/src/server/rdb_save.h
+@@ -199,7 +199,8 @@ class SerializerBase {
+ 
+ class RdbSerializer : public SerializerBase {
+  public:
+-  explicit RdbSerializer(CompressionMode compression_mode);
++  explicit RdbSerializer(CompressionMode compression_mode,
++                         std::function<bool(size_t)> flush_fun = {});
+ 
+   ~RdbSerializer();
+ 
+@@ -215,7 +216,8 @@ class RdbSerializer : public SerializerBase {
+   // This would work for either string or an object.
+   // The arg pv is taken from it->second if accessing
+   // this by finding the key. This function is used
+-  // for the dump command - thus it is public function
++  // for the dump command - thus it is public function.
++  // This function might preempt if flush_fun_ is used.
+   std::error_code SaveValue(const PrimeValue& pv);
+ 
+   std::error_code SendJournalOffset(uint64_t journal_offset);
+@@ -223,6 +225,7 @@ class RdbSerializer : public SerializerBase {
+   size_t GetTempBufferSize() const override;
+ 
+  private:
++  // Might preempt if flush_fun_ is used
+   std::error_code SaveObject(const PrimeValue& pv);
+   std::error_code SaveListObject(const PrimeValue& pv);
+   std::error_code SaveSetObject(const PrimeValue& pv);
+@@ -238,8 +241,12 @@ class RdbSerializer : public SerializerBase {
+   std::error_code SaveStreamPEL(rax* pel, bool nacks);
+   std::error_code SaveStreamConsumers(streamCG* cg);
+ 
++  // Might preempt
++  bool FlushIfNeeded();
++
+   std::string tmp_str_;
+   DbIndex last_entry_db_index_ = kInvalidDbId;
++  std::function<bool(size_t)> flush_fun_;
+ };
+ 
+ }  // namespace dfly
+diff --git a/src/server/snapshot.cc b/src/server/snapshot.cc
+index 6ddeee3ff1d3..f3036005453e 100644
+--- a/src/server/snapshot.cc
++++ b/src/server/snapshot.cc
+@@ -10,6 +10,7 @@
+ 
+ #include <mutex>
+ 
++#include "base/flags.h"
+ #include "base/logging.h"
+ #include "core/heap_size.h"
+ #include "server/db_slice.h"
+@@ -20,6 +21,8 @@
+ #include "server/tiered_storage.h"
+ #include "util/fibers/synchronization.h"
+ 
++ABSL_FLAG(size_t, serialization_max_chunk_size, 0, "Total bytes before flushing big entries");
++
+ namespace dfly {
+ 
+ using namespace std;
+@@ -56,7 +59,7 @@ bool SliceSnapshot::IsSnaphotInProgress() {
+   return tl_slice_snapshots.size() > 0;
+ }
+ 
+-void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll) {
++void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll, SnapshotFlush allow_flush) {
+   DCHECK(!snapshot_fb_.IsJoinable());
+ 
+   auto db_cb = absl::bind_front(&SliceSnapshot::OnDbChange, this);
+@@ -69,7 +72,19 @@ void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll) {
+     journal_cb_id_ = journal->RegisterOnChange(std::move(journal_cb));
+   }
+ 
+-  serializer_ = std::make_unique<RdbSerializer>(compression_mode_);
++  const auto flush_threshold = absl::GetFlag(FLAGS_serialization_max_chunk_size);
++  std::function<bool(size_t)> flush_fun;
++  if (flush_threshold != 0 && allow_flush == SnapshotFlush::kAllow) {
++    flush_fun = [this, flush_threshold](size_t bytes_serialized) {
++      if (bytes_serialized > flush_threshold) {
++        auto serialized = Serialize();
++        VLOG(2) << "FlushedToChannel " << serialized << " bytes";
++        return true;
++      }
++      return false;
++    };
++  }
++  serializer_ = std::make_unique<RdbSerializer>(compression_mode_, flush_fun);
+ 
+   VLOG(1) << "DbSaver::Start - saving entries with version less than " << snapshot_version_;
+ 
+@@ -276,7 +291,7 @@ unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_ite
+ 
+   while (!it.is_done()) {
+     ++result;
+-    // might yield
++    // might preempt
+     SerializeEntry(db_index, it->first, it->second, nullopt, serializer_.get());
+     ++it;
+   }
+@@ -284,8 +299,6 @@ unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_ite
+   return result;
+ }
+ 
+-// This function should not block and should not preempt because it's called
+-// from SerializeBucket which should execute atomically.
+ void SliceSnapshot::SerializeEntry(DbIndex db_indx, const PrimeKey& pk, const PrimeValue& pv,
+                                    optional<uint64_t> expire, RdbSerializer* serializer) {
+   time_t expire_time = expire.value_or(0);
+@@ -309,18 +322,7 @@ void SliceSnapshot::SerializeEntry(DbIndex db_indx, const PrimeKey& pk, const Pr
+   }
+ }
+ 
+-bool SliceSnapshot::PushSerializedToChannel(bool force) {
+-  // Bucket serialization might have accumulated some delayed values.
+-  // Because we can finally block in this function, we'll await and serialize them
+-  while (!delayed_entries_.empty()) {
+-    auto& entry = delayed_entries_.back();
+-    serializer_->SaveEntry(entry.key, entry.value.Get(), entry.expire, entry.dbid);
+-    delayed_entries_.pop_back();
+-  }
+-
+-  if (!force && serializer_->SerializedLen() < 4096)
+-    return false;
+-
++size_t SliceSnapshot::Serialize() {
+   io::StringFile sfile;
+   serializer_->FlushToSink(&sfile);
+ 
+@@ -333,9 +335,29 @@ bool SliceSnapshot::PushSerializedToChannel(bool force) {
+   DbRecord db_rec{.id = id, .value = std::move(sfile.val)};
+ 
+   dest_->Push(std::move(db_rec));
++  if (serialized != 0) {
++    VLOG(2) << "Pushed with Serialize() " << serialized << " bytes";
++  }
++  return serialized;
++}
+ 
+-  VLOG(2) << "PushSerializedToChannel " << serialized << " bytes";
+-  return true;
++bool SliceSnapshot::PushSerializedToChannel(bool force) {
++  if (!force && serializer_->SerializedLen() < 4096)
++    return false;
++
++  // Flush any of the leftovers to avoid interleavings
++  const auto serialized = Serialize();
++
++  // Bucket serialization might have accumulated some delayed values.
++  // Because we can finally block in this function, we'll await and serialize them
++  while (!delayed_entries_.empty()) {
++    auto& entry = delayed_entries_.back();
++    serializer_->SaveEntry(entry.key, entry.value.Get(), entry.expire, entry.dbid);
++    delayed_entries_.pop_back();
++  }
++
++  const auto total_serialized = Serialize() + serialized;
++  return total_serialized > 0;
+ }
+ 
+ void SliceSnapshot::OnDbChange(DbIndex db_index, const DbSlice::ChangeReq& req) {
+@@ -377,6 +399,8 @@ void SliceSnapshot::OnJournalEntry(const journal::JournalItem& item, bool await)
+ }
+ 
+ void SliceSnapshot::CloseRecordChannel() {
++  ConditionGuard guard(&bucket_ser_);
++
+   CHECK(!serialize_bucket_running_);
+   // Make sure we close the channel only once with a CAS check.
+   bool expected = false;
+diff --git a/src/server/snapshot.h b/src/server/snapshot.h
+index af58cf4d9138..95529dca3beb 100644
+--- a/src/server/snapshot.h
++++ b/src/server/snapshot.h
+@@ -67,7 +67,10 @@ class SliceSnapshot {
+ 
+   // Initialize snapshot, start bucket iteration fiber, register listeners.
+   // In journal streaming mode it needs to be stopped by either Stop or Cancel.
+-  void Start(bool stream_journal, const Cancellation* cll);
++  enum class SnapshotFlush { kAllow, kDisallow };
++
++  void Start(bool stream_journal, const Cancellation* cll,
++             SnapshotFlush allow_flush = SnapshotFlush::kDisallow);
+ 
+   // Initialize a snapshot that sends only the missing journal updates
+   // since start_lsn and then registers a callback switches into the
+@@ -117,6 +120,9 @@ class SliceSnapshot {
+   // Return if pushed.
+   bool PushSerializedToChannel(bool force);
+ 
++  // Helper function that flushes the serialized items into the RecordStream
++  size_t Serialize();
++
+  public:
+   uint64_t snapshot_version() const {
+     return snapshot_version_;

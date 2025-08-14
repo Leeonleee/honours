@@ -1,0 +1,574 @@
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index 05ef8b024e4a..49a0d466389f 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -100,6 +100,7 @@ class ConnectionContext {
+   bool sync_dispatch : 1;     // whether this connection is amid a sync dispatch
+   bool journal_emulated : 1;  // whether it is used to dispatch journal commands
+   bool paused : 1;            // whether this connection is paused due to CLIENT PAUSE
++  bool blocked;  // whether it's blocked on blocking commands like BLPOP, needs to be addressable
+ 
+   // How many async subscription sources are active: monitor and/or pubsub - at most 2.
+   uint8_t subscriptions;
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index c2df33088cb9..9ead4e8cdde1 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -1048,6 +1048,12 @@ std::string Connection::DebugInfo() const {
+   absl::StrAppend(&info, "dispatch_queue:pipelined=", pending_pipeline_cmd_cnt_, ", ");
+   absl::StrAppend(&info, "dispatch_queue:intrusive=", intrusive_front, ", ");
+ 
++  absl::StrAppend(&info, "state=");
++  if (cc_->paused)
++    absl::StrAppend(&info, "p");
++  if (cc_->blocked)
++    absl::StrAppend(&info, "b");
++
+   absl::StrAppend(&info, "}");
+   return info;
+ }
+@@ -1225,13 +1231,16 @@ void Connection::SendAclUpdateAsync(AclUpdateMessage msg) {
+   SendAsync({make_unique<AclUpdateMessage>(std::move(msg))});
+ }
+ 
+-void Connection::SendCheckpoint(fb2::BlockingCounter bc, bool ignore_paused) {
++void Connection::SendCheckpoint(fb2::BlockingCounter bc, bool ignore_paused, bool ignore_blocked) {
+   if (!IsCurrentlyDispatching())
+     return;
+ 
+   if (cc_->paused && ignore_paused)
+     return;
+ 
++  if (cc_->blocked && ignore_blocked)
++    return;
++
+   VLOG(1) << "Sent checkpoint to " << DebugInfo();
+ 
+   bc.Add(1);
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 4d502e57ed80..75233ddec4c4 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -195,8 +195,9 @@ class Connection : public util::Connection {
+   void SendAclUpdateAsync(AclUpdateMessage msg);
+ 
+   // If any dispatch is currently in progress, increment counter and send checkpoint message to
+-  // decrement it once finished. It ignore_paused is true, paused dispatches are ignored.
+-  void SendCheckpoint(util::fb2::BlockingCounter bc, bool ignore_paused = false);
++  // decrement it once finished.
++  void SendCheckpoint(util::fb2::BlockingCounter bc, bool ignore_paused = false,
++                      bool ignore_blocked = false);
+ 
+   // Must be called before sending pubsub messages to ensure the threads pipeline queue limit is not
+   // reached. Blocks until free space is available. Controlled with `pipeline_queue_limit` flag.
+diff --git a/src/facade/dragonfly_listener.cc b/src/facade/dragonfly_listener.cc
+index f51cfc23b4fd..d239ad536b82 100644
+--- a/src/facade/dragonfly_listener.cc
++++ b/src/facade/dragonfly_listener.cc
+@@ -374,10 +374,12 @@ ProactorBase* Listener::PickConnectionProactor(util::FiberSocketBase* sock) {
+ }
+ 
+ DispatchTracker::DispatchTracker(absl::Span<facade::Listener* const> listeners,
+-                                 facade::Connection* issuer, bool ignore_paused)
++                                 facade::Connection* issuer, bool ignore_paused,
++                                 bool ignore_blocked)
+     : listeners_{listeners.begin(), listeners.end()},
+       issuer_{issuer},
+-      ignore_paused_{ignore_paused} {
++      ignore_paused_{ignore_paused},
++      ignore_blocked_{ignore_blocked} {
+ }
+ 
+ void DispatchTracker::TrackOnThread() {
+@@ -396,7 +398,7 @@ void DispatchTracker::TrackAll() {
+ 
+ void DispatchTracker::Handle(unsigned thread_index, util::Connection* conn) {
+   if (auto* fconn = static_cast<facade::Connection*>(conn); fconn != issuer_)
+-    fconn->SendCheckpoint(bc_, ignore_paused_);
++    fconn->SendCheckpoint(bc_, ignore_paused_, ignore_blocked_);
+ }
+ 
+ }  // namespace facade
+diff --git a/src/facade/dragonfly_listener.h b/src/facade/dragonfly_listener.h
+index 163fa435f2ed..e6cc751d1abd 100644
+--- a/src/facade/dragonfly_listener.h
++++ b/src/facade/dragonfly_listener.h
+@@ -89,7 +89,7 @@ class Listener : public util::ListenerInterface {
+ class DispatchTracker {
+  public:
+   DispatchTracker(absl::Span<facade::Listener* const>, facade::Connection* issuer = nullptr,
+-                  bool ignore_paused = false);
++                  bool ignore_paused = false, bool ignore_blocked = false);
+ 
+   void TrackAll();       // Track busy connection on all threads
+   void TrackOnThread();  // Track busy connections on current thread
+@@ -105,6 +105,7 @@ class DispatchTracker {
+   facade::Connection* issuer_;
+   util::fb2::BlockingCounter bc_{0};
+   bool ignore_paused_;
++  bool ignore_blocked_;
+ };
+ 
+ }  // namespace facade
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index b4c98e547213..0999439e8a31 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -134,6 +134,7 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, Connection* owner) : ow
+   sync_dispatch = false;
+   journal_emulated = false;
+   paused = false;
++  blocked = false;
+ 
+   subscriptions = 0;
+ }
+diff --git a/src/facade/op_status.h b/src/facade/op_status.h
+index f96fdba7c964..183b7da5401b 100644
+--- a/src/facade/op_status.h
++++ b/src/facade/op_status.h
+@@ -13,6 +13,7 @@ enum class OpStatus : uint16_t {
+   OK,
+   KEY_EXISTS,
+   KEY_NOTFOUND,
++  KEY_MOVED,
+   SKIPPED,
+   INVALID_VALUE,
+   OUT_OF_RANGE,
+diff --git a/src/server/cluster/cluster_config.cc b/src/server/cluster/cluster_config.cc
+index fd897bdde325..50dfd0f91bc8 100644
+--- a/src/server/cluster/cluster_config.cc
++++ b/src/server/cluster/cluster_config.cc
+@@ -311,6 +311,10 @@ bool ClusterConfig::IsMySlot(SlotId id) const {
+   return my_slots_.test(id);
+ }
+ 
++bool ClusterConfig::IsMySlot(std::string_view key) const {
++  return IsMySlot(KeySlot(key));
++}
++
+ ClusterConfig::Node ClusterConfig::GetMasterNodeForSlot(SlotId id) const {
+   CHECK_LT(id, my_slots_.size()) << "Requesting a non-existing slot id " << id;
+ 
+diff --git a/src/server/cluster/cluster_config.h b/src/server/cluster/cluster_config.h
+index 542ac18bfa50..87b55286cd1b 100644
+--- a/src/server/cluster/cluster_config.h
++++ b/src/server/cluster/cluster_config.h
+@@ -65,6 +65,7 @@ class ClusterConfig {
+ 
+   // If key is in my slots ownership return true
+   bool IsMySlot(SlotId id) const;
++  bool IsMySlot(std::string_view key) const;
+ 
+   // Returns the master configured for `id`.
+   Node GetMasterNodeForSlot(SlotId id) const;
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index 5ebb119efee8..db6b357f15c2 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -514,11 +514,21 @@ void ClusterFamily::DflyClusterConfig(CmdArgList args, ConnectionContext* cntx)
+     before = tl_cluster_config->GetOwnedSlots();
+   }
+ 
+-  DispatchTracker tracker{server_family_->GetListeners(), cntx->conn()};
+-  auto cb = [&tracker, &new_config](util::ProactorBase* pb) {
++  // Ignore blocked commands because we filter them with CancelBlockingOnThread
++  DispatchTracker tracker{server_family_->GetListeners(), cntx->conn(), false /* ignore paused */,
++                          true /* ignore blocked */};
++
++  auto blocking_filter = [&new_config](ArgSlice keys) {
++    bool moved = any_of(keys.begin(), keys.end(), [&](auto k) { return !new_config->IsMySlot(k); });
++    return moved ? OpStatus::KEY_MOVED : OpStatus::OK;
++  };
++
++  auto cb = [this, &tracker, &new_config, blocking_filter](util::ProactorBase* pb) {
++    server_family_->CancelBlockingOnThread(blocking_filter);
+     tl_cluster_config = new_config;
+     tracker.TrackOnThread();
+   };
++
+   server_family_->service().proactor_pool().AwaitFiberOnAll(std::move(cb));
+   DCHECK(tl_cluster_config != nullptr);
+ 
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index fa97ee50dfe5..ba2ae77ece43 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -117,12 +117,6 @@ void ConnectionContext::ChangeMonitor(bool start) {
+   EnableMonitoring(start);
+ }
+ 
+-void ConnectionContext::CancelBlocking() {
+-  if (transaction) {
+-    transaction->CancelBlocking();
+-  }
+-}
+-
+ vector<unsigned> ChangeSubscriptions(bool pattern, CmdArgList args, bool to_add, bool to_reply,
+                                      ConnectionContext* conn) {
+   vector<unsigned> result(to_reply ? args.size() : 0, 0);
+diff --git a/src/server/conn_context.h b/src/server/conn_context.h
+index a27d842e1669..837684e4e177 100644
+--- a/src/server/conn_context.h
++++ b/src/server/conn_context.h
+@@ -147,8 +147,6 @@ struct ConnectionState {
+   // For get op - we use it as a mask of MCGetMask values.
+   uint32_t memcache_flag = 0;
+ 
+-  bool is_blocking = false;  // whether this connection is blocking on a command
+-
+   ExecInfo exec_info;
+   ReplicationInfo replication_info;
+ 
+@@ -186,7 +184,6 @@ class ConnectionContext : public facade::ConnectionContext {
+   void UnsubscribeAll(bool to_reply);
+   void PUnsubscribeAll(bool to_reply);
+   void ChangeMonitor(bool start);  // either start or stop monitor on a given connection
+-  void CancelBlocking();           // Cancel an ongoing blocking transaction if there is one.
+ 
+   size_t UsedMemory() const override;
+ 
+diff --git a/src/server/container_utils.cc b/src/server/container_utils.cc
+index 463258009664..aa3901c42e8e 100644
+--- a/src/server/container_utils.cc
++++ b/src/server/container_utils.cc
+@@ -238,7 +238,8 @@ OpResult<ShardFFResult> FindFirstNonEmptyKey(Transaction* trans, int req_obj_typ
+ }
+ 
+ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
+-                                              BlockingResultCb func, unsigned limit_ms) {
++                                              BlockingResultCb func, unsigned limit_ms,
++                                              bool* block_flag) {
+   trans->Schedule();
+ 
+   string result_key;
+@@ -281,9 +282,12 @@ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_ty
+ 
+   auto wcb = [](Transaction* t, EngineShard* shard) { return t->GetShardArgs(shard->shard_id()); };
+ 
+-  bool wait_succeeded = trans->WaitOnWatch(limit_tp, std::move(wcb));
+-  if (!wait_succeeded)
+-    return OpStatus::TIMED_OUT;
++  *block_flag = true;
++  auto status = trans->WaitOnWatch(limit_tp, std::move(wcb));
++  *block_flag = false;
++
++  if (status != OpStatus::OK)
++    return status;
+ 
+   auto cb = [&](Transaction* t, EngineShard* shard) {
+     if (auto wake_key = t->GetWakeKey(shard->shard_id()); wake_key) {
+diff --git a/src/server/container_utils.h b/src/server/container_utils.h
+index d359895d6fb9..dfce2b16610e 100644
+--- a/src/server/container_utils.h
++++ b/src/server/container_utils.h
+@@ -95,8 +95,10 @@ using BlockingResultCb =
+ // Block until a any key of the transaction becomes non-empty and executes the callback.
+ // If multiple keys are non-empty when this function is called, the callback is executed
+ // immediately with the first key listed in the tx arguments.
++// The block flag is set to true while the transaction is blocking.
+ OpResult<std::string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
+-                                                   BlockingResultCb cb, unsigned limit_ms);
++                                                   BlockingResultCb cb, unsigned limit_ms,
++                                                   bool* block_flag);
+ 
+ };  // namespace container_utils
+ 
+diff --git a/src/server/dflycmd.cc b/src/server/dflycmd.cc
+index 77eeabb07984..e5af8137fde6 100644
+--- a/src/server/dflycmd.cc
++++ b/src/server/dflycmd.cc
+@@ -421,12 +421,13 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
+   absl::Time start = absl::Now();
+   AggregateStatus status;
+ 
+-  sf_->CancelBlockingCommands();
+-
+   // We need to await for all dispatches to finish: Otherwise a transaction might be scheduled
+   // after this function exits but before the actual shutdown.
+   facade::DispatchTracker tracker{sf_->GetListeners(), cntx->conn()};
+-  tracker.TrackAll();
++  shard_set->pool()->Await([&](unsigned index, auto* pb) {
++    sf_->CancelBlockingOnThread();
++    tracker.TrackOnThread();
++  });
+ 
+   if (!tracker.Wait(timeout_dur)) {
+     LOG(WARNING) << "Couldn't wait for commands to finish dispatching. " << timeout_dur;
+diff --git a/src/server/list_family.cc b/src/server/list_family.cc
+index 2255fd5fc4dd..dd38bb816569 100644
+--- a/src/server/list_family.cc
++++ b/src/server/list_family.cc
+@@ -889,9 +889,8 @@ OpResult<string> BPopPusher::RunSingle(Transaction* t, time_point tp) {
+   auto wcb = [&](Transaction* t, EngineShard* shard) { return ArgSlice{&this->pop_key_, 1}; };
+ 
+   // Block
+-  bool wait_succeeded = t->WaitOnWatch(tp, std::move(wcb));
+-  if (!wait_succeeded)
+-    return OpStatus::TIMED_OUT;
++  if (auto status = t->WaitOnWatch(tp, std::move(wcb)); status != OpStatus::OK)
++    return status;
+ 
+   t->Execute(cb_move, true);
+   return op_res;
+@@ -914,9 +913,8 @@ OpResult<string> BPopPusher::RunPair(Transaction* t, time_point tp) {
+   // This allows us to run Transaction::Execute on watched transactions in both shards.
+   auto wcb = [&](Transaction* t, EngineShard* shard) { return ArgSlice{&this->pop_key_, 1}; };
+ 
+-  bool wait_succeeded = t->WaitOnWatch(tp, std::move(wcb));
+-  if (!wait_succeeded)
+-    return OpStatus::TIMED_OUT;
++  if (auto status = t->WaitOnWatch(tp, std::move(wcb)); status != OpStatus::OK)
++    return status;
+ 
+   return MoveTwoShards(t, pop_key_, push_key_, popdir_, pushdir_, true);
+ }
+@@ -1206,10 +1204,9 @@ void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cn
+     popped_value = OpBPop(t, shard, key, dir);
+   };
+ 
+-  cntx->conn_state.is_blocking = true;
+   OpResult<string> popped_key = container_utils::RunCbOnFirstNonEmptyBlocking(
+-      transaction, OBJ_LIST, std::move(cb), unsigned(timeout * 1000));
+-  cntx->conn_state.is_blocking = false;
++      transaction, OBJ_LIST, std::move(cb), unsigned(timeout * 1000), &cntx->blocked);
++
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (popped_key) {
+     DVLOG(1) << "BPop " << transaction->DebugId() << " popped from key " << popped_key;  // key.
+@@ -1222,8 +1219,12 @@ void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cn
+   switch (popped_key.status()) {
+     case OpStatus::WRONG_TYPE:
+       return rb->SendError(kWrongTypeErr);
++    case OpStatus::CANCELLED:
+     case OpStatus::TIMED_OUT:
+       return rb->SendNullArray();
++    case OpStatus::KEY_MOVED:
++      // TODO: proper error for moved
++      return rb->SendError("-MOVED");
+     default:
+       LOG(ERROR) << "Unexpected error " << popped_key.status();
+   }
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index aa560c613cbc..6e1783b6595f 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1447,7 +1447,8 @@ facade::ConnectionContext* Service::CreateContext(util::FiberSocketBase* peer,
+   // a bit of a hack. I set up breaker callback here for the owner.
+   // Should work though it's confusing to have it here.
+   owner->RegisterBreakHook([res, this](uint32_t) {
+-    res->CancelBlocking();
++    if (res->transaction)
++      res->transaction->CancelBlocking(nullptr);
+     this->server_family().BreakOnShutdown();
+   });
+ 
+@@ -2407,7 +2408,7 @@ string Service::GetContextInfo(facade::ConnectionContext* cntx) {
+   if (server_cntx->conn_state.subscribe_info)
+     buf[index++] = 'P';
+ 
+-  if (server_cntx->conn_state.is_blocking)
++  if (server_cntx->blocked)
+     buf[index++] = 'b';
+ 
+   if (index) {
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 16869165b86f..a1bb75af7958 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1142,17 +1142,18 @@ void ServerFamily::BreakOnShutdown() {
+   dfly_cmd_->BreakOnShutdown();
+ }
+ 
+-void ServerFamily::CancelBlockingCommands() {
+-  auto cb = [](unsigned thread_index, util::Connection* conn) {
+-    facade::ConnectionContext* fc = static_cast<facade::Connection*>(conn)->cntx();
+-    if (fc) {
+-      ConnectionContext* cntx = static_cast<ConnectionContext*>(fc);
+-      cntx->CancelBlocking();
++void ServerFamily::CancelBlockingOnThread(std::function<OpStatus(ArgSlice)> status_cb) {
++  auto cb = [status_cb](unsigned thread_index, util::Connection* conn) {
++    if (auto fcntx = static_cast<facade::Connection*>(conn)->cntx(); fcntx) {
++      auto* cntx = static_cast<ConnectionContext*>(fcntx);
++      if (cntx->transaction && cntx->blocked) {
++        cntx->transaction->CancelBlocking(status_cb);
++      }
+     }
+   };
+-  for (auto* listener : listeners_) {
+-    listener->TraverseConnections(cb);
+-  }
++
++  for (auto* listener : listeners_)
++    listener->TraverseConnectionsOnThread(cb);
+ }
+ 
+ string GetPassword() {
+diff --git a/src/server/server_family.h b/src/server/server_family.h
+index 192869b04aea..211f456ecadf 100644
+--- a/src/server/server_family.h
++++ b/src/server/server_family.h
+@@ -196,7 +196,7 @@ class ServerFamily {
+ 
+   void BreakOnShutdown();
+ 
+-  void CancelBlockingCommands();
++  void CancelBlockingOnThread(std::function<facade::OpStatus(ArgSlice)> = {});
+ 
+   // Sets the server to replicate another instance. Does not flush the database beforehand!
+   void Replicate(std::string_view host, std::string_view port);
+diff --git a/src/server/stream_family.cc b/src/server/stream_family.cc
+index ccfc29386071..95b0bbe54850 100644
+--- a/src/server/stream_family.cc
++++ b/src/server/stream_family.cc
+@@ -2823,10 +2823,8 @@ void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
+   auto tp = (opts.timeout) ? chrono::steady_clock::now() + chrono::milliseconds(opts.timeout)
+                            : Transaction::time_point::max();
+ 
+-  bool wait_succeeded = cntx->transaction->WaitOnWatch(tp, std::move(wcb));
+-  if (!wait_succeeded) {
++  if (auto status = cntx->transaction->WaitOnWatch(tp, std::move(wcb)); status != OpStatus::OK)
+     return rb->SendNullArray();
+-  }
+ 
+   // Resolve the entry in the woken key. Note this must not use OpRead since
+   // only the shard that contains the woken key blocks for the awoken
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index bc12987eff77..8cd30b0692ba 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -1144,7 +1144,7 @@ size_t Transaction::ReverseArgIndex(ShardId shard_id, size_t arg_index) const {
+   return reverse_index_[sd.arg_start + arg_index];
+ }
+ 
+-bool Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provider) {
++OpStatus Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provider) {
+   DVLOG(2) << "WaitOnWatch " << DebugId();
+   using namespace chrono;
+ 
+@@ -1165,29 +1165,36 @@ bool Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provi
+   auto* stats = ServerState::tl_connection_stats();
+   ++stats->num_blocked_clients;
+ 
++  if (DCHECK_IS_ON()) {
++    int64_t ms = -1;
++    if (tp != time_point::max())
++      ms = duration_cast<milliseconds>(tp - time_point::clock::now()).count();
++    DVLOG(1) << "WaitOnWatch TimeWait for " << ms << " ms " << DebugId();
++  }
++
+   cv_status status = cv_status::no_timeout;
+   if (tp == time_point::max()) {
+-    DVLOG(1) << "WaitOnWatch foreva " << DebugId();
+     blocking_ec_.await(std::move(wake_cb));
+-    DVLOG(1) << "WaitOnWatch AfterWait";
+   } else {
+-    DVLOG(1) << "WaitOnWatch TimeWait for "
+-             << duration_cast<milliseconds>(tp - time_point::clock::now()).count() << " ms "
+-             << DebugId();
+-
+     status = blocking_ec_.await_until(std::move(wake_cb), tp);
+-
+-    DVLOG(1) << "WaitOnWatch await_until " << int(status);
+   }
+ 
++  DVLOG(1) << "WaitOnWatch done " << int(status) << " " << DebugId();
++
+   --stats->num_blocked_clients;
+ 
+-  bool is_expired = (coordinator_state_ & COORD_CANCELLED) || status == cv_status::timeout;
+-  if (is_expired)
++  OpStatus result = OpStatus::OK;
++  if (status == cv_status::timeout) {
++    result = OpStatus::TIMED_OUT;
++  } else if (coordinator_state_ & COORD_CANCELLED) {
++    result = local_result_;
++  }
++
++  if (result != OpStatus::OK)
+     ExpireBlocking(wkeys_provider);
+ 
+   coordinator_state_ &= ~COORD_BLOCKED;
+-  return !is_expired;
++  return result;
+ }
+ 
+ // Runs only in the shard thread.
+@@ -1430,11 +1437,26 @@ void Transaction::RunOnceAsCommand(const CommandId* cid, RunnableType cb) {
+   });
+ }
+ 
+-void Transaction::CancelBlocking() {
+-  if (coordinator_state_ & COORD_BLOCKED) {
+-    coordinator_state_ |= COORD_CANCELLED;
+-    blocking_ec_.notify();
++void Transaction::CancelBlocking(std::function<OpStatus(ArgSlice)> status_cb) {
++  if ((coordinator_state_ & COORD_BLOCKED) == 0)
++    return;
++
++  OpStatus status = OpStatus::CANCELLED;
++  if (status_cb) {
++    vector<string_view> all_keys;
++    IterateActiveShards([this, &all_keys](PerShardData&, auto i) {
++      auto shard_keys = GetShardArgs(i);
++      all_keys.insert(all_keys.end(), shard_keys.begin(), shard_keys.end());
++    });
++    status = status_cb(absl::MakeSpan(all_keys));
+   }
++
++  if (status == OpStatus::OK)
++    return;
++
++  coordinator_state_ |= COORD_CANCELLED;
++  local_result_ = status;
++  blocking_ec_.notify();
+ }
+ 
+ OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args) {
+diff --git a/src/server/transaction.h b/src/server/transaction.h
+index 64d175e28809..6ff5f75c4ee8 100644
+--- a/src/server/transaction.h
++++ b/src/server/transaction.h
+@@ -186,7 +186,7 @@ class Transaction {
+   // or b) tp is reached. If tp is time_point::max() then waits indefinitely.
+   // Expects that the transaction had been scheduled before, and uses Execute(.., true) to register.
+   // Returns false if timeout occurred, true if was notified by one of the keys.
+-  bool WaitOnWatch(const time_point& tp, WaitKeysProvider cb);
++  facade::OpStatus WaitOnWatch(const time_point& tp, WaitKeysProvider cb);
+ 
+   // Returns true if transaction is awaked, false if it's timed-out and can be removed from the
+   // blocking queue.
+@@ -194,7 +194,7 @@ class Transaction {
+ 
+   // Cancel all blocking watches. Set COORD_CANCELLED.
+   // Must be called from coordinator thread.
+-  void CancelBlocking();
++  void CancelBlocking(std::function<OpStatus(ArgSlice)>);
+ 
+   // In some cases for non auto-journaling commands we want to enable the auto journal flow.
+   void RenableAutoJournal() {
+diff --git a/src/server/zset_family.cc b/src/server/zset_family.cc
+index 8c29e2b7dcbf..71f34f7b9177 100644
+--- a/src/server/zset_family.cc
++++ b/src/server/zset_family.cc
+@@ -1321,15 +1321,14 @@ void BZPopMinMax(CmdArgList args, ConnectionContext* cntx, bool is_max) {
+   VLOG(1) << "BZPop timeout(" << timeout << ")";
+ 
+   Transaction* transaction = cntx->transaction;
++
+   OpResult<ScoredArray> popped_array;
+-  cntx->conn_state.is_blocking = true;
++  auto cb = [is_max, &popped_array](Transaction* t, EngineShard* shard, std::string_view key) {
++    popped_array = OpBZPop(t, shard, key, is_max);
++  };
++
+   OpResult<string> popped_key = container_utils::RunCbOnFirstNonEmptyBlocking(
+-      transaction, OBJ_ZSET,
+-      [is_max, &popped_array](Transaction* t, EngineShard* shard, std::string_view key) {
+-        popped_array = OpBZPop(t, shard, key, is_max);
+-      },
+-      unsigned(timeout * 1000));
+-  cntx->conn_state.is_blocking = false;
++      transaction, OBJ_ZSET, std::move(cb), unsigned(timeout * 1000), &cntx->blocked);
+ 
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (popped_key) {

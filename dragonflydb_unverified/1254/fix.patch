@@ -1,0 +1,364 @@
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index 542d4ecf299a..0176112bba85 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -45,13 +45,16 @@ class ConnectionContext {
+   }
+ 
+   // connection state / properties.
+-  bool async_dispatch : 1;  // whether this connection is currently handled by dispatch fiber.
+   bool conn_closing : 1;
+   bool req_auth : 1;
+   bool replica_conn : 1;
+   bool authenticated : 1;
+-  bool force_dispatch : 1;    // whether we should route all requests to the dispatch fiber.
+-  bool journal_emulated : 1;  // whether it is used to dispatch journal commands.
++  bool async_dispatch : 1;    // whether this connection is amid an async dispatch
++  bool sync_dispatch : 1;     // whether this connection is amid a sync dispatch
++  bool journal_emulated : 1;  // whether it is used to dispatch journal commands
++
++  // How many async subscription sources are active: monitor and/or pubsub - at most 2.
++  uint8_t subscriptions;
+ 
+  private:
+   Connection* owner_;
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 15b599547f0d..258eff65c670 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -102,18 +102,14 @@ struct Connection::Shutdown {
+ 
+ Connection::PubMessage::PubMessage(string pattern, shared_ptr<char[]> buf, size_t channel_len,
+                                    size_t message_len)
+-    : data{MessageData{pattern, move(buf), channel_len, message_len}} {
++    : pattern{move(pattern)}, buf{move(buf)}, channel_len{channel_len}, message_len{message_len} {
+ }
+ 
+-Connection::PubMessage::PubMessage(bool add, string_view channel, uint32_t channel_cnt)
+-    : data{SubscribeData{add, string{channel}, channel_cnt}} {
+-}
+-
+-string_view Connection::PubMessage::MessageData::Channel() const {
++string_view Connection::PubMessage::Channel() const {
+   return {buf.get(), channel_len};
+ }
+ 
+-string_view Connection::PubMessage::MessageData::Message() const {
++string_view Connection::PubMessage::Message() const {
+   return {buf.get() + channel_len, message_len};
+ }
+ 
+@@ -179,8 +175,7 @@ template <class... Ts> Overloaded(Ts...) -> Overloaded<Ts...>;
+ size_t Connection::MessageHandle::UsedMemory() const {
+   // TODO: don't count inline size
+   auto pub_size = [](const PubMessage& msg) -> size_t {
+-    const auto* md = get_if<PubMessage::MessageData>(&msg.data);
+-    return sizeof(PubMessage) + (md ? (md->channel_len + md->message_len) : 0u);
++    return sizeof(PubMessage) + (msg.channel_len + msg.message_len);
+   };
+   auto msg_size = [](const PipelineMessage& arg) -> size_t {
+     return sizeof(PipelineMessage) + arg.args.capacity() * sizeof(MutableSlice) +
+@@ -202,28 +197,18 @@ void Connection::DispatchOperations::operator()(const MonitorMessage& msg) {
+ void Connection::DispatchOperations::operator()(const PubMessage& pub_msg) {
+   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
+   ++stats->async_writes_cnt;
+-  auto send_msg = [rbuilder](const PubMessage::MessageData& data) {
+-    unsigned i = 0;
+-    string_view arr[4];
+-    if (data.pattern.empty()) {
+-      arr[i++] = "message";
+-    } else {
+-      arr[i++] = "pmessage";
+-      arr[i++] = data.pattern;
+-    }
+-    arr[i++] = data.Channel();
+-    arr[i++] = data.Message();
+-    rbuilder->SendStringArr(absl::Span<string_view>{arr, i},
+-                            RedisReplyBuilder::CollectionType::PUSH);
+-  };
+-  auto send_sub = [rbuilder](const PubMessage::SubscribeData& data) {
+-    const char* action[2] = {"unsubscribe", "subscribe"};
+-    rbuilder->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
+-    rbuilder->SendBulkString(action[data.add]);
+-    rbuilder->SendBulkString(data.channel);
+-    rbuilder->SendLong(data.channel_cnt);
+-  };
+-  visit(Overloaded{send_msg, send_sub}, pub_msg.data);
++  unsigned i = 0;
++  array<string_view, 4> arr;
++  if (pub_msg.pattern.empty()) {
++    arr[i++] = "message";
++  } else {
++    arr[i++] = "pmessage";
++    arr[i++] = pub_msg.pattern;
++  }
++  arr[i++] = pub_msg.Channel();
++  arr[i++] = pub_msg.Message();
++  rbuilder->SendStringArr(absl::Span<string_view>{arr.data(), i},
++                          RedisReplyBuilder::CollectionType::PUSH);
+ }
+ 
+ void Connection::DispatchOperations::operator()(Connection::PipelineMessage& msg) {
+@@ -231,10 +216,8 @@ void Connection::DispatchOperations::operator()(Connection::PipelineMessage& msg
+ 
+   DVLOG(2) << "Dispatching pipeline: " << ToSV(msg.args.front());
+ 
+-  self->cc_->async_dispatch = true;
+   self->service_->DispatchCommand(CmdArgList{msg.args.data(), msg.args.size()}, self->cc_.get());
+   self->last_interaction_ = time(nullptr);
+-  self->cc_->async_dispatch = false;
+ }
+ 
+ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
+@@ -542,7 +525,44 @@ void Connection::ConnectionFlow(FiberSocketBase* peer) {
+   --stats_->num_conns;
+ }
+ 
+-auto Connection::ParseRedis() -> ParserStatus {
++void Connection::DispatchCommand(uint32_t consumed, mi_heap_t* heap) {
++  bool can_dispatch_sync = (consumed >= io_buf_.InputLen());
++
++  // Avoid sync dispatch if an async dispatch is already in progress, or else they'll interleave.
++  if (cc_->async_dispatch)
++    can_dispatch_sync = false;
++
++  // Avoid sync dispatch if we already have pending async messages or
++  // can potentially receive some (subscriptions > 0). Otherwise the dispatch
++  // fiber might be constantly blocked by sync_dispatch.
++  if (dispatch_q_.size() > 0 || cc_->subscriptions > 0)
++    can_dispatch_sync = false;
++
++  if (can_dispatch_sync) {
++    ShrinkPipelinePool();  // Gradually release pipeline request pool.
++
++    RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
++
++    {
++      cc_->sync_dispatch = true;
++      service_->DispatchCommand(absl::MakeSpan(tmp_cmd_vec_), cc_.get());
++      cc_->sync_dispatch = false;
++    }
++
++    last_interaction_ = time(nullptr);
++
++    // We might have blocked the dispatch queue from processing, wake it up.
++    if (dispatch_q_.size() > 0)
++      evc_.notify();
++
++  } else {
++    SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), heap)});
++    if (dispatch_q_.size() > 10)
++      ThisFiber::Yield();
++  }
++}
++
++Connection::ParserStatus Connection::ParseRedis() {
+   uint32_t consumed = 0;
+ 
+   RedisParser::Result result = RedisParser::OK;
+@@ -558,28 +578,7 @@ auto Connection::ParseRedis() -> ParserStatus {
+         DVLOG(2) << "Got Args with first token " << ToSV(first.GetBuf());
+       }
+ 
+-      // An optimization to skip dispatch_q_ if no pipelining is identified.
+-      // We use ASYNC_DISPATCH as a lock to avoid out-of-order replies when the
+-      // dispatch fiber pulls the last record but is still processing the command and then this
+-      // fiber enters the condition below and executes out of order.
+-      bool is_sync_dispatch = !cc_->async_dispatch && !cc_->force_dispatch;
+-      if (dispatch_q_.empty() && is_sync_dispatch && consumed >= io_buf_.InputLen()) {
+-        // Gradually release the request pool.
+-        ShrinkPipelinePool();
+-
+-        RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
+-
+-        DVLOG(2) << "Sync dispatch " << ToSV(tmp_cmd_vec_.front());
+-
+-        CmdArgList cmd_list{tmp_cmd_vec_.data(), tmp_cmd_vec_.size()};
+-        service_->DispatchCommand(cmd_list, cc_.get());
+-        last_interaction_ = time(nullptr);
+-      } else {
+-        // Dispatch via queue to speedup input reading.
+-        SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), tlh)});
+-        if (dispatch_q_.size() > 10)
+-          ThisFiber::Yield();
+-      }
++      DispatchCommand(consumed, tlh);
+     }
+     io_buf_.ConsumeInput(consumed);
+   } while (RedisParser::OK == result && !builder->GetError());
+@@ -742,7 +741,8 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
+   uint64_t request_cache_limit = absl::GetFlag(FLAGS_request_cache_limit);
+ 
+   while (!builder->GetError()) {
+-    evc_.await([this] { return cc_->conn_closing || !dispatch_q_.empty(); });
++    evc_.await(
++        [this] { return cc_->conn_closing || (!dispatch_q_.empty() && !cc_->sync_dispatch); });
+     if (cc_->conn_closing)
+       break;
+ 
+@@ -751,11 +751,16 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
+ 
+     builder->SetBatchMode(dispatch_q_.size() > 0);
+ 
+-    std::visit(dispatch_op, msg.handle);
++    {
++      cc_->async_dispatch = true;
++      std::visit(dispatch_op, msg.handle);
++      cc_->async_dispatch = false;
++    }
+ 
+     dispatch_q_bytes_.fetch_sub(msg.UsedMemory(), memory_order_relaxed);
+     evc_bp_.notify();
+ 
++    // Retain pipeline message in pool.
+     if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
+       if (stats_->pipeline_cache_capacity < request_cache_limit) {
+         stats_->pipeline_cache_capacity += (*pipe)->StorageCapacity();
+@@ -859,7 +864,12 @@ void Connection::SendAsync(MessageHandle msg) {
+   dispatch_q_bytes_.fetch_add(msg.UsedMemory(), memory_order_relaxed);
+ 
+   dispatch_q_.push_back(move(msg));
+-  if (dispatch_q_.size() == 1) {
++
++  // Don't notify if a sync dispatch is in progress, it will wake after finishing.
++  // This might only happen if we started receving messages while `SUBSCRIBE`
++  // is still updating thread local data (see channel_store). We need to make sure its
++  // ack is sent before all other messages.
++  if (dispatch_q_.size() == 1 && !cc_->sync_dispatch) {
+     evc_.notify();
+   }
+ }
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 5f546047c6f5..d242fa9b90b6 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -62,26 +62,13 @@ class Connection : public util::Connection {
+ 
+   // PubSub message, either incoming message for active subscription or reply for new subscription.
+   struct PubMessage {
+-    // Represents incoming message.
+-    struct MessageData {
+-      std::string pattern{};            // non-empty for pattern subscriber
+-      std::shared_ptr<char[]> buf;      // stores channel name and message
+-      size_t channel_len, message_len;  // lengths in buf
+-
+-      std::string_view Channel() const;
+-      std::string_view Message() const;
+-    };
+-
+-    // Represents reply for subscribe/unsubscribe.
+-    struct SubscribeData {
+-      bool add;
+-      std::string channel;
+-      uint32_t channel_cnt;
+-    };
+-
+-    std::variant<MessageData, SubscribeData> data;
+-
+-    PubMessage(bool add, std::string_view channel, uint32_t channel_cnt);
++    std::string pattern{};            // non-empty for pattern subscriber
++    std::shared_ptr<char[]> buf;      // stores channel name and message
++    size_t channel_len, message_len;  // lengths in buf
++
++    std::string_view Channel() const;
++    std::string_view Message() const;
++
+     PubMessage(std::string pattern, std::shared_ptr<char[]> buf, size_t channel_len,
+                size_t message_len);
+   };
+@@ -194,6 +181,9 @@ class Connection : public util::Connection {
+   // Returns true if HTTP header is detected.
+   io::Result<bool> CheckForHttpProto(util::FiberSocketBase* peer);
+ 
++  // Dispatch last command parsed by ParseRedis
++  void DispatchCommand(uint32_t consumed, mi_heap_t* heap);
++
+   // Handles events from dispatch queue.
+   void DispatchFiber(util::FiberSocketBase* peer);
+ 
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index decbd30e96d0..d7437fb9bcfb 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -115,13 +115,15 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, Connection* owner) : ow
+       break;
+   }
+ 
+-  async_dispatch = false;
+   conn_closing = false;
+   req_auth = false;
+   replica_conn = false;
+   authenticated = false;
+-  force_dispatch = false;
++  async_dispatch = false;
++  sync_dispatch = false;
+   journal_emulated = false;
++
++  subscriptions = 0;
+ }
+ 
+ RedisReplyBuilder* ConnectionContext::operator->() {
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index a18ad224833e..2e04cd7ba6b0 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -105,7 +105,7 @@ vector<unsigned> ChangeSubscriptions(bool pattern, CmdArgList args, bool to_add,
+     DCHECK(to_add);
+ 
+     conn_state.subscribe_info.reset(new ConnectionState::SubscribeInfo);
+-    conn->force_dispatch = true;  // to be able to read input and still write the output.
++    conn->subscriptions++;
+   }
+ 
+   auto& sinfo = *conn->conn_state.subscribe_info.get();
+@@ -134,7 +134,8 @@ vector<unsigned> ChangeSubscriptions(bool pattern, CmdArgList args, bool to_add,
+   // removed.
+   if (!to_add && conn_state.subscribe_info->IsEmpty()) {
+     conn_state.subscribe_info.reset();
+-    conn->force_dispatch = false;
++    DCHECK_GE(conn->subscriptions, 1u);
++    conn->subscriptions--;
+   }
+ 
+   return result;
+@@ -145,7 +146,11 @@ void ConnectionContext::ChangeSubscription(bool to_add, bool to_reply, CmdArgLis
+ 
+   if (to_reply) {
+     for (size_t i = 0; i < result.size(); ++i) {
+-      owner()->SendPubMessageAsync({to_add, ArgS(args, i), result[i]});
++      const char* action[2] = {"unsubscribe", "subscribe"};
++      (*this)->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
++      (*this)->SendBulkString(action[to_add]);
++      (*this)->SendBulkString(ArgS(args, i));
++      (*this)->SendLong(result[i]);
+     }
+   }
+ }
+diff --git a/src/server/conn_context.h b/src/server/conn_context.h
+index 373b5a6b9279..5343d46b540a 100644
+--- a/src/server/conn_context.h
++++ b/src/server/conn_context.h
+@@ -176,7 +176,7 @@ class ConnectionContext : public facade::ConnectionContext {
+ 
+  private:
+   void EnableMonitoring(bool enable) {
+-    force_dispatch = enable;  // required to support the monitoring
++    subscriptions++;  // required to support the monitoring
+     monitor = enable;
+   }
+   void SendSubscriptionChangedResponse(std::string_view action,
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 1a2b1db3fe70..1d41e3e17456 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -735,8 +735,8 @@ bool Service::VerifyCommand(const CommandId* cid, CmdArgList args, ConnectionCon
+   }
+ 
+   if (under_multi) {
+-    if (cmd_name == "SELECT") {
+-      (*dfly_cntx)->SendError("Can not call SELECT within a transaction");
++    if (cmd_name == "SELECT" || absl::EndsWith(cmd_name, "SUBSCRIBE")) {
++      (*dfly_cntx)->SendError(absl::StrCat("Can not call ", cmd_name, " within a transaction"));
+       return false;
+     }
+ 

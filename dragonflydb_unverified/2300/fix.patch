@@ -1,0 +1,160 @@
+diff --git a/src/server/db_slice.cc b/src/server/db_slice.cc
+index 81e79f4d8cbc..6dae685e4ec3 100644
+--- a/src/server/db_slice.cc
++++ b/src/server/db_slice.cc
+@@ -166,10 +166,16 @@ class PrimeEvictionPolicy {
+ 
+ class PrimeBumpPolicy {
+  public:
++  PrimeBumpPolicy(const absl::flat_hash_set<CompactObjectView, PrimeHasher>& bumped_items)
++      : bumped_items_(bumped_items) {
++  }
+   // returns true if key can be made less important for eviction (opposite of bump up)
+-  bool CanBumpDown(const CompactObj& key) const {
+-    return !key.IsSticky();
++  bool CanBumpDown(const CompactObj& obj) const {
++    return !obj.IsSticky() && !bumped_items_.contains(obj);
+   }
++
++ private:
++  const absl::flat_hash_set<CompactObjectView, PrimeHasher>& bumped_items_;
+ };
+ 
+ bool PrimeEvictionPolicy::CanGrow(const PrimeTable& tbl) const {
+@@ -468,12 +474,11 @@ DbSlice::ItAndExp DbSlice::FindInternal(const Context& cntx, std::string_view ke
+           ccb.second(cntx.db_index, bit);
+         }
+       };
+-
+       db.prime.CVCUponBump(change_cb_.back().first, res.it, bump_cb);
+     }
+-
+-    res.it = db.prime.BumpUp(res.it, PrimeBumpPolicy{});
++    res.it = db.prime.BumpUp(res.it, PrimeBumpPolicy{bumped_items_});
+     ++events_.bumpups;
++    bumped_items_.insert(res.it->first.AsRef());
+   }
+ 
+   db.top_keys.Touch(key);
+@@ -625,7 +630,7 @@ bool DbSlice::Del(DbIndex db_ind, PrimeIterator it) {
+     DbContext cntx{db_ind, GetCurrentTimeMs()};
+     doc_del_cb_(key, cntx, it->second);
+   }
+-
++  bumped_items_.erase(it->first.AsRef());
+   PerformDeletion(it, shard_owner(), db.get());
+   deletion_count_++;
+ 
+@@ -686,7 +691,7 @@ void DbSlice::FlushDbIndexes(const std::vector<DbIndex>& indexes) {
+       tiered->CancelAllIos(index);
+     }
+   }
+-
++  CHECK(bumped_items_.empty());
+   auto cb = [this, flush_db_arr = std::move(flush_db_arr)]() mutable {
+     for (auto& db_ptr : flush_db_arr) {
+       if (db_ptr && db_ptr->stats.tiered_entries > 0) {
+@@ -1410,4 +1415,8 @@ void DbSlice::TrackKeys(const facade::Connection::WeakRef& conn, const ArgSlice&
+   }
+ }
+ 
++void DbSlice::OnCbFinish() {
++  bumped_items_.clear();
++}
++
+ }  // namespace dfly
+diff --git a/src/server/db_slice.h b/src/server/db_slice.h
+index 73fa93c0ea6d..89a953a0ad8e 100644
+--- a/src/server/db_slice.h
++++ b/src/server/db_slice.h
+@@ -276,6 +276,8 @@ class DbSlice {
+     return shard_id_;
+   }
+ 
++  void OnCbFinish();
++
+   bool Acquire(IntentLock::Mode m, const KeyLockArgs& lock_args);
+ 
+   void Release(IntentLock::Mode m, const KeyLockArgs& lock_args);
+@@ -445,6 +447,9 @@ class DbSlice {
+   // ordered from the smallest to largest version.
+   std::vector<std::pair<uint64_t, ChangeCallback>> change_cb_;
+ 
++  // Used in temporary computations in Find item and CbFinish
++  mutable absl::flat_hash_set<CompactObjectView, PrimeHasher> bumped_items_;
++
+   // Registered by shard indices on when first document index is created.
+   DocDeletionCallback doc_del_cb_;
+ 
+diff --git a/src/server/table.h b/src/server/table.h
+index 34c556b9f8ce..337059ec080d 100644
+--- a/src/server/table.h
++++ b/src/server/table.h
+@@ -47,6 +47,12 @@ inline bool IsValid(ExpireConstIterator it) {
+   return !it.is_done();
+ }
+ 
++struct PrimeHasher {
++  size_t operator()(const PrimeKey& o) const {
++    return o.HashCode();
++  }
++};
++
+ struct SlotStats {
+   uint64_t key_count = 0;
+   uint64_t total_reads = 0;
+diff --git a/src/server/tiered_storage.cc b/src/server/tiered_storage.cc
+index 2375321f1fa6..75f5c491a30c 100644
+--- a/src/server/tiered_storage.cc
++++ b/src/server/tiered_storage.cc
+@@ -100,12 +100,6 @@ static size_t ExternalizeEntry(size_t item_offset, DbTableStats* stats, PrimeVal
+   return item_size;
+ }
+ 
+-struct PrimeHasher {
+-  size_t operator()(const PrimeKey& o) const {
+-    return o.HashCode();
+-  }
+-};
+-
+ struct SingleRequest {
+   SingleRequest(size_t blob_len, int64 offset, string key)
+       : blob_len(blob_len), offset(offset), key(std::move(key)) {
+@@ -422,7 +416,7 @@ error_code TieredStorage::ScheduleOffload(DbIndex db_index, PrimeIterator it) {
+   CHECK_LT(bin_record.pending_entries.size(), max_entries);
+ 
+   VLOG(2) << "ScheduleOffload:" << it->first.ToString();
+-  bin_record.pending_entries.insert(it->first);
++  bin_record.pending_entries.insert(it->first.AsRef());
+   it->second.SetIoPending(true);
+ 
+   if (bin_record.pending_entries.size() < max_entries)
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index 8cd30b0692ba..7e795825738c 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -497,6 +497,7 @@ bool Transaction::RunInShard(EngineShard* shard, bool txq_ooo) {
+   if (is_concluding)  // Check last hop
+     LogAutoJournalOnShard(shard);
+ 
++  shard->db_slice().OnCbFinish();
+   // at least the coordinator thread owns the reference.
+   DCHECK_GE(GetUseCount(), 1u);
+ 
+@@ -950,7 +951,7 @@ void Transaction::RunQuickie(EngineShard* shard) {
+   } catch (std::exception& e) {
+     LOG(FATAL) << "Unexpected exception " << e.what();
+   }
+-
++  shard->db_slice().OnCbFinish();
+   LogAutoJournalOnShard(shard);
+ 
+   sd.is_armed.store(false, memory_order_relaxed);
+@@ -1238,6 +1239,7 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
+   DCHECK_EQ(unique_shard_cnt_, 1u);
+   auto* shard = EngineShard::tlocal();
+   auto status = cb(this, shard);
++  shard->db_slice().OnCbFinish();
+   LogAutoJournalOnShard(shard);
+   return status;
+ }

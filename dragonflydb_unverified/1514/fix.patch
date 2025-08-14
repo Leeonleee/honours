@@ -1,0 +1,173 @@
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 606a63faca1e..eb288cd7ab4d 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -915,4 +915,8 @@ std::string Connection::RemoteEndpointAddress() const {
+   return re.address().to_string();
+ }
+ 
++ConnectionContext* Connection::cntx() {
++  return cc_.get();
++}
++
+ }  // namespace facade
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 3913aaec7013..9bbd59d6fba3 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -163,6 +163,8 @@ class Connection : public util::Connection {
+     return name_;
+   }
+ 
++  ConnectionContext* cntx();
++
+  protected:
+   void OnShutdown() override;
+   void OnPreMigrateThread() override;
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index 2e04cd7ba6b0..51c124772a65 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -9,6 +9,7 @@
+ #include "server/engine_shard_set.h"
+ #include "server/server_family.h"
+ #include "server/server_state.h"
++#include "server/transaction.h"
+ #include "src/facade/dragonfly_connection.h"
+ 
+ namespace dfly {
+@@ -93,6 +94,12 @@ void ConnectionContext::ChangeMonitor(bool start) {
+   EnableMonitoring(start);
+ }
+ 
++void ConnectionContext::CancelBlocking() {
++  if (transaction) {
++    transaction->CancelBlocking();
++  }
++}
++
+ vector<unsigned> ChangeSubscriptions(bool pattern, CmdArgList args, bool to_add, bool to_reply,
+                                      ConnectionContext* conn) {
+   vector<unsigned> result(to_reply ? args.size() : 0, 0);
+diff --git a/src/server/conn_context.h b/src/server/conn_context.h
+index e768bd960a4d..e2cabc401e07 100644
+--- a/src/server/conn_context.h
++++ b/src/server/conn_context.h
+@@ -175,6 +175,7 @@ class ConnectionContext : public facade::ConnectionContext {
+   void UnsubscribeAll(bool to_reply);
+   void PUnsubscribeAll(bool to_reply);
+   void ChangeMonitor(bool start);  // either start or stop monitor on a given connection
++  void CancelBlocking(); // Cancel an ongoing blocking transaction if there is one.
+ 
+   // Whether this connection is a connection from a replica to its master.
+   // This flag is true only on replica side, where we need to setup a special ConnectionContext
+diff --git a/src/server/dflycmd.cc b/src/server/dflycmd.cc
+index c7fe6d25fd34..15573e021deb 100644
+--- a/src/server/dflycmd.cc
++++ b/src/server/dflycmd.cc
+@@ -377,8 +377,9 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
+   absl::Time start = absl::Now();
+   AggregateStatus status;
+ 
+-  // TODO: We should cancel blocking commands before awaiting all
+-  // dispatches to finish.
++  // We need to await for all dispatches to finish: Otherwise a transaction might be scheduled
++  // after this function exits but before the actual shutdown.
++  sf_->CancelBlockingCommands();
+   if (!sf_->AwaitDispatches(timeout_dur, [self = cntx->owner()](util::Connection* conn) {
+         // The only command that is currently dispatching should be the takeover command -
+         // so we wait until this is true.
+@@ -387,7 +388,12 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
+     LOG(WARNING) << "Couldn't wait for commands to finish dispatching. " << timeout_dur;
+     status = OpStatus::TIMED_OUT;
+   }
++  VLOG(1) << "AwaitDispatches done";
+ 
++  // We have this guard to disable expirations: We don't want any writes to the journal after
++  // we send the `PING`, and expirations could ruin that.
++  // TODO: Decouple disabling expirations from TransactionGuard because we don't
++  // really need TransactionGuard here.
+   TransactionGuard tg{cntx->transaction, /*disable_expirations=*/true};
+ 
+   if (*status == OpStatus::OK) {
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 6ba768ea87cb..1d7195731f25 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1028,9 +1028,7 @@ facade::ConnectionContext* Service::CreateContext(util::FiberSocketBase* peer,
+   // a bit of a hack. I set up breaker callback here for the owner.
+   // Should work though it's confusing to have it here.
+   owner->RegisterBreakHook([res, this](uint32_t) {
+-    if (res->transaction) {
+-      res->transaction->BreakOnShutdown();
+-    }
++    res->CancelBlocking();
+     this->server_family().BreakOnShutdown();
+   });
+ 
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index bff4ce65bf30..1c7859692000 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1260,6 +1260,19 @@ void ServerFamily::BreakOnShutdown() {
+   dfly_cmd_->BreakOnShutdown();
+ }
+ 
++void ServerFamily::CancelBlockingCommands() {
++  auto cb = [](unsigned thread_index, util::Connection* conn) {
++    facade::ConnectionContext* fc = static_cast<facade::Connection*>(conn)->cntx();
++    if (fc) {
++      ConnectionContext* cntx = static_cast<ConnectionContext*>(fc);
++      cntx->CancelBlocking();
++    }
++  };
++  for (auto* listener : listeners_) {
++    listener->TraverseConnections(cb);
++  }
++}
++
+ bool ServerFamily::AwaitDispatches(absl::Duration timeout,
+                                    const std::function<bool(util::Connection*)>& filter) {
+   auto start = absl::Now();
+diff --git a/src/server/server_family.h b/src/server/server_family.h
+index a56148b64bd3..5216848b53a4 100644
+--- a/src/server/server_family.h
++++ b/src/server/server_family.h
+@@ -156,6 +156,8 @@ class ServerFamily {
+ 
+   void BreakOnShutdown();
+ 
++  void CancelBlockingCommands();
++
+   bool AwaitDispatches(absl::Duration timeout,
+                        const std::function<bool(util::Connection*)>& filter);
+ 
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index 4d7bdd8540d9..5b8c1fa286d8 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -1385,7 +1385,7 @@ void Transaction::FinishLogJournalOnShard(EngineShard* shard, uint32_t shard_cnt
+   journal->RecordEntry(txid_, journal::Op::EXEC, db_index_, shard_cnt, {}, false);
+ }
+ 
+-void Transaction::BreakOnShutdown() {
++void Transaction::CancelBlocking() {
+   if (coordinator_state_ & COORD_BLOCKED) {
+     coordinator_state_ |= COORD_CANCELLED;
+     blocking_ec_.notify();
+diff --git a/src/server/transaction.h b/src/server/transaction.h
+index 3d171d95c86f..bfb260a382e6 100644
+--- a/src/server/transaction.h
++++ b/src/server/transaction.h
+@@ -182,8 +182,9 @@ class Transaction {
+   // blocking queue.
+   bool NotifySuspended(TxId committed_ts, ShardId sid, std::string_view key);
+ 
+-  // Cancel all blocking watches on shutdown. Set COORD_CANCELLED.
+-  void BreakOnShutdown();
++  // Cancel all blocking watches. Set COORD_CANCELLED.
++  // Must be called from coordinator thread.
++  void CancelBlocking();
+ 
+   // In some cases for non auto-journaling commands we want to enable the auto journal flow.
+   void RenableAutoJournal() {

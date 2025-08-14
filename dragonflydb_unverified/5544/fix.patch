@@ -1,0 +1,307 @@
+diff --git a/src/server/cluster/cluster_config.h b/src/server/cluster/cluster_config.h
+index a225174897d6..2d8f0081ec46 100644
+--- a/src/server/cluster/cluster_config.h
++++ b/src/server/cluster/cluster_config.h
+@@ -37,6 +37,12 @@ class ClusterConfig {
+ 
+   ClusterShardInfos GetConfig() const;
+ 
++  // Use wisely, only after a deep copy of ClusterConfig and
++  // to edit the config in place.
++  ClusterShardInfos& GetMutableConfig() {
++    return config_;
++  }
++
+   const SlotSet& GetOwnedSlots() const;
+ 
+   std::vector<MigrationInfo> GetNewOutgoingMigrations(
+diff --git a/src/server/cluster/cluster_defs.h b/src/server/cluster/cluster_defs.h
+index b130f20b0698..a00816969388 100644
+--- a/src/server/cluster/cluster_defs.h
++++ b/src/server/cluster/cluster_defs.h
+@@ -147,6 +147,14 @@ class ClusterShardInfos {
+     return infos_.cend();
+   }
+ 
++  auto begin() noexcept {
++    return infos_.begin();
++  }
++
++  auto end() noexcept {
++    return infos_.end();
++  }
++
+   auto size() const noexcept {
+     return infos_.size();
+   }
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index 4c879359f601..404f1ffca938 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -1088,6 +1088,70 @@ size_t ClusterFamily::MigrationsErrorsCount() const {
+   return error_num;
+ }
+ 
++void ClusterFamily::ReconcileMasterFlow() {
++  auto config = cluster::ClusterConfig::Current();
++
++  for (auto& info : config->GetMutableConfig()) {
++    if (info.master.id == id_) {
++      if (!info.replicas.empty()) {
++        LOG_IF(ERROR, info.replicas.size() > 1)
++            << "More than one replica found, slot redirection after takeover corrupted";
++
++        // assumes there is one replica per master node
++        // TODO figure a smart way to get the replica id_ so
++        // we can find it here
++        info.master = info.replicas.front();
++        info.replicas.clear();
++      }
++      break;
++    }
++  }
++}
++
++void ClusterFamily::ReconcileReplicaFlow() {
++  auto new_config = ClusterConfig::Current()->CloneWithChanges({}, {});
++  // Replace master with replica in shard config.
++  bool found = false;
++  for (ClusterShardInfo& info : new_config->GetMutableConfig()) {
++    for (const auto& replica : info.replicas) {
++      if (replica.id == id_) {
++        info.master = replica;
++        // New master has no replicas
++        info.replicas.clear();
++        found = true;
++        break;
++      }
++    }
++    if (found)
++      break;
++  }
++
++  LOG_IF(ERROR, !found) << "Did not find replica in the cluster map";
++
++  server_family_->service().proactor_pool().AwaitFiberOnAll(
++      [&new_config](util::ProactorBase*) { ClusterConfig::SetCurrent(new_config); });
++}
++
++void ClusterFamily::ReconcileMasterReplicaTakeoverSlots(bool was_master) {
++  util::fb2::LockGuard gu(set_config_mu);
++  util::fb2::LockGuard lk(migration_mu_);
++
++  auto config = ClusterConfig::Current();
++
++  // Sanity -- we should not reach there
++  if (!config) {
++    LOG(ERROR) << "Cluster config after takeover is empty";
++    return;
++  }
++
++  if (was_master) {
++    ReconcileMasterFlow();
++    return;
++  }
++
++  ReconcileReplicaFlow();
++}
++
+ using EngineFunc = void (ClusterFamily::*)(CmdArgList args, const CommandContext& cmd_cntx);
+ 
+ inline CommandId::Handler3 HandlerFunc(ClusterFamily* se, EngineFunc f) {
+diff --git a/src/server/cluster/cluster_family.h b/src/server/cluster/cluster_family.h
+index f1bfe9083393..3ba2644f766d 100644
+--- a/src/server/cluster/cluster_family.h
++++ b/src/server/cluster/cluster_family.h
+@@ -44,6 +44,14 @@ class ClusterFamily {
+ 
+   size_t MigrationsErrorsCount() const ABSL_LOCKS_EXCLUDED(migration_mu_);
+ 
++  // Helper function to be used during takeover from both nodes (master and replica).
++  // It reconciles the cluster configuration for both nodes to reflect the node
++  // role changes after the takeover.
++  // For the taking over node it's called at the end of the ReplTakeOver flow
++  // and for the taken over node it's called at the end of the dflycmd::TakeOver
++  void ReconcileMasterReplicaTakeoverSlots(bool was_master)
++      ABSL_LOCKS_EXCLUDED(set_config_mu, migration_mu_);
++
+  private:
+   using SinkReplyBuilder = facade::SinkReplyBuilder;
+ 
+@@ -69,7 +77,6 @@ class ClusterFamily {
+       ABSL_LOCKS_EXCLUDED(migration_mu_);
+   void DflyClusterFlushSlots(CmdArgList args, SinkReplyBuilder* builder);
+ 
+- private:  // Slots migration section
+   void DflySlotMigrationStatus(CmdArgList args, SinkReplyBuilder* builder)
+       ABSL_LOCKS_EXCLUDED(migration_mu_);
+ 
+@@ -114,11 +121,13 @@ class ClusterFamily {
+   std::vector<std::shared_ptr<OutgoingMigration>> outgoing_migration_jobs_
+       ABSL_GUARDED_BY(migration_mu_);
+ 
+- private:
+   std::optional<ClusterShardInfos> GetShardInfos(ConnectionContext* cntx) const;
+ 
+   ClusterShardInfo GetEmulatedShardInfo(ConnectionContext* cntx) const;
+ 
++  void ReconcileMasterFlow() ABSL_EXCLUSIVE_LOCKS_REQUIRED(set_config_mu, migration_mu_);
++  void ReconcileReplicaFlow() ABSL_EXCLUSIVE_LOCKS_REQUIRED(set_config_mu, migration_mu_);
++
+   // Guards set configuration, so that we won't handle 2 in parallel.
+   mutable util::fb2::Mutex set_config_mu;
+ 
+diff --git a/src/server/dflycmd.cc b/src/server/dflycmd.cc
+index 1d348d6df7fb..940c9a39dfde 100644
+--- a/src/server/dflycmd.cc
++++ b/src/server/dflycmd.cc
+@@ -20,6 +20,7 @@
+ #include "facade/cmd_arg_parser.h"
+ #include "facade/dragonfly_connection.h"
+ #include "facade/dragonfly_listener.h"
++#include "server/cluster_support.h"
+ #include "server/debugcmd.h"
+ #include "server/engine_shard_set.h"
+ #include "server/error.h"
+@@ -511,8 +512,7 @@ void DflyCmd::TakeOver(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext
+   atomic_bool catchup_success = true;
+   if (*status == OpStatus::OK) {
+     dfly::SharedLock lk{replica_ptr->shared_mu};
+-    auto cb = [replica_ptr = std::move(replica_ptr), end_time,
+-               &catchup_success](EngineShard* shard) {
++    auto cb = [replica_ptr, end_time, &catchup_success](EngineShard* shard) {
+       if (!WaitReplicaFlowToCatchup(end_time, replica_ptr.get(), shard)) {
+         catchup_success.store(false);
+       }
+@@ -535,10 +535,16 @@ void DflyCmd::TakeOver(CmdArgList args, RedisReplyBuilder* rb, ConnectionContext
+       LOG(WARNING) << "Failed to perform snapshot " << ec.Format();
+     }
+   }
+-  VLOG(1) << "Takeover accepted, shutting down.";
+-  std::string save_arg = "NOSAVE";
+-  MutableSlice sargs(save_arg);
+-  return sf_->ShutdownCmd(CmdArgList(&sargs, 1), CommandContext{nullptr, rb, nullptr});
++
++  // For non-cluster mode we shutdown
++  if (detail::cluster_mode == detail::ClusterMode::kNoCluster) {
++    VLOG(1) << "Takeover accepted, shutting down.";
++    std::string save_arg = "NOSAVE";
++    MutableSlice sargs(save_arg);
++    sf_->ShutdownCmd(CmdArgList(&sargs, 1), CommandContext{nullptr, rb, nullptr});
++    return;
++  }
++  sf_->service().cluster_family().ReconcileMasterReplicaTakeoverSlots(true);
+ }
+ 
+ void DflyCmd::Expire(CmdArgList args, Transaction* tx, RedisReplyBuilder* rb) {
+diff --git a/src/server/dflycmd.h b/src/server/dflycmd.h
+index c4715bef637a..4bdb21ae1521 100644
+--- a/src/server/dflycmd.h
++++ b/src/server/dflycmd.h
+@@ -217,7 +217,6 @@ class DflyCmd {
+   bool CheckReplicaStateOrReply(const ReplicaInfo& ri, SyncState expected,
+                                 facade::RedisReplyBuilder* rb);
+ 
+- private:
+   // Main entrypoint for stopping replication.
+   void StopReplication(uint32_t sync_id) ABSL_LOCKS_EXCLUDED(mu_);
+ 
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 96ef85814818..1144b30b3797 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1039,6 +1039,49 @@ optional<ErrorReply> Service::CheckKeysOwnership(const CommandId* cid, CmdArgLis
+   return nullopt;
+ }
+ 
++// TODO(kostas) refactor. Almost 1-1 with CheckKeyOwnership() above.
++std::optional<facade::ErrorReply> Service::TakenOverSlotError(const CommandId* cid, CmdArgList args,
++                                                              const ConnectionContext& dfly_cntx) {
++  if (cid->first_key_pos() == 0 && !cid->IsShardedPSub()) {
++    return nullopt;  // No key command.
++  }
++
++  OpResult<KeyIndex> key_index_res = FindKeys(cid, args);
++
++  if (!key_index_res) {
++    return ErrorReply{key_index_res.status()};
++  }
++
++  const auto& key_index = *key_index_res;
++
++  UniqueSlotChecker slot_checker;
++  for (string_view key : key_index.Range(args)) {
++    slot_checker.Add(key);
++  }
++
++  if (slot_checker.IsCrossSlot()) {
++    return ErrorReply{kCrossSlotError};
++  }
++
++  optional<SlotId> keys_slot = slot_checker.GetUniqueSlotId();
++  if (!keys_slot.has_value()) {
++    return nullopt;
++  }
++
++  if (auto error = cluster::SlotOwnershipError(*keys_slot);
++      !error.status.has_value() || error.status.value() != facade::OpStatus::OK) {
++    return ErrorReply{std::move(error)};
++  }
++  const auto cluster_config = cluster::ClusterConfig::Current();
++  if (!cluster_config)
++    return facade::ErrorReply{facade::kClusterNotConfigured};
++
++  // Moved regardless, we have been taken over
++  cluster::ClusterNodeInfo redirect = cluster_config->GetMasterNodeForSlot(*keys_slot);
++  return facade::ErrorReply{
++      absl::StrCat("-MOVED ", *keys_slot, " ", redirect.ip, ":", redirect.port), "MOVED"};
++}
++
+ // Return OK if all keys are allowed to be accessed: either declared in EVAL or
+ // transaction is running in global or non-atomic mode.
+ optional<ErrorReply> CheckKeysDeclared(const ConnectionState::ScriptInfo& eval_info,
+@@ -1158,6 +1201,15 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId* cid, CmdA
+       return ErrorReply(kLoadingErr);
+     }
+ 
++    if (gstate == GlobalState::TAKEN_OVER) {
++      if (IsClusterEnabled()) {
++        if (auto err = TakenOverSlotError(cid, tail_args, dfly_cntx); err) {
++          return err;
++        }
++      }
++      return ErrorReply(kLoadingErr);
++    }
++
+     return ErrorReply{StrCat("Can not execute during ", GlobalStateName(gstate))};
+   }
+ 
+diff --git a/src/server/main_service.h b/src/server/main_service.h
+index b8f5160e6e25..a85439a23052 100644
+--- a/src/server/main_service.h
++++ b/src/server/main_service.h
+@@ -160,6 +160,11 @@ class Service : public facade::ServiceInterface {
+   std::optional<facade::ErrorReply> CheckKeysOwnership(const CommandId* cid, CmdArgList args,
+                                                        const ConnectionContext& dfly_cntx);
+ 
++  // Return moved error if we *own* the slot. This function is used from flows that assume our
++  // state is TAKEN_OVER which happens after a replica takeover.
++  std::optional<facade::ErrorReply> TakenOverSlotError(const CommandId* cid, CmdArgList args,
++                                                       const ConnectionContext& dfly_cntx);
++
+   void EvalInternal(CmdArgList args, const EvalArgs& eval_args, Interpreter* interpreter,
+                     SinkReplyBuilder* builder, ConnectionContext* cntx, bool read_only);
+   void CallSHA(CmdArgList args, std::string_view sha, Interpreter* interpreter,
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 8806383ace4c..9e0ea1a019b7 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -3304,6 +3304,8 @@ void ServerFamily::ReplTakeOver(CmdArgList args, const CommandContext& cmd_cntx)
+     return builder->SendError("Couldn't execute takeover");
+ 
+   LOG(INFO) << "Takeover successful, promoting this instance to master.";
++
++  service().cluster_family().ReconcileMasterReplicaTakeoverSlots(false);
+   SetMasterFlagOnAllThreads(true);
+   last_master_data_ = replica_->Stop();
+   replica_.reset();

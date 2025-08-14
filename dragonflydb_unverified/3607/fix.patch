@@ -1,0 +1,140 @@
+diff --git a/src/facade/memcache_parser.h b/src/facade/memcache_parser.h
+index 4f403ca44189..1906c3dedfed 100644
+--- a/src/facade/memcache_parser.h
++++ b/src/facade/memcache_parser.h
+@@ -52,7 +52,8 @@ class MemcacheParser {
+       uint64_t delta;           // for DECR/INCR commands.
+     };
+ 
+-    uint32_t expire_ts = 0;  // relative time in seconds.
++    uint32_t expire_ts =
++        0;  // relative (expire_ts <= month) or unix time (expire_ts > month) in seconds
+     uint32_t bytes_len = 0;
+     uint32_t flags = 0;
+     bool no_reply = false;
+diff --git a/src/server/generic_family.cc b/src/server/generic_family.cc
+index 06b4fd626294..09061be3968a 100644
+--- a/src/server/generic_family.cc
++++ b/src/server/generic_family.cc
+@@ -691,23 +691,6 @@ OpResult<long> OpFieldTtl(Transaction* t, EngineShard* shard, string_view key, s
+   return res <= 0 ? res : int32_t(res - MemberTimeSeconds(db_cntx.time_now_ms));
+ }
+ 
+-OpResult<uint32_t> OpDel(const OpArgs& op_args, const ShardArgs& keys) {
+-  DVLOG(1) << "Del: " << keys.Front();
+-  auto& db_slice = op_args.GetDbSlice();
+-
+-  uint32_t res = 0;
+-
+-  for (string_view key : keys) {
+-    auto fres = db_slice.FindMutable(op_args.db_cntx, key);
+-    if (!IsValid(fres.it))
+-      continue;
+-    fres.post_updater.Run();
+-    res += int(db_slice.Del(op_args.db_cntx, fres.it));
+-  }
+-
+-  return res;
+-}
+-
+ OpResult<uint32_t> OpStick(const OpArgs& op_args, const ShardArgs& keys) {
+   DVLOG(1) << "Stick: " << keys.Front();
+ 
+@@ -727,6 +710,23 @@ OpResult<uint32_t> OpStick(const OpArgs& op_args, const ShardArgs& keys) {
+ 
+ }  // namespace
+ 
++OpResult<uint32_t> GenericFamily::OpDel(const OpArgs& op_args, const ShardArgs& keys) {
++  DVLOG(1) << "Del: " << keys.Front();
++  auto& db_slice = op_args.GetDbSlice();
++
++  uint32_t res = 0;
++
++  for (string_view key : keys) {
++    auto fres = db_slice.FindMutable(op_args.db_cntx, key);
++    if (!IsValid(fres.it))
++      continue;
++    fres.post_updater.Run();
++    res += int(db_slice.Del(op_args.db_cntx, fres.it));
++  }
++
++  return res;
++}
++
+ void GenericFamily::Del(CmdArgList args, ConnectionContext* cntx) {
+   Transaction* transaction = cntx->transaction;
+   VLOG(1) << "Del " << ArgS(args, 0);
+diff --git a/src/server/generic_family.h b/src/server/generic_family.h
+index 207d68009146..4e380850d10c 100644
+--- a/src/server/generic_family.h
++++ b/src/server/generic_family.h
+@@ -39,6 +39,7 @@ class GenericFamily {
+ 
+   // Accessed by Service::Exec and Service::Watch as an utility.
+   static OpResult<uint32_t> OpExists(const OpArgs& op_args, const ShardArgs& keys);
++  static OpResult<uint32_t> OpDel(const OpArgs& op_args, const ShardArgs& keys);
+ 
+  private:
+   static void Del(CmdArgList args, ConnectionContext* cntx);
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index ef60679e0397..9c01145b9554 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1495,7 +1495,7 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
+   char cmd_name[16];
+   char ttl[16];
+   char store_opt[32] = {0};
+-  char ttl_op[] = "EX";
++  char ttl_op[] = "EXAT";
+ 
+   MCReplyBuilder* mc_builder = static_cast<MCReplyBuilder*>(cntx->reply_builder());
+   mc_builder->SetNoreply(cmd.no_reply);
+@@ -1566,9 +1566,15 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
+       args.emplace_back(store_opt, strlen(store_opt));
+     }
+ 
+-    if (cmd.expire_ts && memcmp(cmd_name, "SET", 3) == 0) {
+-      char* next = absl::numbers_internal::FastIntToBuffer(cmd.expire_ts, ttl);
+-      args.emplace_back(ttl_op, 2);
++    // if expire_ts is greater than month it's a unix timestamp
++    // https://github.com/memcached/memcached/blob/master/doc/protocol.txt#L139
++    constexpr uint32_t kExpireLimit = 60 * 60 * 24 * 30;
++    const uint64_t expire_ts = cmd.expire_ts && cmd.expire_ts <= kExpireLimit
++                                   ? cmd.expire_ts + time(nullptr)
++                                   : cmd.expire_ts;
++    if (expire_ts && memcmp(cmd_name, "SET", 3) == 0) {
++      char* next = absl::numbers_internal::FastIntToBuffer(expire_ts, ttl);
++      args.emplace_back(ttl_op, 4);
+       args.emplace_back(ttl, next - ttl);
+     }
+     dfly_cntx->conn_state.memcache_flag = cmd.flags;
+diff --git a/src/server/string_family.cc b/src/server/string_family.cc
+index e43f18a40a9f..3049514dec8f 100644
+--- a/src/server/string_family.cc
++++ b/src/server/string_family.cc
+@@ -28,6 +28,7 @@
+ #include "server/conn_context.h"
+ #include "server/engine_shard_set.h"
+ #include "server/error.h"
++#include "server/generic_family.h"
+ #include "server/journal/journal.h"
+ #include "server/table.h"
+ #include "server/tiered_storage.h"
+@@ -787,9 +788,15 @@ void StringFamily::Set(CmdArgList args, ConnectionContext* cntx) {
+       if (abs_ms < 0)
+         return cntx->SendError(InvalidExpireTime("set"));
+ 
+-      // Redis reports just OK in this case
+-      if (rel_ms < 0)
++      // Remove existed key if the key is expired already
++      if (rel_ms < 0) {
++        cntx->transaction->ScheduleSingleHop([key](const Transaction* tx, EngineShard* es) {
++          ShardArgs args = tx->GetShardArgs(es->shard_id());
++          GenericFamily::OpDel(tx->GetOpArgs(es), args);
++          return OpStatus::OK;
++        });
+         return builder->SendStored();
++      }
+ 
+       tie(sparams.expire_after_ms, ignore) = expiry.Calculate(now_ms, true);
+     } else if (parser.Check("_MCFLAGS").ExpectTail(1)) {

@@ -1,0 +1,513 @@
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index d45a7712f751..27ed3924895a 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -10,6 +10,7 @@
+ 
+ #include <variant>
+ 
++#include "absl/strings/str_cat.h"
+ #include "base/flags.h"
+ #include "base/logging.h"
+ #include "facade/conn_context.h"
+@@ -394,11 +395,11 @@ std::string Connection::LocalBindAddress() const {
+   return le.address().to_string();
+ }
+ 
+-string Connection::GetClientInfo(unsigned thread_id) const {
++std::pair<std::string, std::string> Connection::GetClientInfoBeforeAfterTid() const {
+   CHECK(service_ && socket_);
+   CHECK_LT(unsigned(phase_), NUM_PHASES);
+ 
+-  string res;
++  string before;
+   auto le = socket_->LocalEndpoint();
+   auto re = socket_->RemoteEndpoint();
+   time_t now = time(nullptr);
+@@ -416,19 +417,48 @@ string Connection::GetClientInfo(unsigned thread_id) const {
+   static constexpr string_view PHASE_NAMES[] = {"setup", "readsock", "process"};
+   static_assert(PHASE_NAMES[PROCESS] == "process");
+ 
+-  absl::StrAppend(&res, "id=", id_, " addr=", re.address().to_string(), ":", re.port());
+-  absl::StrAppend(&res, " laddr=", le.address().to_string(), ":", le.port());
+-  absl::StrAppend(&res, " fd=", socket_->native_handle(), " name=", name_);
+-  absl::StrAppend(&res, " tid=", thread_id, " irqmatch=", int(cpu == my_cpu_id));
+-  absl::StrAppend(&res, " age=", now - creation_time_, " idle=", now - last_interaction_);
+-  absl::StrAppend(&res, " phase=", PHASE_NAMES[phase_]);
++  absl::StrAppend(&before, "id=", id_, " addr=", re.address().to_string(), ":", re.port());
++  absl::StrAppend(&before, " laddr=", le.address().to_string(), ":", le.port());
++  absl::StrAppend(&before, " fd=", socket_->native_handle(), " name=", name_);
++
++  string after;
++  absl::StrAppend(&after, " irqmatch=", int(cpu == my_cpu_id));
++  absl::StrAppend(&after, " age=", now - creation_time_, " idle=", now - last_interaction_);
++  absl::StrAppend(&after, " phase=", PHASE_NAMES[phase_]);
+ 
+   if (cc_) {
+     string cc_info = service_->GetContextInfo(cc_.get());
+-    absl::StrAppend(&res, " ", cc_info);
++    absl::StrAppend(&after, " ", cc_info);
+   }
+ 
+-  return res;
++  return {std::move(before), std::move(after)};
++}
++
++string Connection::GetClientInfo(unsigned thread_id) const {
++  auto [before, after] = GetClientInfoBeforeAfterTid();
++  absl::StrAppend(&before, " tid=", thread_id);
++  absl::StrAppend(&before, after);
++  return before;
++}
++
++string Connection::GetClientInfo() const {
++  auto [before, after] = GetClientInfoBeforeAfterTid();
++  absl::StrAppend(&before, after);
++  // The following are dummy fields and users should not rely on those unless
++  // we decide to implement them.
++  // This is only done because the redis pyclient parser for the field "client-info"
++  // for the command ACL LOG hardcodes the expected values. This behaviour does not
++  // conform to the actual expected values, since it's missing half of them.
++  // That is, even for redis-server, issuing an ACL LOG command via redis-cli and the pyclient
++  // will return different results! For example, the fields:
++  // addr=127.0.0.1:57275
++  // laddr=127.0.0.1:6379
++  // are missing from the pyclient.
++
++  absl::StrAppend(&before, " qbuf=0 ", "qbuf-free=0 ", "obl=0 ", "argv-mem=0 ");
++  absl::StrAppend(&before, "oll=0 ", "omem=0 ", "tot-mem=0 ", "multi=0 ");
++  absl::StrAppend(&before, "psub=0 ", "sub=0");
++  return before;
+ }
+ 
+ uint32_t Connection::GetClientId() const {
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 9498c54c5862..a138b741add9 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -156,6 +156,7 @@ class Connection : public util::Connection {
+   bool IsCurrentlyDispatching() const;
+ 
+   std::string GetClientInfo(unsigned thread_id) const;
++  std::string GetClientInfo() const;
+   std::string RemoteEndpointStr() const;
+   std::string RemoteEndpointAddress() const;
+   std::string LocalBindAddress() const;
+@@ -228,6 +229,7 @@ class Connection : public util::Connection {
+   PipelineMessagePtr GetFromPipelinePool();
+ 
+  private:
++  std::pair<std::string, std::string> GetClientInfoBeforeAfterTid() const;
+   std::deque<MessageHandle> dispatch_q_;  // dispatch queue
+   dfly::EventCount evc_;                  // dispatch queue waker
+   util::fb2::Fiber dispatch_fb_;          // dispatch fiber (if started)
+diff --git a/src/server/CMakeLists.txt b/src/server/CMakeLists.txt
+index 85fa5848d818..8d5bb0d9569e 100644
+--- a/src/server/CMakeLists.txt
++++ b/src/server/CMakeLists.txt
+@@ -18,7 +18,7 @@ add_library(dfly_transaction db_slice.cc malloc_stats.cc engine_shard_set.cc blo
+             common.cc journal/journal.cc journal/types.cc journal/journal_slice.cc
+             server_state.cc table.cc  top_keys.cc transaction.cc
+             serializer_commons.cc journal/serializer.cc journal/executor.cc journal/streamer.cc
+-            ${TX_LINUX_SRCS}
++            ${TX_LINUX_SRCS} acl/acl_log.cc
+             )
+ cxx_link(dfly_transaction dfly_core strings_lib)
+ 
+diff --git a/src/server/acl/acl_family.cc b/src/server/acl/acl_family.cc
+index 227feedece64..2dcf8934a8f0 100644
+--- a/src/server/acl/acl_family.cc
++++ b/src/server/acl/acl_family.cc
+@@ -5,13 +5,19 @@
+ 
+ #include <glog/logging.h>
+ 
++#include <algorithm>
+ #include <cctype>
++#include <chrono>
++#include <deque>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <string>
+ #include <utility>
+ #include <variant>
+ 
++#include "absl/strings/match.h"
++#include "absl/strings/numbers.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/types/span.h"
+ #include "base/flags.h"
+@@ -23,15 +29,19 @@
+ #include "io/file_util.h"
+ #include "io/io.h"
+ #include "server/acl/acl_commands_def.h"
++#include "server/acl/acl_log.h"
+ #include "server/acl/helpers.h"
+ #include "server/command_registry.h"
+ #include "server/conn_context.h"
++#include "server/server_state.h"
++#include "util/proactor_pool.h"
+ 
+ ABSL_FLAG(std::string, aclfile, "", "Path and name to aclfile");
+ 
+ namespace dfly::acl {
+ 
+-AclFamily::AclFamily(UserRegistry* registry) : registry_(registry) {
++AclFamily::AclFamily(UserRegistry* registry, util::ProactorPool* pool)
++    : registry_(registry), pool_(pool) {
+ }
+ 
+ void AclFamily::Acl(CmdArgList args, ConnectionContext* cntx) {
+@@ -272,9 +282,89 @@ void AclFamily::Load(CmdArgList args, ConnectionContext* cntx) {
+   cntx->SendOk();
+ }
+ 
++void AclFamily::Log(CmdArgList args, ConnectionContext* cntx) {
++  if (args.size() > 1) {
++    (*cntx)->SendError(facade::OpStatus::OUT_OF_RANGE);
++  }
++
++  size_t max_output = 10;
++  if (args.size() == 1) {
++    auto option = facade::ToSV(args[0]);
++    if (absl::EqualsIgnoreCase(option, "RESET")) {
++      pool_->AwaitFiberOnAll(
++          [](auto index, auto* context) { ServerState::tlocal()->acl_log.Reset(); });
++      (*cntx)->SendOk();
++      return;
++    }
++
++    if (!absl::SimpleAtoi(facade::ToSV(args[0]), &max_output)) {
++      (*cntx)->SendError("Invalid count");
++      return;
++    }
++  }
++
++  std::vector<AclLog::LogType> logs(pool_->size());
++  pool_->AwaitFiberOnAll([&logs, max_output](auto index, auto* context) {
++    logs[index] = ServerState::tlocal()->acl_log.GetLog(max_output);
++  });
++
++  size_t total_entries = 0;
++  for (auto& log : logs) {
++    total_entries += log.size();
++  }
++
++  if (total_entries == 0) {
++    (*cntx)->SendEmptyArray();
++    return;
++  }
++
++  (*cntx)->StartArray(total_entries);
++  auto print_element = [cntx](const auto& entry) {
++    (*cntx)->StartArray(12);
++    (*cntx)->SendSimpleString("reason");
++    using Reason = AclLog::Reason;
++    std::string_view reason = entry.reason == Reason::COMMAND ? "COMMAND" : "AUTH";
++    (*cntx)->SendSimpleString(reason);
++    (*cntx)->SendSimpleString("object");
++    (*cntx)->SendSimpleString(entry.object);
++    (*cntx)->SendSimpleString("username");
++    (*cntx)->SendSimpleString(entry.username);
++    (*cntx)->SendSimpleString("age-seconds");
++    auto now_diff = std::chrono::system_clock::now() - entry.entry_creation;
++    auto secs = std::chrono::duration_cast<std::chrono::seconds>(now_diff);
++    auto left_over = now_diff - std::chrono::duration_cast<std::chrono::microseconds>(secs);
++    auto age = absl::StrCat(secs.count(), ".", left_over.count());
++    (*cntx)->SendSimpleString(absl::StrCat(age));
++    (*cntx)->SendSimpleString("client-info");
++    (*cntx)->SendSimpleString(entry.client_info);
++    (*cntx)->SendSimpleString("timestamp-created");
++    (*cntx)->SendLong(entry.entry_creation.time_since_epoch().count());
++  };
++
++  auto n_way_minimum = [](const auto& logs) {
++    size_t id = 0;
++    AclLog::LogEntry limit;
++    const AclLog::LogEntry* max = &limit;
++    for (size_t i = 0; i < logs.size(); ++i) {
++      if (!logs[i].empty() && logs[i].front() < *max) {
++        id = i;
++        max = &logs[i].front();
++      }
++    }
++
++    return id;
++  };
++
++  for (size_t i = 0; i < total_entries; ++i) {
++    auto min = n_way_minimum(logs);
++    print_element(logs[min].front());
++    logs[min].pop_front();
++  }
++}
++
+ using MemberFunc = void (AclFamily::*)(CmdArgList args, ConnectionContext* cntx);
+ 
+-inline CommandId::Handler HandlerFunc(AclFamily* acl, MemberFunc f) {
++CommandId::Handler HandlerFunc(AclFamily* acl, MemberFunc f) {
+   return [=](CmdArgList args, ConnectionContext* cntx) { return (acl->*f)(args, cntx); };
+ }
+ 
+@@ -287,6 +377,7 @@ constexpr uint32_t kDelUser = acl::ADMIN | acl::SLOW | acl::DANGEROUS;
+ constexpr uint32_t kWhoAmI = acl::SLOW;
+ constexpr uint32_t kSave = acl::ADMIN | acl::SLOW | acl::DANGEROUS;
+ constexpr uint32_t kLoad = acl::ADMIN | acl::SLOW | acl::DANGEROUS;
++constexpr uint32_t kLog = acl::ADMIN | acl::SLOW | acl::DANGEROUS;
+ 
+ // We can't implement the ACL commands and its respective subcommands LIST, CAT, etc
+ // the usual way, (that is, one command called ACL which then dispatches to the subcommand
+@@ -312,6 +403,8 @@ void AclFamily::Register(dfly::CommandRegistry* registry) {
+       Save);
+   *registry << CI{"ACL LOAD", CO::ADMIN | CO::NOSCRIPT | CO::LOADING, 1, 0, 0, 0, acl::kLoad}.HFUNC(
+       Load);
++  *registry << CI{"ACL LOG", CO::ADMIN | CO::NOSCRIPT | CO::LOADING, 0, 0, 0, 0, acl::kLog}.HFUNC(
++      Log);
+ 
+   cmd_registry_ = registry;
+ }
+diff --git a/src/server/acl/acl_family.h b/src/server/acl/acl_family.h
+index d5f9ae6f0a54..417c028cb09f 100644
+--- a/src/server/acl/acl_family.h
++++ b/src/server/acl/acl_family.h
+@@ -23,7 +23,7 @@ namespace acl {
+ 
+ class AclFamily final {
+  public:
+-  explicit AclFamily(UserRegistry* registry);
++  explicit AclFamily(UserRegistry* registry, util::ProactorPool* pool);
+ 
+   void Register(CommandRegistry* registry);
+   void Init(facade::Listener* listener, UserRegistry* registry);
+@@ -36,7 +36,9 @@ class AclFamily final {
+   void WhoAmI(CmdArgList args, ConnectionContext* cntx);
+   void Save(CmdArgList args, ConnectionContext* cntx);
+   void Load(CmdArgList args, ConnectionContext* cntx);
++  // Helper function for bootstrap
+   bool Load();
++  void Log(CmdArgList args, ConnectionContext* cntx);
+ 
+   // Helper function that updates all open connections and their
+   // respective ACL fields on all the available proactor threads
+diff --git a/src/server/acl/acl_log.cc b/src/server/acl/acl_log.cc
+new file mode 100644
+index 000000000000..7717463bbefa
+--- /dev/null
++++ b/src/server/acl/acl_log.cc
+@@ -0,0 +1,58 @@
++// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++
++#include "server/acl/acl_log.h"
++
++#include <chrono>
++#include <iterator>
++
++#include "base/flags.h"
++#include "base/logging.h"
++#include "facade/dragonfly_connection.h"
++
++ABSL_FLAG(size_t, acllog_max_len, 32,
++          "Specify the number of log entries. Logs are kept locally for each thread "
++          "and therefore the total number of entries are acllog_max_len * threads");
++
++namespace dfly::acl {
++
++AclLog::AclLog() : total_entries_allowed_(absl::GetFlag(FLAGS_acllog_max_len)) {
++}
++
++void AclLog::Add(const ConnectionContext& cntx, std::string object, Reason reason,
++                 std::string tried_to_auth) {
++  if (total_entries_allowed_ == 0) {
++    return;
++  }
++
++  if (log_.size() == total_entries_allowed_) {
++    log_.pop_back();
++  }
++
++  std::string username;
++  // We can't use a conditional here because the result is the common type which is a const-ref
++  if (tried_to_auth.empty()) {
++    username = cntx.authed_username;
++  } else {
++    username = std::move(tried_to_auth);
++  }
++
++  std::string client_info = cntx.owner()->GetClientInfo();
++  using clock = std::chrono::system_clock;
++  LogEntry entry = {std::move(username), std::move(client_info), std::move(object), reason,
++                    clock::now()};
++  log_.push_front(std::move(entry));
++}
++
++void AclLog::Reset() {
++  log_.clear();
++}
++
++AclLog::LogType AclLog::GetLog(size_t number_of_entries) const {
++  auto start = log_.begin();
++  auto end = log_.size() <= number_of_entries ? log_.end() : std::next(start, number_of_entries);
++  return {start, end};
++}
++
++}  // namespace dfly::acl
+diff --git a/src/server/acl/acl_log.h b/src/server/acl/acl_log.h
+new file mode 100644
+index 000000000000..ced2af7ece16
+--- /dev/null
++++ b/src/server/acl/acl_log.h
+@@ -0,0 +1,50 @@
++// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++
++#pragma once
++
++#include <chrono>
++#include <deque>
++#include <string>
++
++#include "base/flags.h"
++#include "server/conn_context.h"
++
++ABSL_DECLARE_FLAG(size_t, acllog_max_len);
++
++namespace dfly::acl {
++
++class AclLog {
++ public:
++  explicit AclLog();
++
++  enum class Reason { COMMAND, AUTH };
++
++  struct LogEntry {
++    std::string username;
++    std::string client_info;
++    std::string object;
++    Reason reason;
++    using TimePoint = std::chrono::time_point<std::chrono::system_clock>;
++    TimePoint entry_creation = TimePoint::max();
++
++    friend bool operator<(const LogEntry& lhs, const LogEntry& rhs) {
++      return lhs.entry_creation < rhs.entry_creation;
++    }
++  };
++
++  void Add(const ConnectionContext& cntx, std::string object, Reason reason,
++           std::string tried_to_auth = "");
++  void Reset();
++
++  using LogType = std::deque<LogEntry>;
++
++  LogType GetLog(size_t number_of_entries) const;
++
++ private:
++  LogType log_;
++  const size_t total_entries_allowed_;
++};
++
++}  // namespace dfly::acl
+diff --git a/src/server/acl/helpers.cc b/src/server/acl/helpers.cc
+index 97b68d56eeac..92cfed5b078a 100644
+--- a/src/server/acl/helpers.cc
++++ b/src/server/acl/helpers.cc
+@@ -245,5 +245,4 @@ ParseAclSetUser<std::vector<std::string_view>&>(std::vector<std::string_view>&,
+ 
+ template std::variant<User::UpdateRequest, ErrorReply> ParseAclSetUser<CmdArgList>(
+     CmdArgList args, const CommandRegistry& registry, bool hashed);
+-
+ }  // namespace dfly::acl
+diff --git a/src/server/acl/helpers.h b/src/server/acl/helpers.h
+index bf4d6b476a67..97885197bdf7 100644
+--- a/src/server/acl/helpers.h
++++ b/src/server/acl/helpers.h
+@@ -11,6 +11,7 @@
+ #include <variant>
+ 
+ #include "facade/facade_types.h"
++#include "server/acl/acl_log.h"
+ #include "server/acl/user.h"
+ #include "server/command_registry.h"
+ 
+diff --git a/src/server/acl/validator.cc b/src/server/acl/validator.cc
+index aeb54ab77b9d..ddfa9eac9ced 100644
+--- a/src/server/acl/validator.cc
++++ b/src/server/acl/validator.cc
+@@ -5,6 +5,7 @@
+ #include "server/acl/validator.h"
+ 
+ #include "base/logging.h"
++#include "facade/dragonfly_connection.h"
+ #include "server/acl/acl_commands_def.h"
+ #include "server/server_state.h"
+ 
+@@ -17,9 +18,16 @@ namespace dfly::acl {
+   const size_t index = id.GetFamily();
+   const uint64_t command_mask = id.GetBitIndex();
+   DCHECK_LT(index, cntx.acl_commands.size());
++  const bool is_authed = (cntx.acl_categories & cat_credentials) != 0 ||
++                         (cntx.acl_commands[index] & command_mask) != 0;
+ 
+-  return (cntx.acl_categories & cat_credentials) != 0 ||
+-         (cntx.acl_commands[index] & command_mask) != 0;
++  if (!is_authed) {
++    auto& log = ServerState::tlocal()->acl_log;
++    using Reason = acl::AclLog::Reason;
++    log.Add(cntx, std::string(id.name()), Reason::COMMAND);
++  }
++
++  return is_authed;
+ }
+ 
+ }  // namespace dfly::acl
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index a7cfb52bc90d..f1834f6885fc 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -630,7 +630,7 @@ optional<ShardId> GetRemoteShardToRunAt(const Transaction& tx) {
+ 
+ Service::Service(ProactorPool* pp)
+     : pp_(*pp),
+-      acl_family_(&user_registry_),
++      acl_family_(&user_registry_, pp),
+       server_family_(this),
+       cluster_family_(&server_family_) {
+   CHECK(pp);
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index b9e0461367ea..435afa168c8c 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1013,6 +1013,9 @@ void ServerFamily::Auth(CmdArgList args, ConnectionContext* cntx) {
+       cntx->acl_commands = cred.acl_commands;
+       return (*cntx)->SendOk();
+     }
++    auto& log = ServerState::tlocal()->acl_log;
++    using Reason = acl::AclLog::Reason;
++    log.Add(*cntx, "AUTH", Reason::AUTH, std::string(username));
+     return (*cntx)->SendError(absl::StrCat("Could not authorize user: ", username));
+   }
+ 
+diff --git a/src/server/server_state.h b/src/server/server_state.h
+index fa7d13deed97..e93ad774bfe2 100644
+--- a/src/server/server_state.h
++++ b/src/server/server_state.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/histogram.h"
+ #include "core/interpreter.h"
++#include "server/acl/acl_log.h"
+ #include "server/acl/user_registry.h"
+ #include "server/common.h"
+ #include "server/script_mgr.h"
+@@ -209,6 +210,8 @@ class ServerState {  // public struct - to allow initialization.
+ 
+   acl::UserRegistry* user_registry;
+ 
++  acl::AclLog acl_log;
++
+  private:
+   int64_t live_transactions_ = 0;
+   mi_heap_t* data_heap_;

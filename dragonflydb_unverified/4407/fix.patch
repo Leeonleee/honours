@@ -1,0 +1,280 @@
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index b87e901b473d..d4e777010ea1 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -37,7 +37,7 @@ class ConnectionContext {
+   // connection state / properties.
+   bool conn_closing : 1;
+   bool req_auth : 1;
+-  bool replica_conn : 1;
++  bool replica_conn : 1;  // whether it's a replica connection on the master side.
+   bool authenticated : 1;
+   bool async_dispatch : 1;    // whether this connection is amid an async dispatch
+   bool sync_dispatch : 1;     // whether this connection is amid a sync dispatch
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index a04645cdb256..bcab6c30f2f2 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -610,6 +610,10 @@ Connection::~Connection() {
+   UpdateLibNameVerMap(lib_name_, lib_ver_, -1);
+ }
+ 
++bool Connection::IsSending() const {
++  return reply_builder_ && reply_builder_->IsSendActive();
++}
++
+ // Called from Connection::Shutdown() right after socket_->Shutdown call.
+ void Connection::OnShutdown() {
+   VLOG(1) << "Connection::OnShutdown";
+@@ -1638,9 +1642,6 @@ bool Connection::Migrate(util::fb2::ProactorBase* dest) {
+ 
+ Connection::WeakRef Connection::Borrow() {
+   DCHECK(self_);
+-  // If the connection is unaware of subscriptions, it could migrate threads, making this call
+-  // unsafe. All external mechanisms that borrow references should register subscriptions.
+-  DCHECK_GT(cc_->subscriptions, 0);
+ 
+   return WeakRef(self_, socket_->proactor()->GetPoolIndex(), id_);
+ }
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index f5494396babc..75fecd67fc92 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -303,6 +303,16 @@ class Connection : public util::Connection {
+   static void TrackRequestSize(bool enable);
+   static void EnsureMemoryBudget(unsigned tid);
+ 
++  unsigned idle_time() const {
++    return time(nullptr) - last_interaction_;
++  }
++
++  Phase phase() const {
++    return phase_;
++  }
++
++  bool IsSending() const;
++
+  protected:
+   void OnShutdown() override;
+   void OnPreMigrateThread() override;
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 1b2c391b527d..cc705a38c9d6 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -814,6 +814,7 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*>
+   config_registry.RegisterMutable("migration_finalization_timeout_ms");
+   config_registry.RegisterMutable("table_growth_margin");
+   config_registry.RegisterMutable("tcp_keepalive");
++  config_registry.RegisterMutable("timeout");
+   config_registry.RegisterMutable("managed_service_info");
+ 
+   config_registry.RegisterMutable(
+@@ -849,19 +850,23 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*>
+     shard_num = pp_.size();
+   }
+ 
++  // We assume that listeners.front() is the main_listener
++  // see dfly_main RunEngine. In unit tests, listeners are empty.
++  facade::Listener* main_listener = listeners.empty() ? nullptr : listeners.front();
++
+   ChannelStore* cs = new ChannelStore{};
+   // Must initialize before the shard_set because EngineShard::Init references ServerState.
+   pp_.AwaitBrief([&](uint32_t index, ProactorBase* pb) {
+     tl_facade_stats = new FacadeStats;
+-    ServerState::Init(index, shard_num, &user_registry_);
++    ServerState::Init(index, shard_num, main_listener, &user_registry_);
+     ServerState::tlocal()->UpdateChannelStore(cs);
+   });
+ 
+   const auto tcp_disabled = GetFlag(FLAGS_port) == 0u;
+   // We assume that listeners.front() is the main_listener
+   // see dfly_main RunEngine
+-  if (!tcp_disabled && !listeners.empty()) {
+-    acl_family_.Init(listeners.front(), &user_registry_);
++  if (!tcp_disabled && main_listener) {
++    acl_family_.Init(main_listener, &user_registry_);
+   }
+ 
+   // Initialize shard_set with a callback running once in a while in the shard threads.
+@@ -907,7 +912,7 @@ void Service::Shutdown() {
+   shard_set->Shutdown();
+   Transaction::Shutdown();
+ 
+-  pp_.Await([](ProactorBase* pb) { ServerState::tlocal()->Destroy(); });
++  pp_.AwaitFiberOnAll([](ProactorBase* pb) { ServerState::tlocal()->Destroy(); });
+ 
+   // wait for all the pending callbacks to stop.
+   ThisFiber::SleepFor(10ms);
+diff --git a/src/server/server_state.cc b/src/server/server_state.cc
+index 9bdedc1a7d28..5f29c7271bae 100644
+--- a/src/server/server_state.cc
++++ b/src/server/server_state.cc
+@@ -15,12 +15,19 @@ extern "C" {
+ #include "base/flags.h"
+ #include "base/logging.h"
+ #include "facade/conn_context.h"
++#include "facade/dragonfly_connection.h"
+ #include "server/journal/journal.h"
++#include "util/listener_interface.h"
+ 
+ ABSL_FLAG(uint32_t, interpreter_per_thread, 10, "Lua interpreters per thread");
++ABSL_FLAG(uint32_t, timeout, 0,
++          "Close the connection after it is idle for N seconds (0 to disable)");
+ 
+ namespace dfly {
+ 
++using namespace std;
++using namespace std::chrono_literals;
++
+ __thread ServerState* ServerState::state_ = nullptr;
+ 
+ ServerState::Stats::Stats(unsigned num_shards) : tx_width_freq_arr(num_shards) {
+@@ -102,14 +109,21 @@ ServerState::ServerState() : interpreter_mgr_{absl::GetFlag(FLAGS_interpreter_pe
+ }
+ 
+ ServerState::~ServerState() {
++  watcher_fiber_.JoinIfNeeded();
+ }
+ 
+-void ServerState::Init(uint32_t thread_index, uint32_t num_shards, acl::UserRegistry* registry) {
++void ServerState::Init(uint32_t thread_index, uint32_t num_shards,
++                       util::ListenerInterface* main_listener, acl::UserRegistry* registry) {
+   state_ = new ServerState();
+   state_->gstate_ = GlobalState::ACTIVE;
+   state_->thread_index_ = thread_index;
+   state_->user_registry = registry;
+   state_->stats = Stats(num_shards);
++  if (main_listener) {
++    state_->watcher_fiber_ = util::fb2::Fiber(
++        util::fb2::Launch::post, "ConnectionsWatcher",
++        [state = state_, main_listener] { state->ConnectionsWatcherFb(main_listener); });
++  }
+ }
+ 
+ void ServerState::Destroy() {
+@@ -117,6 +131,11 @@ void ServerState::Destroy() {
+   state_ = nullptr;
+ }
+ 
++void ServerState::EnterLameDuck() {
++  gstate_ = GlobalState::SHUTTING_DOWN;
++  watcher_cv_.notify_all();
++}
++
+ ServerState::MemoryUsageStats ServerState::GetMemoryUsage(uint64_t now_ns) {
+   static constexpr uint64_t kCacheEveryNs = 1000;
+   if (now_ns > used_mem_last_update_ + kCacheEveryNs) {
+@@ -208,4 +227,61 @@ ServerState* ServerState::SafeTLocal() {
+ bool ServerState::ShouldLogSlowCmd(unsigned latency_usec) const {
+   return slow_log_shard_.IsEnabled() && latency_usec >= log_slower_than_usec;
+ }
++
++void ServerState::ConnectionsWatcherFb(util::ListenerInterface* main) {
++  optional<facade::Connection::WeakRef> last_reference;
++
++  while (true) {
++    util::fb2::NoOpLock noop;
++    if (watcher_cv_.wait_for(noop, 1s, [this] { return gstate_ == GlobalState::SHUTTING_DOWN; })) {
++      break;
++    }
++
++    uint32_t timeout = absl::GetFlag(FLAGS_timeout);
++    if (timeout == 0) {
++      continue;
++    }
++
++    facade::Connection* from = nullptr;
++    if (last_reference && !last_reference->IsExpired()) {
++      from = last_reference->Get();
++    }
++
++    // We use weak refs, because ShutdownSelf below can potentially block the fiber,
++    // and during this time some of the connections might be destroyed. Weak refs allow checking
++    // validity of each connection.
++    vector<facade::Connection::WeakRef> conn_refs;
++
++    auto cb = [&](unsigned thread_index, util::Connection* conn) {
++      facade::Connection* dfly_conn = static_cast<facade::Connection*>(conn);
++      using Phase = facade::Connection::Phase;
++      auto phase = dfly_conn->phase();
++      bool is_replica = true;
++      if (dfly_conn->cntx()) {
++        is_replica = dfly_conn->cntx()->replica_conn;
++      }
++
++      if ((phase == Phase::READ_SOCKET || dfly_conn->IsSending()) &&
++          !is_replica && dfly_conn->idle_time() > timeout) {
++        conn_refs.push_back(dfly_conn->Borrow());
++      }
++    };
++
++    util::Connection* next = main->TraverseConnectionsOnThread(cb, 100, from);
++    if (next) {
++      last_reference = static_cast<facade::Connection*>(next)->Borrow();
++    } else {
++      last_reference.reset();
++    }
++
++    for (auto& ref : conn_refs) {
++      facade::Connection* conn = ref.Get();
++      if (conn) {
++        VLOG(1) << "Closing connection due to timeout: " << conn->GetClientInfo();
++        conn->ShutdownSelf();
++      }
++    }
++  }
++}
++
+ }  // end of namespace dfly
+diff --git a/src/server/server_state.h b/src/server/server_state.h
+index 6ea43787f48f..044cd6774c00 100644
+--- a/src/server/server_state.h
++++ b/src/server/server_state.h
+@@ -23,6 +23,10 @@ namespace facade {
+ class Connection;
+ }
+ 
++namespace util {
++class ListenerInterface;
++}
++
+ namespace dfly {
+ 
+ namespace journal {
+@@ -150,12 +154,11 @@ class ServerState {  // public struct - to allow initialization.
+   ServerState();
+   ~ServerState();
+ 
+-  static void Init(uint32_t thread_index, uint32_t num_shards, acl::UserRegistry* registry);
++  static void Init(uint32_t thread_index, uint32_t num_shards,
++                   util::ListenerInterface* main_listener, acl::UserRegistry* registry);
+   static void Destroy();
+ 
+-  void EnterLameDuck() {
+-    state_->gstate_ = GlobalState::SHUTTING_DOWN;
+-  }
++  void EnterLameDuck();
+ 
+   void TxCountInc() {
+     ++live_transactions_;
+@@ -302,6 +305,9 @@ class ServerState {  // public struct - to allow initialization.
+   size_t serialization_max_chunk_size;
+ 
+  private:
++  // A fiber constantly watching connections on the main listener.
++  void ConnectionsWatcherFb(util::ListenerInterface* main);
++
+   int64_t live_transactions_ = 0;
+   SlowLogShard slow_log_shard_;
+   mi_heap_t* data_heap_;
+@@ -321,6 +327,10 @@ class ServerState {  // public struct - to allow initialization.
+   int client_pauses_[2] = {};
+   util::fb2::EventCount client_pause_ec_;
+ 
++  // Monitors connections. Currently responsible for closing timed out connections.
++  util::fb2::Fiber watcher_fiber_;
++  util::fb2::CondVarAny watcher_cv_;
++
+   using Counter = util::SlidingCounter<7>;
+   Counter qps_;
+ 

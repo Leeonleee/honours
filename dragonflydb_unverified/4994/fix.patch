@@ -1,0 +1,761 @@
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 4c325e092d8b..8221193038ba 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -13,6 +13,7 @@
+ #include <numeric>
+ #include <variant>
+ 
++#include "base/cycle_clock.h"
+ #include "base/flags.h"
+ #include "base/histogram.h"
+ #include "base/io_buf.h"
+@@ -23,7 +24,9 @@
+ #include "facade/memcache_parser.h"
+ #include "facade/redis_parser.h"
+ #include "facade/service_interface.h"
++#include "glog/logging.h"
+ #include "io/file.h"
++#include "util/fibers/fibers.h"
+ #include "util/fibers/proactor_base.h"
+ 
+ #ifdef DFLY_USE_SSL
+@@ -93,6 +96,10 @@ ABSL_FLAG(bool, migrate_connections, true,
+           "they operate. Currently this is only supported for Lua script invocations, and can "
+           "happen at most once per connection.");
+ 
++ABSL_FLAG(uint32_t, max_busy_read_usec, 100,
++          "Maximum time we read and parse from "
++          "a socket without yielding. In microseconds.");
++
+ using namespace util;
+ using namespace std;
+ using absl::GetFlag;
+@@ -146,7 +153,7 @@ struct TrafficLogger {
+ 
+ void TrafficLogger::ResetLocked() {
+   if (log_file) {
+-    log_file->Close();
++    std::ignore = log_file->Close();
+     log_file.reset();
+   }
+ }
+@@ -196,7 +203,7 @@ void OpenTrafficLogger(string_view base_path) {
+ 
+   // Write version, incremental numbering :)
+   uint8_t version[1] = {2};
+-  tl_traffic_logger.log_file->Write(version);
++  std::ignore = tl_traffic_logger.log_file->Write(version);
+ }
+ 
+ void LogTraffic(uint32_t id, bool has_more, absl::Span<RespExpr> resp,
+@@ -876,6 +883,7 @@ pair<string, string> Connection::GetClientInfoBeforeAfterTid() const {
+   absl::StrAppend(&after, " irqmatch=", int(cpu == my_cpu_id));
+   if (dispatch_q_.size()) {
+     absl::StrAppend(&after, " pipeline=", dispatch_q_.size());
++    absl::StrAppend(&after, " pbuf=", pending_pipeline_bytes_);
+   }
+   absl::StrAppend(&after, " age=", now - creation_time_, " idle=", now - last_interaction_);
+   string_view phase_name = PHASE_NAMES[phase_];
+@@ -1028,7 +1036,7 @@ void Connection::ConnectionFlow() {
+   if (io_buf_.InputLen() > 0) {
+     phase_ = PROCESS;
+     if (redis_parser_) {
+-      parse_status = ParseRedis();
++      parse_status = ParseRedis(10000);
+     } else {
+       DCHECK(memcache_parser_);
+       parse_status = ParseMemcache();
+@@ -1136,19 +1144,6 @@ void Connection::DispatchSingle(bool has_more, absl::FunctionRef<void()> invoke_
+   // Dispatch async if we're handling a pipeline or if we can't dispatch sync.
+   if (optimize_for_async || !can_dispatch_sync) {
+     SendAsync(cmd_msg_cb());
+-
+-    auto epoch = fb2::FiberSwitchEpoch();
+-
+-    if (async_fiber_epoch_ == epoch) {
+-      // If we pushed too many items without context switching - yield
+-      if (++async_streak_len_ >= 10 && !cc_->async_dispatch) {
+-        async_streak_len_ = 0;
+-        ThisFiber::Yield();
+-      }
+-    } else {
+-      async_streak_len_ = 0;
+-      async_fiber_epoch_ = epoch;
+-    }
+   } else {
+     ShrinkPipelinePool();  // Gradually release pipeline request pool.
+     {
+@@ -1164,20 +1159,17 @@ void Connection::DispatchSingle(bool has_more, absl::FunctionRef<void()> invoke_
+   }
+ }
+ 
+-Connection::ParserStatus Connection::ParseRedis() {
++Connection::ParserStatus Connection::ParseRedis(unsigned max_busy_cycles) {
+   uint32_t consumed = 0;
+   RedisParser::Result result = RedisParser::OK;
+ 
+-  // Re-use connection local resources to reduce allocations
+-  RespVec& parse_args = tmp_parse_args_;
+-  CmdArgVec& cmd_vec = tmp_cmd_vec_;
+-
+-  auto dispatch_sync = [this, &parse_args, &cmd_vec] {
+-    RespExpr::VecToArgList(parse_args, &cmd_vec);
+-    service_->DispatchCommand(absl::MakeSpan(cmd_vec), reply_builder_.get(), cc_.get());
++  auto dispatch_sync = [this] {
++    RespExpr::VecToArgList(tmp_parse_args_, &tmp_cmd_vec_);
++    service_->DispatchCommand(absl::MakeSpan(tmp_cmd_vec_), reply_builder_.get(), cc_.get());
+   };
+-  auto dispatch_async = [this, &parse_args, tlh = mi_heap_get_backing()]() -> MessageHandle {
+-    return {FromArgs(std::move(parse_args), tlh)};
++
++  auto dispatch_async = [this, tlh = mi_heap_get_backing()]() -> MessageHandle {
++    return {FromArgs(std::move(tmp_parse_args_), tlh)};
+   };
+ 
+   ReadBuffer read_buffer = GetReadBuffer();
+@@ -1186,10 +1178,10 @@ Connection::ParserStatus Connection::ParseRedis() {
+     if (read_buffer.ShouldAdvance()) {  // can happen only with io_uring/bundles
+       read_buffer.slice = NextBundleBuffer(read_buffer.available_bytes);
+     }
+-    result = redis_parser_->Parse(read_buffer.slice, &consumed, &parse_args);
++    result = redis_parser_->Parse(read_buffer.slice, &consumed, &tmp_parse_args_);
+     request_consumed_bytes_ += consumed;
+-    if (result == RedisParser::OK && !parse_args.empty()) {
+-      if (RespExpr& first = parse_args.front(); first.type == RespExpr::STRING)
++    if (result == RedisParser::OK && !tmp_parse_args_.empty()) {
++      if (RespExpr& first = tmp_parse_args_.front(); first.type == RespExpr::STRING)
+         DVLOG(2) << "Got Args with first token " << ToSV(first.GetBuf());
+ 
+       if (io_req_size_hist)
+@@ -1198,12 +1190,20 @@ Connection::ParserStatus Connection::ParseRedis() {
+       bool has_more = consumed < read_buffer.available_bytes;
+ 
+       if (tl_traffic_logger.log_file && IsMain() /* log only on the main interface */) {
+-        LogTraffic(id_, has_more, absl::MakeSpan(parse_args), service_->GetContextInfo(cc_.get()));
++        LogTraffic(id_, has_more, absl::MakeSpan(tmp_parse_args_),
++                   service_->GetContextInfo(cc_.get()));
+       }
+ 
+       DispatchSingle(has_more, dispatch_sync, dispatch_async);
+     }
+     read_buffer.Consume(consumed);
++
++    // We must yield from time to time to allow other fibers to run.
++    // Specifically, if a client sends a huge chunk of data resulting in a very long pipeline,
++    // we want to yield to allow AsyncFiber to actually execute on the pending pipeline.
++    if (ThisFiber::GetRunningTimeCycles() > max_busy_cycles) {
++      ThisFiber::Yield();
++    }
+   } while (RedisParser::OK == result && read_buffer.available_bytes > 0 &&
+            !reply_builder_->GetError());
+ 
+@@ -1390,6 +1390,9 @@ auto Connection::IoLoop() -> variant<error_code, ParserStatus> {
+   ParserStatus parse_status = OK;
+ 
+   size_t max_iobfuf_len = GetFlag(FLAGS_max_client_iobuf_len);
++  unsigned max_busy_read_cycles =
++      (base::CycleClock::Frequency() * GetFlag(FLAGS_max_busy_read_usec)) / 1000000U;
++
+   auto* peer = socket_.get();
+   recv_buf_.res_len = 0;
+ 
+@@ -1404,12 +1407,16 @@ auto Connection::IoLoop() -> variant<error_code, ParserStatus> {
+     bool is_iobuf_full = io_buf_.AppendLen() == 0;
+ 
+     if (redis_parser_) {
+-      parse_status = ParseRedis();
++      parse_status = ParseRedis(max_busy_read_cycles);
+     } else {
+       DCHECK(memcache_parser_);
+       parse_status = ParseMemcache();
+     }
+ 
++    if (reply_builder_->GetError()) {
++      return reply_builder_->GetError();
++    }
++
+     if (parse_status == NEED_MORE) {
+       parse_status = OK;
+ 
+@@ -1429,11 +1436,9 @@ auto Connection::IoLoop() -> variant<error_code, ParserStatus> {
+                               [&]() { io_buf_.Reserve(std::min(max_iobfuf_len, parser_hint)); });
+         }
+ 
+-        // If we got a partial request and we couldn't parse the length, just
+-        // double the capacity.
+         // If we got a partial request because iobuf was full, grow it up to
+         // a reasonable limit to save on Recv() calls.
+-        if (io_buf_.AppendLen() < 64u || (is_iobuf_full && capacity < 4096)) {
++        if (is_iobuf_full && capacity < max_iobfuf_len / 2) {
+           // Last io used most of the io_buf to the end.
+           UpdateIoBufCapacity(io_buf_, stats_, [&]() {
+             io_buf_.Reserve(capacity * 2);  // Valid growth range.
+@@ -1441,21 +1446,11 @@ auto Connection::IoLoop() -> variant<error_code, ParserStatus> {
+         }
+ 
+         DCHECK_GT(io_buf_.AppendLen(), 0U);
+-      } else if (io_buf_.AppendLen() == 0) {
+-        // We have a full buffer and we can not progress with parsing.
+-        // This means that we have request too large.
+-        LOG(ERROR) << "Request is too large, closing connection";
+-        parse_status = ERROR;
+-        break;
+       }
+     } else if (parse_status != OK) {
+       break;
+     }
+-    ec = reply_builder_->GetError();
+-  } while (peer->IsOpen() && !ec);
+-
+-  if (ec)
+-    return ec;
++  } while (peer->IsOpen());
+ 
+   return parse_status;
+ }
+@@ -1833,6 +1828,7 @@ void Connection::SendAsync(MessageHandle msg) {
+   // Squashing is only applied to redis commands
+   if (std::holds_alternative<PipelineMessagePtr>(msg.handle)) {
+     pending_pipeline_cmd_cnt_++;
++    pending_pipeline_bytes_ += used_mem;
+   }
+ 
+   if (msg.IsControl()) {
+@@ -1869,7 +1865,10 @@ void Connection::RecycleMessage(MessageHandle msg) {
+ 
+   // Retain pipeline message in pool.
+   if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
++    DCHECK_GE(pending_pipeline_bytes_, used_mem);
++    DCHECK_GE(pending_pipeline_cmd_cnt_, 1u);
+     pending_pipeline_cmd_cnt_--;
++    pending_pipeline_bytes_ -= used_mem;
+     if (stats_->pipeline_cmd_cache_bytes < qbp.pipeline_cache_limit) {
+       stats_->pipeline_cmd_cache_bytes += (*pipe)->StorageCapacity();
+       pipeline_req_pool_.push_back(std::move(*pipe));
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 3b3095a1ee53..5e1e1be97f3a 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -367,7 +367,7 @@ class Connection : public util::Connection {
+   // Create new pipeline request, re-use from pool when possible.
+   PipelineMessagePtr FromArgs(RespVec args, mi_heap_t* heap);
+ 
+-  ParserStatus ParseRedis();
++  ParserStatus ParseRedis(unsigned max_busy_cycles);
+   ParserStatus ParseMemcache();
+ 
+   void OnBreakCb(int32_t mask);
+@@ -427,6 +427,7 @@ class Connection : public util::Connection {
+   util::fb2::Fiber async_fb_;             // async fiber (if started)
+ 
+   uint64_t pending_pipeline_cmd_cnt_ = 0;  // how many queued Redis async commands in dispatch_q
++  size_t pending_pipeline_bytes_ = 0;      // how many bytes of the queued Redis async commands
+ 
+   // how many bytes of the current request have been consumed
+   size_t request_consumed_bytes_ = 0;
+@@ -455,10 +456,6 @@ class Connection : public util::Connection {
+ 
+   unsigned parser_error_ = 0;
+ 
+-  // amount of times we enqued requests asynchronously during the same async_fiber_epoch_.
+-  unsigned async_streak_len_ = 0;
+-  uint64_t async_fiber_epoch_ = 0;
+-
+   BreakerCb breaker_cb_;
+ 
+   // Used by redis parser to avoid allocations
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 91f003b5a466..bf5590b11923 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -116,8 +116,8 @@ ABSL_FLAG(size_t, serialization_max_chunk_size, 64_KB,
+           "Maximum size of a value that may be serialized at once during snapshotting or full "
+           "sync. Values bigger than this threshold will be serialized using streaming "
+           "serialization. 0 - to disable streaming mode");
+-ABSL_FLAG(uint32_t, max_squashed_cmd_num, 32,
+-          "Max number of commands squashed in command squash optimizaiton");
++ABSL_FLAG(uint32_t, max_squashed_cmd_num, 100,
++          "Max number of commands squashed in a single shard during squash optimizaiton");
+ 
+ namespace dfly {
+ 
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 40c4243fda80..155577c2bd3f 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1314,6 +1314,20 @@ void PrintPrometheusMetrics(uint64_t uptime, const Metrics& m, DflyCmd* dfly_cmd
+   AppendMetricWithoutLabels("pipeline_commands_duration_seconds", "",
+                             conn_stats.pipelined_cmd_latency * 1e-6, MetricType::COUNTER,
+                             &resp->body());
++
++  AppendMetricWithoutLabels("cmd_squash_hop_total", "", m.coordinator_stats.multi_squash_executions,
++                            MetricType::COUNTER, &resp->body());
++
++  AppendMetricWithoutLabels("cmd_squash_commands_total", "", m.coordinator_stats.squashed_commands,
++                            MetricType::COUNTER, &resp->body());
++
++  AppendMetricWithoutLabels("cmd_squash_hop_duration_seconds", "",
++                            m.coordinator_stats.multi_squash_exec_hop_usec * 1e-6,
++                            MetricType::COUNTER, &resp->body());
++  AppendMetricWithoutLabels("cmd_squash_hop_reply_seconds", "",
++                            m.coordinator_stats.multi_squash_exec_reply_usec * 1e-6,
++                            MetricType::COUNTER, &resp->body());
++
+   AppendMetricWithoutLabels("commands_squashing_replies_bytes", "",
+                             MultiCommandSquasher::GetRepliesMemSize(), MetricType::GAUGE,
+                             &resp->body());
+@@ -2486,7 +2500,6 @@ string ServerFamily::FormatInfoMetrics(const Metrics& m, std::string_view sectio
+     append("total_commands_processed", conn_stats.command_cnt_main + conn_stats.command_cnt_other);
+     append("instantaneous_ops_per_sec", m.qps);
+     append("total_pipelined_commands", conn_stats.pipelined_cmd_cnt);
+-    append("total_pipelined_squashed_commands", m.coordinator_stats.squashed_commands);
+     append("pipeline_throttle_total", conn_stats.pipeline_throttle_count);
+     append("pipelined_latency_usec", conn_stats.pipelined_cmd_latency);
+     append("total_net_input_bytes", conn_stats.io_read_bytes);
+@@ -2628,9 +2641,6 @@ string ServerFamily::FormatInfoMetrics(const Metrics& m, std::string_view sectio
+     append("eval_shardlocal_coordination_total",
+            m.coordinator_stats.eval_shardlocal_coordination_cnt);
+     append("eval_squashed_flushes", m.coordinator_stats.eval_squashed_flushes);
+-    append("multi_squash_execution_total", m.coordinator_stats.multi_squash_executions);
+-    append("multi_squash_execution_hop_usec", m.coordinator_stats.multi_squash_exec_hop_usec);
+-    append("multi_squash_execution_reply_usec", m.coordinator_stats.multi_squash_exec_reply_usec);
+   };
+ 
+   auto add_repl_info = [&] {
+diff --git a/tools/local/monitoring/grafana/provisioning/dashboards/dragonfly.json b/tools/local/monitoring/grafana/provisioning/dashboards/dragonfly.json
+index 88e0476eaae1..85f1cb9d3c45 100644
+--- a/tools/local/monitoring/grafana/provisioning/dashboards/dragonfly.json
++++ b/tools/local/monitoring/grafana/provisioning/dashboards/dragonfly.json
+@@ -1301,7 +1301,8 @@
+                 "value": 80
+               }
+             ]
+-          }
++          },
++          "unit": "s"
+         },
+         "overrides": []
+       },
+@@ -1311,7 +1312,7 @@
+         "x": 12,
+         "y": 29
+       },
+-      "id": 13,
++      "id": 27,
+       "options": {
+         "alertThreshold": true,
+         "legend": {
+@@ -1335,15 +1336,14 @@
+           "editorMode": "code",
+           "exemplar": true,
+           "expr":
+-              "sum (dragonfly_db_keys{namespace=\"$namespace\",pod=~\"$pod_name\"}) - sum (dragonfly_db_keys_expiring{namespace=\"$namespace\",pod=~\"$pod_name\"}) ",
++              "irate(dragonfly_pipeline_commands_duration_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_pipeline_commands_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
+           "format": "time_series",
+           "interval": "",
+           "intervalFactor": 2,
+-          "legendFormat": "not expiring",
++          "legendFormat": "pipeline",
+           "range": true,
+           "refId": "A",
+-          "step": 240,
+-          "target": ""
++          "step": 240
+         },
+         {
+           "datasource": {
+@@ -1352,18 +1352,37 @@
+           },
+           "editorMode": "code",
+           "exemplar": true,
+-          "expr": "sum (dragonfly_db_keys_expiring{namespace=\"$namespace\",pod=~\"$pod_name\"})",
++          "expr":
++              "irate(dragonfly_cmd_squash_hop_duration_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_cmd_squash_hop_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
+           "format": "time_series",
++          "hide": false,
+           "interval": "",
+           "intervalFactor": 2,
+-          "legendFormat": "expiring",
+-          "metric": "",
++          "legendFormat": "execute_hop",
+           "range": true,
+           "refId": "B",
+           "step": 240
++        },
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${DS_PROMETHEUS}"
++          },
++          "editorMode": "code",
++          "exemplar": true,
++          "expr":
++              "irate(dragonfly_cmd_squash_hop_reply_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_cmd_squash_hop_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
++          "format": "time_series",
++          "hide": false,
++          "interval": "",
++          "intervalFactor": 2,
++          "legendFormat": "reply",
++          "range": true,
++          "refId": "C",
++          "step": 240
+         }
+       ],
+-      "title": "Expiring vs Not-Expiring Keys",
++      "title": "Pipeline Latency",
+       "type": "timeseries"
+     },
+     {
+@@ -1428,7 +1447,7 @@
+       "gridPos": {
+         "h": 7,
+         "w": 12,
+-        "x": 12,
++        "x": 0,
+         "y": 36
+       },
+       "id": 16,
+@@ -1466,19 +1485,6 @@
+       "title": "Dragonfly connected clients",
+       "type": "timeseries"
+     },
+-    {
+-      "collapsed": false,
+-      "gridPos": {
+-        "h": 1,
+-        "w": 24,
+-        "x": 0,
+-        "y": 43
+-      },
+-      "id": 19,
+-      "panels": [],
+-      "title": "Advanced metrics",
+-      "type": "row"
+-    },
+     {
+       "datasource": {
+         "type": "prometheus",
+@@ -1520,6 +1526,7 @@
+               "mode": "off"
+             }
+           },
++          "links": [],
+           "mappings": [],
+           "thresholds": {
+             "mode": "absolute",
+@@ -1533,19 +1540,19 @@
+                 "value": 80
+               }
+             ]
+-          },
+-          "unit": "s"
++          }
+         },
+         "overrides": []
+       },
+       "gridPos": {
+-        "h": 8,
++        "h": 7,
+         "w": 12,
+-        "x": 0,
+-        "y": 44
++        "x": 12,
++        "y": 36
+       },
+-      "id": 18,
++      "id": 13,
+       "options": {
++        "alertThreshold": true,
+         "legend": {
+           "calcs": [],
+           "displayMode": "list",
+@@ -1564,17 +1571,18 @@
+             "type": "prometheus",
+             "uid": "${DS_PROMETHEUS}"
+           },
+-          "disableTextWrap": false,
+           "editorMode": "code",
++          "exemplar": true,
+           "expr":
+-              "irate(dragonfly_fiber_switch_delay_seconds_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/rate(dragonfly_fiber_switch_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
+-          "fullMetaSearch": false,
+-          "includeNullMetadata": false,
+-          "instant": false,
+-          "legendFormat": "switch",
++              "sum (dragonfly_db_keys{namespace=\"$namespace\",pod=~\"$pod_name\"}) - sum (dragonfly_db_keys_expiring{namespace=\"$namespace\",pod=~\"$pod_name\"}) ",
++          "format": "time_series",
++          "interval": "",
++          "intervalFactor": 2,
++          "legendFormat": "not expiring",
+           "range": true,
+           "refId": "A",
+-          "useBackend": false
++          "step": 240,
++          "target": ""
+         },
+         {
+           "datasource": {
+@@ -1582,16 +1590,19 @@
+             "uid": "${DS_PROMETHEUS}"
+           },
+           "editorMode": "code",
+-          "expr":
+-              "irate(dragonfly_fiber_longrun_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_fiber_longrun_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
+-          "hide": false,
+-          "instant": false,
+-          "legendFormat": "longrun",
++          "exemplar": true,
++          "expr": "sum (dragonfly_db_keys_expiring{namespace=\"$namespace\",pod=~\"$pod_name\"})",
++          "format": "time_series",
++          "interval": "",
++          "intervalFactor": 2,
++          "legendFormat": "expiring",
++          "metric": "",
+           "range": true,
+-          "refId": "B"
++          "refId": "B",
++          "step": 240
+         }
+       ],
+-      "title": "FiberSwitchDelay",
++      "title": "Expiring vs Not-Expiring Keys",
+       "type": "timeseries"
+     },
+     {
+@@ -1655,8 +1666,8 @@
+       "gridPos": {
+         "h": 8,
+         "w": 12,
+-        "x": 12,
+-        "y": 44
++        "x": 0,
++        "y": 43
+       },
+       "id": 22,
+       "options": {
+@@ -1694,6 +1705,7 @@
+         "type": "prometheus",
+         "uid": "${DS_PROMETHEUS}"
+       },
++      "description": "",
+       "fieldConfig": {
+         "defaults": {
+           "color": {
+@@ -1747,13 +1759,123 @@
+         },
+         "overrides": []
+       },
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 43
++      },
++      "id": 28,
++      "options": {
++        "legend": {
++          "calcs": [],
++          "displayMode": "list",
++          "placement": "bottom",
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "single",
++          "sort": "none"
++        }
++      },
++      "pluginVersion": "10.1.10",
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${DS_PROMETHEUS}"
++          },
++          "editorMode": "code",
++          "expr":
++              "irate(dragonfly_cmd_squash_commands_total
+{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_cmd_squash_hop_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
++          "instant": false,
++          "legendFormat": "__auto",
++          "range": true,
++          "refId": "A"
++        }
++      ],
++      "title": "Average Squashing Length",
++      "type": "timeseries"
++    },
++    {
++      "collapsed": false,
++      "gridPos": {
++        "h": 1,
++        "w": 24,
++        "x": 0,
++        "y": 51
++      },
++      "id": 19,
++      "panels": [],
++      "title": "Advanced metrics",
++      "type": "row"
++    },
++    {
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${DS_PROMETHEUS}"
++      },
++      "fieldConfig": {
++        "defaults": {
++          "color": {
++            "mode": "palette-classic"
++          },
++          "custom": {
++            "axisCenteredZero": false,
++            "axisColorMode": "text",
++            "axisLabel": "",
++            "axisPlacement": "auto",
++            "barAlignment": 0,
++            "drawStyle": "line",
++            "fillOpacity": 0,
++            "gradientMode": "none",
++            "hideFrom": {
++              "legend": false,
++              "tooltip": false,
++              "viz": false
++            },
++            "insertNulls": false,
++            "lineInterpolation": "linear",
++            "lineWidth": 1,
++            "pointSize": 5,
++            "scaleDistribution": {
++              "type": "linear"
++            },
++            "showPoints": "auto",
++            "spanNulls": false,
++            "stacking": {
++              "group": "A",
++              "mode": "none"
++            },
++            "thresholdsStyle": {
++              "mode": "off"
++            }
++          },
++          "mappings": [],
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "red",
++                "value": 80
++              }
++            ]
++          },
++          "unit": "s"
++        },
++        "overrides": []
++      },
+       "gridPos": {
+         "h": 8,
+         "w": 12,
+         "x": 0,
+         "y": 52
+       },
+-      "id": 21,
++      "id": 18,
+       "options": {
+         "legend": {
+           "calcs": [],
+@@ -1773,13 +1895,17 @@
+             "type": "prometheus",
+             "uid": "${DS_PROMETHEUS}"
+           },
++          "disableTextWrap": false,
+           "editorMode": "code",
+           "expr":
+-              "dragonfly_replication_full_sync_bytes{namespace=\"$namespace\",pod=~\"$pod_name\"}",
++              "irate(dragonfly_fiber_switch_delay_seconds_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/rate(dragonfly_fiber_switch_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
++          "fullMetaSearch": false,
++          "includeNullMetadata": false,
+           "instant": false,
+-          "legendFormat": "fullsync",
++          "legendFormat": "switch",
+           "range": true,
+-          "refId": "A"
++          "refId": "A",
++          "useBackend": false
+         },
+         {
+           "datasource": {
+@@ -1788,15 +1914,15 @@
+           },
+           "editorMode": "code",
+           "expr":
+-              "dragonfly_replication_streaming_bytes{namespace=\"$namespace\",pod=~\"$pod_name\"}",
++              "irate(dragonfly_fiber_longrun_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_fiber_longrun_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
+           "hide": false,
+           "instant": false,
+-          "legendFormat": "stable_sync",
++          "legendFormat": "longrun",
+           "range": true,
+           "refId": "B"
+         }
+       ],
+-      "title": "Master Replication memory",
++      "title": "FiberSwitchDelay",
+       "type": "timeseries"
+     },
+     {
+@@ -1853,8 +1979,7 @@
+                 "value": 80
+               }
+             ]
+-          },
+-          "unit": "s"
++          }
+         },
+         "overrides": []
+       },
+@@ -1864,7 +1989,7 @@
+         "x": 12,
+         "y": 52
+       },
+-      "id": 23,
++      "id": 21,
+       "options": {
+         "legend": {
+           "calcs": [],
+@@ -1886,14 +2011,28 @@
+           },
+           "editorMode": "code",
+           "expr":
+-              "irate(dragonfly_pipeline_commands_duration_seconds{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])/irate(dragonfly_pipeline_commands_total{namespace=\"$namespace\",pod=~\"$pod_name\"}[$__rate_interval])",
++              "dragonfly_replication_full_sync_bytes{namespace=\"$namespace\",pod=~\"$pod_name\"}",
+           "instant": false,
+-          "legendFormat": "{{pod}}",
++          "legendFormat": "fullsync",
+           "range": true,
+           "refId": "A"
++        },
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${DS_PROMETHEUS}"
++          },
++          "editorMode": "code",
++          "expr":
++              "dragonfly_replication_streaming_bytes{namespace=\"$namespace\",pod=~\"$pod_name\"}",
++          "hide": false,
++          "instant": false,
++          "legendFormat": "stable_sync",
++          "range": true,
++          "refId": "B"
+         }
+       ],
+-      "title": "Pipeline latency",
++      "title": "Master Replication memory",
+       "type": "timeseries"
+     }
+   ],
