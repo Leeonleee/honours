@@ -1,0 +1,219 @@
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index a69525c81df3..b50765160ffd 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -791,15 +791,11 @@ bool RemoveIncomingMigrationImpl(std::vector<std::shared_ptr<IncomingSlotMigrati
+ 
+   // TODO make it outside in one run with other slots that should be flushed
+   if (!removed.Empty()) {
+-    auto removed_ranges = make_shared<SlotRanges>(removed.ToSlotRanges());
++    auto removed_ranges = removed.ToSlotRanges();
+     LOG_IF(WARNING, migration->GetState() == MigrationState::C_FINISHED)
+         << "Flushing slots of removed FINISHED migration " << migration->GetSourceID()
+-        << ", slots: " << SlotRange::ToString(*removed_ranges);
+-    shard_set->pool()->DispatchOnAll([removed_ranges](unsigned, ProactorBase*) {
+-      if (EngineShard* shard = EngineShard::tlocal(); shard) {
+-        shard->db_slice().FlushSlots(*removed_ranges);
+-      }
+-    });
++        << ", slots: " << SlotRange::ToString(removed_ranges);
++    DeleteSlots(removed_ranges);
+   }
+ 
+   return true;
+@@ -844,7 +840,7 @@ void ClusterFamily::InitMigration(CmdArgList args, ConnectionContext* cntx) {
+ 
+   lock_guard lk(migration_mu_);
+   auto was_removed = RemoveIncomingMigrationImpl(incoming_migrations_jobs_, source_id);
+-  LOG_IF(WARNING, was_removed) << "Reinit was happen for migration from:" << source_id;
++  LOG_IF(WARNING, was_removed) << "Reinit issued for migration from:" << source_id;
+ 
+   incoming_migrations_jobs_.emplace_back(make_shared<IncomingSlotMigration>(
+       std::move(source_id), &server_family_->service(), std::move(slots), flows_num));
+diff --git a/src/server/cluster/outgoing_slot_migration.cc b/src/server/cluster/outgoing_slot_migration.cc
+index 7261138a67d7..3920f6977905 100644
+--- a/src/server/cluster/outgoing_slot_migration.cc
++++ b/src/server/cluster/outgoing_slot_migration.cc
+@@ -58,17 +58,11 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
+       return;
+     }
+ 
+-    // Check if migration was cancelled while we yielded so far.
+-    if (cancelled_) {
+-      return;
+-    }
+-
+     streamer_.Start(Sock());
+   }
+ 
+   void Cancel() {
+     streamer_.Cancel();
+-    cancelled_ = true;
+   }
+ 
+   void Finalize() {
+@@ -81,7 +75,6 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
+ 
+  private:
+   RestoreStreamer streamer_;
+-  bool cancelled_ = false;
+ };
+ 
+ OutgoingMigration::OutgoingMigration(MigrationInfo info, ClusterFamily* cf, ServerFamily* sf)
+@@ -94,6 +87,13 @@ OutgoingMigration::OutgoingMigration(MigrationInfo info, ClusterFamily* cf, Serv
+ 
+ OutgoingMigration::~OutgoingMigration() {
+   main_sync_fb_.JoinIfNeeded();
++
++  // Destroy each flow in its dedicated thread, because we could be the last owner of the db tables
++  shard_set->pool()->AwaitFiberOnAll([this](util::ProactorBase* pb) {
++    if (const auto* shard = EngineShard::tlocal(); shard) {
++      slot_migrations_[shard->shard_id()].reset();
++    }
++  });
+ }
+ 
+ bool OutgoingMigration::ChangeState(MigrationState new_state) {
+diff --git a/src/server/journal/journal_slice.cc b/src/server/journal/journal_slice.cc
+index f7c068f4613b..e916a09a6c95 100644
+--- a/src/server/journal/journal_slice.cc
++++ b/src/server/journal/journal_slice.cc
+@@ -165,6 +165,7 @@ void JournalSlice::AddLogRecord(const Entry& entry, bool await) {
+     item = &dummy;
+     item->opcode = entry.opcode;
+     item->lsn = lsn_++;
++    item->cmd = entry.payload.cmd;
+     item->slot = entry.slot;
+ 
+     io::BufSink buf_sink{&ring_serialize_buf_};
+diff --git a/src/server/journal/streamer.cc b/src/server/journal/streamer.cc
+index c00c2ae877af..a3f42b9ab505 100644
+--- a/src/server/journal/streamer.cc
++++ b/src/server/journal/streamer.cc
+@@ -34,7 +34,7 @@ uint32_t replication_stream_output_limit_cached = 64_KB;
+ }  // namespace
+ 
+ JournalStreamer::JournalStreamer(journal::Journal* journal, Context* cntx)
+-    : journal_(journal), cntx_(cntx) {
++    : cntx_(cntx), journal_(journal) {
+   // cache the flag to avoid accessing it later.
+   replication_stream_output_limit_cached = absl::GetFlag(FLAGS_replication_stream_output_limit);
+ }
+@@ -44,7 +44,7 @@ JournalStreamer::~JournalStreamer() {
+   VLOG(1) << "~JournalStreamer";
+ }
+ 
+-void JournalStreamer::Start(io::AsyncSink* dest, bool send_lsn) {
++void JournalStreamer::Start(util::FiberSocketBase* dest, bool send_lsn) {
+   CHECK(dest_ == nullptr && dest != nullptr);
+   dest_ = dest;
+   journal_cb_id_ =
+@@ -188,9 +188,13 @@ RestoreStreamer::RestoreStreamer(DbSlice* slice, cluster::SlotSet slots, journal
+                                  Context* cntx)
+     : JournalStreamer(journal, cntx), db_slice_(slice), my_slots_(std::move(slots)) {
+   DCHECK(slice != nullptr);
++  db_array_ = slice->databases();  // Inc ref to make sure DB isn't deleted while we use it
+ }
+ 
+-void RestoreStreamer::Start(io::AsyncSink* dest, bool send_lsn) {
++void RestoreStreamer::Start(util::FiberSocketBase* dest, bool send_lsn) {
++  if (fiber_cancelled_)
++    return;
++
+   VLOG(1) << "RestoreStreamer start";
+   auto db_cb = absl::bind_front(&RestoreStreamer::OnDbChange, this);
+   snapshot_version_ = db_slice_->RegisterOnChange(std::move(db_cb));
+@@ -199,7 +203,7 @@ void RestoreStreamer::Start(io::AsyncSink* dest, bool send_lsn) {
+ 
+   PrimeTable::Cursor cursor;
+   uint64_t last_yield = 0;
+-  PrimeTable* pt = &db_slice_->databases()[0]->prime;
++  PrimeTable* pt = &db_array_[0]->prime;
+ 
+   do {
+     if (fiber_cancelled_)
+@@ -244,14 +248,22 @@ RestoreStreamer::~RestoreStreamer() {
+ void RestoreStreamer::Cancel() {
+   auto sver = snapshot_version_;
+   snapshot_version_ = 0;  // to prevent double cancel in another fiber
++  fiber_cancelled_ = true;
+   if (sver != 0) {
+-    fiber_cancelled_ = true;
+     db_slice_->UnregisterOnChange(sver);
+     JournalStreamer::Cancel();
+   }
+ }
+ 
+ bool RestoreStreamer::ShouldWrite(const journal::JournalItem& item) const {
++  if (item.cmd == "FLUSHALL" || item.cmd == "FLUSHDB") {
++    // On FLUSH* we restart the migration
++    CHECK(dest_ != nullptr);
++    cntx_->ReportError("FLUSH command during migration");
++    dest_->Shutdown(SHUT_RDWR);
++    return false;
++  }
++
+   if (!item.slot.has_value()) {
+     return false;
+   }
+diff --git a/src/server/journal/streamer.h b/src/server/journal/streamer.h
+index 7cb8b34bf5d4..aa61f24fe0b2 100644
+--- a/src/server/journal/streamer.h
++++ b/src/server/journal/streamer.h
+@@ -23,7 +23,7 @@ class JournalStreamer {
+   JournalStreamer(JournalStreamer&& other) = delete;
+ 
+   // Register journal listener and start writer in fiber.
+-  virtual void Start(io::AsyncSink* dest, bool send_lsn);
++  virtual void Start(util::FiberSocketBase* dest, bool send_lsn);
+ 
+   // Must be called on context cancellation for unblocking
+   // and manual cleanup.
+@@ -48,6 +48,9 @@ class JournalStreamer {
+ 
+   void WaitForInflightToComplete();
+ 
++  util::FiberSocketBase* dest_ = nullptr;
++  Context* cntx_;
++
+  private:
+   void OnCompletion(std::error_code ec, size_t len);
+ 
+@@ -58,8 +61,6 @@ class JournalStreamer {
+   bool IsStalled() const;
+ 
+   journal::Journal* journal_;
+-  Context* cntx_;
+-  io::AsyncSink* dest_ = nullptr;
+   std::vector<uint8_t> pending_buf_;
+   size_t in_flight_bytes_ = 0;
+   time_t last_lsn_time_ = 0;
+@@ -74,7 +75,7 @@ class RestoreStreamer : public JournalStreamer {
+   RestoreStreamer(DbSlice* slice, cluster::SlotSet slots, journal::Journal* journal, Context* cntx);
+   ~RestoreStreamer() override;
+ 
+-  void Start(io::AsyncSink* dest, bool send_lsn = false) override;
++  void Start(util::FiberSocketBase* dest, bool send_lsn = false) override;
+   // Cancel() must be called if Start() is called
+   void Cancel() override;
+ 
+@@ -96,6 +97,7 @@ class RestoreStreamer : public JournalStreamer {
+   void WriteCommand(journal::Entry::Payload cmd_payload);
+ 
+   DbSlice* db_slice_;
++  DbTableArray db_array_;
+   uint64_t snapshot_version_ = 0;
+   cluster::SlotSet my_slots_;
+   bool fiber_cancelled_ = false;
+diff --git a/src/server/journal/types.h b/src/server/journal/types.h
+index aeb0286ca65f..63c35b9befc9 100644
+--- a/src/server/journal/types.h
++++ b/src/server/journal/types.h
+@@ -95,6 +95,7 @@ struct JournalItem {
+   LSN lsn;
+   Op opcode;
+   std::string data;
++  std::string_view cmd;
+   std::optional<cluster::SlotId> slot;
+ };
+ 

@@ -1,0 +1,224 @@
+diff --git a/src/core/compact_object.cc b/src/core/compact_object.cc
+index dc8fbfc7fdbb..6d7db4ae1895 100644
+--- a/src/core/compact_object.cc
++++ b/src/core/compact_object.cc
+@@ -574,6 +574,12 @@ size_t CompactObj::Size() const {
+       case ROBJ_TAG:
+         raw_size = u_.r_obj.Size();
+         break;
++      case JSON_TAG:
++        raw_size = u_.json_obj.json_len;
++        break;
++      case SBF_TAG:
++        raw_size = u_.sbf->current_size();
++        break;
+       default:
+         LOG(DFATAL) << "Should not reach " << int(taglen_);
+     }
+@@ -684,9 +690,11 @@ void CompactObj::SetJson(JsonType&& j) {
+   if (taglen_ == JSON_TAG && u_.json_obj.encoding == kEncodingJsonCons) {
+     // already json
+     DCHECK(u_.json_obj.json_ptr != nullptr);  // must be allocated
++    u_.json_obj.json_len = j.size();
+     u_.json_obj.json_ptr->swap(j);
+   } else {
+     SetMeta(JSON_TAG);
++    u_.json_obj.json_len = j.size();
+     u_.json_obj.json_ptr = AllocateMR<JsonType>(std::move(j));
+     u_.json_obj.encoding = kEncodingJsonCons;
+   }
+@@ -842,6 +850,11 @@ bool CompactObj::HasAllocated() const {
+   return true;
+ }
+ 
++bool CompactObj::TagAllowsEmptyValue() const {
++  const auto type = ObjType();
++  return type == OBJ_JSON || type == OBJ_STREAM || type == OBJ_STRING || type == OBJ_SBF;
++}
++
+ void __attribute__((noinline)) CompactObj::GetString(string* res) const {
+   res->resize(Size());
+   GetString(res->data());
+diff --git a/src/core/compact_object.h b/src/core/compact_object.h
+index 1dcb0aa72528..fb50ae6ca1c5 100644
+--- a/src/core/compact_object.h
++++ b/src/core/compact_object.h
+@@ -398,6 +398,12 @@ class CompactObj {
+ 
+   bool HasAllocated() const;
+ 
++  bool TagAllowsEmptyValue() const;
++
++  uint8_t Tag() const {
++    return taglen_;
++  }
++
+  private:
+   void EncodeString(std::string_view str);
+   size_t DecodedLen(size_t sz) const;
+diff --git a/src/server/container_utils.cc b/src/server/container_utils.cc
+index aea658012f8c..14eca9bbc274 100644
+--- a/src/server/container_utils.cc
++++ b/src/server/container_utils.cc
+@@ -34,7 +34,7 @@ struct ShardFFResult {
+ 
+ // Returns (iterator, args-index) if found, KEY_NOTFOUND otherwise.
+ // If multiple keys are found, returns the first index in the ArgSlice.
+-OpResult<std::pair<DbSlice::ConstIterator, unsigned>> FindFirstReadOnly(const DbSlice& db_slice,
++OpResult<std::pair<DbSlice::ConstIterator, unsigned>> FindFirstReadOnly(DbSlice& db_slice,
+                                                                         const DbContext& cntx,
+                                                                         const ShardArgs& args,
+                                                                         int req_obj_type) {
+diff --git a/src/server/db_slice.cc b/src/server/db_slice.cc
+index d19dbba6edc2..ec36fd55ba8c 100644
+--- a/src/server/db_slice.cc
++++ b/src/server/db_slice.cc
+@@ -426,14 +426,25 @@ OpResult<DbSlice::ItAndUpdater> DbSlice::FindMutableInternal(const Context& cntx
+   }
+ }
+ 
+-DbSlice::ItAndExpConst DbSlice::FindReadOnly(const Context& cntx, std::string_view key) const {
++bool DbSlice::DelEmptyPrimeValue(const Context& cntx, Iterator it) {
++  auto& pv = it->second;
++  if (!pv.TagAllowsEmptyValue() && pv.Size() == 0) {
++    auto key = it.key();
++    LOG(ERROR) << "Found empty key: " << key << " with obj type " << pv.ObjType();
++    Del(cntx, it);
++    return true;
++  }
++  return false;
++}
++
++DbSlice::ItAndExpConst DbSlice::FindReadOnly(const Context& cntx, std::string_view key) {
+   auto res = FindInternal(cntx, key, std::nullopt, UpdateStatsMode::kReadStats);
+   return {ConstIterator(res->it, StringOrView::FromView(key)),
+           ExpConstIterator(res->exp_it, StringOrView::FromView(key))};
+ }
+ 
+ OpResult<DbSlice::ConstIterator> DbSlice::FindReadOnly(const Context& cntx, string_view key,
+-                                                       unsigned req_obj_type) const {
++                                                       unsigned req_obj_type) {
+   auto res = FindInternal(cntx, key, req_obj_type, UpdateStatsMode::kReadStats);
+   if (res.ok()) {
+     return ConstIterator(res->it, StringOrView::FromView(key));
+@@ -443,7 +454,7 @@ OpResult<DbSlice::ConstIterator> DbSlice::FindReadOnly(const Context& cntx, stri
+ 
+ OpResult<DbSlice::PrimeItAndExp> DbSlice::FindInternal(const Context& cntx, std::string_view key,
+                                                        std::optional<unsigned> req_obj_type,
+-                                                       UpdateStatsMode stats_mode) const {
++                                                       UpdateStatsMode stats_mode) {
+   if (!IsDbValid(cntx.db_index)) {
+     return OpStatus::KEY_NOTFOUND;
+   }
+@@ -537,6 +548,9 @@ OpResult<DbSlice::PrimeItAndExp> DbSlice::FindInternal(const Context& cntx, std:
+   // We do not use TopKey feature, so disable it until we redesign it.
+   // db.top_keys.Touch(key);
+ 
++  if (DelEmptyPrimeValue(cntx, Iterator(res.it, StringOrView::FromView(key)))) {
++    return OpStatus::KEY_NOTFOUND;
++  }
+   return res;
+ }
+ 
+diff --git a/src/server/db_slice.h b/src/server/db_slice.h
+index f741018eb093..af13788dfb5c 100644
+--- a/src/server/db_slice.h
++++ b/src/server/db_slice.h
+@@ -292,9 +292,9 @@ class DbSlice {
+     ExpConstIterator exp_it;
+   };
+ 
+-  ItAndExpConst FindReadOnly(const Context& cntx, std::string_view key) const;
++  ItAndExpConst FindReadOnly(const Context& cntx, std::string_view key);
+   OpResult<ConstIterator> FindReadOnly(const Context& cntx, std::string_view key,
+-                                       unsigned req_obj_type) const;
++                                       unsigned req_obj_type);
+ 
+   struct AddOrFindResult {
+     Iterator it;
+@@ -515,6 +515,8 @@ class DbSlice {
+   void PreUpdate(DbIndex db_ind, Iterator it, std::string_view key);
+   void PostUpdate(DbIndex db_ind, Iterator it, std::string_view key, size_t orig_size);
+ 
++  bool DelEmptyPrimeValue(const Context& cntx, Iterator it);
++
+   OpResult<AddOrFindResult> AddOrUpdateInternal(const Context& cntx, std::string_view key,
+                                                 PrimeValue obj, uint64_t expire_at_ms,
+                                                 bool force_update);
+@@ -555,7 +557,7 @@ class DbSlice {
+ 
+   OpResult<PrimeItAndExp> FindInternal(const Context& cntx, std::string_view key,
+                                        std::optional<unsigned> req_obj_type,
+-                                       UpdateStatsMode stats_mode) const;
++                                       UpdateStatsMode stats_mode);
+   OpResult<ItAndUpdater> FindMutableInternal(const Context& cntx, std::string_view key,
+                                              std::optional<unsigned> req_obj_type);
+ 
+diff --git a/src/server/rdb_load.cc b/src/server/rdb_load.cc
+index a4b25b31c0d2..be12324ff87a 100644
+--- a/src/server/rdb_load.cc
++++ b/src/server/rdb_load.cc
+@@ -2465,10 +2465,21 @@ void RdbLoader::LoadItemsBuffer(DbIndex db_ind, const ItemsBuf& ib) {
+   for (const auto* item : ib) {
+     PrimeValue pv;
+     if (ec_ = FromOpaque(item->val, &pv); ec_) {
++      if ((*ec_).value() == errc::empty_key) {
++        LOG(ERROR) << "Found empty key: " << item->key << " in DB " << db_ind << " rdb_type "
++                   << item->val.rdb_type;
++        continue;
++      }
+       LOG(ERROR) << "Could not load value for key '" << item->key << "' in DB " << db_ind;
+       stop_early_ = true;
+       break;
+     }
++    // We need this extra check because we don't return empty_key
++    if (!pv.TagAllowsEmptyValue() && pv.Size() == 0) {
++      LOG(ERROR) << "Found empty key: " << item->key << " in DB " << db_ind << " rdb_type "
++                 << item->val.rdb_type;
++      continue;
++    }
+ 
+     if (item->expire_ms > 0 && db_cntx.time_now_ms >= item->expire_ms)
+       continue;
+diff --git a/src/server/rdb_load.h b/src/server/rdb_load.h
+index 3eafe91e1f73..caf71d4a13ef 100644
+--- a/src/server/rdb_load.h
++++ b/src/server/rdb_load.h
+@@ -59,7 +59,7 @@ class RdbLoaderBase {
+ 
+   struct OpaqueObj {
+     RdbVariant obj;
+-    int rdb_type;
++    int rdb_type{0};
+   };
+ 
+   struct LoadBlob {
+diff --git a/src/server/rdb_save.cc b/src/server/rdb_save.cc
+index d5d7ce906383..12f6297f5970 100644
+--- a/src/server/rdb_save.cc
++++ b/src/server/rdb_save.cc
+@@ -337,6 +337,13 @@ error_code RdbSerializer::SelectDb(uint32_t dbid) {
+ // Called by snapshot
+ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValue& pv,
+                                              uint64_t expire_ms, DbIndex dbid) {
++  if (!pv.TagAllowsEmptyValue() && pv.Size() == 0) {
++    string_view key = pk.GetSlice(&tmp_str_);
++    LOG(ERROR) << "SaveEntry skipped empty PrimeValue with key: " << key << " with tag "
++               << pv.Tag();
++    return 0;
++  }
++
+   DVLOG(3) << "Selecting " << dbid << " previous: " << last_entry_db_index_;
+   SelectDb(dbid);
+ 
+@@ -357,9 +364,9 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
+       return make_unexpected(ec);
+   }
+ 
+-  string_view key = pk.GetSlice(&tmp_str_);
+   uint8_t rdb_type = RdbObjectType(pv);
+ 
++  string_view key = pk.GetSlice(&tmp_str_);
+   DVLOG(3) << ((void*)this) << ": Saving key/val start " << key << " in dbid=" << dbid;
+ 
+   if (auto ec = WriteOpcode(rdb_type); ec)

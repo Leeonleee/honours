@@ -1,0 +1,231 @@
+diff --git a/src/server/test_utils.cc b/src/server/test_utils.cc
+index 6fdd8f9e5889..2f334c45bbec 100644
+--- a/src/server/test_utils.cc
++++ b/src/server/test_utils.cc
+@@ -138,7 +138,7 @@ void BaseFamilyTest::SetUp() {
+ 
+   Service::InitOpts opts;
+   opts.disable_time_update = true;
+-  service_->Init(nullptr, nullptr, opts);
++  service_->Init(nullptr, {}, opts);
+ 
+   TEST_current_time_ms = absl::GetCurrentTimeNanos() / 1000000;
+   auto cb = [&](EngineShard* s) { s->db_slice().UpdateExpireBase(TEST_current_time_ms - 1000, 0); };
+diff --git a/tests/dragonfly/__init__.py b/tests/dragonfly/__init__.py
+index 3436c4bd7441..5f26746e66a6 100644
+--- a/tests/dragonfly/__init__.py
++++ b/tests/dragonfly/__init__.py
+@@ -3,6 +3,7 @@
+ import subprocess
+ import aiohttp
+ from prometheus_client.parser import text_string_to_metric_families
++from redis.asyncio import Redis as RedisClient
+ 
+ from dataclasses import dataclass
+ 
+@@ -32,6 +33,10 @@ def __init__(self, params: DflyParams, args):
+         self.args = args
+         self.params = params
+         self.proc = None
++        self._client : Optional[RedisClient] = None
++
++    def client(self) -> RedisClient:
++        return RedisClient(port=self.port)
+ 
+     def start(self):
+         self._start()
+diff --git a/tests/dragonfly/replication_test.py b/tests/dragonfly/replication_test.py
+index 9275bb0ce12f..1e053b6ab258 100644
+--- a/tests/dragonfly/replication_test.py
++++ b/tests/dragonfly/replication_test.py
+@@ -937,7 +937,6 @@ async def assert_lag_condition(inst, client, condition):
+         assert False, "Lag has never satisfied condition!"
+ 
+ 
+-
+ @dfly_args({"proactor_threads": 2})
+ @pytest.mark.asyncio
+ async def test_replication_info(df_local_factory, df_seeder_factory, n_keys=2000):
+@@ -1069,3 +1068,114 @@ async def test_readonly_script(df_local_factory):
+         assert False
+     except aioredis.ResponseError as roe:
+         assert 'READONLY ' in str(roe)
++
++
++take_over_cases = [
++    [2, 2],
++    [2, 4],
++    [4, 2],
++    [8, 8],
++]
++
++
++@pytest.mark.parametrize("master_threads, replica_threads", take_over_cases)
++@pytest.mark.asyncio
++async def test_take_over_counters(df_local_factory, master_threads, replica_threads):
++    master = df_local_factory.create(proactor_threads=master_threads,
++                                     port=BASE_PORT,
++                                     #  vmodule="journal_slice=2,dflycmd=2,main_service=1",
++                                     logtostderr=True)
++    replica1 = df_local_factory.create(
++        port=BASE_PORT+1, proactor_threads=replica_threads)
++    replica2 = df_local_factory.create(
++        port=BASE_PORT+2, proactor_threads=replica_threads)
++    replica3 = df_local_factory.create(
++        port=BASE_PORT+3, proactor_threads=replica_threads)
++    df_local_factory.start_all([master, replica1, replica2, replica3])
++    async with (
++        master.client() as c_master,
++        replica1.client() as c1,
++        master.client() as c_blocking,
++        replica2.client() as c2,
++        replica3.client() as c3,
++    ):
++        await c1.execute_command(f"REPLICAOF localhost {master.port}")
++        await c2.execute_command(f"REPLICAOF localhost {master.port}")
++        await c3.execute_command(f"REPLICAOF localhost {master.port}")
++
++        await wait_available_async(c1)
++
++        async def counter(key):
++            value = 0
++            await c_master.execute_command(f"SET {key} 0")
++            start = time.time()
++            while time.time() - start < 20:
++                try:
++                    value = await c_master.execute_command(f"INCR {key}")
++                except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError) as e:
++                    break
++            else:
++                assert False, "The incrementing loop should be exited with a connection error"
++            return key, value
++
++        async def block_during_takeover():
++            "Add a blocking command during takeover to make sure it doesn't block it."
++            # TODO: We need to make takeover interrupt blocking commands.
++            return
++            try:
++                await c_blocking.execute_command("BLPOP BLOCKING_KEY1 BLOCKING_KEY2 10")
++            except redis.exceptions.ConnectionError:
++                pass
++
++        async def delayed_takeover():
++            await asyncio.sleep(1)
++            await c1.execute_command(f"REPLTAKEOVER 5")
++
++        _, _, *results = await asyncio.gather(delayed_takeover(), block_during_takeover(), *[counter(f"key{i}") for i in range(16)])
++        assert await c1.execute_command("role") == [b'master', []]
++
++        for key, client_value in results:
++            replicated_value = await c1.get(key)
++            assert client_value == int(replicated_value)
++
++
++@pytest.mark.parametrize("master_threads, replica_threads", take_over_cases)
++@pytest.mark.asyncio
++async def test_take_over_seeder(df_local_factory, df_seeder_factory, master_threads, replica_threads):
++    master = df_local_factory.create(proactor_threads=master_threads,
++                                     port=BASE_PORT,
++                                     dbfilename=f"dump_{master_threads}_{replica_threads}",
++                                     logtostderr=True)
++    replica = df_local_factory.create(
++        port=BASE_PORT+1, proactor_threads=replica_threads)
++    df_local_factory.start_all([master, replica])
++
++    seeder = df_seeder_factory.create(port=master.port, keys=1000, dbcount=5, stop_on_failure=False)
++    async with (
++        master.client() as c_master,
++        replica.client() as c_replica,
++    ):
++        await c_replica.execute_command(f"REPLICAOF localhost {master.port}")
++        await wait_available_async(c_replica)
++
++        async def seed():
++            await seeder.run(target_ops=3000)
++
++        fill_task = asyncio.create_task(seed())
++
++        # Give the seeder a bit of time.
++        await asyncio.sleep(1)
++        await c_replica.execute_command(f"REPLTAKEOVER 5")
++        seeder.stop()
++
++        assert await c_replica.execute_command("role") == [b'master', []]
++
++        # Need to wait a bit to give time to write the shutdown snapshot
++        await asyncio.sleep(1)
++        assert master.proc.poll() == 0, "Master process did not exit correctly."
++
++        master.start()
++        await wait_available_async(c_master)
++
++        capture = await seeder.capture()
++        assert await seeder.compare(capture, port=replica.port)
+diff --git a/tests/dragonfly/server_family_test.py b/tests/dragonfly/server_family_test.py
+index 8151533198f6..1bf043331023 100644
+--- a/tests/dragonfly/server_family_test.py
++++ b/tests/dragonfly/server_family_test.py
+@@ -62,10 +62,21 @@ async def test_connection_name(async_client: aioredis.Redis):
+     assert name == "test_conn_name"
+ 
+ 
+-'''
+-make sure that the scan command is working with python
+-'''
++async def test_client_list(df_factory):
++    instance = df_factory.create(port=1111, admin_port=1112)
++    instance.start()
++    async with (aioredis.Redis(port=instance.port) as client, aioredis.Redis(port=instance.admin_port) as admin_client):
++        await client.ping()
++        await admin_client.ping()
++        assert len(await client.execute_command("CLIENT LIST")) == 2
++        assert len(await admin_client.execute_command("CLIENT LIST")) == 2
++    instance.stop()
++
++
+ async def test_scan(async_client: aioredis.Redis):
++    '''
++    make sure that the scan command is working with python
++    '''
+     def gen_test_data():
+         for i in range(10):
+             yield f"key-{i}", f"value-{i}"
+diff --git a/tests/dragonfly/utility.py b/tests/dragonfly/utility.py
+index ef9eb78c96d8..d62d99ac6619 100644
+--- a/tests/dragonfly/utility.py
++++ b/tests/dragonfly/utility.py
+@@ -2,6 +2,7 @@
+ import sys
+ import asyncio
+ from redis import asyncio as aioredis
++import redis
+ import random
+ import string
+ import itertools
+@@ -342,7 +343,7 @@ class DflySeeder:
+         assert await seeder.compare(capture, port=1112)
+     """
+ 
+-    def __init__(self, port=6379, keys=1000, val_size=50, batch_size=100, max_multikey=5, dbcount=1, multi_transaction_probability=0.3, log_file=None, unsupported_types=[]):
++    def __init__(self, port=6379, keys=1000, val_size=50, batch_size=100, max_multikey=5, dbcount=1, multi_transaction_probability=0.3, log_file=None, unsupported_types=[], stop_on_failure=True):
+         self.gen = CommandGenerator(
+             keys, val_size, batch_size, max_multikey, unsupported_types
+         )
+@@ -350,6 +351,7 @@ def __init__(self, port=6379, keys=1000, val_size=50, batch_size=100, max_multik
+         self.dbcount = dbcount
+         self.multi_transaction_probability = multi_transaction_probability
+         self.stop_flag = False
++        self.stop_on_failure = stop_on_failure
+ 
+         self.log_file = log_file
+         if self.log_file is not None:
+@@ -496,6 +498,9 @@ async def _executor_task(self, db, queue):
+ 
+             try:
+                 await pipe.execute()
++            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError) as e:
++                if self.stop_on_failure:
++                    raise SystemExit(e)
+             except Exception as e:
+                 raise SystemExit(e)
+             queue.task_done()

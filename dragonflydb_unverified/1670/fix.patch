@@ -1,0 +1,192 @@
+diff --git a/helio b/helio
+index c8ccbbdf9113..963304405500 160000
+--- a/helio
++++ b/helio
+@@ -1,1 +1,1 @@
+-Subproject commit c8ccbbdf9113e5d3f1dc16c6cb96396ac7e3694d
++Subproject commit 96330440550013c69da14ae173049bf80e1e9257
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index f415b09698c8..5ce02265f09c 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -11,6 +11,7 @@
+ #include "base/flags.h"
+ #include "base/logging.h"
+ #include "facade/conn_context.h"
++#include "facade/dragonfly_listener.h"
+ #include "facade/memcache_parser.h"
+ #include "facade/redis_parser.h"
+ #include "facade/service_interface.h"
+@@ -399,8 +400,7 @@ uint32_t Connection::GetClientId() const {
+ }
+ 
+ bool Connection::IsAdmin() const {
+-  uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
+-  return socket_->LocalEndpoint().port() == admin_port;
++  return static_cast<Listener*>(owner())->IsAdminInterface();
+ }
+ 
+ io::Result<bool> Connection::CheckForHttpProto(FiberSocketBase* peer) {
+diff --git a/src/facade/dragonfly_listener.cc b/src/facade/dragonfly_listener.cc
+index 05e681de1f21..1f2b7f0a412d 100644
+--- a/src/facade/dragonfly_listener.cc
++++ b/src/facade/dragonfly_listener.cc
+@@ -202,6 +202,14 @@ bool Listener::AwaitDispatches(absl::Duration timeout,
+   return false;
+ }
+ 
++bool Listener::IsAdminInterface() const {
++  return is_admin_;
++}
++
++void Listener::SetAdminInterface(bool is_admin) {
++  is_admin_ = is_admin;
++}
++
+ void Listener::PreShutdown() {
+   // Iterate on all connections and allow them to finish their commands for
+   // a short period.
+@@ -267,6 +275,10 @@ void Listener::OnConnectionClose(util::Connection* conn) {
+   }
+ }
+ 
++void Listener::OnMaxConnectionsReached(util::FiberSocketBase* sock) {
++  sock->Write(io::Buffer("-ERR max number of clients reached\r
+"));
++}
++
+ // We can limit number of threads handling dragonfly connections.
+ ProactorBase* Listener::PickConnectionProactor(util::FiberSocketBase* sock) {
+   util::ProactorPool* pp = pool();
+diff --git a/src/facade/dragonfly_listener.h b/src/facade/dragonfly_listener.h
+index d81832241870..b5a4041437f4 100644
+--- a/src/facade/dragonfly_listener.h
++++ b/src/facade/dragonfly_listener.h
+@@ -35,12 +35,16 @@ class Listener : public util::ListenerInterface {
+   bool AwaitDispatches(absl::Duration timeout,
+                        const std::function<bool(util::Connection*)>& filter);
+ 
++  bool IsAdminInterface() const;
++  void SetAdminInterface(bool is_admin = true);
++
+  private:
+   util::Connection* NewConnection(ProactorBase* proactor) final;
+   ProactorBase* PickConnectionProactor(util::FiberSocketBase* sock) final;
+ 
+   void OnConnectionStart(util::Connection* conn) final;
+   void OnConnectionClose(util::Connection* conn) final;
++  void OnMaxConnectionsReached(util::FiberSocketBase* sock) final;
+   void PreAcceptLoop(ProactorBase* pb) final;
+ 
+   void PreShutdown() final;
+@@ -58,6 +62,8 @@ class Listener : public util::ListenerInterface {
+ 
+   std::atomic_uint32_t next_id_{0};
+ 
++  bool is_admin_ = false;
++
+   uint32_t conn_cnt_{0};
+   uint32_t min_cnt_thread_id_{0};
+   int32_t min_cnt_{0};
+diff --git a/src/server/config_registry.cc b/src/server/config_registry.cc
+index c805614badb4..2f99a211355c 100644
+--- a/src/server/config_registry.cc
++++ b/src/server/config_registry.cc
+@@ -39,6 +39,17 @@ bool ConfigRegistry::Set(std::string_view config_name, std::string_view value) {
+   return cb(*flag);
+ }
+ 
++std::optional<std::string> ConfigRegistry::Get(std::string_view config_name) {
++  unique_lock lk(mu_);
++  if (!registry_.contains(config_name))
++    return std::nullopt;
++  lk.unlock();
++
++  absl::CommandLineFlag* flag = absl::FindCommandLineFlag(config_name);
++  CHECK(flag);
++  return flag->CurrentValue();
++}
++
+ void ConfigRegistry::Reset() {
+   unique_lock lk(mu_);
+   registry_.clear();
+diff --git a/src/server/config_registry.h b/src/server/config_registry.h
+index 92eb4d1a568f..ae7c8eacff9b 100644
+--- a/src/server/config_registry.h
++++ b/src/server/config_registry.h
+@@ -19,6 +19,8 @@ class ConfigRegistry {
+   // Returns true if the value was updated.
+   bool Set(std::string_view config_name, std::string_view value);
+ 
++  std::optional<std::string> Get(std::string_view config_name);
++
+   void Reset();
+ 
+  private:
+diff --git a/src/server/dfly_main.cc b/src/server/dfly_main.cc
+index 829666d08608..4dab9d6a10ea 100644
+--- a/src/server/dfly_main.cc
++++ b/src/server/dfly_main.cc
+@@ -388,6 +388,7 @@ bool RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
+     const std::string printable_addr =
+         absl::StrCat("admin socket ", interface_addr ? interface_addr : "any", ":", admin_port);
+     Listener* admin_listener = new Listener{Protocol::REDIS, &service};
++    admin_listener->SetAdminInterface();
+     error_code ec = acceptor->AddListener(interface_addr, admin_port, admin_listener);
+ 
+     if (ec) {
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 146b73b6ae77..1fc83089faa9 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -59,6 +59,8 @@ ABSL_FLAG(string, dbfilename, "dump-{timestamp}", "the filename to save/load the
+ ABSL_FLAG(string, requirepass, "",
+           "password for AUTH authentication. "
+           "If empty can also be set with DFLY_PASSWORD environment variable.");
++ABSL_FLAG(uint32_t, maxclients, 64000, "Maximum number of concurrent clients allowed.");
++
+ ABSL_FLAG(string, save_schedule, "",
+           "glob spec for the UTC time to save a snapshot which matches HH:MM 24h time");
+ ABSL_FLAG(string, snapshot_cron, "",
+@@ -563,12 +565,28 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
+ ServerFamily::~ServerFamily() {
+ }
+ 
++void SetMaxClients(std::vector<facade::Listener*>& listeners, uint32_t maxclients) {
++  for (auto* listener : listeners) {
++    if (!listener->IsAdminInterface()) {
++      listener->SetMaxClients(maxclients);
++    }
++  }
++}
++
+ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
+   CHECK(acceptor_ == nullptr);
+   acceptor_ = acceptor;
+   listeners_ = std::move(listeners);
+   dfly_cmd_ = make_unique<DflyCmd>(this);
+ 
++  SetMaxClients(listeners_, absl::GetFlag(FLAGS_maxclients));
++  config_registry.Register("maxclients", [this](const absl::CommandLineFlag& flag) {
++    auto res = flag.TryGet<uint32_t>();
++    if (res.has_value())
++      SetMaxClients(listeners_, res.value());
++    return res.has_value();
++  });
++
+   pb_task_ = shard_set->pool()->GetNextProactor();
+   if (pb_task_->GetKind() == ProactorBase::EPOLL) {
+     fq_threadpool_.reset(new FiberQueueThreadPool(absl::GetFlag(FLAGS_epoll_file_threads)));
+@@ -1514,9 +1532,10 @@ void ServerFamily::Config(CmdArgList args, ConnectionContext* cntx) {
+     if (param == "databases") {
+       res.emplace_back(param);
+       res.push_back(absl::StrCat(absl::GetFlag(FLAGS_dbnum)));
+-    } else if (param == "maxmemory") {
++    } else if (auto value_from_registry = config_registry.Get(param);
++               value_from_registry.has_value()) {
+       res.emplace_back(param);
+-      res.push_back(absl::StrCat(max_memory_limit));
++      res.push_back(*value_from_registry);
+     }
+ 
+     return (*cntx)->SendStringArr(res, RedisReplyBuilder::MAP);

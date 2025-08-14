@@ -1,0 +1,231 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ba911ccc303f..0d81066493fa 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -162,8 +162,12 @@ jobs:
+         run: |
+           cd ${GITHUB_WORKSPACE}/build
+           echo Run ctest -V -L DFLY
++
+           GLOG_alsologtostderr=1 GLOG_vmodule=rdb_load=1,rdb_save=1,snapshot=1,op_manager=1,op_manager_test=1 \
+-          FLAGS_fiber_safety_margin=4096 FLAGS_list_experimental_v2=true timeout 20m ctest -V -L DFLY
++          FLAGS_fiber_safety_margin=4096 FLAGS_list_experimental_v2=true timeout 20m ctest -V -L DFLY -E allocation_tracker_test
++
++          # Run allocation tracker test separately without alsologtostderr because it generates a TON of logs.
++          FLAGS_fiber_safety_margin=4096 timeout 5m ./allocation_tracker_test
+ 
+           echo "Running tests with --force_epoll"
+ 
+@@ -176,7 +180,9 @@ jobs:
+           EOF
+ 
+           gdb -ix ./init.gdb --batch -ex r --args ./dragonfly_test --force_epoll
+-          FLAGS_fiber_safety_margin=4096 FLAGS_force_epoll=true GLOG_vmodule=rdb_load=1,rdb_save=1,snapshot=1 timeout 20m ctest -V -L DFLY
++          FLAGS_fiber_safety_margin=4096 FLAGS_force_epoll=true GLOG_vmodule=rdb_load=1,rdb_save=1,snapshot=1 timeout 20m ctest -V -L DFLY -E allocation_tracker_test
++
++          FLAGS_fiber_safety_margin=4096 FLAGS_force_epoll=true timeout 5m ./allocation_tracker_test
+ 
+           echo "Finished running tests with --force_epoll"
+ 
+diff --git a/src/facade/command_id.h b/src/facade/command_id.h
+index 9d4dc82563ed..51760a570289 100644
+--- a/src/facade/command_id.h
++++ b/src/facade/command_id.h
+@@ -97,7 +97,12 @@ class CommandId {
+ 
+   // PSUBSCRIBE/PUNSUBSCRIBE variant
+   bool IsPSub() const {
+-    return is_p_sub_;
++    return is_p_pub_sub_;
++  }
++
++  // SSUBSCRIBE/SUNSUBSCRIBE variant
++  bool IsShardedPSub() const {
++    return is_sharded_pub_sub_;
+   }
+ 
+  protected:
+@@ -118,7 +123,8 @@ class CommandId {
+   bool restricted_ = false;
+ 
+   bool is_pub_sub_ = false;
+-  bool is_p_sub_ = false;
++  bool is_sharded_pub_sub_ = false;
++  bool is_p_pub_sub_ = false;
+ };
+ 
+ }  // namespace facade
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index cacd8e4bba2b..3eefce36a9f0 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -138,7 +138,9 @@ CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first
+   if (name_ == "PUBLISH" || name_ == "SUBSCRIBE" || name_ == "UNSUBSCRIBE") {
+     is_pub_sub_ = true;
+   } else if (name_ == "PSUBSCRIBE" || name_ == "PUNSUBSCRIBE") {
+-    is_p_sub_ = true;
++    is_p_pub_sub_ = true;
++  } else if (name_ == "SPUBLISH" || name_ == "SSUBSCRIBE" || name_ == "SUNSUBSCRIBE") {
++    is_sharded_pub_sub_ = true;
+   }
+ }
+ 
+diff --git a/src/server/acl/validator.cc b/src/server/acl/validator.cc
+index b1f5e39f11be..4089ac1843db 100644
+--- a/src/server/acl/validator.cc
++++ b/src/server/acl/validator.cc
+@@ -27,7 +27,7 @@ inline bool Matches(std::string_view pattern, std::string_view target) {
+ 
+   std::pair<bool, AclLog::Reason> auth_res;
+ 
+-  if (id.IsPubSub()) {
++  if (id.IsPubSub() || id.IsShardedPSub()) {
+     auth_res = IsPubSubCommandAuthorized(false, cntx.acl_commands, cntx.pub_sub, tail_args, id);
+   } else if (id.IsPSub()) {
+     auth_res = IsPubSubCommandAuthorized(true, cntx.acl_commands, cntx.pub_sub, tail_args, id);
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index c2441d630534..1bc00ee47e18 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -920,6 +920,20 @@ void Service::Shutdown() {
+   facade::Connection::Shutdown();
+ }
+ 
++OpResult<KeyIndex> Service::FindKeys(const CommandId* cid, CmdArgList args) {
++  if (!cid->IsShardedPSub()) {
++    return DetermineKeys(cid, args);
++  }
++
++  // Sharded pub sub
++  // Command form: SPUBLISH shardchannel message
++  if (cid->name() == registry_.RenamedOrOriginal("SPUBLISH")) {
++    return {KeyIndex(0, 1)};
++  }
++
++  return {KeyIndex(0, args.size())};
++}
++
+ optional<ErrorReply> Service::CheckKeysOwnership(const CommandId* cid, CmdArgList args,
+                                                  const ConnectionContext& dfly_cntx) {
+   if (dfly_cntx.is_replicating) {
+@@ -927,11 +941,12 @@ optional<ErrorReply> Service::CheckKeysOwnership(const CommandId* cid, CmdArgLis
+     return nullopt;
+   }
+ 
+-  if (cid->first_key_pos() == 0) {
++  if (cid->first_key_pos() == 0 && !cid->IsShardedPSub()) {
+     return nullopt;  // No key command.
+   }
+ 
+-  OpResult<KeyIndex> key_index_res = DetermineKeys(cid, args);
++  OpResult<KeyIndex> key_index_res = FindKeys(cid, args);
++
+   if (!key_index_res) {
+     return ErrorReply{key_index_res.status()};
+   }
+@@ -2244,8 +2259,9 @@ void Service::Exec(CmdArgList args, const CommandContext& cmd_cntx) {
+   VLOG(2) << "Exec completed";
+ }
+ 
+-void Service::Publish(CmdArgList args, const CommandContext& cmd_cntx) {
+-  if (IsClusterEnabled()) {
++namespace {
++void PublishImpl(bool reject_cluster, CmdArgList args, const CommandContext& cmd_cntx) {
++  if (reject_cluster && IsClusterEnabled()) {
+     return cmd_cntx.rb->SendError("PUBLISH is not supported in cluster mode yet");
+   }
+   string_view channel = ArgS(args, 0);
+@@ -2255,17 +2271,17 @@ void Service::Publish(CmdArgList args, const CommandContext& cmd_cntx) {
+   cmd_cntx.rb->SendLong(cs->SendMessages(channel, messages));
+ }
+ 
+-void Service::Subscribe(CmdArgList args, const CommandContext& cmd_cntx) {
+-  if (IsClusterEnabled()) {
++void SubscribeImpl(bool reject_cluster, CmdArgList args, const CommandContext& cmd_cntx) {
++  if (reject_cluster && IsClusterEnabled()) {
+     return cmd_cntx.rb->SendError("SUBSCRIBE is not supported in cluster mode yet");
+   }
+   cmd_cntx.conn_cntx->ChangeSubscription(true /*add*/, true /* reply*/, std::move(args),
+                                          static_cast<RedisReplyBuilder*>(cmd_cntx.rb));
+ }
+ 
+-void Service::Unsubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
++void UnSubscribeImpl(bool reject_cluster, CmdArgList args, const CommandContext& cmd_cntx) {
+   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+-  if (IsClusterEnabled()) {
++  if (reject_cluster && IsClusterEnabled()) {
+     return cmd_cntx.rb->SendError("UNSUBSCRIBE is not supported in cluster mode yet");
+   }
+ 
+@@ -2276,6 +2292,32 @@ void Service::Unsubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
+   }
+ }
+ 
++}  // namespace
++
++void Service::Publish(CmdArgList args, const CommandContext& cmd_cntx) {
++  PublishImpl(true, args, cmd_cntx);
++}
++
++void Service::SPublish(CmdArgList args, const CommandContext& cmd_cntx) {
++  PublishImpl(false, args, cmd_cntx);
++}
++
++void Service::Subscribe(CmdArgList args, const CommandContext& cmd_cntx) {
++  SubscribeImpl(true, args, cmd_cntx);
++}
++
++void Service::SSubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
++  SubscribeImpl(false, args, cmd_cntx);
++}
++
++void Service::Unsubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
++  UnSubscribeImpl(true, args, cmd_cntx);
++}
++
++void Service::SUnsubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
++  UnSubscribeImpl(false, args, cmd_cntx);
++}
++
+ void Service::PSubscribe(CmdArgList args, const CommandContext& cmd_cntx) {
+   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+ 
+@@ -2641,9 +2683,13 @@ void Service::Register(CommandRegistry* registry) {
+              .SetValidator(&EvalValidator)
+       << CI{"EXEC", CO::LOADING | CO::NOSCRIPT, 1, 0, 0, acl::kExec}.MFUNC(Exec)
+       << CI{"PUBLISH", CO::LOADING | CO::FAST, 3, 0, 0, acl::kPublish}.MFUNC(Publish)
++      << CI{"SPUBLISH", CO::LOADING | CO::FAST, 3, 0, 0, acl::kPublish}.MFUNC(SPublish)
+       << CI{"SUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -2, 0, 0, acl::kSubscribe}.MFUNC(Subscribe)
++      << CI{"SSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -2, 0, 0, acl::kSubscribe}.MFUNC(SSubscribe)
+       << CI{"UNSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -1, 0, 0, acl::kUnsubscribe}.MFUNC(
+              Unsubscribe)
++      << CI{"SUNSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -1, 0, 0, acl::kUnsubscribe}.MFUNC(
++             SUnsubscribe)
+       << CI{"PSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -2, 0, 0, acl::kPSubscribe}.MFUNC(PSubscribe)
+       << CI{"PUNSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -1, 0, 0, acl::kPUnsubsribe}.MFUNC(
+              PUnsubscribe)
+diff --git a/src/server/main_service.h b/src/server/main_service.h
+index 151f61c08518..32a7386deca8 100644
+--- a/src/server/main_service.h
++++ b/src/server/main_service.h
+@@ -136,8 +136,11 @@ class Service : public facade::ServiceInterface {
+   void EvalShaRo(CmdArgList args, const CommandContext& cmd_cntx);
+   void Exec(CmdArgList args, const CommandContext& cmd_cntx);
+   void Publish(CmdArgList args, const CommandContext& cmd_cntx);
++  void SPublish(CmdArgList args, const CommandContext& cmd_cntx);
+   void Subscribe(CmdArgList args, const CommandContext& cmd_cntx);
++  void SSubscribe(CmdArgList args, const CommandContext& cmd_cntx);
+   void Unsubscribe(CmdArgList args, const CommandContext& cmd_cntx);
++  void SUnsubscribe(CmdArgList args, const CommandContext& cmd_cntx);
+   void PSubscribe(CmdArgList args, const CommandContext& cmd_cntx);
+   void PUnsubscribe(CmdArgList args, const CommandContext& cmd_cntx);
+   void Function(CmdArgList args, const CommandContext& cmd_cntx);
+@@ -169,6 +172,8 @@ class Service : public facade::ServiceInterface {
+ 
+   void CallFromScript(ConnectionContext* cntx, Interpreter::CallArgs& args);
+ 
++  OpResult<KeyIndex> FindKeys(const CommandId* cid, CmdArgList args);
++
+   void RegisterCommands();
+   void Register(CommandRegistry* registry);
+ 

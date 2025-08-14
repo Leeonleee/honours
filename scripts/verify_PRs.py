@@ -5,9 +5,9 @@ import sys
 from datetime import datetime
 
 # Configurations
-PR_FOLDER_PATH = "../prs"
+PR_FOLDER_PATH = "../dragonflydb_unverified"
 # PR_FOLDER_PATH = "../prs"
-DUCKDB_REPO_PATH = "../duckdb"
+DUCKDB_REPO_PATH = "../repos/dragonfly"
 PROCESS_SCRIPT_PATH = "process_single_pr.py"
 
 # def run(cmd, cwd=None, check=True):
@@ -134,6 +134,9 @@ def main():
 
                 continue
 
+            # COMMENT START HERE IF YOU WANT TO ONLY PROCESS, NOT VERIFY
+            """
+
             # Compile baseline code
             print("🔧 Compiling code...")
             if not build_duckdb(DUCKDB_REPO_PATH, log_file=log_file):
@@ -224,7 +227,10 @@ def main():
             for verified_pr in valid_prs:
                 print(verified_pr)
                 log_file.write(verified_pr + "\n")
-            log_file.flush()  # optional: flush to disk immediately
+            log_file.flush()  # optional: flush to disk immediatelyA
+
+            # COMMENT END HERE IF YOU WANT TO PROCESS ONLY
+            """
             # Reset DuckDB repo
             run("git reset --hard", cwd=DUCKDB_REPO_PATH, log_file=log_file)
             run("git clean -fd", cwd=DUCKDB_REPO_PATH, log_file=log_file)

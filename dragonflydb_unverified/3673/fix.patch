@@ -1,0 +1,191 @@
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 685771367d84..9ea6cf5b79f3 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -509,6 +509,19 @@ void Connection::DispatchOperations::operator()(const InvalidationMessage& msg)
+   }
+ }
+ 
++namespace {
++thread_local absl::flat_hash_map<string, uint64_t> g_libname_ver_map;
++
++void UpdateLibNameVerMap(const string& name, const string& ver, int delta) {
++  string key = absl::StrCat(name, ":", ver);
++  uint64_t& val = g_libname_ver_map[key];
++  val += delta;
++  if (val == 0) {
++    g_libname_ver_map.erase(key);
++  }
++}
++}  // namespace
++
+ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
+                        ServiceInterface* service)
+     : io_buf_(kMinReadSize),
+@@ -553,12 +566,16 @@ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener,
+     SSL_CTX_up_ref(ctx);
+   }
+ #endif
++
++  UpdateLibNameVerMap(lib_name_, lib_ver_, +1);
+ }
+ 
+ Connection::~Connection() {
+ #ifdef DFLY_USE_SSL
+   SSL_CTX_free(ssl_ctx_);
+ #endif
++
++  UpdateLibNameVerMap(lib_name_, lib_ver_, -1);
+ }
+ 
+ // Called from Connection::Shutdown() right after socket_->Shutdown call.
+@@ -798,6 +815,7 @@ string Connection::GetClientInfo(unsigned thread_id) const {
+   auto [before, after] = GetClientInfoBeforeAfterTid();
+   absl::StrAppend(&before, " tid=", thread_id);
+   absl::StrAppend(&before, after);
++  absl::StrAppend(&before, " lib-name=", lib_name_, " lib-ver=", lib_ver_);
+   return before;
+ }
+ 
+@@ -838,6 +856,22 @@ void Connection::SetName(std::string name) {
+   name_ = std::move(name);
+ }
+ 
++void Connection::SetLibName(std::string name) {
++  UpdateLibNameVerMap(lib_name_, lib_ver_, -1);
++  lib_name_ = std::move(name);
++  UpdateLibNameVerMap(lib_name_, lib_ver_, +1);
++}
++
++void Connection::SetLibVersion(std::string version) {
++  UpdateLibNameVerMap(lib_name_, lib_ver_, -1);
++  lib_ver_ = std::move(version);
++  UpdateLibNameVerMap(lib_name_, lib_ver_, +1);
++}
++
++const absl::flat_hash_map<string, uint64_t>& Connection::GetLibStatsTL() {
++  return g_libname_ver_map;
++}
++
+ io::Result<bool> Connection::CheckForHttpProto(FiberSocketBase* peer) {
+   if (!IsPrivileged() && !IsMain()) {
+     return false;
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 3d3067f486b4..bb9613ff1844 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -275,6 +275,12 @@ class Connection : public util::Connection {
+ 
+   void SetName(std::string name);
+ 
++  void SetLibName(std::string name);
++  void SetLibVersion(std::string version);
++
++  // Returns a map of 'libname:libver'->count, thread local data
++  static const absl::flat_hash_map<std::string, uint64_t>& GetLibStatsTL();
++
+   std::string_view GetName() const {
+     return name_;
+   }
+@@ -401,6 +407,9 @@ class Connection : public util::Connection {
+   Phase phase_ = SETUP;
+   std::string name_;
+ 
++  std::string lib_name_;
++  std::string lib_ver_;
++
+   unsigned parser_error_ = 0;
+ 
+   // amount of times we enqued requests asynchronously during the same async_fiber_epoch_.
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 2c57015c5d30..b703862379f1 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -541,6 +541,31 @@ void ClientCaching(CmdArgList args, ConnectionContext* cntx) {
+   cntx->SendOk();
+ }
+ 
++void ClientSetInfo(CmdArgList args, ConnectionContext* cntx) {
++  if (args.size() != 2) {
++    return cntx->SendError(kSyntaxErr);
++  }
++
++  auto* conn = cntx->conn();
++  if (conn == nullptr) {
++    return cntx->SendError("No connection");
++  }
++
++  ToUpper(&args[0]);
++  string_view type = ArgS(args, 0);
++  string_view val = ArgS(args, 1);
++
++  if (type == "LIB-NAME") {
++    conn->SetLibName(string(val));
++  } else if (type == "LIB-VER") {
++    conn->SetLibVersion(string(val));
++  } else {
++    return cntx->SendError(kSyntaxErr);
++  }
++
++  cntx->SendOk();
++}
++
+ void ClientId(CmdArgList args, ConnectionContext* cntx) {
+   if (args.size() != 0) {
+     return cntx->SendError(kSyntaxErr);
+@@ -1207,6 +1232,13 @@ void PrintPrometheusMetrics(const Metrics& m, DflyCmd* dfly_cmd, StringResponse*
+   AppendMetricWithoutLabels("pipeline_commands_duration_seconds", "",
+                             conn_stats.pipelined_cmd_latency * 1e-6, MetricType::COUNTER,
+                             &resp->body());
++  string connections_libs;
++  AppendMetricHeader("connections_libs", "Total number of connections by libname:ver",
++                     MetricType::GAUGE, &connections_libs);
++  for (const auto& [lib, count] : m.connections_lib_name_ver_map) {
++    AppendMetricValue("connections_libs", count, {"lib"}, {lib}, &connections_libs);
++  }
++  absl::StrAppend(&resp->body(), connections_libs);
+ 
+   // Memory metrics
+   auto sdata_res = io::ReadStatusInfo();
+@@ -1770,14 +1802,12 @@ void ServerFamily::Client(CmdArgList args, ConnectionContext* cntx) {
+     return ClientKill(sub_args, absl::MakeSpan(listeners_), cntx);
+   } else if (sub_cmd == "CACHING") {
+     return ClientCaching(sub_args, cntx);
++  } else if (sub_cmd == "SETINFO") {
++    return ClientSetInfo(sub_args, cntx);
+   } else if (sub_cmd == "ID") {
+     return ClientId(sub_args, cntx);
+   }
+ 
+-  if (sub_cmd == "SETINFO") {
+-    return cntx->SendOk();
+-  }
+-
+   LOG_FIRST_N(ERROR, 10) << "Subcommand " << sub_cmd << " not supported";
+   return cntx->SendError(UnknownSubCmd(sub_cmd, "CLIENT"), kSyntaxErrType);
+ }
+@@ -2049,6 +2079,11 @@ Metrics ServerFamily::GetMetrics(Namespace* ns) const {
+ 
+     result.lua_stats += InterpreterManager::tl_stats();
+ 
++    auto connections_lib_name_ver_map = facade::Connection::GetLibStatsTL();
++    for (auto& [k, v] : connections_lib_name_ver_map) {
++      result.connections_lib_name_ver_map[k] += v;
++    }
++
+     service_.mutable_registry()->MergeCallStats(index, cmd_stat_cb);
+   };  // cb
+ 
+diff --git a/src/server/server_family.h b/src/server/server_family.h
+index f2c6d6a3be07..52052237f3e8 100644
+--- a/src/server/server_family.h
++++ b/src/server/server_family.h
+@@ -123,6 +123,8 @@ struct Metrics {
+   // command call frequencies (count, aggregated latency in usec).
+   std::map<std::string, std::pair<uint64_t, uint64_t>> cmd_stats_map;
+ 
++  absl::flat_hash_map<std::string, uint64_t> connections_lib_name_ver_map;
++
+   // Replica info on the master side.
+   std::vector<ReplicaRoleInfo> master_side_replicas_info;
+ 

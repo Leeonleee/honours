@@ -1,0 +1,180 @@
+diff --git a/src/core/search/indices.cc b/src/core/search/indices.cc
+index 6eb9f0d67746..538d844b8759 100644
+--- a/src/core/search/indices.cc
++++ b/src/core/search/indices.cc
+@@ -149,6 +149,15 @@ void BaseStringIndex<C>::Remove(DocId id, DocumentAccessor* doc, string_view fie
+   }
+ }
+ 
++template <typename C> vector<string> BaseStringIndex<C>::GetTerms() const {
++  vector<string> res;
++  res.reserve(entries_.size());
++  for (const auto& [term, _] : entries_) {
++    res.push_back(string{term});
++  }
++  return res;
++}
++
+ template struct BaseStringIndex<CompressedSortedSet>;
+ template struct BaseStringIndex<SortedVector>;
+ 
+diff --git a/src/core/search/indices.h b/src/core/search/indices.h
+index c94944a2143c..e8b070e618a2 100644
+--- a/src/core/search/indices.h
++++ b/src/core/search/indices.h
+@@ -51,6 +51,9 @@ template <typename C> struct BaseStringIndex : public BaseIndex {
+   // Pointer is valid as long as index is not mutated. Nullptr if not found
+   const Container* Matching(std::string_view str) const;
+ 
++  // Returns all the terms that appear as keys in the reverse index.
++  std::vector<std::string> GetTerms() const;
++
+  protected:
+   Container* GetOrCreate(std::string_view word);
+ 
+diff --git a/src/facade/error.h b/src/facade/error.h
+index d973b9d334ac..d46b4e71bf8a 100644
+--- a/src/facade/error.h
++++ b/src/facade/error.h
+@@ -39,5 +39,6 @@ extern const char kInvalidDumpValueErr[];
+ extern const char kSyntaxErrType[];
+ extern const char kScriptErrType[];
+ extern const char kConfigErrType[];
++extern const char kSearchErrType[];
+ 
+ }  // namespace facade
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index 041df090a874..01596a4b07d9 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -101,6 +101,7 @@ const char kInvalidDumpValueErr[] = "DUMP payload version or checksum are wrong"
+ const char kSyntaxErrType[] = "syntax_error";
+ const char kScriptErrType[] = "script_error";
+ const char kConfigErrType[] = "config_error";
++const char kSearchErrType[] = "search_error";
+ 
+ const char* RespExpr::TypeName(Type t) {
+   switch (t) {
+diff --git a/src/server/search/doc_index.cc b/src/server/search/doc_index.cc
+index 7daf0cca8942..fd98d3c83743 100644
+--- a/src/server/search/doc_index.cc
++++ b/src/server/search/doc_index.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/logging.h"
+ #include "core/overloaded.h"
++#include "core/search/indices.h"
+ #include "server/engine_shard_set.h"
+ #include "server/search/doc_accessors.h"
+ #include "server/server_state.h"
+@@ -17,6 +18,8 @@
+ namespace dfly {
+ 
+ using namespace std;
++using facade::ErrorReply;
++using nonstd::make_unexpected;
+ 
+ namespace {
+ 
+@@ -269,6 +272,20 @@ DocIndexInfo ShardDocIndex::GetInfo() const {
+   return {*base_, key_index_.Size()};
+ }
+ 
++io::Result<StringVec, ErrorReply> ShardDocIndex::GetTagVals(string_view field) const {
++  search::BaseIndex* base_index = indices_.GetIndex(field);
++  if (base_index == nullptr) {
++    return make_unexpected(ErrorReply{"-No such field"});
++  }
++
++  search::TagIndex* tag_index = dynamic_cast<search::TagIndex*>(base_index);
++  if (tag_index == nullptr) {
++    return make_unexpected(ErrorReply{"-Not a tag field"});
++  }
++
++  return tag_index->GetTerms();
++}
++
+ ShardDocIndices::ShardDocIndices() : local_mr_{ServerState::tlocal()->data_heap()} {
+ }
+ 
+diff --git a/src/server/search/doc_index.h b/src/server/search/doc_index.h
+index ebc689c4a8b5..8aef2b63eb4f 100644
+--- a/src/server/search/doc_index.h
++++ b/src/server/search/doc_index.h
+@@ -138,6 +138,8 @@ class ShardDocIndex {
+ 
+   DocIndexInfo GetInfo() const;
+ 
++  io::Result<StringVec, facade::ErrorReply> GetTagVals(std::string_view field) const;
++
+  private:
+   // Clears internal data. Traverses all matching documents and assigns ids.
+   void Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr);
+diff --git a/src/server/search/search_family.cc b/src/server/search/search_family.cc
+index 95331ce3335c..37df03b2b45f 100644
+--- a/src/server/search/search_family.cc
++++ b/src/server/search/search_family.cc
+@@ -798,6 +798,41 @@ void SearchFamily::FtProfile(CmdArgList args, ConnectionContext* cntx) {
+   }
+ }
+ 
++void SearchFamily::FtTagVals(CmdArgList args, ConnectionContext* cntx) {
++  string_view index_name = ArgS(args, 0);
++  string_view field_name = ArgS(args, 1);
++  VLOG(1) << "FtTagVals: " << index_name << " " << field_name;
++
++  vector<io::Result<StringVec, ErrorReply>> shard_results(shard_set->size(), StringVec{});
++
++  cntx->transaction->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
++    if (auto* index = es->search_indices()->GetIndex(index_name); index)
++      shard_results[es->shard_id()] = index->GetTagVals(field_name);
++    else
++      shard_results[es->shard_id()] = nonstd::make_unexpected(ErrorReply("-Unknown Index name"));
++
++    return OpStatus::OK;
++  });
++
++  absl::flat_hash_set<string> result_set;
++
++  // Check first if either shard had errors. Also merge the results into a single set.
++  for (auto& res : shard_results) {
++    if (res) {
++      result_set.insert(make_move_iterator(res->begin()), make_move_iterator(res->end()));
++    } else {
++      res.error().kind = facade::kSearchErrType;
++      return cntx->SendError(res.error());
++    }
++  }
++
++  shard_results.clear();
++  vector<string> vec(result_set.begin(), result_set.end());
++
++  auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
++  rb->SendStringArr(vec, RedisReplyBuilder::SET);
++}
++
+ void SearchFamily::FtAggregate(CmdArgList args, ConnectionContext* cntx) {
+   const auto params = ParseAggregatorParamsOrReply(args, cntx);
+   if (!params)
+@@ -871,7 +906,8 @@ void SearchFamily::Register(CommandRegistry* registry) {
+             << CI{"FT._LIST", kReadOnlyMask, 1, 0, 0, acl::FT_SEARCH}.HFUNC(FtList)
+             << CI{"FT.SEARCH", kReadOnlyMask, -3, 0, 0, acl::FT_SEARCH}.HFUNC(FtSearch)
+             << CI{"FT.AGGREGATE", kReadOnlyMask, -3, 0, 0, acl::FT_SEARCH}.HFUNC(FtAggregate)
+-            << CI{"FT.PROFILE", kReadOnlyMask, -4, 0, 0, acl::FT_SEARCH}.HFUNC(FtProfile);
++            << CI{"FT.PROFILE", kReadOnlyMask, -4, 0, 0, acl::FT_SEARCH}.HFUNC(FtProfile)
++            << CI{"FT.TAGVALS", kReadOnlyMask, 3, 0, 0, acl::FT_SEARCH}.HFUNC(FtTagVals);
+ }
+ 
+ }  // namespace dfly
+diff --git a/src/server/search/search_family.h b/src/server/search/search_family.h
+index 5abe1c42b416..f3b453eb9488 100644
+--- a/src/server/search/search_family.h
++++ b/src/server/search/search_family.h
+@@ -22,6 +22,7 @@ class SearchFamily {
+   static void FtSearch(CmdArgList args, ConnectionContext* cntx);
+   static void FtProfile(CmdArgList args, ConnectionContext* cntx);
+   static void FtAggregate(CmdArgList args, ConnectionContext* cntx);
++  static void FtTagVals(CmdArgList args, ConnectionContext* cntx);
+ 
+  public:
+   static void Register(CommandRegistry* registry);

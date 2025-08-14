@@ -1,0 +1,147 @@
+diff --git a/src/server/command_registry.cc b/src/server/command_registry.cc
+index 829ea775a9cc..fd291d1a3f4d 100644
+--- a/src/server/command_registry.cc
++++ b/src/server/command_registry.cc
+@@ -32,6 +32,8 @@ ABSL_FLAG(vector<string>, command_alias, {},
+           "Add an alias for given command(s), format is: <alias>=<original>, <alias>=<original>. "
+           "Aliases must be set identically on replicas, if applicable");
+ 
++ABSL_FLAG(bool, latency_tracking, false, "If true, track latency for commands");
++
+ namespace dfly {
+ 
+ using namespace facade;
+@@ -188,7 +190,12 @@ uint64_t CommandId::Invoke(CmdArgList args, const CommandContext& cmd_cntx) cons
+ 
+   ++ent.first;
+   ent.second += execution_time_usec;
+-
++  static const bool is_latency_tracked = GetFlag(FLAGS_latency_tracking);
++  if (is_latency_tracked) {
++    if (hdr_histogram* cmd_histogram = latency_histogram_; cmd_histogram != nullptr) {
++      hdr_record_value(cmd_histogram, execution_time_usec);
++    }
++  }
+   return execution_time_usec;
+ }
+ 
+@@ -212,6 +219,10 @@ optional<facade::ErrorReply> CommandId::Validate(CmdArgList tail_args) const {
+   return nullopt;
+ }
+ 
++hdr_histogram* CommandId::LatencyHist() const {
++  return latency_histogram_;
++}
++
+ CommandRegistry::CommandRegistry() {
+   cmd_rename_map_ = ParseCmdlineArgMap(FLAGS_rename_command);
+ 
+@@ -321,6 +332,15 @@ std::pair<const CommandId*, ArgSlice> CommandRegistry::FindExtended(string_view
+   return {res, tail_args};
+ }
+ 
++absl::flat_hash_map<std::string, hdr_histogram*> CommandRegistry::LatencyMap() const {
++  absl::flat_hash_map<std::string, hdr_histogram*> cmd_latencies;
++  cmd_latencies.reserve(cmd_map_.size());
++  for (const auto& [cmd_name, cmd] : cmd_map_) {
++    cmd_latencies.insert({absl::AsciiStrToLower(cmd_name), cmd.LatencyHist()});
++  }
++  return cmd_latencies;
++}
++
+ namespace CO {
+ 
+ const char* OptName(CO::CommandOpt fl) {
+diff --git a/src/server/command_registry.h b/src/server/command_registry.h
+index 582ed8db4b86..83540a441491 100644
+--- a/src/server/command_registry.h
++++ b/src/server/command_registry.h
+@@ -187,6 +187,8 @@ class CommandId : public facade::CommandId {
+     return is_alias_;
+   }
+ 
++  hdr_histogram* LatencyHist() const;
++
+  private:
+   // The following fields must copy manually in the move constructor.
+   bool implicit_acl_;
+@@ -249,6 +251,8 @@ class CommandRegistry {
+   std::pair<const CommandId*, facade::ArgSlice> FindExtended(std::string_view cmd,
+                                                              facade::ArgSlice tail_args) const;
+ 
++  absl::flat_hash_map<std::string, hdr_histogram*> LatencyMap() const;
++
+  private:
+   absl::flat_hash_map<std::string, CommandId> cmd_map_;
+   absl::flat_hash_map<std::string, std::string> cmd_rename_map_;
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index bf24e6ee92dd..b6e88c70b358 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -237,6 +237,13 @@ using strings::HumanReadableNumBytes;
+ 
+ namespace {
+ 
++// TODO these should be configurable as command line flag and at runtime via config set
++constexpr std::array<double, 3> kLatencyPercentiles = {50.0, 99.0, 99.9};
++
++bool is_histogram_empty(const hdr_histogram* h) {
++  return hdr_min(h) == std::numeric_limits<int64_t>::max();
++}
++
+ const auto kRedisVersion = "7.4.0";
+ 
+ using EngineFunc = void (ServerFamily::*)(CmdArgList args, const CommandContext&);
+@@ -2388,6 +2395,7 @@ Metrics ServerFamily::GetMetrics(Namespace* ns) const {
+   UpdateMax(&peak_stats_.conn_read_buf_capacity, result.facade_stats.conn_stats.read_buf_capacity);
+ 
+   result.peak_stats = peak_stats_;
++  result.cmd_latency_map = service_.mutable_registry()->LatencyMap();
+ 
+   uint64_t delta_ms = (absl::GetCurrentTimeNanos() - start) / 1'000'000;
+   if (delta_ms > 30) {
+@@ -2873,6 +2881,31 @@ string ServerFamily::FormatInfoMetrics(const Metrics& m, std::string_view sectio
+     append("total_migrated_keys", m.shard_stats.total_migrated_keys);
+   }
+ 
++  if (should_enter("LATENCYSTATS")) {
++    for (const auto& [cmd_name, hist] : m.cmd_latency_map) {
++      if (!hist) {
++        continue;
++      }
++
++      if (is_histogram_empty(hist)) {
++        continue;
++      }
++
++      absl::InlinedVector<std::string, 4> stats;
++      for (const auto percentile : kLatencyPercentiles) {
++        const auto value = hdr_value_at_percentile(hist, percentile);
++        // If the percentile is an integer, print it as an integer, otherwise print it as a double
++        if (std::trunc(percentile) == percentile) {
++          stats.emplace_back(absl::StrFormat("p%d=%d", static_cast<int64_t>(percentile), value));
++        } else {
++          stats.emplace_back(absl::StrFormat("p%g=%d", percentile, value));
++        }
++      }
++
++      append(absl::StrFormat("latency_percentiles_usec_%s", cmd_name), absl::StrJoin(stats, ","));
++    }
++  }
++
+   return info;
+ }
+ 
+diff --git a/src/server/server_family.h b/src/server/server_family.h
+index da47d83f942b..e70063207abd 100644
+--- a/src/server/server_family.h
++++ b/src/server/server_family.h
+@@ -132,6 +132,8 @@ struct Metrics {
+   size_t migration_errors_total;
+ 
+   LoadingStats loading_stats;
++
++  absl::flat_hash_map<std::string, hdr_histogram*> cmd_latency_map;
+ };
+ 
+ struct LastSaveInfo {

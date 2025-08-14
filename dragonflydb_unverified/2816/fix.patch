@@ -1,0 +1,238 @@
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index 9ba641108421..b5bce8b4f4d0 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -97,10 +97,9 @@ class ConnectionContext {
+   bool async_dispatch : 1;    // whether this connection is amid an async dispatch
+   bool sync_dispatch : 1;     // whether this connection is amid a sync dispatch
+   bool journal_emulated : 1;  // whether it is used to dispatch journal commands
+-  bool paused : 1;            // whether this connection is paused due to CLIENT PAUSE
+-
++  bool paused = false;        // whether this connection is paused due to CLIENT PAUSE
+   // whether it's blocked on blocking commands like BLPOP, needs to be addressable
+-  bool blocked;
++  bool blocked = false;
+ 
+   // How many async subscription sources are active: monitor and/or pubsub - at most 2.
+   uint8_t subscriptions;
+diff --git a/src/server/container_utils.cc b/src/server/container_utils.cc
+index ab5caab7ae6a..0af7f1b35ba6 100644
+--- a/src/server/container_utils.cc
++++ b/src/server/container_utils.cc
+@@ -258,7 +258,7 @@ string_view LpGetView(uint8_t* lp_it, uint8_t int_buf[]) {
+ 
+ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
+                                               BlockingResultCb func, unsigned limit_ms,
+-                                              bool* block_flag) {
++                                              bool* block_flag, bool* pause_flag) {
+   string result_key;
+ 
+   // Fast path. If we have only a single shard, we can run opportunistically with a single hop.
+@@ -317,9 +317,7 @@ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_ty
+     return owner->db_slice().FindReadOnly(context, key, req_obj_type).ok();
+   };
+ 
+-  *block_flag = true;
+-  auto status = trans->WaitOnWatch(limit_tp, std::move(wcb), key_checker);
+-  *block_flag = false;
++  auto status = trans->WaitOnWatch(limit_tp, std::move(wcb), key_checker, block_flag, pause_flag);
+ 
+   if (status != OpStatus::OK)
+     return status;
+diff --git a/src/server/container_utils.h b/src/server/container_utils.h
+index 508af5c0b9e3..e149ce95feef 100644
+--- a/src/server/container_utils.h
++++ b/src/server/container_utils.h
+@@ -87,10 +87,9 @@ using BlockingResultCb =
+ // Block until a any key of the transaction becomes non-empty and executes the callback.
+ // If multiple keys are non-empty when this function is called, the callback is executed
+ // immediately with the first key listed in the tx arguments.
+-// The block flag is set to true while the transaction is blocking.
+ OpResult<std::string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
+                                                    BlockingResultCb cb, unsigned limit_ms,
+-                                                   bool* block_flag);
++                                                   bool* block_flag, bool* pause_flag);
+ 
+ };  // namespace container_utils
+ 
+diff --git a/src/server/list_family.cc b/src/server/list_family.cc
+index fc06a484bcef..ca5bec84decb 100644
+--- a/src/server/list_family.cc
++++ b/src/server/list_family.cc
+@@ -164,11 +164,11 @@ class BPopPusher {
+ 
+   // Returns WRONG_TYPE, OK.
+   // If OK is returned then use result() to fetch the value.
+-  OpResult<string> Run(Transaction* t, unsigned limit_ms);
++  OpResult<string> Run(ConnectionContext* cntx, unsigned limit_ms);
+ 
+  private:
+-  OpResult<string> RunSingle(Transaction* t, time_point tp);
+-  OpResult<string> RunPair(Transaction* t, time_point tp);
++  OpResult<string> RunSingle(ConnectionContext* cntx, time_point tp);
++  OpResult<string> RunPair(ConnectionContext* cntx, time_point tp);
+ 
+   string_view pop_key_, push_key_;
+   ListDir popdir_, pushdir_;
+@@ -765,7 +765,7 @@ void BRPopLPush(CmdArgList args, ConnectionContext* cntx) {
+   }
+ 
+   BPopPusher bpop_pusher(src, dest, ListDir::RIGHT, ListDir::LEFT);
+-  OpResult<string> op_res = bpop_pusher.Run(cntx->transaction, unsigned(timeout * 1000));
++  OpResult<string> op_res = bpop_pusher.Run(cntx, unsigned(timeout * 1000));
+ 
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (op_res) {
+@@ -808,7 +808,7 @@ void BLMove(CmdArgList args, ConnectionContext* cntx) {
+   }
+ 
+   BPopPusher bpop_pusher(src, dest, *src_dir, *dest_dir);
+-  OpResult<string> op_res = bpop_pusher.Run(cntx->transaction, unsigned(timeout * 1000));
++  OpResult<string> op_res = bpop_pusher.Run(cntx, unsigned(timeout * 1000));
+ 
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (op_res) {
+@@ -831,20 +831,21 @@ BPopPusher::BPopPusher(string_view pop_key, string_view push_key, ListDir popdir
+     : pop_key_(pop_key), push_key_(push_key), popdir_(popdir), pushdir_(pushdir) {
+ }
+ 
+-OpResult<string> BPopPusher::Run(Transaction* t, unsigned limit_ms) {
++OpResult<string> BPopPusher::Run(ConnectionContext* cntx, unsigned limit_ms) {
+   time_point tp =
+       limit_ms ? chrono::steady_clock::now() + chrono::milliseconds(limit_ms) : time_point::max();
+ 
+-  t->Schedule();
++  cntx->transaction->Schedule();
+ 
+-  if (t->GetUniqueShardCnt() == 1) {
+-    return RunSingle(t, tp);
++  if (cntx->transaction->GetUniqueShardCnt() == 1) {
++    return RunSingle(cntx, tp);
+   }
+ 
+-  return RunPair(t, tp);
++  return RunPair(cntx, tp);
+ }
+ 
+-OpResult<string> BPopPusher::RunSingle(Transaction* t, time_point tp) {
++OpResult<string> BPopPusher::RunSingle(ConnectionContext* cntx, time_point tp) {
++  Transaction* t = cntx->transaction;
+   OpResult<string> op_res;
+   bool is_multi = t->IsMulti();
+   auto cb_move = [&](Transaction* t, EngineShard* shard) {
+@@ -873,14 +874,16 @@ OpResult<string> BPopPusher::RunSingle(Transaction* t, time_point tp) {
+     return owner->db_slice().FindReadOnly(context, key, OBJ_LIST).ok();
+   };
+   // Block
+-  if (auto status = t->WaitOnWatch(tp, std::move(wcb), key_checker); status != OpStatus::OK)
++  auto status = t->WaitOnWatch(tp, std::move(wcb), key_checker, &(cntx->blocked), &(cntx->paused));
++  if (status != OpStatus::OK)
+     return status;
+ 
+   t->Execute(cb_move, true);
+   return op_res;
+ }
+ 
+-OpResult<string> BPopPusher::RunPair(Transaction* t, time_point tp) {
++OpResult<string> BPopPusher::RunPair(ConnectionContext* cntx, time_point tp) {
++  Transaction* t = cntx->transaction;
+   bool is_multi = t->IsMulti();
+   OpResult<string> op_res = MoveTwoShards(t, pop_key_, push_key_, popdir_, pushdir_, false);
+ 
+@@ -902,7 +905,8 @@ OpResult<string> BPopPusher::RunPair(Transaction* t, time_point tp) {
+     return owner->db_slice().FindReadOnly(context, key, OBJ_LIST).ok();
+   };
+ 
+-  if (auto status = t->WaitOnWatch(tp, std::move(wcb), key_checker); status != OpStatus::OK)
++  if (auto status = t->WaitOnWatch(tp, std::move(wcb), key_checker, &cntx->blocked, &cntx->paused);
++      status != OpStatus::OK)
+     return status;
+ 
+   return MoveTwoShards(t, pop_key_, push_key_, popdir_, pushdir_, true);
+@@ -1194,7 +1198,8 @@ void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cn
+   };
+ 
+   OpResult<string> popped_key = container_utils::RunCbOnFirstNonEmptyBlocking(
+-      transaction, OBJ_LIST, std::move(cb), unsigned(timeout * 1000), &cntx->blocked);
++      transaction, OBJ_LIST, std::move(cb), unsigned(timeout * 1000), &cntx->blocked,
++      &cntx->paused);
+ 
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (popped_key) {
+diff --git a/src/server/stream_family.cc b/src/server/stream_family.cc
+index 9d10fc01283b..d700fb5029cc 100644
+--- a/src/server/stream_family.cc
++++ b/src/server/stream_family.cc
+@@ -2833,7 +2833,8 @@ void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
+     return streamCompareID(&last_id, &sitem.group->last_id) > 0;
+   };
+ 
+-  if (auto status = cntx->transaction->WaitOnWatch(tp, std::move(wcb), key_checker);
++  if (auto status = cntx->transaction->WaitOnWatch(tp, std::move(wcb), key_checker, &cntx->blocked,
++                                                   &cntx->paused);
+       status != OpStatus::OK)
+     return rb->SendNullArray();
+ 
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index 36578ff7dbcb..b5aadaf9ced0 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -1320,7 +1320,7 @@ size_t Transaction::ReverseArgIndex(ShardId shard_id, size_t arg_index) const {
+ }
+ 
+ OpStatus Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provider,
+-                                  KeyReadyChecker krc) {
++                                  KeyReadyChecker krc, bool* block_flag, bool* pause_flag) {
+   DCHECK(!blocking_barrier_.IsClaimed());  // Blocking barrier can't be re-used
+ 
+   // Register keys on active shards blocking controllers and mark shard state as suspended.
+@@ -1333,16 +1333,19 @@ OpStatus Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_p
+   auto* stats = ServerState::tl_connection_stats();
+   ++stats->num_blocked_clients;
+   DVLOG(1) << "WaitOnWatch wait for " << tp << " " << DebugId();
+-  // TBD set connection blocking state
++
+   // Wait for the blocking barrier to be closed.
+   // Note: It might return immediately if another thread already notified us.
++  *block_flag = true;
+   cv_status status = blocking_barrier_.Wait(tp);
++  *block_flag = false;
+ 
+   DVLOG(1) << "WaitOnWatch done " << int(status) << " " << DebugId();
+   --stats->num_blocked_clients;
+ 
+-  // TBD set connection pause state
++  *pause_flag = true;
+   ServerState::tlocal()->AwaitPauseState(true);  // blocking are always write commands
++  *pause_flag = false;
+ 
+   OpStatus result = OpStatus::OK;
+   if (status == cv_status::timeout) {
+diff --git a/src/server/transaction.h b/src/server/transaction.h
+index 6aa9d0dbc75f..a1d62e3eaeb1 100644
+--- a/src/server/transaction.h
++++ b/src/server/transaction.h
+@@ -213,7 +213,8 @@ class Transaction {
+   // or b) tp is reached. If tp is time_point::max() then waits indefinitely.
+   // Expects that the transaction had been scheduled before, and uses Execute(.., true) to register.
+   // Returns false if timeout occurred, true if was notified by one of the keys.
+-  facade::OpStatus WaitOnWatch(const time_point& tp, WaitKeysProvider cb, KeyReadyChecker krc);
++  facade::OpStatus WaitOnWatch(const time_point& tp, WaitKeysProvider cb, KeyReadyChecker krc,
++                               bool* block_flag, bool* pause_flag);
+ 
+   // Returns true if transaction is awaked, false if it's timed-out and can be removed from the
+   // blocking queue.
+diff --git a/src/server/zset_family.cc b/src/server/zset_family.cc
+index 7d74639c4642..a27ddff04a2b 100644
+--- a/src/server/zset_family.cc
++++ b/src/server/zset_family.cc
+@@ -1318,7 +1318,8 @@ void BZPopMinMax(CmdArgList args, ConnectionContext* cntx, bool is_max) {
+   };
+ 
+   OpResult<string> popped_key = container_utils::RunCbOnFirstNonEmptyBlocking(
+-      transaction, OBJ_ZSET, std::move(cb), unsigned(timeout * 1000), &cntx->blocked);
++      transaction, OBJ_ZSET, std::move(cb), unsigned(timeout * 1000), &cntx->blocked,
++      &cntx->paused);
+ 
+   auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
+   if (popped_key) {

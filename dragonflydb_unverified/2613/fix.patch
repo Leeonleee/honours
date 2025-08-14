@@ -1,0 +1,405 @@
+diff --git a/src/server/common.cc b/src/server/common.cc
+index 9b308e123656..6a208f714f32 100644
+--- a/src/server/common.cc
++++ b/src/server/common.cc
+@@ -76,8 +76,6 @@ const char* GlobalStateName(GlobalState s) {
+       return "ACTIVE";
+     case GlobalState::LOADING:
+       return "LOADING";
+-    case GlobalState::SAVING:
+-      return "SAVING";
+     case GlobalState::SHUTTING_DOWN:
+       return "SHUTTING DOWN";
+     case GlobalState::TAKEN_OVER:
+diff --git a/src/server/common.h b/src/server/common.h
+index 325a4ea7d46e..b3b5b3b72d0e 100644
+--- a/src/server/common.h
++++ b/src/server/common.h
+@@ -154,7 +154,6 @@ struct SearchStats {
+ enum class GlobalState : uint8_t {
+   ACTIVE,
+   LOADING,
+-  SAVING,
+   SHUTTING_DOWN,
+   TAKEN_OVER,
+ };
+diff --git a/src/server/detail/save_stages_controller.cc b/src/server/detail/save_stages_controller.cc
+index 18ce620fed9a..70ef99d04688 100644
+--- a/src/server/detail/save_stages_controller.cc
++++ b/src/server/detail/save_stages_controller.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/flags.h"
+ #include "base/logging.h"
++#include "server/detail/snapshot_storage.h"
+ #include "server/main_service.h"
+ #include "server/script_mgr.h"
+ #include "server/transaction.h"
+@@ -147,40 +148,26 @@ SaveStagesController::SaveStagesController(SaveStagesInputs&& inputs)
+ SaveStagesController::~SaveStagesController() {
+ }
+ 
+-GenericError SaveStagesController::Save() {
+-  if (auto err = BuildFullPath(); err)
+-    return err;
++SaveInfo SaveStagesController::Save() {
++  if (auto err = BuildFullPath(); err) {
++    shared_err_ = err;
++    return GetSaveInfo();
++  }
+ 
+-  if (auto err = InitResources(); err)
+-    return err;
++  InitResources();
+ 
+-  // The stages below report errors to shared_err_
+   if (use_dfs_format_)
+     SaveDfs();
+   else
+     SaveRdb();
+ 
+-  is_saving_->store(true, memory_order_relaxed);
+-  {
+-    lock_guard lk{*save_mu_};
+-    *save_bytes_cb_ = [this]() { return GetSaveBuffersSize(); };
+-  }
+-
+   RunStage(&SaveStagesController::SaveCb);
+-  {
+-    lock_guard lk{*save_mu_};
+-    *save_bytes_cb_ = nullptr;
+-  }
+-
+-  is_saving_->store(false, memory_order_relaxed);
+ 
+   RunStage(&SaveStagesController::CloseCb);
+ 
+   FinalizeFileMovement();
+ 
+-  UpdateSaveInfo();
+-
+-  return *shared_err_;
++  return GetSaveInfo();
+ }
+ 
+ size_t SaveStagesController::GetSaveBuffersSize() {
+@@ -264,14 +251,18 @@ void SaveStagesController::SaveRdb() {
+   trans_->ScheduleSingleHop(std::move(cb));
+ }
+ 
+-void SaveStagesController::UpdateSaveInfo() {
+-  auto seconds = (absl::Now() - start_time_) / absl::Seconds(1);
++uint32_t SaveStagesController::GetCurrentSaveDuration() {
++  return (absl::Now() - start_time_) / absl::Seconds(1);
++}
++
++SaveInfo SaveStagesController::GetSaveInfo() {
++  SaveInfo info;
++  info.save_time = absl::ToUnixSeconds(start_time_);
++  info.duration_sec = GetCurrentSaveDuration();
++
+   if (shared_err_) {
+-    lock_guard lk{*save_mu_};
+-    last_save_info_->last_error = *shared_err_;
+-    last_save_info_->last_error_time = absl::ToUnixSeconds(start_time_);
+-    last_save_info_->failed_duration_sec = seconds;
+-    return;
++    info.error = *shared_err_;
++    return info;
+   }
+ 
+   fs::path resulting_path = full_path_;
+@@ -281,23 +272,22 @@ void SaveStagesController::UpdateSaveInfo() {
+     resulting_path.replace_extension();  // remove .tmp
+ 
+   LOG(INFO) << "Saving " << resulting_path << " finished after "
+-            << strings::HumanReadableElapsedTime(seconds);
++            << strings::HumanReadableElapsedTime(info.duration_sec);
+ 
+-  lock_guard lk{*save_mu_};
+-  last_save_info_->freq_map.clear();
++  info.freq_map.clear();
+   for (const auto& k_v : rdb_name_map_) {
+-    last_save_info_->freq_map.emplace_back(k_v);
++    info.freq_map.emplace_back(k_v);
+   }
+-  last_save_info_->save_time = absl::ToUnixSeconds(start_time_);
+-  last_save_info_->file_name = resulting_path.generic_string();
+-  last_save_info_->success_duration_sec = seconds;
++
++  info.file_name = resulting_path.generic_string();
++
++  return info;
+ }
+ 
+-GenericError SaveStagesController::InitResources() {
++void SaveStagesController::InitResources() {
+   snapshots_.resize(use_dfs_format_ ? shard_set->size() + 1 : 1);
+   for (auto& [snapshot, _] : snapshots_)
+     snapshot = make_unique<RdbSnapshot>(fq_threadpool_, snapshot_storage_.get());
+-  return {};
+ }
+ 
+ // Remove .tmp extension or delete files in case of error
+diff --git a/src/server/detail/save_stages_controller.h b/src/server/detail/save_stages_controller.h
+index d9526570088d..cb40d50e3b79 100644
+--- a/src/server/detail/save_stages_controller.h
++++ b/src/server/detail/save_stages_controller.h
+@@ -7,9 +7,7 @@
+ 
+ #include <filesystem>
+ 
+-#include "server/detail/snapshot_storage.h"
+ #include "server/rdb_save.h"
+-#include "server/server_family.h"
+ #include "util/fibers/fiberqueue_threadpool.h"
+ 
+ namespace dfly {
+@@ -19,16 +17,22 @@ class Service;
+ 
+ namespace detail {
+ 
++class SnapshotStorage;
++
++struct SaveInfo {
++  time_t save_time = 0;  // epoch time in seconds.
++  uint32_t duration_sec = 0;
++  std::string file_name;
++  std::vector<std::pair<std::string_view, size_t>> freq_map;  // RDB_TYPE_xxx -> count mapping.
++  GenericError error;
++};
++
+ struct SaveStagesInputs {
+   bool use_dfs_format_;
+   std::string_view basename_;
+   Transaction* trans_;
+   Service* service_;
+-  std::atomic_bool* is_saving_;
+   util::fb2::FiberQueueThreadPool* fq_threadpool_;
+-  LastSaveInfo* last_save_info_ ABSL_GUARDED_BY(save_mu_);
+-  util::fb2::Mutex* save_mu_;
+-  std::function<size_t()>* save_bytes_cb_;
+   std::shared_ptr<SnapshotStorage> snapshot_storage_;
+ };
+ 
+@@ -70,7 +74,9 @@ struct SaveStagesController : public SaveStagesInputs {
+ 
+   ~SaveStagesController();
+ 
+-  GenericError Save();
++  SaveInfo Save();
++  size_t GetSaveBuffersSize();
++  uint32_t GetCurrentSaveDuration();
+ 
+  private:
+   // In the new version (.dfs) we store a file for every shard and one more summary file.
+@@ -83,9 +89,9 @@ struct SaveStagesController : public SaveStagesInputs {
+   // Save a single rdb file
+   void SaveRdb();
+ 
+-  void UpdateSaveInfo();
++  SaveInfo GetSaveInfo();
+ 
+-  GenericError InitResources();
++  void InitResources();
+ 
+   // Remove .tmp extension or delete files in case of error
+   void FinalizeFileMovement();
+@@ -102,8 +108,6 @@ struct SaveStagesController : public SaveStagesInputs {
+ 
+   void RunStage(void (SaveStagesController::*cb)(unsigned));
+ 
+-  size_t GetSaveBuffersSize();
+-
+  private:
+   absl::Time start_time_;
+   std::filesystem::path full_path_;
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index e9f935eb274d..759e14346470 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -40,6 +40,7 @@ extern "C" {
+ #include "server/conn_context.h"
+ #include "server/debugcmd.h"
+ #include "server/detail/save_stages_controller.h"
++#include "server/detail/snapshot_storage.h"
+ #include "server/dflycmd.h"
+ #include "server/engine_shard_set.h"
+ #include "server/error.h"
+@@ -52,6 +53,7 @@ extern "C" {
+ #include "server/rdb_save.h"
+ #include "server/script_mgr.h"
+ #include "server/server_state.h"
++#include "server/snapshot.h"
+ #include "server/tiered_storage.h"
+ #include "server/transaction.h"
+ #include "server/version.h"
+@@ -1290,28 +1292,51 @@ GenericError ServerFamily::DoSave(bool new_version, string_view basename, Transa
+     return GenericError{make_error_code(errc::operation_not_permitted),
+                         StrCat("Can not save database in tiering mode")};
+   }
+-  if (!ignore_state) {
+-    auto [new_state, success] = service_.SwitchState(GlobalState::ACTIVE, GlobalState::SAVING);
+-    if (!success) {
+-      return GenericError{make_error_code(errc::operation_in_progress),
+-                          StrCat(GlobalStateName(new_state), " - can not save database")};
+-    }
++  auto state = service_.GetGlobalState();
++  // In some cases we want to create a snapshot even if server is not active, f.e in takeover
++  if (!ignore_state && (state != GlobalState::ACTIVE)) {
++    return GenericError{make_error_code(errc::operation_in_progress),
++                        StrCat(GlobalStateName(state), " - can not save database")};
+   }
++
+   {
+-    std::lock_guard lck(save_mu_);
+-    start_save_time_ = absl::Now();
++    std::lock_guard lk(save_mu_);
++    if (save_controller_) {
++      return GenericError{make_error_code(errc::operation_in_progress),
++                          "SAVING - can not save database"};
++    }
++    save_controller_ = make_unique<SaveStagesController>(detail::SaveStagesInputs{
++        new_version, basename, trans, &service_, fq_threadpool_.get(), snapshot_storage_});
+   }
+-  SaveStagesController sc{detail::SaveStagesInputs{
+-      new_version, basename, trans, &service_, &is_saving_, fq_threadpool_.get(), &last_save_info_,
+-      &save_mu_, &save_bytes_cb_, snapshot_storage_}};
+-  auto res = sc.Save();
++
++  detail::SaveInfo save_info = save_controller_->Save();
++
+   {
+-    std::lock_guard lck(save_mu_);
+-    start_save_time_.reset();
++    std::lock_guard lk(save_mu_);
++
++    if (save_info.error) {
++      last_save_info_.last_error = save_info.error;
++      last_save_info_.last_error_time = save_info.save_time;
++      last_save_info_.failed_duration_sec = save_info.duration_sec;
++    } else {
++      last_save_info_.save_time = save_info.save_time;
++      last_save_info_.success_duration_sec = save_info.duration_sec;
++      last_save_info_.file_name = save_info.file_name;
++      last_save_info_.freq_map = save_info.freq_map;
++    }
++    save_controller_.reset();
+   }
+-  if (!ignore_state)
+-    service_.SwitchState(GlobalState::SAVING, GlobalState::ACTIVE);
+-  return res;
++
++  return save_info.error;
++}
++
++bool ServerFamily::TEST_IsSaving() const {
++  std::atomic_bool is_saving{false};
++  shard_set->pool()->AwaitFiberOnAll([&](auto*) {
++    if (SliceSnapshot::IsSnaphotInProgress())
++      is_saving.store(true, std::memory_order_relaxed);
++  });
++  return is_saving.load(std::memory_order_relaxed);
+ }
+ 
+ error_code ServerFamily::Drakarys(Transaction* transaction, DbIndex db_ind) {
+@@ -1841,10 +1866,10 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
+       append("replication_full_sync_buffer_bytes", repl_mem.full_sync_buf_bytes_);
+     }
+ 
+-    if (IsSaving()) {
++    {
+       lock_guard lk{save_mu_};
+-      if (save_bytes_cb_) {
+-        append("save_buffer_bytes", save_bytes_cb_());
++      if (save_controller_) {
++        append("save_buffer_bytes", save_controller_->GetSaveBuffersSize());
+       }
+     }
+   }
+@@ -1914,9 +1939,17 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
+     size_t is_loading = service_.GetGlobalState() == GlobalState::LOADING;
+     append("loading", is_loading);
+ 
+-    auto curent_durration_sec =
+-        start_save_time_ ? (absl::Now() - *start_save_time_) / absl::Seconds(1) : 0;
+-    append("saving", curent_durration_sec != 0);
++    bool is_saving = false;
++    uint32_t curent_durration_sec = 0;
++    {
++      lock_guard lk{save_mu_};
++      if (save_controller_) {
++        is_saving = true;
++        curent_durration_sec = save_controller_->GetCurrentSaveDuration();
++      }
++    }
++
++    append("saving", is_saving);
+     append("current_save_duration_sec", curent_durration_sec);
+ 
+     for (const auto& k_v : save_info.freq_map) {
+diff --git a/src/server/server_family.h b/src/server/server_family.h
+index 290119f9f226..822055f5d810 100644
+--- a/src/server/server_family.h
++++ b/src/server/server_family.h
+@@ -12,6 +12,7 @@
+ #include "facade/redis_parser.h"
+ #include "facade/reply_builder.h"
+ #include "server/channel_store.h"
++#include "server/detail/save_stages_controller.h"
+ #include "server/engine_shard_set.h"
+ #include "server/replica.h"
+ #include "server/server_state.h"
+@@ -173,9 +174,7 @@ class ServerFamily {
+   // future with error_code.
+   util::fb2::Future<GenericError> Load(const std::string& file_name);
+ 
+-  bool IsSaving() const {
+-    return is_saving_.load(std::memory_order_relaxed);
+-  }
++  bool TEST_IsSaving() const;
+ 
+   void ConfigureMetrics(util::HttpListenerBase* listener);
+ 
+@@ -282,13 +281,7 @@ class ServerFamily {
+   time_t start_time_ = 0;  // in seconds, epoch time.
+ 
+   LastSaveInfo last_save_info_ ABSL_GUARDED_BY(save_mu_);
+-  std::atomic_bool is_saving_{false};
+-  // this field duplicate SaveStagesController::start_save_time_
+-  // TODO make SaveStagesController as member of this class
+-  std::optional<absl::Time> start_save_time_;
+-  // If a save operation is currently in progress, calling this function will provide information
+-  // about the memory consumption during the save operation.
+-  std::function<size_t()> save_bytes_cb_ = nullptr;
++  std::unique_ptr<detail::SaveStagesController> save_controller_ ABSL_GUARDED_BY(save_mu_);
+ 
+   // Used to override save on shutdown behavior that is usually set
+   // be --dbfilename.
+diff --git a/src/server/snapshot.cc b/src/server/snapshot.cc
+index c39a0e8d2931..b3aa21ab18e5 100644
+--- a/src/server/snapshot.cc
++++ b/src/server/snapshot.cc
+@@ -52,6 +52,10 @@ size_t SliceSnapshot::GetThreadLocalMemoryUsage() {
+   return mem;
+ }
+ 
++bool SliceSnapshot::IsSnaphotInProgress() {
++  return tl_slice_snapshots.size() > 0;
++}
++
+ void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll) {
+   DCHECK(!snapshot_fb_.IsJoinable());
+ 
+diff --git a/src/server/snapshot.h b/src/server/snapshot.h
+index 0e98bc79f258..eb1d33f8d5ab 100644
+--- a/src/server/snapshot.h
++++ b/src/server/snapshot.h
+@@ -61,6 +61,7 @@ class SliceSnapshot {
+   ~SliceSnapshot();
+ 
+   static size_t GetThreadLocalMemoryUsage();
++  static bool IsSnaphotInProgress();
+ 
+   // Initialize snapshot, start bucket iteration fiber, register listeners.
+   // In journal streaming mode it needs to be stopped by either Stop or Cancel.

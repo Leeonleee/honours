@@ -1,0 +1,208 @@
+diff --git a/src/core/compact_object.cc b/src/core/compact_object.cc
+index 1e5aa0bcdbcb..408174d8e1fc 100644
+--- a/src/core/compact_object.cc
++++ b/src/core/compact_object.cc
+@@ -171,6 +171,11 @@ pair<void*, bool> DefragIntSet(intset* is, float ratio) {
+   return {replacement, true};
+ }
+ 
++pair<void*, bool> DefragSortedMap(detail::SortedMap* sm, float ratio) {
++  const bool reallocated = sm->DefragIfNeeded(ratio);
++  return {sm, reallocated};
++}
++
+ // Iterates over allocations of internal hash data structures and re-allocates
+ // them if their pages are underutilized.
+ // Returns pointer to new object ptr and whether any re-allocations happened.
+@@ -208,6 +213,23 @@ pair<void*, bool> DefragSet(unsigned encoding, void* ptr, float ratio) {
+   }
+ }
+ 
++pair<void*, bool> DefragZSet(unsigned encoding, void* ptr, float ratio) {
++  switch (encoding) {
++    // Listpack is stored as a single contiguous array
++    case OBJ_ENCODING_LISTPACK: {
++      return DefragListPack((uint8_t*)ptr, ratio);
++    }
++
++    // SKIPLIST really means ScoreMap
++    case OBJ_ENCODING_SKIPLIST: {
++      return DefragSortedMap((detail::SortedMap*)ptr, ratio);
++    }
++
++    default:
++      ABSL_UNREACHABLE();
++  }
++}
++
+ inline void FreeObjStream(void* ptr) {
+   freeStream((stream*)ptr);
+ }
+@@ -420,19 +442,23 @@ void RobjWrapper::SetString(string_view s, MemoryResource* mr) {
+ }
+ 
+ bool RobjWrapper::DefragIfNeeded(float ratio) {
++  auto do_defrag = [this, ratio](auto defrag_fun) mutable {
++    auto [new_ptr, realloced] = defrag_fun(encoding_, inner_obj_, ratio);
++    inner_obj_ = new_ptr;
++    return realloced;
++  };
++
+   if (type() == OBJ_STRING) {
+     if (zmalloc_page_is_underutilized(inner_obj(), ratio)) {
+       ReallocateString(tl.local_mr);
+       return true;
+     }
+   } else if (type() == OBJ_HASH) {
+-    auto [new_ptr, realloced] = DefragHash(encoding_, inner_obj_, ratio);
+-    inner_obj_ = new_ptr;
+-    return realloced;
++    return do_defrag(DefragHash);
+   } else if (type() == OBJ_SET) {
+-    auto [new_ptr, realloced] = DefragSet(encoding_, inner_obj_, ratio);
+-    inner_obj_ = new_ptr;
+-    return realloced;
++    return do_defrag(DefragSet);
++  } else if (type() == OBJ_ZSET) {
++    return do_defrag(DefragZSet);
+   }
+   return false;
+ }
+@@ -440,11 +466,11 @@ bool RobjWrapper::DefragIfNeeded(float ratio) {
+ int RobjWrapper::ZsetAdd(double score, sds ele, int in_flags, int* out_flags, double* newscore) {
+   // copied from zsetAdd for listpack only.
+   /* Turn options into simple to check vars. */
+-  int incr = (in_flags & ZADD_IN_INCR) != 0;
+-  int nx = (in_flags & ZADD_IN_NX) != 0;
+-  int xx = (in_flags & ZADD_IN_XX) != 0;
+-  int gt = (in_flags & ZADD_IN_GT) != 0;
+-  int lt = (in_flags & ZADD_IN_LT) != 0;
++  bool incr = (in_flags & ZADD_IN_INCR) != 0;
++  bool nx = (in_flags & ZADD_IN_NX) != 0;
++  bool xx = (in_flags & ZADD_IN_XX) != 0;
++  bool gt = (in_flags & ZADD_IN_GT) != 0;
++  bool lt = (in_flags & ZADD_IN_LT) != 0;
+   *out_flags = 0; /* We'll return our response flags. */
+   double curscore;
+ 
+diff --git a/src/core/score_map.cc b/src/core/score_map.cc
+index 276627bb06d7..8ab7158e51ce 100644
+--- a/src/core/score_map.cc
++++ b/src/core/score_map.cc
+@@ -146,4 +146,43 @@ detail::SdsScorePair ScoreMap::iterator::BreakToPair(void* obj) {
+   return detail::SdsScorePair(f, GetValue(f));
+ }
+ 
++namespace {
++// Does not Release obj. Callers must do so explicitly if a `Reallocation` happened
++pair<sds, bool> ReallocIfNeededGeneric(void* obj, float ratio) {
++  sds key = (sds)obj;
++  size_t key_len = sdslen(key);
++
++  if (!zmalloc_page_is_underutilized(key, ratio))
++    return {key, false};
++
++  sds newkey = AllocSdsWithSpace(key_len, 8);
++  memcpy(newkey, key, key_len + 8 + 1);
++
++  return {newkey, true};
++}
++
++}  // namespace
++
++bool ScoreMap::iterator::ReallocIfNeeded(float ratio, std::function<void(sds, sds)> cb) {
++  // Unwrap all links to correctly call SetObject()
++  auto* ptr = curr_entry_;
++
++  if (ptr->IsLink()) {
++    ptr = ptr->AsLink();
++  }
++
++  // Note: we do not iterate over the links. Although we could that...
++  auto* obj = ptr->GetObject();
++  auto [new_obj, reallocated] = ReallocIfNeededGeneric(obj, ratio);
++  if (reallocated) {
++    if (cb) {
++      cb((sds)obj, (sds)new_obj);
++    }
++    sdsfree((sds)obj);
++    ptr->SetObject(new_obj);
++  }
++
++  return reallocated;
++}
++
+ }  // namespace dfly
+diff --git a/src/core/score_map.h b/src/core/score_map.h
+index 22bd86b453b4..33f330930389 100644
+--- a/src/core/score_map.h
++++ b/src/core/score_map.h
+@@ -63,6 +63,14 @@ class ScoreMap : public DenseSet {
+       return BreakToPair(ptr);
+     }
+ 
++    // Try reducing memory fragmentation of the value by re-allocating. Returns true if
++    // re-allocation happened.
++    // If function is set, we call it with the old and the new sds. This is used for data
++    // structures that hold multiple storages that need to be update simultaneously. For example,
++    // SortedMap contains both a B+ tree and a ScoreMap with the former, containing pointers
++    // to the later. Therefore, we need to update those. This is handled by the cb below.
++    bool ReallocIfNeeded(float ratio, std::function<void(sds, sds)> = {});
++
+     iterator& operator++() {
+       Advance();
+       return *this;
+diff --git a/src/core/sorted_map.cc b/src/core/sorted_map.cc
+index 3cdcb96ac969..d2f395908c05 100644
+--- a/src/core/sorted_map.cc
++++ b/src/core/sorted_map.cc
+@@ -769,5 +769,19 @@ SortedMap* SortedMap::FromListPack(PMR_NS::memory_resource* res, const uint8_t*
+   return zs;
+ }
+ 
++bool SortedMap::DefragIfNeeded(float ratio) {
++  auto cb = [this](sds old_obj, sds new_obj) {
++    score_tree->Delete(old_obj);
++    score_tree->Insert(new_obj);
++  };
++  bool reallocated = false;
++
++  for (auto it = score_map->begin(); it != score_map->end(); ++it) {
++    reallocated |= it.ReallocIfNeeded(ratio, cb);
++  }
++
++  return reallocated;
++}
++
+ }  // namespace detail
+ }  // namespace dfly
+diff --git a/src/core/sorted_map.h b/src/core/sorted_map.h
+index b69c64ddb6de..8206779d65f7 100644
+--- a/src/core/sorted_map.h
++++ b/src/core/sorted_map.h
+@@ -88,6 +88,8 @@ class SortedMap {
+   uint8_t* ToListPack() const;
+   static SortedMap* FromListPack(PMR_NS::memory_resource* res, const uint8_t* lp);
+ 
++  bool DefragIfNeeded(float ratio);
++
+  private:
+   using ScoreTree = BPTree<ScoreSds, ScoreSdsPolicy>;
+ 
+diff --git a/src/core/string_map.cc b/src/core/string_map.cc
+index cc22b7b44268..0f9b586bbf49 100644
+--- a/src/core/string_map.cc
++++ b/src/core/string_map.cc
+@@ -300,9 +300,11 @@ detail::SdsPair StringMap::iterator::BreakToPair(void* obj) {
+ bool StringMap::iterator::ReallocIfNeeded(float ratio) {
+   // Unwrap all links to correctly call SetObject()
+   auto* ptr = curr_entry_;
+-  while (ptr->IsLink())
++  if (ptr->IsLink()) {
+     ptr = ptr->AsLink();
++  }
+ 
++  // Note: we do not iterate over the links. Although we could that...
+   auto* obj = ptr->GetObject();
+   auto [new_obj, realloced] = static_cast<StringMap*>(owner_)->ReallocIfNeeded(obj, ratio);
+   ptr->SetObject(new_obj);

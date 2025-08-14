@@ -1,0 +1,194 @@
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 833dbc7c6c5c..2695281a3ae0 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -26,7 +26,7 @@ add_library(dfly_core allocation_tracker.cc bloom.cc compact_object.cc dense_set
+     segment_allocator.cc score_map.cc small_string.cc sorted_map.cc task_queue.cc
+     tx_queue.cc string_set.cc string_map.cc top_keys.cc detail/bitpacking.cc)
+ 
+-cxx_link(dfly_core base absl::flat_hash_map absl::str_format redis_lib TRDP::lua lua_modules
++cxx_link(dfly_core base absl::flat_hash_map absl::str_format absl::random_random redis_lib TRDP::lua lua_modules
+     fibers2 ${SEARCH_LIB} jsonpath OpenSSL::Crypto TRDP::dconv TRDP::lz4)
+ 
+ add_executable(dash_bench dash_bench.cc)
+diff --git a/src/core/dense_set.cc b/src/core/dense_set.cc
+index d78b572a6e30..5effbe13b024 100644
+--- a/src/core/dense_set.cc
++++ b/src/core/dense_set.cc
+@@ -12,6 +12,8 @@
+ #include <type_traits>
+ #include <vector>
+ 
++#include "absl/random/distributions.h"
++#include "absl/random/random.h"
+ #include "base/logging.h"
+ 
+ extern "C" {
+@@ -670,22 +672,38 @@ void DenseSet::Delete(DensePtr* prev, DensePtr* ptr) {
+   ObjDelete(obj, false);
+ }
+ 
+-void* DenseSet::PopInternal() {
+-  ChainVectorIterator bucket_iter = entries_.begin();
++DenseSet::ChainVectorIterator DenseSet::GetRandomChain() {
++  size_t offset = absl::Uniform(absl::BitGen{}, 0u, entries_.size());
++  for (size_t i = offset; i < entries_.size() + offset; i++) {
++    auto it = entries_.begin() + (i % entries_.size());
++    ExpireIfNeeded(nullptr, &*it);
++    if (!it->IsEmpty())
++      return it;
++  }
++  return entries_.end();
++}
+ 
+-  // find the first non-empty chain
+-  do {
+-    while (bucket_iter != entries_.end() && bucket_iter->IsEmpty()) {
+-      ++bucket_iter;
+-    }
++DenseSet::IteratorBase DenseSet::GetRandomIterator() {
++  ChainVectorIterator chain_it = GetRandomChain();
++  if (chain_it == entries_.end())
++    return IteratorBase{};
+ 
+-    // empty set
+-    if (bucket_iter == entries_.end()) {
+-      return nullptr;
+-    }
++  DensePtr* ptr = &*chain_it;
++  absl::BitGen bg{};
++  while (ptr->IsLink() && absl::Bernoulli(bg, 0.5)) {
++    DensePtr* next = ptr->Next();
++    if (ExpireIfNeeded(ptr, next))  // stop if we break the chain with expiration
++      break;
++    ptr = next;
++  }
+ 
+-    ExpireIfNeeded(nullptr, &(*bucket_iter));
+-  } while (bucket_iter->IsEmpty());
++  return IteratorBase{(DenseSet*)this, chain_it, ptr};
++}
++
++void* DenseSet::PopInternal() {
++  auto bucket_iter = GetRandomChain();  // Find first non empty chain
++  if (bucket_iter == entries_.end())
++    return nullptr;
+ 
+   if (bucket_iter->IsObject()) {
+     --num_used_buckets_;
+diff --git a/src/core/dense_set.h b/src/core/dense_set.h
+index 0ac73a47bc0c..bd8c7898622f 100644
+--- a/src/core/dense_set.h
++++ b/src/core/dense_set.h
+@@ -305,6 +305,12 @@ class DenseSet {
+     return IteratorBase{};
+   }
+ 
++  // Get iterator to start of random non-empty chain (bucket)
++  ChainVectorIterator GetRandomChain();
++
++  // Wrap RandomChain() into iterator and advance with reservoir sampling
++  IteratorBase GetRandomIterator();
++
+   void* PopInternal();
+ 
+   void IncreaseMallocUsed(size_t delta) {
+diff --git a/src/core/string_set.cc b/src/core/string_set.cc
+index ea424f6e6d5e..8c1ed043d8a0 100644
+--- a/src/core/string_set.cc
++++ b/src/core/string_set.cc
+@@ -112,6 +112,10 @@ unsigned StringSet::AddBatch(absl::Span<std::string_view> span, uint32_t ttl_sec
+   return res;
+ }
+ 
++StringSet::iterator StringSet::GetRandomMember() {
++  return iterator{DenseSet::GetRandomIterator()};
++}
++
+ std::optional<std::string> StringSet::Pop() {
+   sds str = (sds)PopInternal();
+ 
+diff --git a/src/core/string_set.h b/src/core/string_set.h
+index 846ee852c7a9..3fe1f3ef1945 100644
+--- a/src/core/string_set.h
++++ b/src/core/string_set.h
+@@ -39,8 +39,6 @@ class StringSet : public DenseSet {
+     return FindInternal(&s1, Hash(&s1, 1), 1) != nullptr;
+   }
+ 
+-  std::optional<std::string> Pop();
+-
+   class iterator : private IteratorBase {
+    public:
+     using iterator_category = std::forward_iterator_tag;
+@@ -99,6 +97,11 @@ class StringSet : public DenseSet {
+     return iterator{};
+   }
+ 
++  // See DenseSet::GetRandomIterator
++  iterator GetRandomMember();
++
++  std::optional<std::string> Pop();
++
+   uint32_t Scan(uint32_t, const std::function<void(sds)>&) const;
+ 
+   iterator Find(std::string_view member) {
+diff --git a/src/server/set_family.cc b/src/server/set_family.cc
+index 6a8ded6f26ab..711233a771bd 100644
+--- a/src/server/set_family.cc
++++ b/src/server/set_family.cc
+@@ -133,6 +133,10 @@ struct StringSetWrapper {
+     return curs;
+   }
+ 
++  explicit operator StringSet*() const {
++    return ss;
++  }
++
+   StringSet* operator->() const {
+     return ss;
+   }
+@@ -265,9 +269,33 @@ void InterStrSet(const DbContext& db_context, const vector<SetType>& vec, String
+   }
+ }
+ 
++template <typename C = absl::flat_hash_set<string>>
++StringVec RandMemberStrSetPicky(StringSet* strset, size_t count) {
++  C picks;
++  picks.reserve(count);
++
++  size_t tries = 0;
++  while (picks.size() < count && tries++ < count * 2)
++    picks.insert(picks.end(), string{*strset->GetRandomMember()});
++
++  if constexpr (is_same_v<StringVec, C>)
++    return picks;
++  return StringVec{make_move_iterator(picks.begin()), make_move_iterator(picks.end())};
++}
++
+ StringVec RandMemberStrSet(const DbContext& db_context, const CompactObj& co,
+-                           PicksGenerator& generator, std::size_t picks_count) {
++                           PicksGenerator& generator, size_t picks_count) {
+   CHECK(IsDenseEncoding(co));
++  StringSetWrapper strset{co, db_context};
++
++  // If the set is small, extract entries with StringSet::GetRandomMember
++  if (picks_count * 5 < strset->UpperBoundSize()) {
++    StringSet* ss(strset);
++    if (bool unique = (dynamic_cast<UniquePicksGenerator*>(&generator) != nullptr); unique)
++      return RandMemberStrSetPicky(ss, picks_count);
++    else
++      return RandMemberStrSetPicky<StringVec>(ss, picks_count);
++  }
+ 
+   std::unordered_map<RandomPick, std::uint32_t> times_index_is_picked;
+   for (std::size_t i = 0; i < picks_count; i++) {
+@@ -278,7 +306,7 @@ StringVec RandMemberStrSet(const DbContext& db_context, const CompactObj& co,
+   result.reserve(picks_count);
+ 
+   std::uint32_t ss_entry_index = 0;
+-  for (string_view str : StringSetWrapper{co, db_context}.Range()) {
++  for (string_view str : strset.Range()) {
+     auto it = times_index_is_picked.find(ss_entry_index++);
+     if (it != times_index_is_picked.end()) {
+       while (it->second--)

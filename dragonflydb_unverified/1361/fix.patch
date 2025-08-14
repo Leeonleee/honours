@@ -1,0 +1,470 @@
+diff --git a/src/server/cluster/cluster_config.cc b/src/server/cluster/cluster_config.cc
+index 13ae9189a85e..69ff52d4cc3f 100644
+--- a/src/server/cluster/cluster_config.cc
++++ b/src/server/cluster/cluster_config.cc
+@@ -1,3 +1,5 @@
++#include <optional>
++
+ extern "C" {
+ #include "redis/crc16.h"
+ }
+@@ -32,10 +34,6 @@ SlotId ClusterConfig::KeySlot(string_view key) {
+   return crc16(tag.data(), tag.length()) & kMaxSlotNum;
+ }
+ 
+-ClusterConfig::ClusterConfig(string_view my_id) : my_id_(my_id) {
+-  cluster_enabled = true;
+-}
+-
+ namespace {
+ bool HasValidNodeIds(const ClusterConfig::ClusterShards& new_config) {
+   absl::flat_hash_set<string_view> nodes;
+@@ -60,11 +58,10 @@ bool HasValidNodeIds(const ClusterConfig::ClusterShards& new_config) {
+ 
+   return true;
+ }
+-}  // namespace
+ 
+-bool ClusterConfig::IsConfigValid(const ClusterShards& new_config) {
++bool IsConfigValid(const ClusterConfig::ClusterShards& new_config) {
+   // Make sure that all slots are set exactly once.
+-  array<bool, tuple_size<decltype(slots_)>::value> slots_found = {};
++  array<bool, ClusterConfig::kMaxSlotNum + 1> slots_found = {};
+ 
+   if (!HasValidNodeIds(new_config)) {
+     return false;
+@@ -103,38 +100,33 @@ bool ClusterConfig::IsConfigValid(const ClusterShards& new_config) {
+ 
+   return true;
+ }
++}  // namespace
+ 
+-optional<SlotSet> ClusterConfig::SetConfig(const vector<ClusterShard>& new_config) {
+-  if (!IsConfigValid(new_config)) {
+-    return nullopt;
++/* static */
++unique_ptr<ClusterConfig> ClusterConfig::CreateFromConfig(string_view my_id,
++                                                          const ClusterShards& config) {
++  if (!IsConfigValid(config)) {
++    return nullptr;
+   }
+ 
+-  // When set config is called the first time, deleted_slots will contain all slots which are not
+-  // allocated to this node. This makes sure that if there is data in server that was loaded from
+-  // disk (rdb_load), then after the call to set config the server data will contain only data from
+-  // the node owned slots.
+-  bool is_first_config = !IsConfigured();
++  unique_ptr<ClusterConfig> result(new ClusterConfig());
+ 
+-  lock_guard gu(mu_);
++  result->config_ = config;
+ 
+-  config_ = new_config;
+-
+-  SlotSet deleted_slots;
+-  for (const auto& shard : config_) {
+-    for (const auto& slot_range : shard.slot_ranges) {
+-      bool owned_by_me =
+-          shard.master.id == my_id_ || any_of(shard.replicas.begin(), shard.replicas.end(),
+-                                              [&](const Node& node) { return node.id == my_id_; });
+-      for (SlotId i = slot_range.start; i <= slot_range.end; ++i) {
+-        if ((slots_[i].owned_by_me || is_first_config) && !owned_by_me) {
+-          deleted_slots.insert(i);
++  for (const auto& shard : result->config_) {
++    bool owned_by_me =
++        shard.master.id == my_id || any_of(shard.replicas.begin(), shard.replicas.end(),
++                                           [&](const Node& node) { return node.id == my_id; });
++    if (owned_by_me) {
++      for (const auto& slot_range : shard.slot_ranges) {
++        for (SlotId i = slot_range.start; i <= slot_range.end; ++i) {
++          result->my_slots_.set(i);
+         }
+-        slots_[i] = {.shard = &shard, .owned_by_me = owned_by_me};
+       }
+     }
+   }
+ 
+-  return deleted_slots;
++  return result;
+ }
+ 
+ namespace {
+@@ -261,43 +253,53 @@ optional<ClusterConfig::ClusterShards> BuildClusterConfigFromJson(const JsonType
+ }
+ }  // namespace
+ 
+-optional<SlotSet> ClusterConfig::SetConfig(const JsonType& json) {
+-  optional<ClusterShards> config = BuildClusterConfigFromJson(json);
++/* static */
++unique_ptr<ClusterConfig> ClusterConfig::CreateFromConfig(string_view my_id,
++                                                          const JsonType& json_config) {
++  optional<ClusterShards> config = BuildClusterConfigFromJson(json_config);
+   if (!config.has_value()) {
+-    return nullopt;
++    return nullptr;
+   }
+ 
+-  return SetConfig(config.value());
++  return CreateFromConfig(my_id, config.value());
+ }
+ 
+ bool ClusterConfig::IsMySlot(SlotId id) const {
+-  if (id >= slots_.size()) {
++  if (id >= my_slots_.size()) {
+     DCHECK(false) << "Requesting a non-existing slot id " << id;
+     return false;
+   }
+ 
+-  shared_lock gu(mu_);
+-  return slots_[id].owned_by_me;
++  return my_slots_.test(id);
+ }
+ 
+ ClusterConfig::Node ClusterConfig::GetMasterNodeForSlot(SlotId id) const {
+-  shared_lock gu(mu_);
++  CHECK_LT(id, my_slots_.size()) << "Requesting a non-existing slot id " << id;
+ 
+-  CHECK_LT(id, slots_.size()) << "Requesting a non-existing slot id " << id;
+-  CHECK_NE(slots_[id].shard, nullptr)
+-      << "Calling GetMasterNodeForSlot(" << id << ") before SetConfig()";
++  for (const auto& shard : config_) {
++    for (const auto& range : shard.slot_ranges) {
++      if (id >= range.start && id <= range.end) {
++        return shard.master;
++      }
++    }
++  }
+ 
+-  return slots_[id].shard->master;
++  DCHECK(false) << "Can't find master node for slot " << id;
++  return {};
+ }
+ 
+ ClusterConfig::ClusterShards ClusterConfig::GetConfig() const {
+-  shared_lock gu(mu_);
+   return config_;
+ }
+ 
+-bool ClusterConfig::IsConfigured() const {
+-  shared_lock gu(mu_);
+-  return !config_.empty();
++SlotSet ClusterConfig::GetOwnedSlots() const {
++  SlotSet set;
++  for (SlotId id = 0; id <= kMaxSlotNum; ++id) {
++    if (IsMySlot(id)) {
++      set.insert(id);
++    }
++  }
++  return set;
+ }
+ 
+ }  // namespace dfly
+diff --git a/src/server/cluster/cluster_config.h b/src/server/cluster/cluster_config.h
+index ee97b4f9b8b3..a5d702d96a6a 100644
+--- a/src/server/cluster/cluster_config.h
++++ b/src/server/cluster/cluster_config.h
+@@ -8,7 +8,8 @@
+ #include <absl/container/flat_hash_set.h>
+ 
+ #include <array>
+-#include <optional>
++#include <bitset>
++#include <memory>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -43,10 +44,14 @@ class ClusterConfig {
+ 
+   using ClusterShards = std::vector<ClusterShard>;
+ 
+-  explicit ClusterConfig(std::string_view my_id);
++  ClusterConfig& operator=(const ClusterConfig&) = default;
+ 
+   static SlotId KeySlot(std::string_view key);
+ 
++  static void EnableCluster() {
++    cluster_enabled = true;
++  }
++
+   static bool IsClusterEnabled() {
+     return cluster_enabled;
+   }
+@@ -54,24 +59,24 @@ class ClusterConfig {
+   // If the key contains the {...} pattern, return only the part between { and }
+   static std::string_view KeyTag(std::string_view key);
+ 
++  // Returns an instance with `config` if it is valid.
++  // Returns heap-allocated object as it is too big for a stack frame.
++  static std::unique_ptr<ClusterConfig> CreateFromConfig(std::string_view my_id,
++                                                         const ClusterShards& config);
++
++  // Parses `json_config` into `ClusterShards` and calls the above overload.
++  static std::unique_ptr<ClusterConfig> CreateFromConfig(std::string_view my_id,
++                                                         const JsonType& json_config);
++
+   // If key is in my slots ownership return true
+   bool IsMySlot(SlotId id) const;
+ 
+   // Returns the master configured for `id`.
+-  // Must not be called when IsConfigured() == false.
+   Node GetMasterNodeForSlot(SlotId id) const;
+ 
+   ClusterShards GetConfig() const;
+ 
+-  // Returns deleted slot set if `new_config` is valid and internal state was changed. Returns
+-  // nullopt and changes nothing otherwise.
+-  std::optional<SlotSet> SetConfig(const ClusterShards& new_config);
+-
+-  // Parses `json` into `ClusterShards` and calls the above overload.
+-  std::optional<SlotSet> SetConfig(const JsonType& json);
+-
+-  // Returns whether SetConfig() was ever successfully called.
+-  bool IsConfigured() const;
++  SlotSet GetOwnedSlots() const;
+ 
+  private:
+   struct SlotEntry {
+@@ -79,18 +84,16 @@ class ClusterConfig {
+     bool owned_by_me = false;
+   };
+ 
+-  bool IsConfigValid(const ClusterShards& new_config);
+-
+   static bool cluster_enabled;
+ 
+-  const std::string my_id_;
++  ClusterConfig() = default;
+ 
+-  mutable util::SharedMutex mu_;
++  std::string my_id_;
+ 
+-  ClusterShards config_ ABSL_GUARDED_BY(mu_);
++  ClusterShards config_;
+ 
+-  // This array covers the whole range of possible slots for fast access. It points into `config_`.
+-  std::array<SlotEntry, kMaxSlotNum + 1> slots_ ABSL_GUARDED_BY(mu_) = {};
++  // True bits in `my_slots_` indicate that this slot is owned by this node.
++  std::bitset<kMaxSlotNum + 1> my_slots_;
+ };
+ 
+ }  // namespace dfly
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index 1d0993c50002..fa6013d818d3 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -5,6 +5,7 @@
+ #include "server/cluster/cluster_family.h"
+ 
+ #include <jsoncons/json.hpp>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ 
+@@ -17,6 +18,7 @@
+ #include "server/conn_context.h"
+ #include "server/dflycmd.h"
+ #include "server/error.h"
++#include "server/main_service.h"
+ #include "server/replica.h"
+ #include "server/server_family.h"
+ #include "server/server_state.h"
+@@ -43,6 +45,8 @@ constexpr string_view kClusterDisabled =
+     "Cluster is disabled. Enabled via passing --cluster_mode=emulated|yes";
+ constexpr string_view kDflyClusterCmdPort = "DflyCluster command allowed only under admin port";
+ 
++thread_local unique_ptr<ClusterConfig> tl_cluster_config;
++
+ }  // namespace
+ 
+ ClusterFamily::ClusterFamily(ServerFamily* server_family) : server_family_(server_family) {
+@@ -52,13 +56,17 @@ ClusterFamily::ClusterFamily(ServerFamily* server_family) : server_family_(serve
+   if (cluster_mode == "emulated") {
+     is_emulated_cluster_ = true;
+   } else if (cluster_mode == "yes") {
+-    cluster_config_ = std::make_unique<ClusterConfig>(server_family_->master_id());
++    ClusterConfig::EnableCluster();
+   } else if (!cluster_mode.empty()) {
+     LOG(ERROR) << "invalid cluster_mode. Exiting...";
+     exit(1);
+   }
+ }
+ 
++ClusterConfig* ClusterFamily::cluster_config() {
++  return tl_cluster_config.get();
++}
++
+ bool ClusterFamily::IsEnabledOrEmulated() const {
+   return is_emulated_cluster_ || ClusterConfig::IsClusterEnabled();
+ }
+@@ -163,8 +171,8 @@ void ClusterShardsImpl(const ClusterShards& config, ConnectionContext* cntx) {
+ void ClusterFamily::ClusterShards(ConnectionContext* cntx) {
+   if (is_emulated_cluster_) {
+     return ClusterShardsImpl({GetEmulatedShardInfo(cntx)}, cntx);
+-  } else if (cluster_config_->IsConfigured()) {
+-    return ClusterShardsImpl(cluster_config_->GetConfig(), cntx);
++  } else if (tl_cluster_config != nullptr) {
++    return ClusterShardsImpl(tl_cluster_config->GetConfig(), cntx);
+   } else {
+     return (*cntx)->SendError(kClusterNotConfigured);
+   }
+@@ -206,8 +214,8 @@ void ClusterSlotsImpl(const ClusterShards& config, ConnectionContext* cntx) {
+ void ClusterFamily::ClusterSlots(ConnectionContext* cntx) {
+   if (is_emulated_cluster_) {
+     return ClusterSlotsImpl({GetEmulatedShardInfo(cntx)}, cntx);
+-  } else if (cluster_config_->IsConfigured()) {
+-    return ClusterSlotsImpl(cluster_config_->GetConfig(), cntx);
++  } else if (tl_cluster_config != nullptr) {
++    return ClusterSlotsImpl(tl_cluster_config->GetConfig(), cntx);
+   } else {
+     return (*cntx)->SendError(kClusterNotConfigured);
+   }
+@@ -259,8 +267,8 @@ void ClusterNodesImpl(const ClusterShards& config, string_view my_id, Connection
+ void ClusterFamily::ClusterNodes(ConnectionContext* cntx) {
+   if (is_emulated_cluster_) {
+     return ClusterNodesImpl({GetEmulatedShardInfo(cntx)}, server_family_->master_id(), cntx);
+-  } else if (cluster_config_->IsConfigured()) {
+-    return ClusterNodesImpl(cluster_config_->GetConfig(), server_family_->master_id(), cntx);
++  } else if (tl_cluster_config != nullptr) {
++    return ClusterNodesImpl(tl_cluster_config->GetConfig(), server_family_->master_id(), cntx);
+   } else {
+     return (*cntx)->SendError(kClusterNotConfigured);
+   }
+@@ -321,8 +329,8 @@ void ClusterInfoImpl(const ClusterShards& config, ConnectionContext* cntx) {
+ void ClusterFamily::ClusterInfo(ConnectionContext* cntx) {
+   if (is_emulated_cluster_) {
+     return ClusterInfoImpl({GetEmulatedShardInfo(cntx)}, cntx);
+-  } else if (cluster_config_->IsConfigured()) {
+-    return ClusterInfoImpl(cluster_config_->GetConfig(), cntx);
++  } else if (tl_cluster_config != nullptr) {
++    return ClusterInfoImpl(tl_cluster_config->GetConfig(), cntx);
+   } else {
+     return ClusterInfoImpl({}, cntx);
+   }
+@@ -377,8 +385,6 @@ void ClusterFamily::DflyCluster(CmdArgList args, ConnectionContext* cntx) {
+     return (*cntx)->SendError(kDflyClusterCmdPort);
+   }
+ 
+-  CHECK(is_emulated_cluster_ || cluster_config_.get() != nullptr);
+-
+   ToUpper(&args[0]);
+   string_view sub_cmd = ArgS(args, 0);
+   if (sub_cmd == "GETSLOTINFO") {
+@@ -399,6 +405,21 @@ void ClusterFamily::DflyClusterMyId(CmdArgList args, ConnectionContext* cntx) {
+   (*cntx)->SendBulkString(server_family_->master_id());
+ }
+ 
++namespace {
++SlotSet GetDeletedSlots(bool is_first_config, const SlotSet& before, const SlotSet& after) {
++  SlotSet result;
++  for (SlotId id = 0; id <= ClusterConfig::kMaxSlotNum; ++id) {
++    if ((before.contains(id) || is_first_config) && !after.contains(id)) {
++      result.insert(id);
++    }
++  }
++  return result;
++}
++
++// Guards set configuration, so that we won't handle 2 in parallel.
++Mutex set_config_mu;
++}  // namespace
++
+ void ClusterFamily::DflyClusterConfig(CmdArgList args, ConnectionContext* cntx) {
+   SinkReplyBuilder* rb = cntx->reply_builder();
+ 
+@@ -413,19 +434,44 @@ void ClusterFamily::DflyClusterConfig(CmdArgList args, ConnectionContext* cntx)
+     return rb->SendError("Invalid JSON cluster config", kSyntaxErrType);
+   }
+ 
+-  auto deleted_slot_ids = cluster_config_->SetConfig(json.value());
+-  if (!deleted_slot_ids.has_value()) {
++  unique_ptr<ClusterConfig> new_config =
++      ClusterConfig::CreateFromConfig(server_family_->master_id(), json.value());
++  if (new_config == nullptr) {
++    LOG(WARNING) << "Can't set cluster config";
+     return rb->SendError("Invalid cluster configuration.");
+   }
+ 
++  lock_guard gu(set_config_mu);
++
++  bool is_first_config = true;
++  SlotSet before;
++  if (tl_cluster_config != nullptr) {
++    is_first_config = false;
++    before = tl_cluster_config->GetOwnedSlots();
++  }
++
++  auto cb = [&](util::ProactorBase* pb) {
++    if (tl_cluster_config == nullptr) {
++      tl_cluster_config = make_unique<ClusterConfig>(*new_config);
++    } else {
++      *tl_cluster_config = *new_config;
++    }
++  };
++  server_family_->service().proactor_pool().AwaitFiberOnAll(std::move(cb));
++
++  DCHECK(tl_cluster_config != nullptr);
++
++  SlotSet after = tl_cluster_config->GetOwnedSlots();
++
+   // Delete old slots data.
+-  if (!deleted_slot_ids.value().empty()) {
++  SlotSet deleted_slot_ids = GetDeletedSlots(is_first_config, before, after);
++  if (!deleted_slot_ids.empty()) {
+     auto cb = [&](auto*) {
+       EngineShard* shard = EngineShard::tlocal();
+       if (shard == nullptr)
+         return;
+ 
+-      shard->db_slice().FlushSlots(deleted_slot_ids.value());
++      shard->db_slice().FlushSlots(deleted_slot_ids);
+     };
+     shard_set->pool()->AwaitFiberOnAll(std::move(cb));
+   }
+diff --git a/src/server/cluster/cluster_family.h b/src/server/cluster/cluster_family.h
+index 73e85906c051..8716917bfff7 100644
+--- a/src/server/cluster/cluster_family.h
++++ b/src/server/cluster/cluster_family.h
+@@ -4,7 +4,6 @@
+ 
+ #pragma once
+ 
+-#include <memory>
+ #include <string>
+ 
+ #include "facade/conn_context.h"
+@@ -25,9 +24,8 @@ class ClusterFamily {
+ 
+   bool IsEnabledOrEmulated() const;
+ 
+-  ClusterConfig* cluster_config() {
+-    return cluster_config_.get();
+-  }
++  // Returns a thread-local pointer.
++  ClusterConfig* cluster_config();
+ 
+  private:
+   // Cluster commands compatible with Redis
+@@ -51,8 +49,6 @@ class ClusterFamily {
+ 
+   bool is_emulated_cluster_ = false;
+   ServerFamily* server_family_ = nullptr;
+-
+-  std::unique_ptr<ClusterConfig> cluster_config_;
+ };
+ 
+ }  // namespace dfly
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index b8cae07227c0..6b768aae57d8 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -628,8 +628,8 @@ bool Service::CheckKeysOwnership(const CommandId* cid, CmdArgList args,
+   }
+ 
+   // Check keys slot is in my ownership
+-  const auto& cluster_config = cluster_family_.cluster_config();
+-  if (!cluster_config->IsConfigured()) {
++  const ClusterConfig* cluster_config = cluster_family_.cluster_config();
++  if (cluster_config == nullptr) {
+     (*dfly_cntx)->SendError(kClusterNotConfigured);
+     return false;
+   }

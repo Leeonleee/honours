@@ -1,0 +1,322 @@
+diff --git a/src/server/CMakeLists.txt b/src/server/CMakeLists.txt
+index 00df29205d3e..cbcc357ed739 100644
+--- a/src/server/CMakeLists.txt
++++ b/src/server/CMakeLists.txt
+@@ -11,7 +11,7 @@ endif()
+ add_library(dfly_transaction db_slice.cc malloc_stats.cc engine_shard_set.cc blocking_controller.cc
+             common.cc
+             io_mgr.cc journal/journal.cc journal/journal_slice.cc server_state.cc table.cc
+-            tiered_storage.cc transaction.cc)
++            tiered_storage.cc top_keys.cc transaction.cc)
+ cxx_link(dfly_transaction uring_fiber_lib dfly_core strings_lib)
+ 
+ add_library(dragonfly_lib  channel_slice.cc command_registry.cc
+@@ -21,7 +21,8 @@ add_library(dragonfly_lib  channel_slice.cc command_registry.cc
+             snapshot.cc script_mgr.cc server_family.cc malloc_stats.cc
+             set_family.cc stream_family.cc string_family.cc
+             zset_family.cc version.cc bitops_family.cc container_utils.cc io_utils.cc
+-            serializer_commons.cc journal/serializer.cc journal/executor.cc journal/streamer.cc)
++            serializer_commons.cc journal/serializer.cc journal/executor.cc journal/streamer.cc
++            top_keys.cc)
+ 
+ cxx_link(dragonfly_lib dfly_transaction dfly_facade redis_lib strings_lib html_lib http_client_lib
+          absl::random_random TRDP::jsoncons zstd TRDP::lz4)
+@@ -46,6 +47,7 @@ cxx_test(snapshot_test dragonfly_lib LABELS DFLY)
+ cxx_test(json_family_test dfly_test_lib LABELS DFLY)
+ cxx_test(journal_test dfly_test_lib LABELS DFLY)
+ cxx_test(tiered_storage_test dfly_test_lib LABELS DFLY)
++cxx_test(top_keys_test dfly_test_lib LABELS DFLY)
+ 
+ add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
+ add_dependencies(check_dfly dragonfly_test json_family_test list_family_test
+diff --git a/src/server/db_slice.cc b/src/server/db_slice.cc
+index 332d3fe2b828..3d04f80f1084 100644
+--- a/src/server/db_slice.cc
++++ b/src/server/db_slice.cc
+@@ -329,6 +329,7 @@ pair<PrimeIterator, ExpireIterator> DbSlice::FindExt(const Context& cntx, string
+   }
+ 
+   events_.hits++;
++  db.top_keys.Touch(key);
+   return res;
+ }
+ 
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 2d6b7203c5e1..962ac517233c 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -428,6 +428,34 @@ bool EvalValidator(CmdArgList args, ConnectionContext* cntx) {
+   return true;
+ }
+ 
++void Topkeys(const http::QueryArgs& args, HttpContext* send) {
++  http::StringResponse resp = http::MakeStringResponse(h2::status::ok);
++  resp.body() = "<h1>Detected top keys</h1>
+<pre>
+";
++
++  std::atomic_bool is_enabled = false;
++  if (shard_set) {
++    vector<string> rows(shard_set->size());
++
++    shard_set->RunBriefInParallel([&](EngineShard* shard) {
++      for (const auto& db : shard->db_slice().databases()) {
++        if (db->top_keys.IsEnabled()) {
++          is_enabled = true;
++          for (const auto& [key, count] : db->top_keys.GetTopKeys()) {
++            absl::StrAppend(&resp.body(), key, ":\t", count, "
+");
++          }
++        }
++      }
++    });
++  }
++
++  resp.body() += "</pre>";
++
++  if (!is_enabled) {
++    resp.body() += "<i>TopKeys are disabled.</i>";
++  }
++  send->Invoke(std::move(resp));
++}
++
+ void TxTable(const http::QueryArgs& args, HttpContext* send) {
+   using html::SortedTable;
+ 
+@@ -1566,6 +1594,7 @@ GlobalState Service::SwitchState(GlobalState from, GlobalState to) {
+ void Service::ConfigureHttpHandlers(util::HttpListenerBase* base) {
+   server_family_.ConfigureMetrics(base);
+   base->RegisterCb("/txz", TxTable);
++  base->RegisterCb("/topkeys", Topkeys);
+ }
+ 
+ void Service::OnClose(facade::ConnectionContext* cntx) {
+diff --git a/src/server/table.cc b/src/server/table.cc
+index 281a0ebf0412..77825168c019 100644
+--- a/src/server/table.cc
++++ b/src/server/table.cc
+@@ -4,8 +4,12 @@
+ 
+ #include "server/table.h"
+ 
++#include "base/flags.h"
+ #include "base/logging.h"
+ 
++ABSL_FLAG(bool, enable_top_keys_tracking, false,
++          "Enables / disables tracking of hot keys debugging feature");
++
+ namespace dfly {
+ 
+ #define ADD(x) (x) += o.x
+@@ -31,7 +35,8 @@ DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
+ 
+ DbTable::DbTable(std::pmr::memory_resource* mr)
+     : prime(kInitSegmentLog, detail::PrimeTablePolicy{}, mr),
+-      expire(0, detail::ExpireTablePolicy{}, mr), mcflag(0, detail::ExpireTablePolicy{}, mr) {
++      expire(0, detail::ExpireTablePolicy{}, mr), mcflag(0, detail::ExpireTablePolicy{}, mr),
++      top_keys({.enabled = absl::GetFlag(FLAGS_enable_top_keys_tracking)}) {
+ }
+ 
+ DbTable::~DbTable() {
+diff --git a/src/server/table.h b/src/server/table.h
+index cc7776d6fdbd..14687e4b16e1 100644
+--- a/src/server/table.h
++++ b/src/server/table.h
+@@ -13,6 +13,7 @@
+ #include "core/intent_lock.h"
+ #include "server/conn_context.h"
+ #include "server/detail/table.h"
++#include "server/top_keys.h"
+ 
+ namespace dfly {
+ 
+@@ -72,6 +73,8 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
+   ExpireTable::Cursor expire_cursor;
+   PrimeTable::Cursor prime_cursor;
+ 
++  TopKeys top_keys;
++
+   explicit DbTable(std::pmr::memory_resource* mr);
+   ~DbTable();
+ 
+diff --git a/src/server/top_keys.cc b/src/server/top_keys.cc
+new file mode 100644
+index 000000000000..27141cdd2295
+--- /dev/null
++++ b/src/server/top_keys.cc
+@@ -0,0 +1,96 @@
++// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++
++#include "server/top_keys.h"
++
++#include <xxhash.h>
++
++#include "absl/numeric/bits.h"
++#include "absl/random/distributions.h"
++#include "base/logging.h"
++
++namespace dfly {
++
++TopKeys::TopKeys(Options options) : options_(options) {
++  fingerprints_.resize(options_.buckets * options_.arrays);
++}
++
++void TopKeys::Touch(std::string_view key) {
++  if (!IsEnabled()) {
++    return;
++  }
++
++  auto ResetCell = [&](Cell& cell, uint64_t fingerprint) {
++    cell.fingerprint = fingerprint;
++    cell.count = 1;
++    if (cell.count >= options_.min_key_count_to_record) {
++      cell.key = key;
++    }
++  };
++
++  const uint64_t fingerprint = XXH3_64bits(key.data(), key.size());
++  const int shift = absl::bit_width(options_.buckets);
++
++  for (uint64_t array = 0; array < options_.arrays; ++array) {
++    // TODO: if we decide to keep this logic, CHECK that bit_width(buckets) * arrays < 64
++    const int bucket = (fingerprint >> (shift * array)) % options_.buckets;
++    Cell& cell = GetCell(array, bucket);
++    if (cell.count == 0) {
++      // No fingerprint in cell.
++      ResetCell(cell, fingerprint);
++    } else if (cell.fingerprint == fingerprint) {
++      // Same fingerprint, simply increment count.
++
++      // We could make sure that, if !cell.key.empty(), then key == cell.key.empty() here. However,
++      // what do we do in case they are different?
++      ++cell.count;
++
++      if (cell.count >= options_.min_key_count_to_record && cell.key.empty()) {
++        cell.key = key;
++      }
++    } else {
++      // Different fingerprint, apply exponential decay.
++      const double rand = absl::Uniform(bitgen_, 0, 1.0);
++      if (rand < std::pow(options_.decay_base, -static_cast<double>(cell.count))) {
++        --cell.count;
++        if (cell.count == 0) {
++          ResetCell(cell, fingerprint);
++        }
++      }
++    }
++  }
++}
++
++absl::flat_hash_map<std::string, uint64_t> TopKeys::GetTopKeys() const {
++  absl::flat_hash_map<std::string, uint64_t> results;
++
++  for (uint64_t array = 0; array < options_.arrays; ++array) {
++    for (uint64_t bucket = 0; bucket < options_.buckets; ++bucket) {
++      const Cell& cell = GetCell(array, bucket);
++      if (!cell.key.empty()) {
++        results[cell.key] = std::max(results[cell.key], cell.count);
++      }
++    }
++  }
++
++  return results;
++}
++
++bool TopKeys::IsEnabled() const {
++  return options_.enabled;
++}
++
++TopKeys::Cell& TopKeys::GetCell(uint64_t array, uint64_t bucket) {
++  DCHECK(array < options_.arrays);
++  DCHECK(bucket < options_.buckets);
++  return fingerprints_[array * options_.buckets + bucket];
++}
++
++const TopKeys::Cell& TopKeys::GetCell(uint64_t array, uint64_t bucket) const {
++  DCHECK(array < options_.arrays);
++  DCHECK(bucket < options_.buckets);
++  return fingerprints_[array * options_.buckets + bucket];
++}
++
++}  // end of namespace dfly
+diff --git a/src/server/top_keys.h b/src/server/top_keys.h
+new file mode 100644
+index 000000000000..5d89f15e9bab
+--- /dev/null
++++ b/src/server/top_keys.h
+@@ -0,0 +1,73 @@
++// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++
++#pragma once
++
++#include <absl/container/flat_hash_map.h>
++#include <absl/random/random.h>
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace dfly {
++
++// TopKeys is a utility class that helps determine the most frequently used keys.
++//
++// Usage:
++// - Instanciate this class with proper options (see below)
++// - For every used key k, call Touch(k)
++// - At some point(s) in time, call GetTopKeys() to get an estimated list of top keys along with
++//   their approximate count (i.e. how many times Touch() was invoked for them).
++//
++// Notes:
++// - This class implements a slightly modified version of HeavyKeeper, a data structure designed
++//   for a similar problem domain. The modification made is to store the keys directly within the
++//   tables, when they meet a certain threshold, instead of using a min-heap.
++// - This class is statistical in nature. Do *not* expect accurate counts.
++// - When misconfigured, real top keys may be missing from GetTopKeys(). This can occur when there
++//   are too few buckets, or when min_key_count_to_record is too high, depending on actual usage.
++class TopKeys {
++ public:
++  struct Options {
++    // HeavyKeeper options
++    uint64_t buckets = 1 << 16;
++    uint64_t arrays = 4;
++    double decay_base = 1.08;
++
++    // What is the minimum times Touch() has to be called for a given key in order for the key to be
++    // saved. Use lower values when load is low, or higher values when load is high. The cost of a
++    // low value for high load is frequent string copying and memory allocation.
++    uint64_t min_key_count_to_record = 100;
++
++    // Pass false to disable, making this class no-op.
++    bool enabled = true;
++  };
++
++  explicit TopKeys(Options options);
++
++  void Touch(std::string_view key);
++  absl::flat_hash_map<std::string, uint64_t> GetTopKeys() const;
++
++  bool IsEnabled() const;
++
++ private:
++  // Each cell consists of a key-fingerprint, a count, and potentially the key itself, when it's
++  // above options_.min_key_count_to_record.
++  struct Cell {
++    uint64_t fingerprint = 0;
++    uint64_t count = 0;
++    std::string key;
++  };
++  Cell& GetCell(uint64_t array, uint64_t bucket);
++  const Cell& GetCell(uint64_t array, uint64_t bucket) const;
++
++  Options options_;
++  absl::BitGen bitgen_;
++
++  // fingerprints_'s size is options_.buckets * options_.arrays. Always access fields via GetCell().
++  std::vector<Cell> fingerprints_;
++};
++
++}  // end of namespace dfly

@@ -1,0 +1,209 @@
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index 3f7facd85c47..5c1349428266 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -814,8 +814,7 @@ bool RemoveIncomingMigrationImpl(std::vector<std::shared_ptr<IncomingSlotMigrati
+ void ClusterFamily::RemoveIncomingMigrations(const std::vector<MigrationInfo>& migrations) {
+   lock_guard lk(migration_mu_);
+   for (const auto& m : migrations) {
+-    auto was_removed = RemoveIncomingMigrationImpl(incoming_migrations_jobs_, m.node_id);
+-    DCHECK(was_removed);
++    RemoveIncomingMigrationImpl(incoming_migrations_jobs_, m.node_id);
+     VLOG(1) << "Migration was canceled from: " << m.node_id;
+   }
+ }
+@@ -835,6 +834,17 @@ void ClusterFamily::InitMigration(CmdArgList args, ConnectionContext* cntx) {
+   if (auto err = parser.Error(); err)
+     return cntx->SendError(err->MakeReply());
+ 
++  const auto& incoming_migrations = cluster_config()->GetIncomingMigrations();
++  bool found = any_of(incoming_migrations.begin(), incoming_migrations.end(),
++                      [&](const MigrationInfo& info) {
++                        // TODO: also compare slot ranges (in an order-agnostic way)
++                        return info.node_id == source_id;
++                      });
++  if (!found) {
++    VLOG(1) << "Unrecognized incoming migration from " << source_id;
++    return cntx->SendError(OutgoingMigration::kUnknownMigration);
++  }
++
+   VLOG(1) << "Init migration " << source_id;
+ 
+   lock_guard lk(migration_mu_);
+diff --git a/src/server/cluster/incoming_slot_migration.cc b/src/server/cluster/incoming_slot_migration.cc
+index cee46f422db6..c4b959b6d57d 100644
+--- a/src/server/cluster/incoming_slot_migration.cc
++++ b/src/server/cluster/incoming_slot_migration.cc
+@@ -109,7 +109,7 @@ IncomingSlotMigration::IncomingSlotMigration(string source_id, Service* se, Slot
+       service_(*se),
+       slots_(std::move(slots)),
+       state_(MigrationState::C_CONNECTING),
+-      bc_(shards_num) {
++      bc_(0) {
+   shard_flows_.resize(shards_num);
+   for (unsigned i = 0; i < shards_num; ++i) {
+     shard_flows_[i].reset(new ClusterShardMigration(i, &service_));
+@@ -137,6 +137,7 @@ void IncomingSlotMigration::StartFlow(uint32_t shard, util::FiberSocketBase* sou
+   VLOG(1) << "Start flow for shard: " << shard;
+   state_.store(MigrationState::C_SYNC);
+ 
++  bc_->Add();
+   shard_flows_[shard]->Start(&cntx_, source, bc_);
+ }
+ 
+diff --git a/src/server/cluster/outgoing_slot_migration.cc b/src/server/cluster/outgoing_slot_migration.cc
+index ba9a6b7c8662..14efc8de2412 100644
+--- a/src/server/cluster/outgoing_slot_migration.cc
++++ b/src/server/cluster/outgoing_slot_migration.cc
+@@ -57,11 +57,17 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
+       return;
+     }
+ 
++    // Check if migration was cancelled while we yielded so far.
++    if (cancelled_) {
++      return;
++    }
++
+     streamer_.Start(Sock());
+   }
+ 
+   void Cancel() {
+     streamer_.Cancel();
++    cancelled_ = true;
+   }
+ 
+   void Finalize() {
+@@ -74,6 +80,7 @@ class OutgoingMigration::SliceSlotMigration : private ProtocolClient {
+ 
+  private:
+   RestoreStreamer streamer_;
++  bool cancelled_ = false;
+ };
+ 
+ OutgoingMigration::OutgoingMigration(MigrationInfo info, ClusterFamily* cf, ServerFamily* sf)
+@@ -88,26 +95,42 @@ OutgoingMigration::~OutgoingMigration() {
+   main_sync_fb_.JoinIfNeeded();
+ }
+ 
++bool OutgoingMigration::ChangeState(MigrationState new_state) {
++  std::lock_guard lk(state_mu_);
++  if (state_ == MigrationState::C_FINISHED) {
++    return false;
++  }
++
++  state_ = new_state;
++  return true;
++}
++
+ void OutgoingMigration::Finish(bool is_error) {
+-  std::lock_guard lk(finish_mu_);
+-  if (state_.load() != MigrationState::C_FINISHED) {
+-    const auto new_state = is_error ? MigrationState::C_ERROR : MigrationState::C_FINISHED;
+-    state_.store(new_state);
++  const auto new_state = is_error ? MigrationState::C_ERROR : MigrationState::C_FINISHED;
++  if (ChangeState(new_state)) {
+     shard_set->pool()->AwaitFiberOnAll([this](util::ProactorBase* pb) {
+-      if (const auto* shard = EngineShard::tlocal(); shard)
+-        slot_migrations_[shard->shard_id()]->Cancel();
++      if (const auto* shard = EngineShard::tlocal(); shard) {
++        auto& flow = slot_migrations_[shard->shard_id()];
++        if (flow != nullptr) {
++          flow->Cancel();
++        }
++      }
+     });
+   }
+ }
+ 
+ MigrationState OutgoingMigration::GetState() const {
+-  return state_.load();
++  std::lock_guard lk(state_mu_);
++  return state_;
+ }
+ 
+ void OutgoingMigration::SyncFb() {
+   // we retry starting migration until "cancel" is happened
+-  while (state_.load() != MigrationState::C_FINISHED) {
+-    state_.store(MigrationState::C_CONNECTING);
++  while (GetState() != MigrationState::C_FINISHED) {
++    if (!ChangeState(MigrationState::C_CONNECTING)) {
++      break;
++    }
++
+     last_error_ = cntx_.GetError();
+     cntx_.Reset(nullptr);
+ 
+@@ -137,11 +160,15 @@ void OutgoingMigration::SyncFb() {
+     }
+ 
+     if (!CheckRespIsSimpleReply("OK")) {
+-      cntx_.ReportError(GenericError(std::string(ToSV(LastResponseArgs().front().GetBuf()))));
++      if (!CheckRespIsSimpleReply(kUnknownMigration)) {
++        cntx_.ReportError(GenericError(std::string(ToSV(LastResponseArgs().front().GetBuf()))));
++      }
+       continue;
+     }
+ 
+-    state_.store(MigrationState::C_SYNC);
++    if (!ChangeState(MigrationState::C_SYNC)) {
++      break;
++    }
+ 
+     shard_set->pool()->AwaitFiberOnAll([this](util::ProactorBase* pb) {
+       if (auto* shard = EngineShard::tlocal(); shard) {
+@@ -163,7 +190,7 @@ void OutgoingMigration::SyncFb() {
+     VLOG(1) << "Migrations snapshot is finished";
+ 
+     long attempt = 0;
+-    while (state_.load() != MigrationState::C_FINISHED && !FinalyzeMigration(++attempt)) {
++    while (GetState() != MigrationState::C_FINISHED && !FinalizeMigration(++attempt)) {
+       // process commands that were on pause and try again
+       ThisFiber::SleepFor(500ms);
+     }
+@@ -174,7 +201,7 @@ void OutgoingMigration::SyncFb() {
+   }
+ }
+ 
+-bool OutgoingMigration::FinalyzeMigration(long attempt) {
++bool OutgoingMigration::FinalizeMigration(long attempt) {
+   // if it's not the 1st attempt and flows are work correctly we try to reconnect and ACK one more
+   // time
+   if (attempt > 1) {
+diff --git a/src/server/cluster/outgoing_slot_migration.h b/src/server/cluster/outgoing_slot_migration.h
+index 6bbd821173d0..aa2a1b0d3fb2 100644
+--- a/src/server/cluster/outgoing_slot_migration.h
++++ b/src/server/cluster/outgoing_slot_migration.h
+@@ -54,6 +54,7 @@ class OutgoingMigration : private ProtocolClient {
+   }
+ 
+   static constexpr long kInvalidAttempt = -1;
++  static constexpr std::string_view kUnknownMigration = "UNKNOWN_MIGRATION";
+ 
+  private:
+   // should be run for all shards
+@@ -68,11 +69,12 @@ class OutgoingMigration : private ProtocolClient {
+ 
+   void SyncFb();
+   // return true if migration is finalized even with C_ERROR state
+-  bool FinalyzeMigration(long attempt);
++  bool FinalizeMigration(long attempt);
++
++  bool ChangeState(MigrationState new_state) ABSL_LOCKS_EXCLUDED(state_mu_);
+ 
+  private:
+   MigrationInfo migration_info_;
+-  mutable util::fb2::Mutex finish_mu_;
+   std::vector<std::unique_ptr<SliceSlotMigration>> slot_migrations_;
+   ServerFamily* server_family_;
+   ClusterFamily* cf_;
+@@ -80,8 +82,8 @@ class OutgoingMigration : private ProtocolClient {
+ 
+   util::fb2::Fiber main_sync_fb_;
+ 
+-  // Atomic only for simple read operation, writes - from the same thread, reads - from any thread
+-  std::atomic<MigrationState> state_ = MigrationState::C_NO_STATE;
++  mutable util::fb2::Mutex state_mu_;
++  MigrationState state_ ABSL_GUARDED_BY(state_mu_) = MigrationState::C_NO_STATE;
+ };
+ 
+ }  // namespace dfly::cluster

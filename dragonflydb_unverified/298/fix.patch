@@ -1,0 +1,163 @@
+diff --git a/docs/api_status.md b/docs/api_status.md
+index 6fd2af08a685..01386a9916e5 100644
+--- a/docs/api_status.md
++++ b/docs/api_status.md
+@@ -40,6 +40,7 @@ with respect to Memcached and Redis APIs.
+   - [X] EXPIRE
+   - [X] EXPIREAT
+   - [X] KEYS
++  - [X] MOVE
+   - [X] PING
+   - [X] RENAME
+   - [X] RENAMENX
+@@ -105,7 +106,6 @@ with respect to Memcached and Redis APIs.
+   - [ ] BGREWRITEAOF
+   - [ ] MONITOR
+   - [ ] RANDOMKEY
+-  - [ ] MOVE
+ 
+ ### API 2
+ - [X] List Family
+diff --git a/src/server/generic_family.cc b/src/server/generic_family.cc
+index c772598947b5..60550bbeba39 100644
+--- a/src/server/generic_family.cc
++++ b/src/server/generic_family.cc
+@@ -463,6 +463,38 @@ void GenericFamily::Stick(CmdArgList args, ConnectionContext* cntx) {
+   (*cntx)->SendLong(match_cnt);
+ }
+ 
++void GenericFamily::Move(CmdArgList args, ConnectionContext* cntx) {
++  string_view key = ArgS(args, 1);
++  int64_t target_db;
++
++  if (!absl::SimpleAtoi(ArgS(args, 2), &target_db)) {
++    return (*cntx)->SendError(kInvalidIntErr);
++  }
++
++  if (target_db < 0 || target_db >= absl::GetFlag(FLAGS_dbnum)) {
++    return (*cntx)->SendError(kDbIndOutOfRangeErr);
++  }
++
++  if (target_db == cntx->db_index()) {
++    return (*cntx)->SendError("source and destination objects are the same");
++  }
++
++  OpStatus res = OpStatus::SKIPPED;
++  ShardId target_shard = Shard(key, shard_set->size());
++  auto cb = [&](Transaction* t, EngineShard* shard) {
++    // MOVE runs as a global transaction and is therefore scheduled on every shard.
++    if (target_shard == shard->shard_id()) {
++      res = OpMove(t->GetOpArgs(shard), key, target_db);
++    }
++    return OpStatus::OK;
++  };
++
++  cntx->transaction->ScheduleSingleHop(std::move(cb));
++  // Exactly one shard will call OpMove.
++  DCHECK(res != OpStatus::SKIPPED);
++  (*cntx)->SendLong(res == OpStatus::OK);
++}
++
+ void GenericFamily::Rename(CmdArgList args, ConnectionContext* cntx) {
+   OpResult<void> st = RenameGeneric(args, false, cntx);
+   (*cntx)->SendError(st.status());
+@@ -771,6 +803,43 @@ OpResult<uint32_t> GenericFamily::OpStick(const OpArgs& op_args, ArgSlice keys)
+   return res;
+ }
+ 
++// OpMove touches multiple databases (op_args.db_idx, target_db), so it assumes it runs
++// as a global transaction.
++// TODO: Allow running OpMove without a global transaction.
++OpStatus GenericFamily::OpMove(const OpArgs& op_args, string_view key, DbIndex target_db) {
++  auto& db_slice = op_args.shard->db_slice();
++
++  // Fetch value at key in current db.
++  auto [from_it, from_expire] = db_slice.FindExt(op_args.db_ind, key);
++  if (!IsValid(from_it))
++    return OpStatus::KEY_NOTFOUND;
++
++  // Fetch value at key in target db.
++  auto [to_it, _] = db_slice.FindExt(target_db, key);
++  if (IsValid(to_it))
++    return OpStatus::KEY_EXISTS;
++
++  // Ensure target database exists.
++  db_slice.ActivateDb(target_db);
++
++  bool sticky = from_it->first.IsSticky();
++  uint64_t exp_ts = db_slice.ExpireTime(from_expire);
++  PrimeValue from_obj = std::move(from_it->second);
++
++  // Restore expire flag after std::move.
++  from_it->second.SetExpire(IsValid(from_expire));
++
++  CHECK(db_slice.Del(op_args.db_ind, from_it));
++  to_it = db_slice.AddNew(target_db, key, std::move(from_obj), exp_ts);
++  to_it->first.SetSticky(sticky);
++
++  if (to_it->second.ObjType() == OBJ_LIST && op_args.shard->blocking_controller()) {
++    op_args.shard->blocking_controller()->AwakeWatched(target_db, key);
++  }
++
++  return OpStatus::OK;
++}
++
+ using CI = CommandId;
+ 
+ #define HFUNC(x) SetHandler(&GenericFamily::x)
+@@ -798,7 +867,8 @@ void GenericFamily::Register(CommandRegistry* registry) {
+             << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Pttl)
+             << CI{"TYPE", CO::READONLY | CO::FAST | CO::LOADING, 2, 1, 1, 1}.HFUNC(Type)
+             << CI{"UNLINK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Del)
+-            << CI{"STICK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Stick);
++            << CI{"STICK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Stick)
++            << CI{"MOVE", CO::WRITE | CO::GLOBAL_TRANS, 3, 1, 1, 1}.HFUNC(Move);
+ }
+ 
+ }  // namespace dfly
+diff --git a/src/server/generic_family.h b/src/server/generic_family.h
+index 50c43a8bb1b9..470e754fe8a0 100644
+--- a/src/server/generic_family.h
++++ b/src/server/generic_family.h
+@@ -49,6 +49,7 @@ class GenericFamily {
+   static void Keys(CmdArgList args, ConnectionContext* cntx);
+   static void PexpireAt(CmdArgList args, ConnectionContext* cntx);
+   static void Stick(CmdArgList args, ConnectionContext* cntx);
++  static void Move(CmdArgList args, ConnectionContext* cntx);
+ 
+   static void Rename(CmdArgList args, ConnectionContext* cntx);
+   static void RenameNx(CmdArgList args, ConnectionContext* cntx);
+@@ -71,6 +72,7 @@ class GenericFamily {
+   static OpResult<void> OpRen(const OpArgs& op_args, std::string_view from, std::string_view to,
+                               bool skip_exists);
+   static OpResult<uint32_t> OpStick(const OpArgs& op_args, ArgSlice keys);
++  static OpStatus OpMove(const OpArgs& op_args, std::string_view key, DbIndex target_db);
+ };
+ 
+ }  // namespace dfly
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index 09881009a09a..c792d1e4a86c 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -398,13 +398,14 @@ bool Transaction::RunInShard(EngineShard* shard) {
+         }
+       }
+       sd.local_mask &= ~OUT_OF_ORDER;
+-
+-      // It has 2 responsibilities.
+-      // 1: to go over potential wakened keys, verify them and activate watch queues.
+-      // 2: if this transaction was notified and finished running - to remove it from the head
+-      //    of the queue and notify the next one.
+-      if (shard->blocking_controller())
+-        shard->blocking_controller()->RunStep(awaked_prerun ? this : nullptr);
++    }
++    // It has 2 responsibilities.
++    // 1: to go over potential wakened keys, verify them and activate watch queues.
++    // 2: if this transaction was notified and finished running - to remove it from the head
++    //    of the queue and notify the next one.
++    // RunStep is also called for global transactions because of commands like MOVE.
++    if (shard->blocking_controller()) {
++      shard->blocking_controller()->RunStep(awaked_prerun ? this : nullptr);
+     }
+   }
+ 

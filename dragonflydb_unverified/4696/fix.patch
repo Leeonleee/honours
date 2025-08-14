@@ -1,0 +1,649 @@
+diff --git a/src/facade/acl_commands_def.h b/src/facade/acl_commands_def.h
+index 13bbc63665c9..ea6878440dbb 100644
+--- a/src/facade/acl_commands_def.h
++++ b/src/facade/acl_commands_def.h
+@@ -43,6 +43,7 @@ struct UserCredentials {
+   AclKeys keys;
+   AclPubSub pub_sub;
+   std::string ns;
++  size_t db;
+ };
+ 
+ }  // namespace dfly::acl
+diff --git a/src/facade/conn_context.h b/src/facade/conn_context.h
+index 38133e391d47..0817a7291efa 100644
+--- a/src/facade/conn_context.h
++++ b/src/facade/conn_context.h
+@@ -65,6 +65,8 @@ class ConnectionContext {
+   dfly::acl::AclKeys keys{{}, true};
+   // pub/sub
+   dfly::acl::AclPubSub pub_sub{{}, true};
++  // db index, std::numeric_limits<size_t>::max for ALL db's
++  size_t acl_db_idx = 0;
+ 
+  private:
+   Connection* owner_;
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index a9cde22703ec..0a1fa0f02676 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -492,6 +492,7 @@ void Connection::AsyncOperations::operator()(const AclUpdateMessage& msg) {
+       self->cntx()->acl_commands = msg.commands;
+       self->cntx()->keys = msg.keys;
+       self->cntx()->pub_sub = msg.pub_sub;
++      self->cntx()->acl_db_idx = msg.db_indx;
+     }
+   }
+ }
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index a264722e1098..c25a45c63510 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -116,6 +116,7 @@ class Connection : public util::Connection {
+     std::vector<uint64_t> commands;
+     dfly::acl::AclKeys keys;
+     dfly::acl::AclPubSub pub_sub;
++    size_t db_indx;
+   };
+ 
+   // Migration request message, the async fiber stops to give way for thread migration.
+diff --git a/src/server/acl/acl_family.cc b/src/server/acl/acl_family.cc
+index 25fb4fc85173..157c2024e0cd 100644
+--- a/src/server/acl/acl_family.cc
++++ b/src/server/acl/acl_family.cc
+@@ -1,4 +1,4 @@
+-// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// Copyright 2025, DragonflyDB authors.  All rights reserved.
+ // See LICENSE for licensing terms.
+ 
+ #include "server/acl/acl_family.h"
+@@ -45,6 +45,7 @@
+ using namespace std;
+ 
+ ABSL_FLAG(string, aclfile, "", "Path and name to aclfile");
++ABSL_DECLARE_FLAG(uint32_t, dbnum);
+ 
+ namespace dfly::acl {
+ 
+@@ -58,10 +59,16 @@ MaterializedContents MaterializeFileContents(vector<string>* usernames, string_v
+ string AclKeysToString(const AclKeys& keys);
+ 
+ string AclPubSubToString(const AclPubSub& pub_sub);
++
++void SendAclSecurityEvents(const AclLog::LogEntry& entry, facade::RedisReplyBuilder* rb);
++
++string AclDbToString(size_t db);
++
+ }  // namespace
+ 
+ AclFamily::AclFamily(UserRegistry* registry, util::ProactorPool* pool)
+     : registry_(registry), pool_(pool) {
++  dbnum_ = absl::GetFlag(FLAGS_dbnum);
+ }
+ 
+ void AclFamily::Acl(CmdArgList args, const CommandContext& cmd_cntx) {
+@@ -87,10 +94,13 @@ void AclFamily::List(CmdArgList args, const CommandContext& cmd_cntx) {
+     const string acl_cat_and_commands =
+         AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
+ 
++    const string db_index = AclDbToString(user.Db());
++
+     using namespace string_view_literals;
+ 
+     absl::StrAppend(&buffer, username, " ", user.IsActive() ? "on "sv : "off "sv, password,
+-                    acl_keys, maybe_space_com, acl_pub_sub, " ", acl_cat_and_commands);
++                    acl_keys, maybe_space_com, acl_pub_sub, " ", acl_cat_and_commands, " $",
++                    db_index);
+ 
+     rb->SendSimpleString(buffer);
+   }
+@@ -99,13 +109,13 @@ void AclFamily::List(CmdArgList args, const CommandContext& cmd_cntx) {
+ void AclFamily::StreamUpdatesToAllProactorConnections(const std::string& user,
+                                                       const Commands& update_commands,
+                                                       const AclKeys& update_keys,
+-                                                      const AclPubSub& update_pub_sub) {
++                                                      const AclPubSub& update_pub_sub, size_t db) {
+   auto update_cb = [&]([[maybe_unused]] size_t id, util::Connection* conn) {
+     DCHECK(conn);
+     auto connection = static_cast<facade::Connection*>(conn);
+     if (!connection->IsHttp() && connection->cntx()) {
+-      connection->SendAclUpdateAsync(
+-          facade::Connection::AclUpdateMessage{user, update_commands, update_keys, update_pub_sub});
++      connection->SendAclUpdateAsync(facade::Connection::AclUpdateMessage{
++          user, update_commands, update_keys, update_pub_sub, db});
+     }
+   };
+ 
+@@ -141,7 +151,7 @@ void AclFamily::SetUser(CmdArgList args, const CommandContext& cmd_cntx) {
+     if (exists) {
+       if (!reset_channels) {
+         StreamUpdatesToAllProactorConnections(string(username), user.AclCommands(), user.Keys(),
+-                                              user.PubSub());
++                                              user.PubSub(), user.Db());
+       }
+       // We evict connections that had their channels reseted
+       else {
+@@ -230,10 +240,13 @@ string AclFamily::RegistryToString() const {
+     const string acl_cat_and_commands =
+         AclCatAndCommandToString(user.CatChanges(), user.CmdChanges());
+ 
++    const string db_index = AclDbToString(user.Db());
++
+     using namespace string_view_literals;
+ 
+     absl::StrAppend(&result, command, username, " ", user.IsActive() ? "ON "sv : "OFF "sv, password,
+-                    acl_keys, maybe_space, acl_pub_sub, " ", acl_cat_and_commands, "
+");
++                    acl_keys, maybe_space, acl_pub_sub, " ", acl_cat_and_commands, " $", db_index,
++                    "
+");
+   }
+ 
+   return result;
+@@ -399,40 +412,6 @@ void AclFamily::Log(CmdArgList args, const CommandContext& cmd_cntx) {
+     return;
+   }
+ 
+-  rb->StartArray(total_entries);
+-  auto print_element = [rb](const auto& entry) {
+-    rb->StartArray(12);
+-    rb->SendSimpleString("reason");
+-    using Reason = AclLog::Reason;
+-    std::string reason;
+-    if (entry.reason == Reason::COMMAND) {
+-      reason = "COMMAND";
+-    } else if (entry.reason == Reason::KEY) {
+-      reason = "KEY";
+-    } else if (entry.reason == Reason::PUB_SUB) {
+-      reason = "PUB_SUB";
+-    } else {
+-      reason = "AUTH";
+-    }
+-
+-    rb->SendSimpleString(reason);
+-    rb->SendSimpleString("object");
+-    rb->SendSimpleString(entry.object);
+-    rb->SendSimpleString("username");
+-    rb->SendSimpleString(entry.username);
+-    rb->SendSimpleString("age-seconds");
+-
+-    auto now_diff = std::chrono::system_clock::now() - entry.entry_creation;
+-    auto secs = std::chrono::duration_cast<std::chrono::seconds>(now_diff);
+-    auto left_over = now_diff - std::chrono::duration_cast<std::chrono::microseconds>(secs);
+-    auto age = absl::StrCat(secs.count(), ".", left_over.count());
+-    rb->SendSimpleString(absl::StrCat(age));
+-    rb->SendSimpleString("client-info");
+-    rb->SendSimpleString(entry.client_info);
+-    rb->SendSimpleString("timestamp-created");
+-    rb->SendLong(entry.entry_creation.time_since_epoch().count());
+-  };
+-
+   auto n_way_minimum = [](const auto& logs) {
+     size_t id = 0;
+     AclLog::LogEntry limit;
+@@ -447,9 +426,11 @@ void AclFamily::Log(CmdArgList args, const CommandContext& cmd_cntx) {
+     return id;
+   };
+ 
++  rb->StartArray(total_entries);
++
+   for (size_t i = 0; i < total_entries; ++i) {
+-    auto min = n_way_minimum(logs);
+-    print_element(logs[min].front());
++    const auto min = n_way_minimum(logs);
++    SendAclSecurityEvents(logs[min].front(), rb);
+     logs[min].pop_front();
+   }
+ }
+@@ -617,8 +598,14 @@ void AclFamily::DryRun(CmdArgList args, const CommandContext& cmd_cntx) {
+   }
+ 
+   const auto& user = registry.find(username)->second;
+-  const bool is_allowed =
+-      IsUserAllowedToInvokeCommandGeneric(user.AclCommandsRef(), {{}, true}, {}, *cid).first;
++  // Stub, used to mimic connection context for a user.
++  ConnectionContext stub(nullptr, nullptr);
++  stub.acl_commands = user.AclCommandsRef();
++  // "mock" without an actual connection we can't know which db is active so we skip this check
++  // for DryRun.
++  stub.acl_db_idx = {};
++  stub.keys = {{}, true};
++  const auto [is_allowed, reason] = IsUserAllowedToInvokeCommandGeneric(stub, *cid, {});
+   if (is_allowed) {
+     rb->SendOk();
+     return;
+@@ -856,6 +843,23 @@ std::optional<ParsePubSubResult> MaybeParseAclPubSub(std::string_view command) {
+   return {};
+ }
+ 
++std::optional<size_t> MaybeParseAclDflySelect(std::string_view command, uint32_t dbnum) {
++  if (!absl::StartsWith(command, "$")) {
++    return std::nullopt;
++  }
++
++  size_t res = 0;
++  if (absl::SimpleAtoi(command.substr(1), &res) && res < dbnum) {
++    return {res};
++  }
++
++  if (absl::EqualsIgnoreCase(command.substr(1), "ALL")) {
++    return {std::numeric_limits<size_t>::max()};
++  }
++
++  return std::nullopt;
++}
++
+ std::string PrettyPrintSha(std::string_view pass, bool all) {
+   if (all) {
+     return absl::BytesToHexString(pass);
+@@ -945,6 +949,43 @@ std::string AclPubSubToString(const AclPubSub& pub_sub) {
+   return result;
+ }
+ 
++void SendAclSecurityEvents(const AclLog::LogEntry& entry, facade::RedisReplyBuilder* rb) {
++  rb->StartArray(12);
++  rb->SendSimpleString("reason");
++  using Reason = AclLog::Reason;
++  std::string reason;
++  if (entry.reason == Reason::COMMAND) {
++    reason = "COMMAND";
++  } else if (entry.reason == Reason::KEY) {
++    reason = "KEY";
++  } else if (entry.reason == Reason::PUB_SUB) {
++    reason = "PUB_SUB";
++  } else {
++    reason = "AUTH";
++  }
++
++  rb->SendSimpleString(reason);
++  rb->SendSimpleString("object");
++  rb->SendSimpleString(entry.object);
++  rb->SendSimpleString("username");
++  rb->SendSimpleString(entry.username);
++  rb->SendSimpleString("age-seconds");
++
++  auto now_diff = std::chrono::system_clock::now() - entry.entry_creation;
++  auto secs = std::chrono::duration_cast<std::chrono::seconds>(now_diff);
++  auto left_over = now_diff - std::chrono::duration_cast<std::chrono::microseconds>(secs);
++  auto age = absl::StrCat(secs.count(), ".", left_over.count());
++  rb->SendSimpleString(absl::StrCat(age));
++  rb->SendSimpleString("client-info");
++  rb->SendSimpleString(entry.client_info);
++  rb->SendSimpleString("timestamp-created");
++  rb->SendLong(entry.entry_creation.time_since_epoch().count());
++}
++
++std::string AclDbToString(size_t db) {
++  return std::numeric_limits<size_t>::max() == db ? "all" : absl::StrCat(db);
++}
++
+ }  // namespace
+ 
+ std::string AclFamily::AclCatAndCommandToString(const User::CategoryChanges& cat,
+@@ -1096,6 +1137,14 @@ std::variant<User::UpdateRequest, ErrorReply> AclFamily::ParseAclSetUser(
+       continue;
+     }
+ 
++    if (auto res = MaybeParseAclDflySelect(facade::ToSV(arg), dbnum_); res) {
++      if (req.select_db) {
++        return ErrorReply("ERR Error, select db $ was used twice");
++      }
++      req.select_db = res;
++      continue;
++    }
++
+     std::string command = absl::AsciiStrToUpper(arg);
+ 
+     if (auto status = MaybeParseStatus(command); status) {
+diff --git a/src/server/acl/acl_family.h b/src/server/acl/acl_family.h
+index 70324c3e5fdc..645d0a5c755e 100644
+--- a/src/server/acl/acl_family.h
++++ b/src/server/acl/acl_family.h
+@@ -1,4 +1,4 @@
+-// Copyright 2022, DragonflyDB authors.  All rights reserved.
++// Copyright 2025, DragonflyDB authors.  All rights reserved.
+ // See LICENSE for licensing terms.
+ //
+ 
+@@ -59,7 +59,7 @@ class AclFamily final {
+   void StreamUpdatesToAllProactorConnections(const std::string& user,
+                                              const Commands& update_commands,
+                                              const AclKeys& update_keys,
+-                                             const AclPubSub& update_pub_sub);
++                                             const AclPubSub& update_pub_sub, size_t db);
+ 
+   // Helper function that closes all open connection from the deleted user
+   void EvictOpenConnectionsOnAllProactors(const absl::flat_hash_set<std::string_view>& user);
+@@ -161,6 +161,8 @@ class AclFamily final {
+     return index;
+   }
+ 
++  size_t dbnum_ = 0;
++
+   // Only for testing interface
+  public:
+   // Helper accessors for tests. Do not use them directly.
+diff --git a/src/server/acl/user.cc b/src/server/acl/user.cc
+index 44cc8c478bdd..bd976dc35620 100644
+--- a/src/server/acl/user.cc
++++ b/src/server/acl/user.cc
+@@ -84,6 +84,8 @@ void User::Update(UpdateRequest&& req, const CategoryToIdxStore& cat_to_id,
+     SetIsActive(*req.is_active);
+   }
+ 
++  SetSelectDb(req.select_db);
++
+   SetNamespace(req.ns);
+ }
+ 
+@@ -109,6 +111,16 @@ void User::SetNamespace(const std::string& ns) {
+   namespace_ = ns;
+ }
+ 
++void User::SetSelectDb(std::optional<size_t> db) {
++  if (db) {
++    db_ = *db;
++  }
++}
++
++size_t User::Db() const {
++  return db_;
++}
++
+ const std::string& User::Namespace() const {
+   return namespace_;
+ }
+diff --git a/src/server/acl/user.h b/src/server/acl/user.h
+index 134c8aeb7541..fb8daa418fc5 100644
+--- a/src/server/acl/user.h
++++ b/src/server/acl/user.h
+@@ -74,6 +74,8 @@ class User final {
+     // TODO allow reset all
+     // bool reset_all{false};
+ 
++    // DFLY specific
++    std::optional<size_t> select_db;
+     std::string ns;
+   };
+ 
+@@ -123,6 +125,8 @@ class User final {
+ 
+   const std::string& Namespace() const;
+ 
++  size_t Db() const;
++
+   using CategoryChanges = absl::flat_hash_map<CategoryChange, ChangeMetadata>;
+   using CommandChanges = absl::flat_hash_map<CommandChange, ChangeMetadata>;
+ 
+@@ -160,6 +164,8 @@ class User final {
+ 
+   void SetNamespace(const std::string& ns);
+ 
++  void SetSelectDb(std::optional<size_t> db);
++
+   // Set NOPASS and remove all passwords
+   void SetNopass();
+ 
+@@ -195,6 +201,10 @@ class User final {
+   bool is_active_{false};
+ 
+   std::string namespace_;
++
++  // if db == std::numeric_limits<size_t>::max() then all db's.
++  // Otherwise user restricted to the value of db_
++  size_t db_{std::numeric_limits<size_t>::max()};
+ };
+ 
+ }  // namespace dfly::acl
+diff --git a/src/server/acl/user_registry.cc b/src/server/acl/user_registry.cc
+index 309d944f1f29..307a2f9cdc7c 100644
+--- a/src/server/acl/user_registry.cc
++++ b/src/server/acl/user_registry.cc
+@@ -36,7 +36,8 @@ UserCredentials UserRegistry::GetCredentials(std::string_view username) const {
+     return {};
+   }
+   auto& user = it->second;
+-  return {user.AclCategory(), user.AclCommands(), user.Keys(), user.PubSub(), user.Namespace()};
++  return {user.AclCategory(), user.AclCommands(), user.Keys(),
++          user.PubSub(),      user.Namespace(),   user.Db()};
+ }
+ 
+ bool UserRegistry::IsUserActive(std::string_view username) const {
+diff --git a/src/server/acl/validator.cc b/src/server/acl/validator.cc
+index 4089ac1843db..941ca7ad5978 100644
+--- a/src/server/acl/validator.cc
++++ b/src/server/acl/validator.cc
+@@ -1,4 +1,4 @@
+-// Copyright 2023, DragonflyDB authors.  All rights reserved.
++// Copyright 2025, DragonflyDB authors.  All rights reserved.
+ // See LICENSE for licensing terms.
+ //
+ 
+@@ -14,11 +14,52 @@
+ 
+ namespace dfly::acl {
+ 
+-inline bool Matches(std::string_view pattern, std::string_view target) {
++namespace {
++
++bool Matches(std::string_view pattern, std::string_view target) {
+   GlobMatcher matcher(pattern, true);
+   return matcher.Matches(target);
+ };
+ 
++bool ValidateCommand(const std::vector<uint64_t>& acl_commands, const CommandId& id) {
++  const size_t index = id.GetFamily();
++  const uint64_t command_mask = id.GetBitIndex();
++  DCHECK_LT(index, acl_commands.size());
++
++  return (acl_commands[index] & command_mask) != 0;
++}
++
++[[nodiscard]] std::pair<bool, AclLog::Reason> IsPubSubCommandAuthorized(
++    bool literal_match, const std::vector<uint64_t>& acl_commands, const AclPubSub& pub_sub,
++    CmdArgList tail_args, const CommandId& id) {
++  if (!ValidateCommand(acl_commands, id)) {
++    return {false, AclLog::Reason::COMMAND};
++  }
++
++  auto iterate_globs = [&](std::string_view target) {
++    for (auto& [glob, has_asterisk] : pub_sub.globs) {
++      if (literal_match && (glob == target)) {
++        return true;
++      }
++      if (!literal_match && Matches(glob, target)) {
++        return true;
++      }
++    }
++    return false;
++  };
++
++  bool allowed = true;
++  if (!pub_sub.all_channels) {
++    for (auto channel : tail_args) {
++      allowed &= iterate_globs(facade::ToSV(channel));
++    }
++  }
++
++  return {allowed, AclLog::Reason::PUB_SUB};
++}
++
++}  // namespace
++
+ [[nodiscard]] bool IsUserAllowedToInvokeCommand(const ConnectionContext& cntx, const CommandId& id,
+                                                 ArgSlice tail_args) {
+   if (cntx.skip_acl_validation) {
+@@ -32,7 +73,7 @@ inline bool Matches(std::string_view pattern, std::string_view target) {
+   } else if (id.IsPSub()) {
+     auth_res = IsPubSubCommandAuthorized(true, cntx.acl_commands, cntx.pub_sub, tail_args, id);
+   } else {
+-    auth_res = IsUserAllowedToInvokeCommandGeneric(cntx.acl_commands, cntx.keys, tail_args, id);
++    auth_res = IsUserAllowedToInvokeCommandGeneric(cntx, id, tail_args);
+   }
+ 
+   const auto [is_authed, reason] = auth_res;
+@@ -45,17 +86,24 @@ inline bool Matches(std::string_view pattern, std::string_view target) {
+   return is_authed;
+ }
+ 
+-static bool ValidateCommand(const std::vector<uint64_t>& acl_commands, const CommandId& id) {
+-  const size_t index = id.GetFamily();
+-  const uint64_t command_mask = id.GetBitIndex();
+-  DCHECK_LT(index, acl_commands.size());
+-
+-  return (acl_commands[index] & command_mask) != 0;
+-}
+-
+ [[nodiscard]] std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
+-    const std::vector<uint64_t>& acl_commands, const AclKeys& keys, CmdArgList tail_args,
+-    const CommandId& id) {
++    const ConnectionContext& cntx, const CommandId& id, CmdArgList tail_args) {
++  const size_t max = std::numeric_limits<size_t>::max();
++  // Once we support ranges this must change
++  const bool reject_move_command = cntx.acl_db_idx != max && id.name() == "MOVE";
++  const bool reject_trans_command =
++      cntx.acl_db_idx != max && cntx.acl_db_idx != cntx.db_index() && id.IsTransactional();
++  if (reject_move_command || reject_trans_command) {
++    return {false, AclLog::Reason::AUTH};
++  }
++  size_t res = 0;
++  if (tail_args.size() == 1 && id.name() == "SELECT" && absl::SimpleAtoi(tail_args[0], &res) &&
++      cntx.acl_db_idx != max && cntx.acl_db_idx != res) {
++    return {false, AclLog::Reason::AUTH};
++  }
++
++  const auto& acl_commands = cntx.acl_commands;
++  const auto& keys = cntx.keys;
+   if (!ValidateCommand(acl_commands, id)) {
+     return {false, AclLog::Reason::COMMAND};
+   }
+@@ -89,33 +137,4 @@ static bool ValidateCommand(const std::vector<uint64_t>& acl_commands, const Com
+   return {keys_allowed, AclLog::Reason::KEY};
+ }
+ 
+-[[nodiscard]] std::pair<bool, AclLog::Reason> IsPubSubCommandAuthorized(
+-    bool literal_match, const std::vector<uint64_t>& acl_commands, const AclPubSub& pub_sub,
+-    CmdArgList tail_args, const CommandId& id) {
+-  if (!ValidateCommand(acl_commands, id)) {
+-    return {false, AclLog::Reason::COMMAND};
+-  }
+-
+-  auto iterate_globs = [&](std::string_view target) {
+-    for (auto& [glob, has_asterisk] : pub_sub.globs) {
+-      if (literal_match && (glob == target)) {
+-        return true;
+-      }
+-      if (!literal_match && Matches(glob, target)) {
+-        return true;
+-      }
+-    }
+-    return false;
+-  };
+-
+-  bool allowed = true;
+-  if (!pub_sub.all_channels) {
+-    for (auto channel : tail_args) {
+-      allowed &= iterate_globs(facade::ToSV(channel));
+-    }
+-  }
+-
+-  return {allowed, AclLog::Reason::PUB_SUB};
+-}
+-
+ }  // namespace dfly::acl
+diff --git a/src/server/acl/validator.h b/src/server/acl/validator.h
+index 70d849f97de8..231c891cf956 100644
+--- a/src/server/acl/validator.h
++++ b/src/server/acl/validator.h
+@@ -1,4 +1,4 @@
+-// Copyright 2023, DragonflyDB authors.  All rights reserved.
++// Copyright 2025, DragonflyDB authors.  All rights reserved.
+ // See LICENSE for licensing terms.
+ //
+ 
+@@ -15,17 +15,10 @@ namespace dfly::acl {
+ struct AclKeys;
+ struct AclPubSub;
+ 
+-std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(
+-    const std::vector<uint64_t>& acl_commands, const AclKeys& keys, facade::CmdArgList tail_args,
+-    const CommandId& id);
++std::pair<bool, AclLog::Reason> IsUserAllowedToInvokeCommandGeneric(const ConnectionContext& cntx,
++                                                                    const CommandId& id,
++                                                                    facade::CmdArgList tail_args);
+ 
+ bool IsUserAllowedToInvokeCommand(const ConnectionContext& cntx, const CommandId& id,
+                                   facade::CmdArgList tail_args);
+-
+-std::pair<bool, AclLog::Reason> IsPubSubCommandAuthorized(bool literal_match,
+-                                                          const std::vector<uint64_t>& acl_commands,
+-                                                          const AclPubSub& pub_sub,
+-                                                          facade::CmdArgList tail_args,
+-                                                          const CommandId& id);
+-
+ }  // namespace dfly::acl
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index 9ffa535733ca..c01bd3a009ab 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -113,6 +113,7 @@ ConnectionContext::ConnectionContext(facade::Connection* owner, acl::UserCredent
+   } else {
+     acl_commands = std::move(cred.acl_commands);
+   }
++  acl_db_idx = cred.db;
+ }
+ 
+ ConnectionContext::ConnectionContext(const ConnectionContext* owner, Transaction* tx)
+@@ -122,6 +123,7 @@ ConnectionContext::ConnectionContext(const ConnectionContext* owner, Transaction
+     keys = owner->keys;
+     pub_sub = owner->pub_sub;
+     skip_acl_validation = owner->skip_acl_validation;
++    acl_db_idx = owner->acl_db_idx;
+     ns = owner->ns;
+   } else {
+     acl_commands = std::vector<uint64_t>(acl::NumberOfFamilies(), acl::NONE_COMMANDS);
+diff --git a/src/server/generic_family.h b/src/server/generic_family.h
+index c91eb5823dce..5876ad7ff028 100644
+--- a/src/server/generic_family.h
++++ b/src/server/generic_family.h
+@@ -10,7 +10,6 @@
+ 
+ ABSL_DECLARE_FLAG(uint32_t, dbnum);
+ 
+-
+ namespace dfly {
+ 
+ using facade::CmdArgList;
+@@ -26,8 +25,8 @@ class GenericFamily {
+   // Accessed by Service::Exec and Service::Watch as an utility.
+   static OpResult<uint32_t> OpExists(const OpArgs& op_args, const ShardArgs& keys);
+   static OpResult<uint32_t> OpDel(const OpArgs& op_args, const ShardArgs& keys, bool async);
+- private:
+ 
++ private:
+   static void Del(CmdArgList args, const CommandContext& cmd_cntx);
+   static void Unlink(CmdArgList args, const CommandContext& cmd_cntx);
+   static void Ping(CmdArgList args, const CommandContext& cmd_cntx);
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 952fa1f64b93..ca8c0754bd1e 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1857,6 +1857,18 @@ bool ServerFamily::DoAuth(ConnectionContext* cntx, std::string_view username,
+     cntx->pub_sub = std::move(cred.pub_sub);
+     cntx->ns = &namespaces->GetOrInsert(cred.ns);
+     cntx->authenticated = true;
++    cntx->acl_db_idx = cred.db;
++    if (cred.db == std::numeric_limits<size_t>::max()) {
++      cntx->conn_state.db_index = 0;
++    } else {
++      auto cb = [ns = cntx->ns, index = cred.db](EngineShard* shard) {
++        auto& db_slice = ns->GetDbSlice(shard->shard_id());
++        db_slice.ActivateDb(index);
++        return OpStatus::OK;
++      };
++      shard_set->RunBriefInParallel(std::move(cb));
++      cntx->conn_state.db_index = cred.db;
++    }
+   }
+   return is_authorized;
+ }

@@ -1,0 +1,204 @@
+diff --git a/src/facade/dragonfly_connection.cc b/src/facade/dragonfly_connection.cc
+index 969862b4275b..eff1079cdbbd 100644
+--- a/src/facade/dragonfly_connection.cc
++++ b/src/facade/dragonfly_connection.cc
+@@ -87,7 +87,7 @@ constexpr size_t kMaxReadSize = 32_KB;
+ struct PubMsgRecord {
+   Connection::PubMessage pub_msg;
+ 
+-  PubMsgRecord(const Connection::PubMessage& pmsg) : pub_msg(pmsg) {
++  PubMsgRecord(Connection::PubMessage pmsg) : pub_msg(move(pmsg)) {
+   }
+ };
+ 
+@@ -149,7 +149,7 @@ class Connection::Request {
+   static RequestPtr New(mi_heap_t* heap, const RespVec& args, size_t capacity);
+ 
+   // Overload to create a new pubsub message
+-  static RequestPtr New(const PubMessage& pub_msg);
++  static RequestPtr New(PubMessage pub_msg);
+ 
+   // Overload to create a new the monitor message
+   static RequestPtr New(MonitorMessage msg);
+@@ -221,13 +221,13 @@ void Connection::Request::SetArgs(const RespVec& args) {
+   }
+ }
+ 
+-Connection::RequestPtr Connection::Request::New(const PubMessage& pub_msg) {
++Connection::RequestPtr Connection::Request::New(PubMessage pub_msg) {
+   // This will generate a new request for pubsub message
+   // Please note that unlike the above case, we don't need to "protect", the internals here
+   // since we are currently using a borrow token for it - i.e. the BlockingCounter will
+   // ensure that the message is not deleted until we are finish sending it at the other
+   // side of the queue
+-  PubMsgRecord new_msg{pub_msg};
++  PubMsgRecord new_msg{move(pub_msg)};
+   void* ptr = mi_malloc(sizeof(Request));
+   Request* req = new (ptr) Request(std::move(new_msg));
+   return Connection::RequestPtr{req, Connection::RequestDeleter{}};
+@@ -275,17 +275,26 @@ void Connection::DispatchOperations::operator()(const PubMsgRecord& msg) {
+   ++stats->async_writes_cnt;
+   const PubMessage& pub_msg = msg.pub_msg;
+   string_view arr[4];
+-  if (pub_msg.pattern.empty()) {
+-    arr[0] = "message";
+-    arr[1] = pub_msg.channel;
+-    arr[2] = *pub_msg.message;
+-    rbuilder->SendStringArr(absl::Span<string_view>{arr, 3});
++  if (pub_msg.type == PubMessage::kPublish) {
++    if (pub_msg.pattern.empty()) {
++      DVLOG(1) << "Sending message, from channel: " << *pub_msg.channel << " " << *pub_msg.message;
++      arr[0] = "message";
++      arr[1] = *pub_msg.channel;
++      arr[2] = *pub_msg.message;
++      rbuilder->SendStringArr(absl::Span<string_view>{arr, 3});
++    } else {
++      arr[0] = "pmessage";
++      arr[1] = pub_msg.pattern;
++      arr[2] = *pub_msg.channel;
++      arr[3] = *pub_msg.message;
++      rbuilder->SendStringArr(absl::Span<string_view>{arr, 4});
++    }
+   } else {
+-    arr[0] = "pmessage";
+-    arr[1] = pub_msg.pattern;
+-    arr[2] = pub_msg.channel;
+-    arr[3] = *pub_msg.message;
+-    rbuilder->SendStringArr(absl::Span<string_view>{arr, 4});
++    const char* action[2] = {"unsubscribe", "subscribe"};
++    rbuilder->StartArray(3);
++    rbuilder->SendBulkString(action[pub_msg.type == PubMessage::kSubscribe]);
++    rbuilder->SendBulkString(*pub_msg.channel);
++    rbuilder->SendLong(pub_msg.channel_cnt);
+   }
+ }
+ 
+@@ -445,13 +454,14 @@ void Connection::RegisterOnBreak(BreakerCb breaker_cb) {
+   breaker_cb_ = breaker_cb;
+ }
+ 
+-void Connection::SendMsgVecAsync(const PubMessage& pub_msg) {
++void Connection::SendMsgVecAsync(PubMessage pub_msg) {
+   DCHECK(cc_);
+ 
+   if (cc_->conn_closing) {
+     return;
+   }
+-  RequestPtr req = Request::New(pub_msg);  // new (ptr) Request(0, 0);
++
++  RequestPtr req = Request::New(move(pub_msg));
+   dispatch_q_.push_back(std::move(req));
+   if (dispatch_q_.size() == 1) {
+     evc_.notify();
+diff --git a/src/facade/dragonfly_connection.h b/src/facade/dragonfly_connection.h
+index 2fcfd55e6995..2836a6d0c0b2 100644
+--- a/src/facade/dragonfly_connection.h
++++ b/src/facade/dragonfly_connection.h
+@@ -54,14 +54,21 @@ class Connection : public util::Connection {
+ 
+   struct PubMessage {
+     // if empty - means its a regular message, otherwise it's pmessage.
+-    std::string_view pattern;
+-    std::string_view channel;
+-    std::shared_ptr<const std::string> message;  // ensure that this message would out live passing
+-                                                 // between different threads/fibers
++    std::string pattern;
++    std::shared_ptr<std::string> channel;
++    std::shared_ptr<std::string> message;  // ensure that this message would out live passing
++                                           // between different threads/fibers
++    enum Type { kSubscribe, kUnsubscribe, kPublish } type;
++    uint32_t channel_cnt;  // relevant only for kSubscribe and kUnsubscribe
++
++    PubMessage() = default;
++    PubMessage(const PubMessage&) = delete;
++    PubMessage& operator=(const PubMessage&) = delete;
++    PubMessage(PubMessage&&) = default;
+   };
+ 
+   // this function is overriden at test_utils TestConnection
+-  virtual void SendMsgVecAsync(const PubMessage& pub_msg);
++  virtual void SendMsgVecAsync(PubMessage pub_msg);
+ 
+   // Note that this is accepted by value because the message is processed asynchronously.
+   void SendMonitorMsg(std::string monitor_msg);
+diff --git a/src/server/conn_context.cc b/src/server/conn_context.cc
+index 6d54f80e1073..474d1e47ad0d 100644
+--- a/src/server/conn_context.cc
++++ b/src/server/conn_context.cc
+@@ -135,16 +135,13 @@ void ConnectionContext::ChangeSubscription(bool to_add, bool to_reply, CmdArgLis
+   }
+ 
+   if (to_reply) {
+-    const char* action[2] = {"unsubscribe", "subscribe"};
+-
++    using PubMessage = facade::Connection::PubMessage;
+     for (size_t i = 0; i < result.size(); ++i) {
+-      (*this)->StartArray(3);
+-      (*this)->SendBulkString(action[to_add]);
+-      (*this)->SendBulkString(ArgS(args, i));  // channel
+-
+-      // number of subscribed channels for this connection *right after*
+-      // we subscribe.
+-      (*this)->SendLong(result[i]);
++      PubMessage msg;
++      msg.type = to_add ? PubMessage::kSubscribe : PubMessage::kUnsubscribe;
++      msg.channel = make_shared<string>(ArgS(args, i));
++      msg.channel_cnt = result[i];
++      owner()->SendMsgVecAsync(move(msg));
+     }
+   }
+ }
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index 2d6b7203c5e1..7dcf9e39acc5 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1366,9 +1366,6 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
+ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
+   string_view channel = ArgS(args, 1);
+ 
+-  // shared_ptr ensures that the message lives until it's been sent to all subscribers and handled
+-  // by DispatchOperations.
+-  std::shared_ptr<const std::string> message = std::make_shared<const std::string>(ArgS(args, 2));
+   ShardId sid = Shard(channel, shard_count());
+ 
+   auto cb = [&] { return EngineShard::tlocal()->channel_slice().FetchSubscribers(channel); };
+@@ -1390,12 +1387,18 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
+       }
+     }
+ 
++    // shared_ptr ensures that the message lives until it's been sent to all subscribers and handled
++    // by DispatchOperations.
++    shared_ptr<string> msg_ptr = make_shared<string>(ArgS(args, 2));
++    shared_ptr<string> channel_ptr = make_shared<string>(channel);
++    using PubMessage = facade::Connection::PubMessage;
++
+     // We run publish_cb in each subscriber's thread.
+     auto publish_cb = [&](unsigned idx, util::ProactorBase*) mutable {
+       unsigned start = slices[idx];
+ 
+       for (unsigned i = start; i < subscriber_arr.size(); ++i) {
+-        const ChannelSlice::Subscriber& subscriber = subscriber_arr[i];
++        ChannelSlice::Subscriber& subscriber = subscriber_arr[i];
+         if (subscriber.thread_id != idx)
+           break;
+ 
+@@ -1403,11 +1406,14 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
+ 
+         facade::Connection* conn = subscriber_arr[i].conn_cntx->owner();
+         DCHECK(conn);
+-        facade::Connection::PubMessage pmsg;
+-        pmsg.channel = channel;
+-        pmsg.message = message;
+-        pmsg.pattern = subscriber.pattern;
+-        conn->SendMsgVecAsync(pmsg);
++
++        PubMessage pmsg;
++        pmsg.channel = channel_ptr;
++        pmsg.message = msg_ptr;
++        pmsg.pattern = move(subscriber.pattern);
++        pmsg.type = PubMessage::kPublish;
++
++        conn->SendMsgVecAsync(move(pmsg));
+       }
+     };
+ 

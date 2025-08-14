@@ -1,0 +1,556 @@
+diff --git a/src/server/CMakeLists.txt b/src/server/CMakeLists.txt
+index 01be21810e43..c099025746be 100644
+--- a/src/server/CMakeLists.txt
++++ b/src/server/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(dragonfly_lib engine_shard_set.cc channel_store.cc command_registry.
+             zset_family.cc version.cc bitops_family.cc container_utils.cc io_utils.cc
+             top_keys.cc multi_command_squasher.cc hll_family.cc cluster/cluster_config.cc
+             cluster/cluster_family.cc cluster/cluster_slot_migration.cc
++            cluster/cluster_shard_migration.cc
+             acl/user.cc acl/user_registry.cc acl/acl_family.cc
+             acl/validator.cc acl/helpers.cc)
+ 
+diff --git a/src/server/cluster/cluster_family.cc b/src/server/cluster/cluster_family.cc
+index db6b357f15c2..103bf4e187b3 100644
+--- a/src/server/cluster/cluster_family.cc
++++ b/src/server/cluster/cluster_family.cc
+@@ -41,6 +41,8 @@ using ClusterShards = ClusterConfig::ClusterShards;
+ using Node = ClusterConfig::Node;
+ using SlotRange = ClusterConfig::SlotRange;
+ 
++constexpr char kIdNotFound[] = "syncid not found";
++
+ constexpr string_view kClusterDisabled =
+     "Cluster is disabled. Enabled via passing --cluster_mode=emulated|yes";
+ constexpr string_view kDflyClusterCmdPort = "DflyCluster command allowed only under admin port";
+@@ -636,7 +638,7 @@ void ClusterFamily::DflySlotMigrationStatus(CmdArgList args, ConnectionContext*
+     return cntx->SendError(err->MakeReply());
+ 
+   auto state = [&] {
+-    lock_guard lk(migrations_jobs_mu_);
++    lock_guard lk(migration_mu_);
+     for (const auto& m : migrations_jobs_) {
+       const auto& info = m->GetInfo();
+       if (info.host == host_ip && info.port == port)
+@@ -669,6 +671,10 @@ void ClusterFamily::DflyMigrate(CmdArgList args, ConnectionContext* cntx) {
+   args.remove_prefix(1);
+   if (sub_cmd == "CONF") {
+     MigrationConf(args, cntx);
++  } else if (sub_cmd == "FLOW") {
++    Flow(args, cntx);
++  } else if (sub_cmd == "SYNC") {
++    Sync(args, cntx);
+   } else {
+     cntx->SendError(facade::UnknownSubCmd(sub_cmd, "DFLYMIGRATE"), facade::kSyntaxErrType);
+   }
+@@ -676,7 +682,7 @@ void ClusterFamily::DflyMigrate(CmdArgList args, ConnectionContext* cntx) {
+ 
+ ClusterSlotMigration* ClusterFamily::AddMigration(std::string host_ip, uint16_t port,
+                                                   std::vector<ClusterConfig::SlotRange> slots) {
+-  lock_guard lk(migrations_jobs_mu_);
++  lock_guard lk(migration_mu_);
+   for (const auto& mj : migrations_jobs_) {
+     if (auto info = mj->GetInfo(); info.host == host_ip && info.port == port) {
+       return nullptr;
+@@ -691,7 +697,6 @@ void ClusterFamily::MigrationConf(CmdArgList args, ConnectionContext* cntx) {
+   VLOG(1) << "Create slot migration config";
+   CmdArgParser parser{args};
+   auto port = parser.Next<uint16_t>();
+-  (void)port;  // we need it for the next step
+ 
+   std::vector<ClusterConfig::SlotRange> slots;
+   do {
+@@ -718,12 +723,80 @@ void ClusterFamily::MigrationConf(CmdArgList args, ConnectionContext* cntx) {
+     }
+   }
+ 
+-  cntx->conn()->SetName("slot_migration_ctrl");
++  auto sync_id = CreateMigrationSession(cntx, port, std::move(slots));
+ 
+-  cntx->SendLong(shard_set->size());
++  cntx->conn()->SetName("slot_migration_ctrl");
++  auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
++  rb->StartArray(2);
++  rb->SendLong(sync_id);
++  rb->SendLong(shard_set->size());
+   return;
+ }
+ 
++uint32_t ClusterFamily::CreateMigrationSession(ConnectionContext* cntx, uint16_t port,
++                                               std::vector<ClusterConfig::SlotRange> slots) {
++  std::lock_guard lk(migration_mu_);
++  auto sync_id = next_sync_id_++;
++  auto info = make_shared<MigrationInfo>(shard_set->size(), cntx->conn()->RemoteEndpointAddress(),
++                                         sync_id, port, std::move(slots));
++  auto [it, inserted] = migration_infos_.emplace(sync_id, info);
++  CHECK(inserted);
++  return sync_id;
++}
++
++void ClusterFamily::Flow(CmdArgList args, ConnectionContext* cntx) {
++  CmdArgParser parser{args};
++  auto [sync_id, shard_id] = parser.Next<uint32_t, uint32_t>();
++
++  if (auto err = parser.Error(); err) {
++    return cntx->SendError(err->MakeReply());
++  }
++
++  VLOG(1) << "Create flow "
++          << " sync_id: " << sync_id << " shard_id: " << shard_id << " shard";
++
++  cntx->conn()->SetName(absl::StrCat("migration_flow_", sync_id));
++
++  auto info = GetMigrationInfo(sync_id);
++  if (!info)
++    cntx->SendError(kIdNotFound);
++
++  info->flows[shard_id].conn = cntx->conn();
++
++  cntx->conn()->Migrate(shard_set->pool()->at(shard_id));
++
++  cntx->SendOk();
++}
++
++void ClusterFamily::Sync(CmdArgList args, ConnectionContext* cntx) {
++  CmdArgParser parser{args};
++  auto sync_id = parser.Next<uint32_t>();
++  if (auto err = parser.Error(); err)
++    return cntx->SendError(err->MakeReply());
++  RedisReplyBuilder* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
++
++  VLOG(1) << "Got DFLYMIGRATE SYNC " << sync_id;
++
++  auto info = GetMigrationInfo(sync_id);
++  if (!info)
++    cntx->SendError(kIdNotFound);
++
++  auto cb = [info](EngineShard* shard) {
++    info->flows[shard->shard_id()].conn->socket()->Write(io::Buffer("OK"));
++  };
++  shard_set->RunBlockingInParallel(std::move(cb));
++
++  LOG(INFO) << "Started migation with target node " << info->host_ip << ":" << info->port;
++
++  return rb->SendOk();
++}
++
++shared_ptr<ClusterFamily::MigrationInfo> ClusterFamily::GetMigrationInfo(uint32_t sync_id) {
++  unique_lock lk(migration_mu_);
++  auto sync_it = migration_infos_.find(sync_id);
++  return sync_it != migration_infos_.end() ? sync_it->second : nullptr;
++}
++
+ using EngineFunc = void (ClusterFamily::*)(CmdArgList args, ConnectionContext* cntx);
+ 
+ inline CommandId::Handler HandlerFunc(ClusterFamily* se, EngineFunc f) {
+diff --git a/src/server/cluster/cluster_family.h b/src/server/cluster/cluster_family.h
+index 6ec07f1efcb2..ef5e92855e60 100644
+--- a/src/server/cluster/cluster_family.h
++++ b/src/server/cluster/cluster_family.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <absl/container/btree_map.h>
++
+ #include <string>
+ 
+ #include "facade/conn_context.h"
+@@ -46,22 +48,75 @@ class ClusterFamily {
+   void DflyClusterGetSlotInfo(CmdArgList args, ConnectionContext* cntx);
+   void DflyClusterMyId(CmdArgList args, ConnectionContext* cntx);
+   void DflyClusterFlushSlots(CmdArgList args, ConnectionContext* cntx);
++
++ private:  // Slots migration section
+   void DflyClusterStartSlotMigration(CmdArgList args, ConnectionContext* cntx);
+   void DflySlotMigrationStatus(CmdArgList args, ConnectionContext* cntx);
++
++  // DFLYMIGRATE is internal command defines several steps in slots migrations process
+   void DflyMigrate(CmdArgList args, ConnectionContext* cntx);
+ 
++  // DFLYMIGRATE CONF initiate first step in slots migration procedure
++  // MigrationConf process this request and saving slots range and
++  // target node port in migration_infos_.
++  // return sync_id and shard number to the target node
+   void MigrationConf(CmdArgList args, ConnectionContext* cntx);
++
++  // DFLYMIGRATE FLOW initiate second step in slots migration procedure
++  // this request should be done for every shard on the target node
++  // this method assocciate connection and shard that will be the data
++  // source for migration
++  void Flow(CmdArgList args, ConnectionContext* cntx);
++
++  // DFLYMIGRATE SYNC is the third step that trigger data transferring
++  // for all flows simultaneously
++  // This method can be removed in the future if we decide to tranfser
++  // data without any synchronization in FLOW step
++  void Sync(CmdArgList args, ConnectionContext* cntx);
++
++  // create a ClusterSlotMigration entity which will execute migration
+   ClusterSlotMigration* AddMigration(std::string host_ip, uint16_t port,
+                                      std::vector<ClusterConfig::SlotRange> slots);
+ 
++  // store info about migration and create unique session id
++  uint32_t CreateMigrationSession(ConnectionContext* cntx, uint16_t port,
++                                  std::vector<ClusterConfig::SlotRange> slots);
++
++  // FlowInfo is used to store state, connection, and all auxiliary data
++  // that is needed for correct slots (per shard) data transfer
++  struct FlowInfo {
++    facade::Connection* conn = nullptr;
++  };
++
++  // Whole slots migration process information
++  struct MigrationInfo {
++    MigrationInfo() = default;
++    MigrationInfo(std::uint32_t flows_num, std::string ip, uint32_t sync_id, uint16_t port,
++                  std::vector<ClusterConfig::SlotRange> slots)
++        : host_ip(ip), flows(flows_num), slots(slots), sync_id(sync_id), port(port) {
++    }
++    std::string host_ip;
++    std::vector<FlowInfo> flows;
++    std::vector<ClusterConfig::SlotRange> slots;
++    uint32_t sync_id;
++    uint16_t port;
++  };
++
++  std::shared_ptr<MigrationInfo> GetMigrationInfo(uint32_t sync_id);
++
++  mutable Mutex migration_mu_;  // guard migrations operations
++  // holds all slots migrations that are currently in progress.
++  std::vector<std::unique_ptr<ClusterSlotMigration>> migrations_jobs_
++      ABSL_GUARDED_BY(migration_mu_);
++
++  uint32_t next_sync_id_ = 1;
++  using MigrationInfoMap = absl::btree_map<uint32_t, std::shared_ptr<MigrationInfo>>;
++  MigrationInfoMap migration_infos_;
++
++ private:
+   ClusterConfig::ClusterShard GetEmulatedShardInfo(ConnectionContext* cntx) const;
+ 
+   ServerFamily* server_family_ = nullptr;
+-
+-  mutable Mutex migrations_jobs_mu_;
+-  // holds all slot migrations that are currently in progress.
+-  std::vector<std::unique_ptr<ClusterSlotMigration>> migrations_jobs_
+-      ABSL_GUARDED_BY(migrations_jobs_mu_);
+ };
+ 
+ }  // namespace dfly
+diff --git a/src/server/cluster/cluster_shard_migration.cc b/src/server/cluster/cluster_shard_migration.cc
+new file mode 100644
+index 000000000000..ea582544849e
+--- /dev/null
++++ b/src/server/cluster/cluster_shard_migration.cc
+@@ -0,0 +1,77 @@
++// Copyright 2023, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++#include "server/cluster/cluster_shard_migration.h"
++
++#include <absl/flags/flag.h>
++#include <absl/strings/str_cat.h>
++
++#include "base/logging.h"
++#include "server/error.h"
++
++ABSL_DECLARE_FLAG(int, source_connect_timeout_ms);
++
++namespace dfly {
++
++using namespace std;
++using namespace facade;
++using namespace util;
++using absl::GetFlag;
++
++ClusterShardMigration::ClusterShardMigration(ServerContext server_context, uint32_t shard_id,
++                                             uint32_t sync_id)
++    : ProtocolClient(server_context), source_shard_id_(shard_id), sync_id_(sync_id) {
++}
++
++ClusterShardMigration::~ClusterShardMigration() {
++  JoinFlow();
++}
++
++std::error_code ClusterShardMigration::StartSyncFlow(Context* cntx) {
++  RETURN_ON_ERR(ConnectAndAuth(absl::GetFlag(FLAGS_source_connect_timeout_ms) * 1ms, &cntx_));
++
++  std::string cmd = absl::StrCat("DFLYMIGRATE FLOW ", sync_id_, " ", source_shard_id_);
++  VLOG(1) << "cmd: " << cmd;
++
++  ResetParser(/*server_mode=*/false);
++  leftover_buf_.emplace(128);
++  RETURN_ON_ERR(SendCommand(cmd));
++  auto read_resp = ReadRespReply(&*leftover_buf_);
++  if (!read_resp.has_value()) {
++    return read_resp.error();
++  }
++
++  PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
++
++  leftover_buf_->ConsumeInput(read_resp->left_in_buffer);
++
++  sync_fb_ =
++      fb2::Fiber("shard_migration_full_sync", &ClusterShardMigration::FullSyncShardFb, this, cntx);
++
++  return {};
++}
++
++void ClusterShardMigration::FullSyncShardFb(Context* cntx) {
++  DCHECK(leftover_buf_);
++  io::PrefixSource ps{leftover_buf_->InputBuffer(), Sock()};
++
++  uint8_t ok_buf[2];
++  ps.ReadAtLeast(io::MutableBytes{ok_buf, 2}, 2);
++
++  if (string_view(reinterpret_cast<char*>(ok_buf), 2) != "OK") {
++    cntx->ReportError(std::make_error_code(errc::protocol_error),
++                      "Incorrect FullSync data, only for tets");
++  }
++
++  VLOG(1) << "FullSyncShardFb finished after reading 2 bytes";
++}
++
++void ClusterShardMigration::Cancel() {
++  CloseSocket();
++}
++
++void ClusterShardMigration::JoinFlow() {
++  sync_fb_.JoinIfNeeded();
++}
++
++}  // namespace dfly
+diff --git a/src/server/cluster/cluster_shard_migration.h b/src/server/cluster/cluster_shard_migration.h
+new file mode 100644
+index 000000000000..e5d31484fdfe
+--- /dev/null
++++ b/src/server/cluster/cluster_shard_migration.h
+@@ -0,0 +1,33 @@
++// Copyright 2023, DragonflyDB authors.  All rights reserved.
++// See LICENSE for licensing terms.
++//
++#pragma once
++
++#include "base/io_buf.h"
++#include "server/protocol_client.h"
++
++namespace dfly {
++
++// ClusterShardMigration manage data receiving in slots migration process.
++// It is created per shard on the target node to initiate FLOW step.
++class ClusterShardMigration : public ProtocolClient {
++ public:
++  ClusterShardMigration(ServerContext server_context, uint32_t shard_id, uint32_t sync_id);
++  ~ClusterShardMigration();
++
++  std::error_code StartSyncFlow(Context* cntx);
++  void Cancel();
++
++ private:
++  void FullSyncShardFb(Context* cntx);
++  void JoinFlow();
++
++ private:
++  uint32_t source_shard_id_;
++  uint32_t sync_id_;
++  std::optional<base::IoBuf> leftover_buf_;
++
++  Fiber sync_fb_;
++};
++
++}  // namespace dfly
+diff --git a/src/server/cluster/cluster_slot_migration.cc b/src/server/cluster/cluster_slot_migration.cc
+index 8b47e55b65e4..acd661fdaa67 100644
+--- a/src/server/cluster/cluster_slot_migration.cc
++++ b/src/server/cluster/cluster_slot_migration.cc
+@@ -3,9 +3,11 @@
+ //
+ #include "server/cluster/cluster_slot_migration.h"
+ 
++#include <absl/cleanup/cleanup.h>
+ #include <absl/flags/flag.h>
+ 
+ #include "base/logging.h"
++#include "server/cluster/cluster_shard_migration.h"
+ #include "server/error.h"
+ #include "server/main_service.h"
+ 
+@@ -17,15 +19,29 @@ ABSL_DECLARE_FLAG(int32_t, port);
+ namespace dfly {
+ 
+ using namespace std;
++using namespace util;
+ using namespace facade;
+ using absl::GetFlag;
+ 
++namespace {
++// Distribute flow indices over all available threads (shard_set pool size).
++vector<vector<unsigned>> Partition(unsigned num_flows) {
++  vector<vector<unsigned>> partition(shard_set->pool()->size());
++  for (unsigned i = 0; i < num_flows; ++i) {
++    partition[i % partition.size()].push_back(i);
++  }
++  return partition;
++}
++
++}  // namespace
++
+ ClusterSlotMigration::ClusterSlotMigration(string host_ip, uint16_t port,
+                                            std::vector<ClusterConfig::SlotRange> slots)
+-    : ProtocolClient(std::move(host_ip), port), slots_(std::move(slots)) {
++    : ProtocolClient(move(host_ip), port), slots_(std::move(slots)) {
+ }
+ 
+ ClusterSlotMigration::~ClusterSlotMigration() {
++  sync_fb_.JoinIfNeeded();
+ }
+ 
+ error_code ClusterSlotMigration::Start(ConnectionContext* cntx) {
+@@ -46,11 +62,13 @@ error_code ClusterSlotMigration::Start(ConnectionContext* cntx) {
+   ec = ConnectAndAuth(absl::GetFlag(FLAGS_source_connect_timeout_ms) * 1ms, &cntx_);
+   RETURN_ON_ERR(check_connection_error(ec, "couldn't connect to source"));
+ 
++  state_ = ClusterSlotMigration::C_CONNECTING;
++
+   VLOG(1) << "Greeting";
+   ec = Greet();
+   RETURN_ON_ERR(check_connection_error(ec, "couldn't greet source "));
+ 
+-  state_ = ClusterSlotMigration::C_CONNECTING;
++  sync_fb_ = fb2::Fiber("main_migration", &ClusterSlotMigration::MainMigrationFb, this);
+ 
+   return {};
+ }
+@@ -68,11 +86,12 @@ error_code ClusterSlotMigration::Greet() {
+   }
+   VLOG(1) << "Migration command: " << cmd;
+   RETURN_ON_ERR(SendCommandAndReadResponse(cmd));
+-  // Response is: num_shards
+-  if (!CheckRespFirstTypes({RespExpr::INT64}))
++  // Response is: sync_id, num_shards
++  if (!CheckRespFirstTypes({RespExpr::INT64, RespExpr::INT64}))
+     return make_error_code(errc::bad_message);
+ 
+-  souce_shards_num_ = get<int64_t>(LastResponseArgs()[0].u);
++  sync_id_ = get<int64_t>(LastResponseArgs()[0].u);
++  source_shards_num_ = get<int64_t>(LastResponseArgs()[1].u);
+ 
+   return error_code{};
+ }
+@@ -82,4 +101,69 @@ ClusterSlotMigration::Info ClusterSlotMigration::GetInfo() const {
+   return {ctx.host, ctx.port, state_};
+ }
+ 
++void ClusterSlotMigration::MainMigrationFb() {
++  VLOG(1) << "Main migration fiber started";
++
++  state_ = ClusterSlotMigration::C_FULL_SYNC;
++
++  // TODO add reconnection code
++  if (auto ec = InitiateSlotsMigration(); ec) {
++    LOG(WARNING) << "Error syncing with " << server().Description() << " " << ec << " "
++                 << ec.message();
++  }
++}
++
++std::error_code ClusterSlotMigration::InitiateSlotsMigration() {
++  shard_flows_.resize(source_shards_num_);
++  for (unsigned i = 0; i < source_shards_num_; ++i) {
++    shard_flows_[i].reset(new ClusterShardMigration(server(), i, sync_id_));
++  }
++
++  // Switch to new error handler that closes flow sockets.
++  auto err_handler = [this](const auto& ge) mutable {
++    // Make sure the flows are not in a state transition
++    lock_guard lk{flows_op_mu_};
++
++    // Unblock all sockets.
++    DefaultErrorHandler(ge);
++    for (auto& flow : shard_flows_)
++      flow->Cancel();
++  };
++  RETURN_ON_ERR(cntx_.SwitchErrorHandler(std::move(err_handler)));
++
++  std::atomic_uint32_t synced_shards = 0;
++  auto partition = Partition(source_shards_num_);
++  auto shard_cb = [&](unsigned index, auto*) {
++    for (auto id : partition[index]) {
++      auto ec = shard_flows_[id]->StartSyncFlow(&cntx_);
++      if (!ec) {
++        ++synced_shards;
++      } else {
++        cntx_.ReportError(ec);
++      }
++    }
++  };
++  // Lock to prevent the error handler from running instantly
++  // while the flows are in a mixed state.
++  lock_guard lk{flows_op_mu_};
++  shard_set->pool()->AwaitFiberOnAll(std::move(shard_cb));
++
++  VLOG(1) << synced_shards << " from " << source_shards_num_ << " shards were set flow";
++  if (synced_shards != source_shards_num_) {
++    cntx_.ReportError(std::make_error_code(errc::state_not_recoverable),
++                      "incorrect shards num, only for tests");
++  }
++
++  RETURN_ON_ERR(cntx_.GetError());
++
++  string request = absl::StrCat("DFLYMIGRATE SYNC ", sync_id_);
++
++  VLOG(1) << "Sending: " << request;
++  RETURN_ON_ERR(SendCommandAndReadResponse(request));
++
++  PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
++
++  return cntx_.GetError();
++}
++
+ }  // namespace dfly
+diff --git a/src/server/cluster/cluster_slot_migration.h b/src/server/cluster/cluster_slot_migration.h
+index d85ec214cc0d..506fa0316a5e 100644
+--- a/src/server/cluster/cluster_slot_migration.h
++++ b/src/server/cluster/cluster_slot_migration.h
+@@ -3,10 +3,14 @@
+ //
+ #pragma once
+ 
++#include "server/cluster/cluster_shard_migration.h"
+ #include "server/protocol_client.h"
+ 
+ namespace dfly {
+ 
++// The main entity on the target side that manage slots migration process
++// Creates initial connection between the target and source node,
++// manage migration process state and data
+ class ClusterSlotMigration : ProtocolClient {
+  public:
+   enum State : uint8_t { C_NO_STATE, C_CONNECTING, C_FULL_SYNC, C_STABLE_SYNC };
+@@ -21,14 +25,26 @@ class ClusterSlotMigration : ProtocolClient {
+                        std::vector<ClusterConfig::SlotRange> slots);
+   ~ClusterSlotMigration();
+ 
++  // Initiate connection with source node and create migration fiber
+   std::error_code Start(ConnectionContext* cntx);
+   Info GetInfo() const;
+ 
+  private:
++  // Send DFLYMIGRATE CONF to the source and get info about migration process
+   std::error_code Greet();
++  void MainMigrationFb();
++  // Creates flows, one per shard on the source node and manage migration process
++  std::error_code InitiateSlotsMigration();
++
++ private:
++  Mutex flows_op_mu_;
++  std::vector<std::unique_ptr<ClusterShardMigration>> shard_flows_;
+   std::vector<ClusterConfig::SlotRange> slots_;
+-  size_t souce_shards_num_ = 0;
++  uint32_t source_shards_num_ = 0;
++  uint32_t sync_id_ = 0;
+   State state_ = C_NO_STATE;
++
++  Fiber sync_fb_;
+ };
+ 
+ }  // namespace dfly

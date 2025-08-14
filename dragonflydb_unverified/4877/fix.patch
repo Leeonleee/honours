@@ -1,0 +1,177 @@
+diff --git a/src/server/db_slice.cc b/src/server/db_slice.cc
+index 22ddc6547337..5d16b09cefa2 100644
+--- a/src/server/db_slice.cc
++++ b/src/server/db_slice.cc
+@@ -355,20 +355,9 @@ SliceEvents& SliceEvents::operator+=(const SliceEvents& o) {
+ 
+ class DbSlice::PrimeBumpPolicy {
+  public:
+-  PrimeBumpPolicy(absl::flat_hash_set<uint64_t, FpHasher>* items) : fetched_items_(items) {
+-  }
+-
+-  // returns true if we can change the object location in dash table.
+   bool CanBump(const CompactObj& obj) const {
+-    if (obj.IsSticky()) {
+-      return false;
+-    }
+-    auto hc = obj.HashCode();
+-    return fetched_items_->insert(hc).second;
++    return !obj.IsSticky();
+   }
+-
+- private:
+-  mutable absl::flat_hash_set<uint64_t, FpHasher>* fetched_items_;
+ };
+ 
+ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner)
+@@ -565,21 +554,9 @@ auto DbSlice::FindInternal(const Context& cntx, string_view key, optional<unsign
+   }
+ 
+   DCHECK(IsValid(res.it));
+-  if (IsCacheMode()) {
+-    if (!change_cb_.empty()) {
+-      auto bump_cb = [&](PrimeTable::bucket_iterator bit) {
+-        CallChangeCallbacks(cntx.db_index, key, bit);
+-      };
+-      db.prime.CVCUponBump(change_cb_.back().first, res.it, bump_cb);
+-    }
+ 
+-    // We must not change the bucket's internal order during serialization
+-    serialization_latch_.Wait();
+-    auto bump_it = db.prime.BumpUp(res.it, PrimeBumpPolicy{&fetched_items_});
+-    if (bump_it != res.it) {  // the item was bumped
+-      res.it = bump_it;
+-      ++events_.bumpups;
+-    }
++  if (IsCacheMode()) {
++    fetched_items_.insert({res.it->first.HashCode(), cntx.db_index});
+   }
+ 
+   switch (stats_mode) {
+@@ -1714,10 +1691,40 @@ void DbSlice::PerformDeletion(Iterator del_it, DbTable* table) {
+   PerformDeletionAtomic(del_it, exp_it, table);
+ }
+ 
+-void DbSlice::OnCbFinish() {
+-  // TBD update bumpups logic we can not clear now after cb finish as cb can preempt
+-  // btw what do we do with inline?
+-  fetched_items_.clear();
++void DbSlice::OnCbFinishBlocking() {
++  if (IsCacheMode()) {
++    // move fetched items to local variable
++    auto fetched_items = std::move(fetched_items_);
++    for (const auto& [key_hash, db_index] : fetched_items) {
++      auto& db = *db_arr_[db_index];
++
++      // We intentionally don't do extra key checking on this callback to speedup
++      // fetching. Probability of having hash collision is quite low and for bumpup
++      // purposes it should be fine if different key (with same hash) is returned.
++      auto predicate = [](const PrimeKey&) { return true; };
++
++      PrimeIterator it = db.prime.FindFirst(key_hash, predicate);
++
++      if (!IsValid(it)) {
++        continue;
++      }
++
++      if (!change_cb_.empty()) {
++        auto key = it->first.ToString();
++        auto bump_cb = [&](PrimeTable::bucket_iterator bit) {
++          CallChangeCallbacks(db_index, key, bit);
++        };
++        db.prime.CVCUponBump(change_cb_.back().first, it, bump_cb);
++      }
++
++      // We must not change the bucket's internal order during serialization
++      serialization_latch_.Wait();
++      auto bump_it = db.prime.BumpUp(it, PrimeBumpPolicy{});
++      if (bump_it != it) {  // the item was bumped
++        ++events_.bumpups;
++      }
++    }
++  }
+ 
+   if (!pending_send_map_.empty()) {
+     SendQueuedInvalidationMessages();
+diff --git a/src/server/db_slice.h b/src/server/db_slice.h
+index 623a537a78aa..b246c2727366 100644
+--- a/src/server/db_slice.h
++++ b/src/server/db_slice.h
+@@ -357,7 +357,7 @@ class DbSlice {
+     return shard_id_;
+   }
+ 
+-  void OnCbFinish();
++  void OnCbFinishBlocking();
+ 
+   bool Acquire(IntentLock::Mode m, const KeyLockArgs& lock_args);
+   void Release(IntentLock::Mode m, const KeyLockArgs& lock_args);
+@@ -615,10 +615,16 @@ class DbSlice {
+ 
+   DbTableArray db_arr_;
+ 
++  // key for bump up items pair contains <key hash, db_index>
++  using FetchedItemKey = std::pair<uint64_t, DbIndex>;
++
+   struct FpHasher {
+     size_t operator()(uint64_t val) const {
+       return val;
+     }
++    size_t operator()(const FetchedItemKey& val) const {
++      return val.first;
++    }
+   };
+ 
+   // Used in temporary computations in Acquire/Release.
+@@ -635,7 +641,7 @@ class DbSlice {
+   // for operations that preempt in the middle we have another mechanism -
+   // auto laundering iterators, so in case of preemption we do not mind that fetched_items are
+   // cleared or changed.
+-  mutable absl::flat_hash_set<uint64_t, FpHasher> fetched_items_;
++  mutable absl::flat_hash_set<FetchedItemKey, FpHasher> fetched_items_;
+ 
+   // Registered by shard indices on when first document index is created.
+   DocDeletionCallback doc_del_cb_;
+diff --git a/src/server/debugcmd.cc b/src/server/debugcmd.cc
+index 892424a3ce1a..f0377c8c06f3 100644
+--- a/src/server/debugcmd.cc
++++ b/src/server/debugcmd.cc
+@@ -903,11 +903,11 @@ void DebugCmd::PopulateRangeFiber(uint64_t from, uint64_t num_of_keys,
+ 
+   ess.AwaitRunningOnShardQueue([&](EngineShard* shard) {
+     DoPopulateBatch(options, ps[shard->shard_id()]);
+-    // Debug populate does not use transaction framework therefore we call OnCbFinish manually
+-    // after running the callback
+-    // Note that running debug populate while running flushall/db can cause dcheck fail because the
+-    // finish cb is executed just when we finish populating the database.
+-    cntx_->ns->GetDbSlice(shard->shard_id()).OnCbFinish();
++    // Debug populate does not use transaction framework therefore we call OnCbFinishBlocking
++    // manually after running the callback Note that running debug populate while running
++    // flushall/db can cause dcheck fail because the finish cb is executed just when we finish
++    // populating the database.
++    cntx_->ns->GetDbSlice(shard->shard_id()).OnCbFinishBlocking();
+   });
+ }
+ 
+diff --git a/src/server/transaction.cc b/src/server/transaction.cc
+index cb631e3780fc..af27812ae936 100644
+--- a/src/server/transaction.cc
++++ b/src/server/transaction.cc
+@@ -695,7 +695,7 @@ void Transaction::RunCallback(EngineShard* shard) {
+   }
+ 
+   auto& db_slice = GetDbSlice(shard->shard_id());
+-  db_slice.OnCbFinish();
++  db_slice.OnCbFinishBlocking();
+ 
+   // Handle result flags to alter behaviour.
+   if (result.flags & RunnableResult::AVOID_CONCLUDING) {
+@@ -1364,7 +1364,7 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
+   auto& db_slice = GetDbSlice(shard->shard_id());
+ 
+   auto result = cb(this, shard);
+-  db_slice.OnCbFinish();
++  db_slice.OnCbFinishBlocking();
+ 
+   LogAutoJournalOnShard(shard, result);
+   MaybeInvokeTrackingCb();

@@ -1,0 +1,167 @@
+diff --git a/src/facade/error.h b/src/facade/error.h
+index bc24278820ae..3eaf060cfc84 100644
+--- a/src/facade/error.h
++++ b/src/facade/error.h
+@@ -32,6 +32,7 @@ extern const char kOutOfMemory[];
+ extern const char kInvalidNumericResult[];
+ extern const char kClusterNotConfigured[];
+ extern const char kLoadingErr[];
++extern const char kUndeclaredKeyErr[];
+ 
+ extern const char kSyntaxErrType[];
+ extern const char kScriptErrType[];
+diff --git a/src/facade/facade.cc b/src/facade/facade.cc
+index f5a832ad0d8f..d6487fe9dd9d 100644
+--- a/src/facade/facade.cc
++++ b/src/facade/facade.cc
+@@ -42,7 +42,7 @@ ConnectionStats& ConnectionStats::operator+=(const ConnectionStats& o) {
+ }
+ 
+ ReplyStats& ReplyStats::operator+=(const ReplyStats& o) {
+-  static_assert(sizeof(ReplyStats) == 64u + kSanitizerOverhead);
++  static_assert(sizeof(ReplyStats) == 72u + kSanitizerOverhead);
+   ADD(io_write_cnt);
+   ADD(io_write_bytes);
+ 
+@@ -50,6 +50,8 @@ ReplyStats& ReplyStats::operator+=(const ReplyStats& o) {
+     err_count[k_v.first] += k_v.second;
+   }
+ 
++  ADD(script_error_count);
++
+   send_stats += o.send_stats;
+ 
+   return *this;
+@@ -91,6 +93,7 @@ const char kOutOfMemory[] = "Out of memory";
+ const char kInvalidNumericResult[] = "result is not a number";
+ const char kClusterNotConfigured[] = "Cluster is not yet configured";
+ const char kLoadingErr[] = "-LOADING Dragonfly is loading the dataset in memory";
++const char kUndeclaredKeyErr[] = "script tried accessing undeclared key";
+ 
+ const char kSyntaxErrType[] = "syntax_error";
+ const char kScriptErrType[] = "script_error";
+diff --git a/src/facade/facade_types.h b/src/facade/facade_types.h
+index 035e381986e4..97079f9feda8 100644
+--- a/src/facade/facade_types.h
++++ b/src/facade/facade_types.h
+@@ -95,6 +95,7 @@ struct ReplyStats {
+   size_t io_write_cnt = 0;
+   size_t io_write_bytes = 0;
+   absl::flat_hash_map<std::string, uint64_t> err_count;
++  size_t script_error_count = 0;
+ 
+   ReplyStats& operator+=(const ReplyStats& other);
+ };
+diff --git a/src/server/main_service.cc b/src/server/main_service.cc
+index fcc00b48235f..3b8159bc4de3 100644
+--- a/src/server/main_service.cc
++++ b/src/server/main_service.cc
+@@ -1084,7 +1084,7 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId* cid, CmdA
+         CheckKeysDeclared(*dfly_cntx.conn_state.script_info, cid, tail_args, dfly_cntx.transaction);
+ 
+     if (status == OpStatus::KEY_NOTFOUND)
+-      return ErrorReply{"script tried accessing undeclared key"};
++      return ErrorReply(kUndeclaredKeyErr);
+ 
+     if (status != OpStatus::OK)
+       return ErrorReply{status};
+@@ -1943,6 +1943,7 @@ void Service::EvalInternal(CmdArgList args, const EvalArgs& eval_args, Interpret
+ 
+   if (result == Interpreter::RUN_ERR) {
+     string resp = StrCat("Error running script (call to ", eval_args.sha, "): ", error);
++    server_family_.script_mgr()->OnScriptError(eval_args.sha, error);
+     return cntx->SendError(resp, facade::kScriptErrType);
+   }
+ 
+diff --git a/src/server/script_mgr.cc b/src/server/script_mgr.cc
+index 726112dd82dc..214d9d354bde 100644
+--- a/src/server/script_mgr.cc
++++ b/src/server/script_mgr.cc
+@@ -33,8 +33,12 @@ ABSL_FLAG(
+     bool, lua_auto_async, false,
+     "If enabled, call/pcall with discarded values are automatically replaced with acall/apcall.");
+ 
+-namespace dfly {
++ABSL_FLAG(bool, lua_allow_undeclared_auto_correct, false,
++          "If enabled, when a script that is not allowed to run with undeclared keys is trying to "
++          "access undeclared keys, automaticaly set the script flag to be able to run with "
++          "undeclared key.");
+ 
++namespace dfly {
+ using namespace std;
+ using namespace facade;
+ using namespace util;
+@@ -283,6 +287,29 @@ optional<ScriptMgr::ScriptData> ScriptMgr::Find(std::string_view sha) const {
+   return std::nullopt;
+ }
+ 
++void ScriptMgr::OnScriptError(std::string_view sha, std::string_view error) {
++  ++tl_facade_stats->reply_stats.script_error_count;
++  lock_guard lk{mu_};
++  auto it = db_.find(sha);
++  if (it == db_.end()) {
++    return;
++  }
++
++  if (++it->second.error_resp < 5) {
++    LOG(ERROR) << "Error running script (call to " << sha << "): " << error;
++  }
++  // If script has undeclared_keys and was not flaged to run in this mode we will change the
++  // script flag - this will make script next run to not fail but run as global.
++  if (absl::GetFlag(FLAGS_lua_allow_undeclared_auto_correct)) {
++    size_t pos = error.rfind(kUndeclaredKeyErr);
++    if (pos != string::npos) {
++      it->second.undeclared_keys = true;
++      LOG(WARNING) << "Setting undeclared_keys flag for script with sha : (" << sha << ")";
++      UpdateScriptCaches(sha, it->second);
++    }
++  }
++}
++
+ void ScriptMgr::FlushAllScript() {
+   lock_guard lk{mu_};
+   db_.clear();
+diff --git a/src/server/script_mgr.h b/src/server/script_mgr.h
+index c80296725001..ab92f96d5cb6 100644
+--- a/src/server/script_mgr.h
++++ b/src/server/script_mgr.h
+@@ -59,6 +59,8 @@ class ScriptMgr {
+   // Returns if scripts run as global transactions by default
+   bool AreGlobalByDefault() const;
+ 
++  void OnScriptError(std::string_view sha, std::string_view error);
++
+  private:
+   void ExistsCmd(CmdArgList args, ConnectionContext* cntx) const;
+   void FlushCmd(CmdArgList args, ConnectionContext* cntx);
+@@ -73,6 +75,7 @@ class ScriptMgr {
+   struct InternalScriptData : public ScriptParams {
+     std::unique_ptr<char[]> body{};
+     std::unique_ptr<char[]> orig_body{};
++    uint32_t error_resp = 0;
+   };
+ 
+   ScriptParams default_params_;
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index f4023e5431de..55854128feb0 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -1146,6 +1146,9 @@ void PrintPrometheusMetrics(const Metrics& m, StringResponse* resp) {
+     }
+   }
+ 
++  AppendMetricWithoutLabels("script_error_total", "", m.facade_stats.reply_stats.script_error_count,
++                            MetricType::COUNTER, &resp->body());
++
+   // DB stats
+   AppendMetricWithoutLabels("expired_keys_total", "", m.events.expired_keys, MetricType::COUNTER,
+                             &resp->body());
+@@ -1792,6 +1795,8 @@ void ServerFamily::ResetStat() {
+     tl_facade_stats->reply_stats.io_write_bytes = 0;
+     tl_facade_stats->reply_stats.io_write_cnt = 0;
+     tl_facade_stats->reply_stats.send_stats = {};
++    tl_facade_stats->reply_stats.script_error_count = 0;
++    tl_facade_stats->reply_stats.err_count.clear();
+ 
+     service_.mutable_registry()->ResetCallStats(index);
+   });

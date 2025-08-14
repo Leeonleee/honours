@@ -1,0 +1,268 @@
+diff --git a/src/server/common.cc b/src/server/common.cc
+index b0745982c1ea..648102b70b11 100644
+--- a/src/server/common.cc
++++ b/src/server/common.cc
+@@ -258,13 +258,15 @@ bool ParseDouble(string_view src, double* value) {
+ #define ADD(x) (x) += o.x
+ 
+ TieredStats& TieredStats::operator+=(const TieredStats& o) {
+-  static_assert(sizeof(TieredStats) == 96);
++  static_assert(sizeof(TieredStats) == 112);
+ 
+   ADD(total_stashes);
+   ADD(total_fetches);
+   ADD(total_cancels);
+   ADD(total_deletes);
+   ADD(total_defrags);
++  ADD(total_heap_buf_allocs);
++  ADD(total_registered_buf_allocs);
+ 
+   ADD(allocated_bytes);
+   ADD(capacity_bytes);
+diff --git a/src/server/common.h b/src/server/common.h
+index e850d1c41d31..03cdcb2c3584 100644
+--- a/src/server/common.h
++++ b/src/server/common.h
+@@ -66,6 +66,8 @@ struct TieredStats {
+   size_t total_cancels = 0;
+   size_t total_deletes = 0;
+   size_t total_defrags = 0;
++  size_t total_registered_buf_allocs = 0;
++  size_t total_heap_buf_allocs = 0;
+ 
+   size_t allocated_bytes = 0;
+   size_t capacity_bytes = 0;
+diff --git a/src/server/debugcmd.h b/src/server/debugcmd.h
+index 1743fd67a2d5..607e0ecb9a30 100644
+--- a/src/server/debugcmd.h
++++ b/src/server/debugcmd.h
+@@ -17,7 +17,7 @@ class DebugCmd {
+   struct PopulateOptions {
+     uint64_t total_count = 0;
+     std::string_view prefix{"key"};
+-    uint32_t val_size = 0;
++    uint32_t val_size = 16;
+     bool populate_random_values = false;
+     std::string_view type{"STRING"};
+     uint32_t elements = 1;
+diff --git a/src/server/server_family.cc b/src/server/server_family.cc
+index 5f7c4725bd00..b56807797023 100644
+--- a/src/server/server_family.cc
++++ b/src/server/server_family.cc
+@@ -2175,7 +2175,8 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
+     append("tiered_total_fetches", m.tiered_stats.total_fetches);
+     append("tiered_total_cancels", m.tiered_stats.total_cancels);
+     append("tiered_total_deletes", m.tiered_stats.total_deletes);
+-    append("tiered_total_deletes", m.tiered_stats.total_defrags);
++    append("tiered_heap_buf_allocations", m.tiered_stats.total_heap_buf_allocs);
++    append("tiered_registered_buf_allocations", m.tiered_stats.total_registered_buf_allocs);
+ 
+     append("tiered_allocated_bytes", m.tiered_stats.allocated_bytes);
+     append("tiered_capacity_bytes", m.tiered_stats.capacity_bytes);
+diff --git a/src/server/tiered_storage.cc b/src/server/tiered_storage.cc
+index 63e614fb913f..a1f8b86aaadd 100644
+--- a/src/server/tiered_storage.cc
++++ b/src/server/tiered_storage.cc
+@@ -331,6 +331,8 @@ TieredStats TieredStorage::GetStats() const {
+     stats.pending_stash_cnt = op_stats.pending_stash_cnt;
+     stats.allocated_bytes = op_stats.disk_stats.allocated_bytes;
+     stats.capacity_bytes = op_stats.disk_stats.capacity_bytes;
++    stats.total_heap_buf_allocs = op_stats.disk_stats.heap_buf_alloc_count;
++    stats.total_registered_buf_allocs = op_stats.disk_stats.registered_buf_alloc_count;
+   }
+ 
+   {  // SmallBins stats
+diff --git a/src/server/tiering/disk_storage.cc b/src/server/tiering/disk_storage.cc
+index b0e8f5ca9eb4..42bd6efc7741 100644
+--- a/src/server/tiering/disk_storage.cc
++++ b/src/server/tiering/disk_storage.cc
+@@ -15,7 +15,7 @@
+ 
+ using namespace ::dfly::tiering::literals;
+ 
+-ABSL_FLAG(bool, backing_file_direct, false, "If true uses O_DIRECT to open backing files");
++ABSL_FLAG(bool, backing_file_direct, true, "If true uses O_DIRECT to open backing files");
+ 
+ ABSL_FLAG(uint64_t, registered_buffer_size, 512_KB,
+           "Size of registered buffer for IoUring fixed read/writes");
+@@ -39,16 +39,6 @@ void DestroyTmpBuf(UringBuf buf) {
+   ::operator delete[](buf.bytes.data(), std::align_val_t(kPageSize));
+ }
+ 
+-UringBuf PrepareBuf(size_t size) {
+-  DCHECK_EQ(ProactorBase::me()->GetKind(), ProactorBase::IOURING);
+-  auto* up = static_cast<UringProactor*>(ProactorBase::me());
+-
+-  if (auto borrowed = up->RequestBuffer(size); borrowed)
+-    return *borrowed;
+-  else
+-    return AllocateTmpBuf(size);
+-}
+-
+ void ReturnBuf(UringBuf buf) {
+   DCHECK_EQ(ProactorBase::me()->GetKind(), ProactorBase::IOURING);
+   auto* up = static_cast<UringProactor*>(ProactorBase::me());
+@@ -103,6 +93,8 @@ std::error_code DiskStorage::Open(std::string_view path) {
+ 
+ void DiskStorage::Close() {
+   using namespace std::chrono_literals;
++
++  // TODO: to fix this polling.
+   while (pending_ops_ > 0 || grow_pending_)
+     util::ThisFiber::SleepFor(10ms);
+ 
+@@ -175,7 +167,7 @@ std::error_code DiskStorage::Stash(io::Bytes bytes, StashCb cb) {
+ }
+ 
+ DiskStorage::Stats DiskStorage::GetStats() const {
+-  return {alloc_.allocated_bytes(), alloc_.capacity()};
++  return {alloc_.allocated_bytes(), alloc_.capacity(), heap_buf_alloc_cnt_, reg_buf_alloc_cnt_};
+ }
+ 
+ std::error_code DiskStorage::Grow(off_t grow_size) {
+@@ -196,4 +188,16 @@ std::error_code DiskStorage::Grow(off_t grow_size) {
+   return {};
+ }
+ 
++UringBuf DiskStorage::PrepareBuf(size_t size) {
++  DCHECK_EQ(ProactorBase::me()->GetKind(), ProactorBase::IOURING);
++  auto* up = static_cast<UringProactor*>(ProactorBase::me());
++
++  if (auto borrowed = up->RequestBuffer(size); borrowed) {
++    ++reg_buf_alloc_cnt_;
++    return *borrowed;
++  }
++  ++heap_buf_alloc_cnt_;
++  return AllocateTmpBuf(size);
++}
++
+ }  // namespace dfly::tiering
+diff --git a/src/server/tiering/disk_storage.h b/src/server/tiering/disk_storage.h
+index 0aecd699fa70..bb0edccb7350 100644
+--- a/src/server/tiering/disk_storage.h
++++ b/src/server/tiering/disk_storage.h
+@@ -10,6 +10,7 @@
+ #include "server/tiering/common.h"
+ #include "server/tiering/external_alloc.h"
+ #include "util/fibers/uring_file.h"
++#include "util/fibers/uring_proactor.h"  // for UringBuf
+ 
+ namespace dfly::tiering {
+ 
+@@ -19,6 +20,8 @@ class DiskStorage {
+   struct Stats {
+     size_t allocated_bytes = 0;
+     size_t capacity_bytes = 0;
++    uint64_t heap_buf_alloc_count = 0;
++    uint64_t registered_buf_alloc_count = 0;
+   };
+ 
+   using ReadCb = std::function<void(std::string_view, std::error_code)>;
+@@ -45,10 +48,14 @@ class DiskStorage {
+ 
+  private:
+   std::error_code Grow(off_t grow_size);
++  util::fb2::UringBuf PrepareBuf(size_t len);
+ 
+- private:
+   off_t size_, max_size_;
+   size_t pending_ops_ = 0;  // number of ongoing ops for safe shutdown
++
++  // how many times we allocate registered/heap buffers.
++  uint64_t heap_buf_alloc_cnt_ = 0, reg_buf_alloc_cnt_ = 0;
++
+   bool grow_pending_ = false;
+   std::unique_ptr<util::fb2::LinuxFile> backing_file_;
+ 
+diff --git a/src/server/tiering/small_bins.cc b/src/server/tiering/small_bins.cc
+index 84d7726be668..44c3f4c91ab6 100644
+--- a/src/server/tiering/small_bins.cc
++++ b/src/server/tiering/small_bins.cc
+@@ -16,13 +16,22 @@
+ #include "server/tx_base.h"
+ 
+ namespace dfly::tiering {
++using namespace std;
++
++namespace {
++
++// See FlushBin() for format details
++size_t StashedValueSize(string_view value) {
++  return 2 /* dbid */ + 8 /* hash */ + 2 /* strlen*/ + value.size();
++}
++
++}  // namespace
+ 
+ std::optional<SmallBins::FilledBin> SmallBins::Stash(DbIndex dbid, std::string_view key,
+                                                      std::string_view value) {
+   DCHECK_LT(value.size(), 2_KB);
+ 
+-  // See FlushBin() for format details
+-  size_t value_bytes = 2 /* dbid */ + 8 /* hash */ + 2 /* strlen*/ + value.size();
++  size_t value_bytes = StashedValueSize(value);
+ 
+   std::optional<FilledBin> filled_bin;
+   if (2 /* num entries */ + current_bin_bytes_ + value_bytes >= kPageSize) {
+@@ -30,11 +39,17 @@ std::optional<SmallBins::FilledBin> SmallBins::Stash(DbIndex dbid, std::string_v
+   }
+ 
+   current_bin_bytes_ += value_bytes;
+-  current_bin_.emplace(std::make_pair(dbid, key), value);
++
++  bool inserted = current_bin_.emplace(std::make_pair(dbid, key), value).second;
++  CHECK(inserted);
++  DVLOG(2) << "current_bin_bytes: " << current_bin_bytes_
++           << ", current_bin_size:" << current_bin_.size();
+   return filled_bin;
+ }
+ 
+ SmallBins::FilledBin SmallBins::FlushBin() {
++  DCHECK_GT(current_bin_.size(), 0u);
++
+   std::string out;
+   out.resize(current_bin_bytes_ + 2);
+ 
+@@ -67,18 +82,24 @@ SmallBins::FilledBin SmallBins::FlushBin() {
+   }
+ 
+   current_bin_bytes_ = 0;
++
++  // erase does not shrink, unlike clear().
+   current_bin_.erase(current_bin_.begin(), current_bin_.end());
+ 
+   return {id, std::move(out)};
+ }
+ 
+ SmallBins::KeySegmentList SmallBins::ReportStashed(BinId id, DiskSegment segment) {
+-  auto key_list = pending_bins_.extract(id);
+-  DCHECK_GT(key_list.mapped().size(), 0u);
++  DVLOG(1) << "ReportStashed " << id;
++
++  DCHECK(pending_bins_.contains(id));
++  auto seg_map_node = pending_bins_.extract(id);
++  const auto& seg_map = seg_map_node.mapped();
++  DCHECK_GT(seg_map.size(), 0u) << id;
+ 
+   uint16_t bytes = 0;
+   SmallBins::KeySegmentList list;
+-  for (auto& [key, sub_segment] : key_list.mapped()) {
++  for (auto& [key, sub_segment] : seg_map) {
+     bytes += sub_segment.length;
+ 
+     DiskSegment real_segment{segment.offset + sub_segment.offset, sub_segment.length};
+@@ -103,8 +124,14 @@ std::vector<std::pair<DbIndex, std::string>> SmallBins::ReportStashAborted(BinId
+ 
+ std::optional<SmallBins::BinId> SmallBins::Delete(DbIndex dbid, std::string_view key) {
+   std::pair<DbIndex, std::string> key_pair{dbid, key};
++  auto it = current_bin_.find(key_pair);
++
++  if (it != current_bin_.end()) {
++    size_t stashed_size = StashedValueSize(it->second);
++    DCHECK_GE(current_bin_bytes_, stashed_size);
+ 
+-  if (current_bin_.erase(key_pair)) {
++    current_bin_bytes_ -= stashed_size;
++    current_bin_.erase(it);
+     return std::nullopt;
+   }
+ 
