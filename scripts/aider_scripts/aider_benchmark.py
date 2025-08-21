@@ -2,10 +2,6 @@
 Usage: python aider_benchmark.py --m <model_name> --k <num_completions>
 """
 
-# TODO: add logging for built/test failures to try identify the cause
-# TODO: add timer for each step to identify bottlenecks
-# TODO: add error handling for if Aider fails to generate a fix due to things like API key issues
-
 import argparse, shutil
 from pathlib import Path
 import subprocess
@@ -18,7 +14,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = False
+debug = True
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
@@ -30,6 +26,7 @@ load_dotenv(dotenv_path=HONOURS_DIR / ".env")
 
 if debug:
     DEFAULT_BENCHMARK_DIR = (SCRIPT_DIR.parent.parent / "benchmarks/testbenchmark").resolve()
+
 
 def send_email_notification(subject, body, sender_email, app_password, recipient_email):
     msg = EmailMessage()
@@ -83,7 +80,6 @@ def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
     stderr_lines = []
 
     with open(log_file, 'a') if log_file else open(os.devnull, 'w') as log:
-        # Read both stdout and stderr line by line
         from threading import Thread
         def read_stream(stream, buffer, prefix):
             for line in stream:
@@ -112,12 +108,12 @@ def run(cmd, cwd=None, env=None, check=True, log_file=None, timeout=None):
 
     return Result(return_code, ''.join(stdout_lines), ''.join(stderr_lines))
 
+
 def main():
     args = parse_arguments()
     start_time = time.time()
     print(f"Model: {args.m}, Completions: {args.k}, Benchmark Directory: {args.dir}, Output Directory: {args.out}")
 
-    results = {}
     # Logging setup
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     safe_model_name = args.m.replace("/", "_").replace(":", "_")
@@ -127,122 +123,152 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = output_dir / f"{run_name}.log"
-    csv_path = output_dir / f"{run_name}.csv"
+    summary_csv_path = output_dir / f"{run_name}_summary.csv"
+    attempts_csv_path = output_dir / f"{run_name}_attempts.csv"
+
+    # Write a small run meta file for provenance
+    meta_path = output_dir / f"{run_name}_meta.json"
+    meta = {
+        "run_id": run_name,
+        "model": args.m,
+        "Kmax": args.k,
+        "benchmark_dir": str(Path(args.dir).resolve()),
+        "repo_root": str(HONOURS_DIR),
+        "timestamp": timestamp,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Prepare CSV writers
+    attempts_headers = ["problem", "attempt_index", "generation_success", "build_success", "test_success"]
+    summary_headers = ["problem", "total_generations", "successful_builds", "failed_builds", "passed_tests", "failed_tests"]
+
+    # Keep per-problem summary in memory
+    results = {}
 
     try:
-        # main loop
-        problems = sorted(
-            [p for p in Path(args.dir).iterdir() if p.is_dir()],
-            key=lambda p: int(p.name)
-        )
-        for problem in problems:
-            print(f"Processing problem: {problem.name}")
+        # Open attempts CSV once and append rows as we go
+        with open(attempts_csv_path, 'w', newline='') as attempts_csv:
+            attempts_writer = csv.DictWriter(attempts_csv, fieldnames=attempts_headers)
+            attempts_writer.writeheader()
 
-            results[problem.name] = {
-                "problem": problem.name,
-                "total_generations": 0,
-                "successful_builds": 0,
-                "failed_builds": 0,
-                "passed_tests": 0,
-                "failed_tests": 0,
-            }
-
-            # Parse json file to get problem details
-            problem_json = problem / f"{problem.name}.json"
-            if not problem_json.exists():
-                print(f"Problem JSON file not found for {problem.name}, skipping.")
-                continue
-            # Load problem details
-            with open(problem_json, 'r') as f:
-                problem_data = json.load(f)
-            
-            base_commit = problem_data.get("base_commit")
-            modified_files = problem_data.get("modified_files", [])
-            modified_test_files = problem_data.get("modified_test_files", [])
-
-            for i in range(args.k):
-                print(f"Generating completion {i+1} for {problem.name} using model {args.m}")
-                
-                # cleanup repo for fresh start
-                run(
-                    ["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)],
-                    log_file=log_path
-                )
-                # checkout to correct commit
-                run(
-                    ["bash", "scripts/aider_scripts/checkout.sh", str(HONOURS_DIR), base_commit],
-                    log_file=log_path
-                )
-
-                # apply test patches
-                test_patch_path = problem / "test.patch"
-                run(
-                    ["bash", "scripts/aider_scripts/apply_test_patch.sh", str(HONOURS_DIR), str(test_patch_path)],
-                    log_file=log_path
-                )
-                # generate fix
-
-                res = run(
-                    ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
-                    log_file=log_path,
-                    check=False
-                )
-
-                if res.returncode != 0:
-                    print(f"❌ Completion generation failed for {problem.name} completion {i+1}, skipping tests.")
-                    results[problem.name]["total_generations"] += 1
-                    continue
-                print(f"✅ Completion generated for {problem.name} completion {i+1}")
-                results[problem.name]["total_generations"] += 1
-
-                # build
-
-                res = run (
-                    ["bash", "scripts/aider_scripts/build.sh", str(HONOURS_DIR)],
-                    log_file=log_path,
-                    check=False
-                )
-
-                if res.returncode != 0:
-                    print(f"❌ Build failed for {problem.name} completion {i+1}, skipping tests.")
-                    results[problem.name]["failed_builds"] += 1
-                    continue
-                print(f"✅ Build successful for {problem.name} completion {i+1}")
-                results[problem.name]["successful_builds"] += 1
-
-                # test
-                test_args = [str(HONOURS_DIR)] + modified_test_files
-                res = run(
-                    ["bash", "scripts/aider_scripts/run_tests.sh", str(HONOURS_DIR)] + modified_test_files,
-                    log_file=log_path,
-                    check=False
-                )
-
-                tests_passed = (res.returncode == 0)
-                if tests_passed:
-                    print(f"✅ Tests passed for {problem.name} completion {i+1}")
-                    results[problem.name]["passed_tests"] += 1
-                else:
-                    print(f"❌ Tests failed for {problem.name} completion {i+1}")
-                    results[problem.name]["failed_tests"] += 1
-
-                # store results
-        print(results)
-        # archive results
-        
-
-        with open(csv_path, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=["problem", "total_generations", "successful_builds", "failed_builds", "passed_tests", "failed_tests"]
+            problems = sorted(
+                [p for p in Path(args.dir).iterdir() if p.is_dir()],
+                key=lambda p: int(p.name)
             )
+            for problem in problems:
+                print(f"Processing problem: {problem.name}")
+
+                results[problem.name] = {
+                    "problem": problem.name,
+                    "total_generations": 0,
+                    "successful_builds": 0,
+                    "failed_builds": 0,
+                    "passed_tests": 0,
+                    "failed_tests": 0,
+                }
+
+                # Parse json file to get problem details
+                problem_json = problem / f"{problem.name}.json"
+                if not problem_json.exists():
+                    print(f"Problem JSON file not found for {problem.name}, skipping.")
+                    continue
+
+                with open(problem_json, 'r') as f:
+                    problem_data = json.load(f)
+
+                base_commit = problem_data.get("base_commit")
+                modified_test_files = problem_data.get("modified_test_files", [])
+
+                for i in range(args.k):
+                    attempt_idx = i + 1
+                    print(f"Generating completion {attempt_idx} for {problem.name} using model {args.m}")
+
+                    # reset repo
+                    run(["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)], log_file=log_path)
+                    # checkout base commit
+                    run(["bash", "scripts/aider_scripts/checkout.sh", str(HONOURS_DIR), base_commit], log_file=log_path)
+                    # apply test patch
+                    test_patch_path = problem / "test.patch"
+                    run(["bash", "scripts/aider_scripts/apply_test_patch.sh", str(HONOURS_DIR), str(test_patch_path)], log_file=log_path)
+
+                    # generate fix (one-shot)
+                    gen = run(
+                        ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
+                        log_file=log_path,
+                        check=False
+                    )
+                    generation_success = int(gen.returncode == 0)
+                    results[problem.name]["total_generations"] += 1
+
+                    # Default per-attempt outcomes
+                    build_success = 0
+                    test_success = 0
+
+                    if not generation_success:
+                        print(f"❌ Completion generation failed for {problem.name} attempt {attempt_idx}, skipping build/tests.")
+                        # record attempt row
+                        attempts_writer.writerow({
+                            "problem": problem.name,
+                            "attempt_index": attempt_idx,
+                            "generation_success": generation_success,
+                            "build_success": build_success,
+                            "test_success": test_success,
+                        })
+                        attempts_csv.flush()
+                        continue
+
+                    print(f"✅ Completion generated for {problem.name} attempt {attempt_idx}")
+
+                    # build
+                    bld = run(["bash", "scripts/aider_scripts/build.sh", str(HONOURS_DIR)], log_file=log_path, check=False)
+                    if bld.returncode != 0:
+                        print(f"❌ Build failed for {problem.name} attempt {attempt_idx}, skipping tests.")
+                        results[problem.name]["failed_builds"] += 1
+                        # record attempt row
+                        attempts_writer.writerow({
+                            "problem": problem.name,
+                            "attempt_index": attempt_idx,
+                            "generation_success": generation_success,
+                            "build_success": build_success,
+                            "test_success": test_success,
+                        })
+                        attempts_csv.flush()
+                        continue
+
+                    print(f"✅ Build successful for {problem.name} attempt {attempt_idx}")
+                    results[problem.name]["successful_builds"] += 1
+                    build_success = 1
+
+                    # test
+                    tst = run(["bash", "scripts/aider_scripts/run_tests.sh", str(HONOURS_DIR)] + modified_test_files, log_file=log_path, check=False)
+                    if tst.returncode == 0:
+                        print(f"✅ Tests passed for {problem.name} attempt {attempt_idx}")
+                        results[problem.name]["passed_tests"] += 1
+                        test_success = 1
+                    else:
+                        print(f"❌ Tests failed for {problem.name} attempt {attempt_idx}")
+                        results[problem.name]["failed_tests"] += 1
+                        test_success = 0
+
+                    # record attempt row
+                    attempts_writer.writerow({
+                        "problem": problem.name,
+                        "attempt_index": attempt_idx,
+                        "generation_success": generation_success,
+                        "build_success": build_success,
+                        "test_success": test_success,
+                    })
+                    attempts_csv.flush()
+
+        # write summary CSV
+        with open(summary_csv_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=summary_headers)
             writer.writeheader()
             for row in results.values():
                 writer.writerow(row)
+
         print(f"Results and logs saved to {output_dir}")
-
-        # cleanup everything
-
 
         # Send email notification
         elapsed_seconds = int(time.time() - start_time)
@@ -252,19 +278,12 @@ def main():
 
         body = (
             f"Model: {args.m}\n"
-            f"Results saved to: {csv_path.resolve()}\n"
+            f"Run ID: {run_name}\n"
+            f"Results saved to:\n"
+            f"  Attempts: {attempts_csv_path.resolve()}\n"
+            f"  Summary : {summary_csv_path.resolve()}\n"
             f"Total runtime: {elapsed_str}\n"
-            f"Results:\n"
-            + "\n".join(
-                f"{problem}: {data['total_generations']} generations, "
-                f"{data['successful_builds']} successful builds, "
-                f"{data['failed_builds']} failed builds, "
-                f"{data['passed_tests']} passed tests, "
-                f"{data['failed_tests']} failed tests"
-                for problem, data in results.items()
-            )
         )
-
 
         send_email_notification(
             subject="✅ Benchmark Completed!",
@@ -273,24 +292,25 @@ def main():
             app_password=os.getenv("EMAIL_PASS"),
             recipient_email=os.getenv("EMAIL_USER")
         )
+
     except KeyboardInterrupt:
         print("Emergency stop requested. Writing results to CSV and exiting")
-        # Add 'partial' to the filename if interrupted
-        csv_path = csv_path.with_name(f"{csv_path.stem}_partial.csv")
-        log_path = log_path.with_name(f"{log_path.stem}_partial.log")
-        # Ensure results are saved even if interrupted
-        with open(csv_path, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=["problem", "total_generations", "successful_builds", "failed_builds", "passed_tests", "failed_tests"]
-            )
+        # Partial summary dump
+        partial_summary = summary_csv_path.with_name(f"{summary_csv_path.stem}_partial.csv")
+        with open(partial_summary, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=summary_headers)
             writer.writeheader()
             for row in results.values():
                 writer.writerow(row)
-        print(f"Partial results and logs saved to {output_dir}")
+        print(f"Partial summary saved to {partial_summary}")
 
+        # attempt CSV already has rows flushed incrementally
         # Cleanup
-        run(["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)], log_file=log_path)
-        
+        try:
+            run(["bash", "scripts/aider_scripts/clean_repo.sh", str(HONOURS_DIR)], log_file=log_path)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     main()
