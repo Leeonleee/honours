@@ -39,6 +39,9 @@ cp "$IGNORE_SRC" "$DUCKDB_DIR/.aiderignore"
 echo "Copied .aiderignore into duckdb"
 
 # Run aider from within duckdb
+
+# --show-prompts to show the prompt being sent to the models (doesn't include the content in the .prompt file)
+# --map-tokens 0 to disable the repo
 cd "$DUCKDB_DIR" || exit 1
 aider --model "$MODEL_NAME" --no-gitignore --yes --disable-playwright -f "$PROMPT_PATH" $MODIFIED_FILES
 
