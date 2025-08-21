@@ -7,7 +7,7 @@ DUCKDB_DIR="$HONOURS_DIR/repos/duckdb"
 cd "$DUCKDB_DIR" || exit 1
 
 echo "Starting build..."
-make -j2 # can change to any number, to use all -j$(nproc)
+make -j3 # can change to any number, to use all -j$(nproc)
 
 if [ $? -eq 0 ]; then
   echo "Build succeeded"
