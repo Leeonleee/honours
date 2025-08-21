@@ -18,7 +18,7 @@ import os
 from dotenv import load_dotenv
 import time
 
-debug = True
+debug = False
 
 # Constants
 HONOURS_DIR = Path(__file__).resolve().parents[2]
