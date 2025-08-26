@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Problem Difficulty Classifier
 
@@ -283,8 +282,10 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
         print(f"{'='*60}")
         
         # Lines changed buckets
-        lines_buckets = defaultdict(int)
-        for lines in lines_changed:
+        lines_buckets = defaultdict(list)
+        for problem in all_problems:
+            lines = problem['lines_changed']
+            problem_id = problem['problem_id']
             if lines == 0:
                 bucket = "0 lines"
             elif lines <= 5:
@@ -299,13 +300,16 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
                 bucket = "51-100 lines"
             else:
                 bucket = "100+ lines"
-            lines_buckets[bucket] += 1
+            lines_buckets[bucket].append(problem_id)
         
         bucket_order = ["0 lines", "1-5 lines", "6-10 lines", "11-20 lines", "21-50 lines", "51-100 lines", "100+ lines"]
         for bucket in bucket_order:
-            count = lines_buckets[bucket]
+            problems = lines_buckets[bucket]
+            count = len(problems)
             percentage = (count / total_problems * 100) if total_problems > 0 else 0
             print(f"{bucket:12s}: {count:3d} problems ({percentage:5.1f}%)")
+            if detailed:
+                print(f"             Problems: {', '.join(sorted(problems, key=int))}")
         
         print(f"Mean: {sum(lines_changed)/len(lines_changed):.1f}, Min: {min(lines_changed)}, Max: {max(lines_changed)}")
         
@@ -314,8 +318,10 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
         print(f"{'='*60}")
         
         # Files touched buckets
-        files_buckets = defaultdict(int)
-        for files in files_touched:
+        files_buckets = defaultdict(list)
+        for problem in all_problems:
+            files = max(problem['files_changed_in_diff'], problem['files_in_modified_files'])
+            problem_id = problem['problem_id']
             if files == 0:
                 bucket = "0 files"
             elif files == 1:
@@ -328,13 +334,16 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
                 bucket = "6-10 files"
             else:
                 bucket = "10+ files"
-            files_buckets[bucket] += 1
+            files_buckets[bucket].append(problem_id)
         
         bucket_order = ["0 files", "1 file", "2-3 files", "4-5 files", "6-10 files", "10+ files"]
         for bucket in bucket_order:
-            count = files_buckets[bucket]
+            problems = files_buckets[bucket]
+            count = len(problems)
             percentage = (count / total_problems * 100) if total_problems > 0 else 0
             print(f"{bucket:12s}: {count:3d} problems ({percentage:5.1f}%)")
+            if detailed:
+                print(f"             Problems: {', '.join(sorted(problems, key=int))}")
         
         print(f"Mean: {sum(files_touched)/len(files_touched):.1f}, Min: {min(files_touched)}, Max: {max(files_touched)}")
         
@@ -343,8 +352,10 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
         print(f"{'='*60}")
         
         # Test files buckets
-        test_buckets = defaultdict(int)
-        for tests in test_files:
+        test_buckets = defaultdict(list)
+        for problem in all_problems:
+            tests = problem['test_files_modified']
+            problem_id = problem['problem_id']
             if tests == 0:
                 bucket = "0 tests"
             elif tests == 1:
@@ -355,13 +366,16 @@ def analyze_benchmark(benchmark_dir, output_file=None, detailed=False):
                 bucket = "4-5 tests"
             else:
                 bucket = "5+ tests"
-            test_buckets[bucket] += 1
+            test_buckets[bucket].append(problem_id)
         
         bucket_order = ["0 tests", "1 test", "2-3 tests", "4-5 tests", "5+ tests"]
         for bucket in bucket_order:
-            count = test_buckets[bucket]
+            problems = test_buckets[bucket]
+            count = len(problems)
             percentage = (count / total_problems * 100) if total_problems > 0 else 0
             print(f"{bucket:12s}: {count:3d} problems ({percentage:5.1f}%)")
+            if detailed:
+                print(f"             Problems: {', '.join(sorted(problems, key=int))}")
         
         print(f"Mean: {sum(test_files)/len(test_files):.1f}, Min: {min(test_files)}, Max: {max(test_files)}")
     
