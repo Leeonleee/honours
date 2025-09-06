@@ -4,7 +4,7 @@
 
 set -e
 
-# Usage: ./apply_once.sh <honours_dir> <problem_directory> <problem_id> <model_name>
+# Usage: ./generate_fix.sh <honours_dir> <problem_directory> <problem_id> <model_name> [--thinking-tokens <value>] [--reasoning-effort <value>]
 # Run from project root directory
 
 # Arguments
@@ -12,6 +12,29 @@ HONOURS_DIR="$1"
 PROBLEM_DIR="$2"
 PROBLEM_ID="$3"
 MODEL_NAME="$4"
+
+# Optional parameters
+THINKING_TOKENS=""
+REASONING_EFFORT=""
+
+# Parse optional arguments
+shift 4
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --thinking-tokens)
+      THINKING_TOKENS="$2"
+      shift 2
+      ;;
+    --reasoning-effort)
+      REASONING_EFFORT="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
 
 # Paths
 DUCKDB_DIR="$HONOURS_DIR/repos/duckdb"
@@ -43,7 +66,27 @@ echo "Copied .aiderignore into duckdb"
 # --show-prompts to show the prompt being sent to the models (doesn't include the content in the .prompt file)
 # --map-tokens 0 to disable the repo
 cd "$DUCKDB_DIR" || exit 1
-aider --model "$MODEL_NAME" --no-gitignore --yes --disable-playwright --thinking-tokens 0 -f "$PROMPT_PATH" $MODIFIED_FILES
+
+# Build aider command with optional parameters
+AIDER_CMD="aider --model \"$MODEL_NAME\" --no-gitignore --yes --disable-playwright"
+
+# Add thinking tokens parameter (default to 0 if not specified)
+if [ -n "$THINKING_TOKENS" ]; then
+  AIDER_CMD="$AIDER_CMD --thinking-tokens $THINKING_TOKENS"
+else
+  AIDER_CMD="$AIDER_CMD --thinking-tokens 0"
+fi
+
+# Add reasoning effort parameter
+if [ -n "$REASONING_EFFORT" ]; then
+  AIDER_CMD="$AIDER_CMD --reasoning-effort $REASONING_EFFORT"
+fi
+
+# Add the prompt file and modified files
+AIDER_CMD="$AIDER_CMD -f \"$PROMPT_PATH\" $MODIFIED_FILES"
+
+# Execute the command
+eval $AIDER_CMD
 
 
 # Track success

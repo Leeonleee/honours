@@ -1,5 +1,14 @@
 """
-Usage: python aider_benchmark.py --m <model_name> --k <num_completions>
+Usage: python aider_benchmark.py --m <model_name> --k <num_completions> [--thinking-tokens <value>] [--reasoning-effort <value>]
+
+Optional parameters:
+  --thinking-tokens: Thinking tokens value (e.g., 0, 8k, 16k, 24k)
+  --reasoning-effort: Reasoning effort level (low, medium, high)
+
+Examples:
+  python aider_benchmark.py --m openrouter/openai/gpt-5 --k 5 --reasoning-effort low
+  python aider_benchmark.py --m openrouter/google/gemini-2.5-pro --k 5 --thinking-tokens 8k
+  python aider_benchmark.py --m openrouter/anthropic/claude-sonnet-4 --k 5 --thinking-tokens 0
 """
 
 import argparse, shutil
@@ -46,6 +55,8 @@ def parse_arguments():
     parser.add_argument("--k", type=int, required=True, help="Number of completions per problem")
     parser.add_argument("--dir", type=str, default=DEFAULT_BENCHMARK_DIR, help="Path to benchmark directory")
     parser.add_argument("--out", type=str, default=DEFAULT_OUTPUT_DIR, help="Where to move organized results")
+    parser.add_argument("--thinking-tokens", type=str, help="Thinking tokens value (e.g., 0, 8k, 16k, 24k)")
+    parser.add_argument("--reasoning-effort", type=str, choices=['low', 'medium', 'high'], help="Reasoning effort level")
     return parser.parse_args()
 
 
@@ -117,7 +128,18 @@ def main():
     # Logging setup
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     safe_model_name = args.m.replace("/", "_").replace(":", "_")
-    run_name = f"{timestamp}_{safe_model_name}_k{args.k}"
+    
+    # Build run name with optional thinking tokens and reasoning effort
+    name_parts = [timestamp, safe_model_name]
+    
+    if args.thinking_tokens:
+        name_parts.append(f"thinking{args.thinking_tokens}")
+    
+    if args.reasoning_effort:
+        name_parts.append(f"reasoning{args.reasoning_effort}")
+    
+    name_parts.append(f"k{args.k}")
+    run_name = "_".join(name_parts)
 
     output_dir = Path("outputs") / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +158,12 @@ def main():
         "repo_root": str(HONOURS_DIR),
         "timestamp": timestamp,
     }
+    
+    # Add optional parameters to metadata
+    if args.thinking_tokens:
+        meta["thinking_tokens"] = args.thinking_tokens
+    if args.reasoning_effort:
+        meta["reasoning_effort"] = args.reasoning_effort
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -193,8 +221,16 @@ def main():
                     run(["bash", "scripts/aider_scripts/apply_test_patch.sh", str(HONOURS_DIR), str(test_patch_path)], log_file=log_path)
 
                     # generate fix (one-shot)
+                    generate_cmd = ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)]
+                    
+                    # Add optional parameters
+                    if args.thinking_tokens:
+                        generate_cmd.extend(["--thinking-tokens", args.thinking_tokens])
+                    if args.reasoning_effort:
+                        generate_cmd.extend(["--reasoning-effort", args.reasoning_effort])
+                    
                     gen = run(
-                        ["bash", "scripts/aider_scripts/generate_fix.sh", str(HONOURS_DIR), str(problem), str(problem.name), str(args.m)],
+                        generate_cmd,
                         log_file=log_path,
                         check=False
                     )
